@@ -38,6 +38,9 @@ pub enum BackgroundTaskKind {
     ReorganizeTake(i64),
     ReorganizeMonitor(i64),
     ReorganizeChannel(i64),
+    /// Re-applying the effective post-join cleanup to takes that were joined
+    /// while the setting was still "Keep" (see `ManualCommand::RerunJoinCleanup`).
+    RerunJoinCleanup,
     /// A single Twitch VOD recovery (CDN probe + segment salvage + mux).
     /// Carries the recording id when recovering into an existing take
     /// (`None` for a standalone recovery not tied to a recording).
@@ -86,6 +89,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ReorganizeTake(_) => "Re-organize take",
             BackgroundTaskKind::ReorganizeMonitor(_) => "Re-organize monitor",
             BackgroundTaskKind::ReorganizeChannel(_) => "Re-organize channel",
+            BackgroundTaskKind::RerunJoinCleanup => "Re-run join cleanup",
             BackgroundTaskKind::RecoverVod(_) => "VOD recovery",
             BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
             BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
@@ -121,6 +125,7 @@ impl BackgroundTaskKind {
             | BackgroundTaskKind::ReorganizeAll
             | BackgroundTaskKind::ReorganizeMonitor(_)
             | BackgroundTaskKind::ReorganizeChannel(_)
+            | BackgroundTaskKind::RerunJoinCleanup
             | BackgroundTaskKind::RecoverVodScan
             | BackgroundTaskKind::RefreshCdnHosts
             | BackgroundTaskKind::ReembedChaptersAll
@@ -505,6 +510,14 @@ pub enum ManualCommand {
     ReorganizeMonitor(i64),
     /// Reorganize all recordings belonging to a channel.
     ReorganizeChannel(i64),
+    /// Re-apply the effective post-join cleanup to every take that already has
+    /// a `full.mkv` but is still carrying the parts it was built from.
+    ///
+    /// `join_cleanup` is evaluated **at join time only**, so switching it away
+    /// from "Keep" does nothing for takes joined earlier — they keep costing
+    /// double forever. This is the catch-up pass, and it re-verifies the join's
+    /// duration gate per take before disposing anything.
+    RerunJoinCleanup,
     /// Rename a recording's output file using the given new filename stem.
     RenameRecording { rec_id: i64, new_stem: String },
     /// Recover a Twitch VOD from surviving CDN segments and file the muxed MKV per

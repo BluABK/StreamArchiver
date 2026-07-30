@@ -444,7 +444,10 @@ impl StreamArchiverApp {
                                          (post-join cleanup, superseded heads, a live capture \
                                          replaced by its VOD): moved to the configured trash folder, \
                                          sent to the Recycle Bin, or deleted permanently. Inherit \
-                                         follows the global default.",
+                                         follows the global default. Note that \"Trash folder\" \
+                                         needs a trash folder configured for the drive in \
+                                         Settings → Automatic deletion — without one it quietly \
+                                         falls back to the Recycle Bin.",
                                     );
                                 ui.end_row();
 

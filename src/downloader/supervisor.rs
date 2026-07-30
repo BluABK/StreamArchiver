@@ -182,6 +182,7 @@ impl Supervisor {
             ManualCommand::ReorganizeChannel(channel_id) => {
                 self.cmd_reorganize_channel(channel_id)
             }
+            ManualCommand::RerunJoinCleanup => self.cmd_rerun_join_cleanup(),
             ManualCommand::RenameRecording { rec_id, new_stem } => {
                 self.cmd_rename_recording(rec_id, new_stem)
             }
@@ -842,6 +843,139 @@ progress_info: None,
                 outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
             });
         });
+    }
+
+    /// [`ManualCommand::RerunJoinCleanup`]: catch-up pass for takes joined
+    /// while `join_cleanup` was still "Keep".
+    ///
+    /// The setting is only ever consulted at the moment a join lands, so
+    /// switching it later leaves every earlier take carrying its head + live
+    /// capture next to a full that already contains both — permanently double
+    /// the stream's size (199 GB on one drive when this was found, 2026-07-31).
+    ///
+    /// Deletes nothing on trust: each take is re-verified against the SAME
+    /// duration gate the original join had to pass (`|full - (head + live)|`
+    /// within tolerance) before its parts are disposed, because the parts are
+    /// the only remaining evidence that the full is complete. A take that
+    /// fails the gate, or whose full is missing, is skipped and counted.
+    fn cmd_rerun_join_cleanup(&self) {
+        let this = self.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::RerunJoinCleanup,
+                label: "Re-run join cleanup".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let takes = match this.store.joined_takes_with_parts() {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = takes.len();
+            let (mut cleaned, mut skipped, mut unsafe_) = (0u32, 0u32, 0u32);
+            for (i, (rec_id, full, live, head)) in takes.iter().enumerate() {
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id,
+                    progress: Some(i as f32 / total.max(1) as f32),
+                    info: format!("{}/{total}", i + 1),
+                });
+                let (full_p, live_p, head_p) =
+                    (Path::new(full), Path::new(live), Path::new(head));
+                if crate::iomon::fs::metadata(Cat::Promote, full_p).await.is_err() {
+                    debug!(rec_id, "re-run join cleanup: full.mkv is gone — skipping");
+                    skipped += 1;
+                    continue;
+                }
+                // Nothing left to reclaim: the take already points at the full
+                // and holds no head.
+                let has_live = live != full
+                    && crate::iomon::fs::metadata(Cat::Promote, live_p).await.is_ok();
+                let has_head =
+                    !head.is_empty() && crate::iomon::fs::metadata(Cat::Promote, head_p).await.is_ok();
+                if !has_live && !has_head {
+                    skipped += 1;
+                    continue;
+                }
+                if !Self::join_still_verifies(*rec_id, full_p, live_p, head_p, has_live, has_head)
+                    .await
+                {
+                    unsafe_ += 1;
+                    continue;
+                }
+                let note = this.post_join_cleanup(*rec_id, head_p, live_p, full_p).await;
+                info!(rec_id, "re-run join cleanup: {note}");
+                let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                cleaned += 1;
+            }
+            let note = format!(
+                "{cleaned} cleaned, {skipped} already done, {unsafe_} left alone (unverifiable)"
+            );
+            info!("re-run join cleanup finished: {note}");
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(note),
+            });
+        });
+    }
+
+    /// Re-check that `full` really does contain the parts still sitting next to
+    /// it, using the same tolerance the original join applied
+    /// (`head_backfill`'s duration sanity gate). `false` = don't touch the
+    /// parts: either a probe failed or the durations don't add up, and in both
+    /// cases keeping a redundant copy beats deleting the only good one.
+    async fn join_still_verifies(
+        rec_id: i64,
+        full_p: &Path,
+        live_p: &Path,
+        head_p: &Path,
+        has_live: bool,
+        has_head: bool,
+    ) -> bool {
+        let Some(full_d) = media_duration_secs(full_p).await.filter(|d| *d > 0) else {
+            warn!(rec_id, "re-run join cleanup: could not probe the full.mkv — parts kept");
+            return false;
+        };
+        let mut expected = 0i64;
+        for (p, present) in [(live_p, has_live), (head_p, has_head)] {
+            if !present {
+                continue;
+            }
+            let Some(d) = media_duration_secs(p).await.filter(|d| *d > 0) else {
+                warn!(rec_id, "re-run join cleanup: could not probe {} — parts kept", p.display());
+                return false;
+            };
+            expected += d;
+        }
+        // Only one part survives on some takes, so the full is legitimately
+        // LONGER than what we can measure. Require it to be at least as long
+        // as the parts (never shorter) — a truncated full is the failure this
+        // gate exists to catch.
+        let both = has_live && has_head;
+        let ok = if both {
+            (full_d - expected).abs() <= 5 + expected / 50
+        } else {
+            full_d + 5 >= expected
+        };
+        if !ok {
+            warn!(
+                rec_id,
+                full_d,
+                expected,
+                "re-run join cleanup: the full.mkv doesn't account for its parts — keeping them"
+            );
+        }
+        ok
     }
 
     /// [`ManualCommand::RenameRecording`]: rename a recording's files to a new stem.

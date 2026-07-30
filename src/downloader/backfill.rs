@@ -1157,7 +1157,12 @@ impl Supervisor {
     /// Recent row ("parts kept", "head sent to Recycle Bin, capture moved to
     /// trash", …). Failure never blocks the join: a part whose disposal fails
     /// is simply kept, with its DB pointer intact.
-    async fn post_join_cleanup(
+    ///
+    /// Also reached retroactively by the "Re-run join cleanup" maintenance
+    /// action for takes joined while the setting was still "Keep" — which is
+    /// why each part's presence is checked rather than assumed: on that path
+    /// one part is often already gone.
+    pub(super) async fn post_join_cleanup(
         &self,
         rec_id: i64,
         head_p: &Path,
@@ -1180,7 +1185,9 @@ impl Supervisor {
         }
         // Head first — only a successful disposal clears the DB pointer (the
         // 🧩 head badge follows `backfill_path`).
-        let head_note =
+        let head_note = if crate::iomon::fs::metadata(Cat::Promote, head_p).await.is_err() {
+            "no head".to_string()
+        } else {
             match crate::disposal::dispose_media(
                 &self.store,
                 channel_id,
@@ -1199,9 +1206,15 @@ impl Supervisor {
                     warn!(rec_id, "post-join cleanup: head disposal failed: {e:#} (head kept)");
                     "head kept (disposal failed)".to_string()
                 }
-            };
+            }
+        };
         if cleanup != crate::disposal::JoinCleanup::Both {
             return head_note;
+        }
+        // Already re-pointed at the full (a previous cleanup ran, or this take
+        // never had a separate live capture): nothing left to dispose.
+        if live_p == full || crate::iomon::fs::metadata(Cat::Promote, live_p).await.is_err() {
+            return format!("{head_note}, no live capture");
         }
         // The live capture is the take's main file: re-point the row at the
         // full BEFORE removing it, so there is no window where `output_path`

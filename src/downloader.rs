@@ -179,6 +179,7 @@ pub use gap_recover::K_GAP_RECOVER;
 pub use gap_splice::K_GAP_SPLICE;
 #[allow(unused_imports)]
 use lock_culprit::*;
+pub use cache::K_CACHE_DROP_REDUNDANT;
 pub use cache::*;
 pub use finalize::*;
 pub use naming::*;

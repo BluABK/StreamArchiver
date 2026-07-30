@@ -2745,9 +2745,26 @@ impl StreamArchiverApp {
                          removal uses the deletion method below.",
                     );
             });
+            ui.checkbox(
+                &mut self.settings.cache_drop_redundant,
+                "Drop working-dir captures whose archive copy is verified",
+            )
+            .on_hover_text(
+                "A capture is written to the hidden working folder first and moved out on \
+                 success — but a crash, a failed remux or a re-attach can leave the original \
+                 behind, and nothing ever cleans those up, because \"it looks stale\" is not \
+                 evidence (a stale-looking .ts was once the only complete copy of a \
+                 recording). With this on, the startup sweep may remove such a leftover, but \
+                 ONLY after proving the take finished, its final file exists, and ffprobe says \
+                 that file is at least as long as the leftover. Anything unprovable is kept \
+                 untouched, and what is removed goes through the deletion method below, so \
+                 it's still recoverable. Turn off to keep every working-dir capture forever.",
+            );
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Deleted media goes to:");
                 let v = &mut self.settings.disposal_method;
+                let before = *v;
                 egui::ComboBox::from_id_salt("settings_disposal_method")
                     .selected_text(v.label())
                     .show_ui(ui, |ui| {
@@ -2764,6 +2781,21 @@ impl StreamArchiverApp {
                          immediately. A failed move/recycle always leaves the file in \
                          place — it is never escalated to a permanent delete.",
                     );
+                // Picking "Trash folder" with nowhere to put trash silently
+                // degrades every deletion to the Recycle Bin. Fill in the
+                // per-drive default the moment it's selected so the working
+                // configuration is the one you get by default; the warning
+                // below covers it if this is then cleared by hand.
+                if *v == crate::disposal::DisposalMethod::Trash
+                    && before != *v
+                    && self.settings.disposal_trash_dirs.trim().is_empty()
+                    && self.settings.disposal_trash_default_root.trim().is_empty()
+                {
+                    self.settings.disposal_trash_default_root =
+                        crate::disposal::TRASH_ROOT_SUGGESTION.to_string();
+                    self.status =
+                        "Trash folder selected — filled in a per-drive default trash root.".into();
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Default trash folder:");
@@ -2777,10 +2809,11 @@ impl StreamArchiverApp {
                      below — write it once with a '{drive}' token (e.g. \
                      '{drive}:\\streams\\.sa-trash') and every drive automatically \
                      gets its own trash folder in that shape, without moving files \
-                     across disks. Leave blank to require an explicit folder per \
-                     drive (the old behavior: unlisted drives fall back to the \
-                     Recycle Bin). An explicit override below always wins for its \
-                     drive.",
+                     across disks. An explicit override below always wins for its \
+                     drive. Blank here AND below is the one combination to avoid: \
+                     the method still reads \"Trash folder\", but every deletion \
+                     quietly goes to the Recycle Bin, which frees nothing on a \
+                     recordings drive until you empty it yourself.",
                 );
             });
             ui.horizontal(|ui| {
@@ -2825,6 +2858,38 @@ impl StreamArchiverApp {
                     }));
                 }
             });
+            // "Trash folder" with neither field set is the trap that let 133 GB
+            // pile up unnoticed in a Recycle Bin: the deletions all ran, none of
+            // them freed a byte, and nothing in the UI said so. Say it loudly,
+            // and offer the one-click fix rather than just complaining.
+            if crate::disposal::trash_root_missing(
+                self.settings.disposal_method,
+                &self.settings.disposal_trash_dirs,
+                &self.settings.disposal_trash_default_root,
+            ) {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 90, 70),
+                        "⚠ \"Trash folder\" is selected but no trash folder is configured — \
+                         every automatic deletion will silently go to the Recycle Bin \
+                         instead, which frees no space on the recordings drive until you \
+                         empty it by hand.",
+                    );
+                    if ui
+                        .button("Use the default")
+                        .on_hover_text(format!(
+                            "Set the default trash folder to {} — one folder per drive, so a \
+                             deletion stays an instant same-drive move.",
+                            crate::disposal::TRASH_ROOT_SUGGESTION
+                        ))
+                        .clicked()
+                    {
+                        self.settings.disposal_trash_default_root =
+                            crate::disposal::TRASH_ROOT_SUGGESTION.to_string();
+                    }
+                });
+            }
             }
     }
 
@@ -3713,6 +3778,7 @@ impl StreamArchiverApp {
             let embed_thumb_running   = self.background_tasks.iter().any(|t| t.kind == BTK::EmbedMissingThumbnails);
             let fetch_thumb_running   = self.background_tasks.iter().any(|t| t.kind == BTK::FetchMissingThumbnails);
             let reorganize_running    = self.background_tasks.iter().any(|t| t.kind == BTK::ReorganizeAll);
+            let join_cleanup_running  = self.background_tasks.iter().any(|t| t.kind == BTK::RerunJoinCleanup);
             egui::Grid::new("maintenance_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -3742,6 +3808,25 @@ impl StreamArchiverApp {
                         self.core.manual(ManualCommand::ReorganizeAll);
                     }
                     ui.label("Move files into/out of subdirectories based on current File Management settings.");
+                    ui.end_row();
+
+                    if ui
+                        .add_enabled(!join_cleanup_running, egui::Button::new("Re-run join cleanup"))
+                        .on_hover_text(
+                            "\"After full.mkv join\" is only applied at the moment a join lands, \
+                             so changing it does nothing for streams joined earlier — those keep \
+                             their head + live capture next to a full that already contains both, \
+                             costing double the stream's size forever. This is the catch-up pass. \
+                             Every take is re-verified first: the full.mkv is probed and must \
+                             account for the parts still beside it, and anything that can't be \
+                             verified is left completely alone. Parts go through the deletion \
+                             method above, so they're recoverable from the Trash view.",
+                        )
+                        .clicked()
+                    {
+                        self.core.manual(ManualCommand::RerunJoinCleanup);
+                    }
+                    ui.label("Apply the current \"After full.mkv join\" setting to already-joined streams.");
                     ui.end_row();
 
                     ui.horizontal(|ui| {

@@ -281,6 +281,10 @@ impl StreamArchiverApp {
                 crate::disposal::K_GAP_SPLICE_CLEANUP,
             ))
             .unwrap_or_default(),
+            cache_drop_redundant: setting_or_empty(
+                &core,
+                crate::downloader::K_CACHE_DROP_REDUNDANT,
+            ) != "0",
             chapters_enabled: crate::chapters::global_chapters_enabled(&core.store),
             raid_follow_record: crate::raid_follow::global_raid_follow_record(&core.store),
             raid_follow_play: crate::raid_follow::global_raid_follow_play(&core.store),
@@ -541,6 +545,7 @@ impl StreamArchiverApp {
             warnings_rows: Vec::new(),
             rec_alert_badges: std::collections::HashMap::new(),
             warn_refreshed: None,
+            trash_badge: 0,
             warn_badge: (0, 0),
             warn_search: String::new(),
             warn_sev_filter: None,
@@ -1797,6 +1802,7 @@ impl StreamArchiverApp {
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),
             (crate::downloader::K_GAP_SPLICE, if s.gap_splice { "1" } else { "0" }),
             (crate::disposal::K_GAP_SPLICE_CLEANUP, s.gap_splice_cleanup.as_str()),
+            (crate::downloader::K_CACHE_DROP_REDUNDANT, if s.cache_drop_redundant { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_ENABLED, if s.chapters_enabled { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_TITLE, if s.chapters_title { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_CATEGORY, if s.chapters_category { "1" } else { "0" }),

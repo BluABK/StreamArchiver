@@ -78,6 +78,24 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// How many disposed files are still sitting in a trash folder
+    /// (`state == SoftDeleted`) — i.e. still occupying the recordings drive and
+    /// still restorable.
+    ///
+    /// Backs the top bar's 🗑 badge. A trash folder is only ever emptied by
+    /// hand, so without a visible count it silently accumulates: the whole
+    /// point of choosing "Trash folder" over the Recycle Bin is that the app
+    /// knows what's in it, so it should say so.
+    pub fn trashed_file_count(&self) -> Result<i64> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT COUNT(*) FROM disposal_record WHERE state = ?1",
+            params![DisposalRecordState::SoftDeleted.as_str()],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     /// `(rec_id, reason)` pairs already logged — the historical-import scan
     /// (`disposal_backfill`) skips any candidate matching one of these, so
     /// re-running the scan never duplicates an entry.
@@ -219,6 +237,29 @@ mod tests {
 
         let live_id = store.insert_disposal_record(&sample(6, DisposalRecordState::Permanent)).unwrap();
         assert_eq!(store.get_disposal_record(live_id).unwrap().unwrap().confidence, DisposalConfidence::Live);
+    }
+
+    /// The 🗑 badge counts only what's still IN a trash folder — a recycled or
+    /// permanently-deleted file is gone and costs nothing, so it must not keep
+    /// the badge lit forever.
+    #[test]
+    fn trashed_file_count_counts_only_soft_deleted() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.trashed_file_count().unwrap(), 0);
+
+        store.insert_disposal_record(&sample(1, DisposalRecordState::SoftDeleted)).unwrap();
+        store.insert_disposal_record(&sample(2, DisposalRecordState::SoftDeleted)).unwrap();
+        store.insert_disposal_record(&sample(3, DisposalRecordState::Permanent)).unwrap();
+        store.insert_disposal_record(&sample(4, DisposalRecordState::Restored)).unwrap();
+        assert_eq!(store.trashed_file_count().unwrap(), 2);
+
+        // Emptying the trash (permanently deleting a row) clears it down.
+        let id = store.insert_disposal_record(&sample(5, DisposalRecordState::SoftDeleted)).unwrap();
+        assert_eq!(store.trashed_file_count().unwrap(), 3);
+        store
+            .set_disposal_record_state(id, DisposalRecordState::Permanent, None, 99)
+            .unwrap();
+        assert_eq!(store.trashed_file_count().unwrap(), 2);
     }
 
     #[test]

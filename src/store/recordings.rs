@@ -631,6 +631,55 @@ impl Store {
         Ok(rows)
     }
 
+    /// `(rec_id, output_path, full_path)` for every take that has FINISHED and
+    /// claims a final file — the lookup table the capture-cache sweep uses to
+    /// map a leftover working-dir capture back to the archive copy that
+    /// supersedes it (`Supervisor::sweep_redundant_captures`).
+    ///
+    /// In-flight takes are excluded by `ended_at IS NOT NULL`: their cache file
+    /// IS the recording, and nothing may touch it.
+    pub fn finished_takes_final_paths(&self) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, COALESCE(output_path, ''), COALESCE(full_path, '')
+             FROM recording
+             WHERE ended_at IS NOT NULL AND COALESCE(output_path, '') != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Takes that have a joined `full.mkv` but may still be carrying the parts
+    /// it was built from — the input to the "Re-run join cleanup" maintenance
+    /// action (`Supervisor::cmd_rerun_join_cleanup`).
+    ///
+    /// Returns `(rec_id, full_path, output_path, backfill_path)`. Deliberately
+    /// broader than "definitely uncleaned": a take whose `output_path` already
+    /// IS the full has had `Both` applied, but it may still hold a head, and a
+    /// take with neither part left simply produces no work. The caller decides,
+    /// because only it knows the effective per-scope cleanup setting and what
+    /// is actually on disk.
+    ///
+    /// Exists because `join_cleanup` is applied **at join time only** — flipping
+    /// it from "Keep" later does nothing for takes already joined, which is how
+    /// 199 GB of redundant parts accumulated on one drive (2026-07-31).
+    pub fn joined_takes_with_parts(&self) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, full_path, COALESCE(output_path, ''), COALESCE(backfill_path, '')
+             FROM recording
+             WHERE full_path IS NOT NULL AND full_path != ''
+               AND (COALESCE(output_path, '') != full_path OR COALESCE(backfill_path, '') != '')
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Promote orphaned recordings that have a non-TS final output file to
     /// 'completed'. These are captures where the app crashed after the file was
     /// fully written but before the status column was updated — the content is
@@ -2380,6 +2429,64 @@ mod tests {
 
         let candidates = store.vod_replace_candidates().unwrap();
         assert_eq!(candidates, vec![(replaced, "C:/tmp/live.mkv".to_string(), 200)]);
+    }
+
+    /// The catch-up pass's input: takes that joined but may still carry parts.
+    /// A take whose `output_path` already IS the full AND has no head left is
+    /// fully cleaned and must not come back every run.
+    #[test]
+    fn joined_takes_with_parts_lists_only_takes_with_something_left() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let new = |t: i64, out: &str| {
+            store.insert_recording(mid, t, out, Some(t), false, None, None, "", "").unwrap()
+        };
+
+        // Never joined — not our business.
+        new(100, "C:/rec/plain.mkv");
+        // Joined, nothing cleaned yet: output still the live capture.
+        let uncleaned = new(200, "C:/rec/a.mkv");
+        store.set_recording_full_path(uncleaned, "C:/rec/a.full.mkv").unwrap();
+        store.set_recording_backfill_path(uncleaned, "C:/rec/a.head.mkv").unwrap();
+        // Joined, head disposed, live capture still there (`Head` cleanup).
+        let head_only = new(300, "C:/rec/b.mkv");
+        store.set_recording_full_path(head_only, "C:/rec/b.full.mkv").unwrap();
+        // Fully cleaned (`Both`): re-pointed at the full, no head.
+        let done = new(400, "C:/rec/c.full.mkv");
+        store.set_recording_full_path(done, "C:/rec/c.full.mkv").unwrap();
+        // Re-pointed at the full but a head somehow survived — still work to do.
+        let stray_head = new(500, "C:/rec/d.full.mkv");
+        store.set_recording_full_path(stray_head, "C:/rec/d.full.mkv").unwrap();
+        store.set_recording_backfill_path(stray_head, "C:/rec/d.head.mkv").unwrap();
+
+        let ids: Vec<i64> =
+            store.joined_takes_with_parts().unwrap().into_iter().map(|(id, ..)| id).collect();
+        assert_eq!(ids, vec![uncleaned, head_only, stray_head]);
+        assert!(!ids.contains(&done), "an already-cleaned take must not be revisited");
+    }
+
+    /// The cache sweep's lookup only offers FINISHED takes — an in-flight
+    /// take's working-dir file IS the recording and must never be a candidate.
+    #[test]
+    fn finished_takes_final_paths_excludes_in_flight() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let live = store
+            .insert_recording(mid, 100, "C:/rec/live.mkv", Some(50), false, None, None, "", "")
+            .unwrap();
+        let done = store
+            .insert_recording(mid, 200, "C:/rec/done.mkv", Some(150), false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(done, 900, 123, Some(0), "completed", "C:/rec/done.mkv", "")
+            .unwrap();
+
+        let rows = store.finished_takes_final_paths().unwrap();
+        let ids: Vec<i64> = rows.iter().map(|(id, ..)| *id).collect();
+        assert_eq!(ids, vec![done]);
+        assert!(!ids.contains(&live), "an open take is never superseded by anything");
     }
 
     #[test]

@@ -595,6 +595,28 @@ pub fn unique_trash_target(dir: &Path, name: &str, exists: impl Fn(&Path) -> boo
     unreachable!("u32 exhausted finding a free trash name");
 }
 
+/// The default trash root offered when the user picks the Trash method with
+/// nothing configured — one folder per drive, alongside the capture cache, so
+/// a trashed file is always an instant same-drive rename.
+pub const TRASH_ROOT_SUGGESTION: &str = r"{drive}:\streams\.sa-trash";
+
+/// True when "Trash folder" is selected but **nothing says where the trash
+/// folder is** — no per-drive entry and no `{drive}` default template.
+///
+/// This combination is not an error, but it is a trap: `execute_disposal`
+/// quietly degrades to the Recycle Bin, which on a recordings drive frees
+/// *nothing* until the bin is emptied by hand. It read as "deletions are
+/// configured" while 133 GB accumulated in `G:\$RECYCLE.BIN` (2026-07-31).
+/// Settings uses this to refuse to leave the pair blank silently.
+///
+/// Takes the raw field values rather than the store so the Settings form can
+/// call it on unsaved edits.
+pub fn trash_root_missing(method: DisposalMethod, trash_dirs: &str, default_root: &str) -> bool {
+    method == DisposalMethod::Trash
+        && trash_dirs.trim().is_empty()
+        && default_root.trim().is_empty()
+}
+
 /// Dispose of a finished-media file per the effective (instance > channel >
 /// global) method. On failure the file is left in place and an error returned —
 /// disposal never escalates (a failed trash move or recycle NEVER falls
@@ -610,8 +632,30 @@ pub async fn dispose_media(
     rec_id: i64,
     reason: &str,
 ) -> std::io::Result<Disposed> {
+    let result = execute_disposal(store, channel_id, monitor_id, path).await;
+    if let Ok(disposed) = &result {
+        log_disposal(store, rec_id, reason, path, disposed);
+    }
+    result
+}
+
+/// The disposal itself, split out from [`dispose_media`] purely so the history
+/// log above it is **unbypassable**. It used to be one function whose tail did
+/// the logging, and one `return` in the middle — the "no trash folder on this
+/// drive, degrade to the Recycle Bin" path — jumped straight over it. Every
+/// disposal on a Trash-method setup with no configured root was therefore
+/// executed but never recorded: `disposal_record` stayed empty, the Trash view
+/// showed nothing to restore or prune, and 133 GB of "trashed" captures piled
+/// up invisibly in the Recycle Bin (found 2026-07-31). With the log in the
+/// caller, no early return in here can lose an entry again.
+async fn execute_disposal(
+    store: &Store,
+    channel_id: i64,
+    monitor_id: i64,
+    path: &Path,
+) -> std::io::Result<Disposed> {
     let method = effective_method(store, channel_id, monitor_id);
-    let result: std::io::Result<Disposed> = match method {
+    match method {
         DisposalMethod::Trash => {
             let dirs = store.get_setting(K_TRASH_DIRS).ok().flatten().unwrap_or_default();
             let default_root =
@@ -653,11 +697,7 @@ pub async fn dispose_media(
         DisposalMethod::Unknown => {
             unreachable!("Unknown is only ever constructed by disposal_backfill, never resolved by effective_method")
         }
-    };
-    if let Ok(disposed) = &result {
-        log_disposal(store, rec_id, reason, path, disposed);
     }
-    result
 }
 
 async fn recycle(path: &Path) -> std::io::Result<Disposed> {
@@ -670,7 +710,72 @@ async fn recycle(path: &Path) -> std::io::Result<Disposed> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // test fixtures, not app I/O paths
     use super::*;
+
+    /// Every successful disposal lands a history row, whichever branch of
+    /// `execute_disposal` produced it. The regression this guards: the
+    /// no-trash-root Recycle fallback used to `return` past the logging, so a
+    /// Trash-method setup with no configured root disposed hundreds of GB
+    /// without a single `disposal_record` row (see `execute_disposal`).
+    #[tokio::test]
+    async fn every_successful_disposal_is_logged() {
+        let dir = std::env::temp_dir().join(format!("sa-disp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Trash WITH a configured root: soft-deleted, restorable.
+        let store = Store::open_in_memory().unwrap();
+        let trash = dir.join("trash");
+        store.set_setting(K_DISPOSAL_METHOD, "trash").unwrap();
+        store.set_setting(K_TRASH_DIRS, &trash.to_string_lossy()).unwrap();
+        let victim = dir.join("a.mkv");
+        std::fs::write(&victim, b"x").unwrap();
+        let d = dispose_media(&store, 1, 1, &victim, 42, "post-join cleanup: head").await.unwrap();
+        assert!(matches!(d, Disposed::Trashed(_)), "{d:?}");
+        let rows = store.list_disposal_records().unwrap();
+        assert_eq!(rows.len(), 1, "the trash move must be logged");
+        assert_eq!(rows[0].row.rec_id, 42);
+        assert_eq!(rows[0].row.method, DisposalMethod::Trash);
+        assert_eq!(rows[0].row.state, DisposalRecordState::SoftDeleted);
+        assert_eq!(rows[0].row.reason, "post-join cleanup: head");
+        assert!(!rows[0].row.trash_path.is_empty(), "restore needs the new path");
+        assert!(!victim.exists() && std::fs::read_dir(&trash).unwrap().count() == 1);
+
+        // 2. Permanent delete: a different branch, still logged.
+        let store = Store::open_in_memory().unwrap();
+        store.set_setting(K_DISPOSAL_METHOD, "delete").unwrap();
+        let victim = dir.join("b.mkv");
+        std::fs::write(&victim, b"x").unwrap();
+        let d = dispose_media(&store, 1, 1, &victim, 7, "post-join cleanup: live capture").await.unwrap();
+        assert!(matches!(d, Disposed::Deleted));
+        let rows = store.list_disposal_records().unwrap();
+        assert_eq!(rows.len(), 1, "the permanent delete must be logged");
+        assert_eq!(rows[0].row.state, DisposalRecordState::Permanent);
+        assert!(!victim.exists());
+
+        // 3. A FAILED disposal logs nothing (the file is still there — a row
+        //    would offer a restore for something that was never removed).
+        let store = Store::open_in_memory().unwrap();
+        store.set_setting(K_DISPOSAL_METHOD, "delete").unwrap();
+        assert!(dispose_media(&store, 1, 1, &dir.join("nope.mkv"), 9, "x").await.is_err());
+        assert!(store.list_disposal_records().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact condition that silently routes a "Trash" disposal to the
+    /// Recycle Bin: no explicit entry for the file's drive AND no `{drive}`
+    /// default template. Settings warns about this loudly — see
+    /// `trash_root_missing`.
+    #[test]
+    fn no_trash_root_configured_is_what_triggers_the_recycle_fallback() {
+        let p = Path::new(r"G:\streams\x.mkv");
+        assert!(pick_trash_root("", "", p).is_none(), "blank config = fallback");
+        assert!(pick_trash_root(r"A:\streams\.sa-trash", "", p).is_none(), "other drive only");
+        assert!(pick_trash_root(r"G:\streams\.sa-trash", "", p).is_some());
+        assert!(pick_trash_root("", r"{drive}:\streams\.sa-trash", p).is_some(), "template covers it");
+    }
 
     #[test]
     fn enum_strings_roundtrip() {

@@ -652,6 +652,9 @@ impl StreamArchiverApp {
             // The Streams-grid take/stream badges ride the same throttle.
             self.rec_alert_badges =
                 self.core.store.alert_badges_by_recording().unwrap_or_default();
+            // The 🗑 tab badge rides along: a trash folder is only emptied by
+            // hand, so it needs to be visible without opening the view.
+            self.trash_badge = self.core.store.trashed_file_count().unwrap_or(0);
             if self.show_warnings {
                 self.warnings_rows = self.core.store.list_capture_alerts(500).unwrap_or_default();
             }

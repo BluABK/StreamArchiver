@@ -24,6 +24,15 @@ impl StreamArchiverApp {
     pub(super) fn reload_trash(&mut self) {
         self.trash_records = self.core.store.list_disposal_records().unwrap_or_default();
         self.trash_loaded = true;
+        // Restoring or permanently deleting changes how many files are left in
+        // the trash folders, so re-derive the 🗑 tab badge from the rows we
+        // just loaded rather than letting it sit stale for up to a minute
+        // waiting on its own throttle.
+        self.trash_badge = self
+            .trash_records
+            .iter()
+            .filter(|d| d.row.state == crate::disposal::DisposalRecordState::SoftDeleted)
+            .count() as i64;
     }
 
     /// Drain completed Restore/Permanently-delete outcomes posted by

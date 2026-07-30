@@ -533,7 +533,16 @@ per-channel and per-instance) can instead delete just the head, or both parts �
 in which case the take's main file becomes the full. The cleanup only runs
 after the join passes its duration sanity check, and removals follow the
 configured [deletion method](#automatic-deletion) (trash folder / Recycle Bin /
-permanent), so nothing is irrecoverably gone unless you chose that. The take shows a **🧩 head**
+permanent), so nothing is irrecoverably gone unless you chose that.
+
+The setting is read **at the moment a join lands**, so changing it later does
+nothing for streams already joined — they keep both parts forever. *Settings →
+Maintenance → **Re-run join cleanup*** is the catch-up pass: it re-applies the
+current setting to every already-joined take. It deletes nothing on trust —
+each take's `full.mkv` is probed and must account for the parts still sitting
+beside it (a full shorter than its own parts is kept, not cleaned), and any
+take that can't be verified is left completely alone and counted in the result.
+The take shows a **🧩 head**
 badge while only the head exists and **🧩 full** once the join lands — visible
 on the stream's row directly for the common single-take case, and rolled up
 onto the stream row (in addition to each take's own row) when a reconnect
@@ -609,18 +618,47 @@ chain (channel Properties / edit instance):
   neither falls back to the Recycle Bin. Name collisions get a ` (1)` suffix.
 - **Delete permanently**: gone immediately.
 
+> **Trash folder with nothing configured is the one combination to avoid.**
+> It still reads as "Trash folder", but with no override and no `{drive}`
+> template every deletion quietly falls back to the Recycle Bin — which frees
+> **no space** on a recordings drive until you empty it by hand. Selecting the
+> method now fills in the `{drive}` default automatically, and Settings shows a
+> standing warning (with a one-click fix) if both fields are ever left blank.
+> This is not hypothetical: it went unnoticed long enough to park 133 GB in one
+> drive's Recycle Bin.
+
 A failed move or recycle always leaves the file in place (and logs why) — a
 disposal failure is never escalated to a more destructive method. Transient
 working files (playlists, cache leftovers, `.state`) are not media and are
 always plainly deleted regardless of these settings.
 
+**Drop superseded working-dir captures.** A capture is written into the hidden
+working folder and moved out on success — but a crash, a failed remux or a
+re-attach can leave the original behind, and normally *nothing* removes it:
+the cache sweep only age-deletes files matching an allowlist of known tool
+byproducts, precisely because "it looks stale" once cost 7.7 h of footage (the
+stale-looking `.ts` was the only complete copy). With this setting on
+(**default**, next to the deletion method) the startup sweep may finally clear
+such a leftover — but only after *proving* it's redundant: the take must have
+finished, its final file must exist, and **ffprobe must confirm that file is at
+least as long** as the leftover. Anything unprovable — no matching take,
+missing final, either probe failing, or a final that comes back *shorter*
+(exactly the botched-promotion case) — is left untouched and logged. What does
+get removed goes through the deletion method above, so it stays recoverable.
+Turn it off to keep every working-dir capture forever.
+
 **🗑 Trash view.** Every automatic disposal is logged here — reason (post-join
-cleanup, gap-splice cleanup, superseded old head, VOD replace), method, when,
+cleanup, gap-splice cleanup, superseded old head, VOD replace, superseded
+working-dir capture), method, when,
 and its current path — grouped by channel like the Streams grid, with a
 channel-name filter. A **Trash folder** disposal is "soft-deleted": the file
 still exists in its trash folder, so its row gets **↩ Restore** (moves it back
 to where it lived) and **🗑 Permanently delete** (asks for confirmation, then
-removes it for good). Recycle Bin and permanent-delete rows are history only —
+removes it for good). Because a trash folder is only ever emptied by hand, the
+top bar's **🗑** tab carries a **count in amber** whenever soft-deleted files
+are still sitting in one — otherwise those files silently keep occupying the
+recordings drive with nothing to say so. The badge clears itself as rows are
+restored or permanently deleted. Recycle Bin and permanent-delete rows are history only —
 Windows owns Recycle Bin recovery, and a permanent delete has nothing left to
 act on. Every row also has **▶ Open file** / **📂 Open folder**, enabled only
 while the shown path still exists on disk. A **Source** column marks each row

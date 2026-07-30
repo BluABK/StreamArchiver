@@ -235,6 +235,41 @@ pub(super) fn live_capture_candidates(final_path: &Path) -> Vec<PathBuf> {
 /// Stale `.cache\` working files are swept after this age on startup.
 pub(super) const CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
 
+/// Settings key: `"0"` disables dropping a leftover working-dir capture whose
+/// finished archive copy has been verified (default on). The kill switch
+/// exists because this is the ONE sweep rule allowed to remove a real capture
+/// — see [`is_sweepable_cache_litter`] for the incident that made everything
+/// else name-allowlisted.
+pub const K_CACHE_DROP_REDUNDANT: &str = "cache_drop_redundant_captures";
+
+pub(super) fn cache_drop_redundant_enabled(store: &Store) -> bool {
+    store.get_setting(K_CACHE_DROP_REDUNDANT).ok().flatten().as_deref() != Some("0")
+}
+
+/// A cache capture's stem maps to the take that superseded it. Built from both
+/// `output_path` and `full_path` because a joined take's `output_path` may
+/// have been re-pointed at `{stem}.full.mkv`, whose file stem (`{stem}.full`)
+/// no longer matches the `{stem}.ts` still sitting in the working dir.
+fn final_paths_by_capture_stem(store: &Store) -> HashMap<String, (i64, PathBuf)> {
+    let mut map: HashMap<String, (i64, PathBuf)> = HashMap::new();
+    for (rec_id, output_path, full_path) in store.finished_takes_final_paths().unwrap_or_default() {
+        // The take's current best copy: after a `Both` cleanup that IS the
+        // full, and `output_path` has already been re-pointed at it.
+        let final_p = PathBuf::from(&output_path);
+        for p in [&output_path, &full_path] {
+            let Some(stem) = Path::new(p).file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            for key in [stem, stem.trim_end_matches(".full")] {
+                if !key.is_empty() {
+                    map.entry(key.to_string()).or_insert_with(|| (rec_id, final_p.clone()));
+                }
+            }
+        }
+    }
+    map
+}
+
 /// The working dir (current or legacy name) that still holds SABR resume
 /// state (`.state` / `.sq0.part` / `.part`) for the recording's stem — i.e.
 /// an interrupted SABR capture that can be continued, AND where its surviving
@@ -300,6 +335,12 @@ impl Supervisor {
         dirs.dedup();
         let now = std::time::SystemTime::now();
         let mut orphan_tmp_removed = 0u32;
+        // Lookup for the one rule allowed to remove a real capture (below):
+        // "this take finished and its archive copy is verifiably at least as
+        // long". Built once — it's a single query plus string work.
+        let drop_redundant = cache_drop_redundant_enabled(&self.store);
+        let finals =
+            if drop_redundant { final_paths_by_capture_stem(&self.store) } else { HashMap::new() };
         for d in dirs {
             let out_dir = Path::new(&d);
             if let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, out_dir).await {
@@ -334,9 +375,6 @@ impl Supervisor {
                 let mut removed = 0u32;
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if !is_sweepable_cache_litter(&name) {
-                        continue; // not a recognized transient pattern — could be a real capture
-                    }
                     if skip_stems
                         .iter()
                         .any(|s| name.starts_with(&format!("{s}.")))
@@ -352,7 +390,20 @@ impl Supervisor {
                         .and_then(|m| now.duration_since(m).ok())
                         .map(|age| age.as_secs() >= CACHE_MAX_AGE_SECS)
                         .unwrap_or(false);
-                    if stale && meta.is_file() && crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await.is_ok() {
+                    if !stale || !meta.is_file() {
+                        continue;
+                    }
+                    if !is_sweepable_cache_litter(&name) {
+                        // Not a recognized transient pattern — a real capture.
+                        // Age alone must never remove one (that mistake cost
+                        // 7.7h of footage once); the only way out is a
+                        // verified archive copy.
+                        if drop_redundant {
+                            self.drop_if_superseded(&entry.path(), &name, &finals).await;
+                        }
+                        continue;
+                    }
+                    if crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await.is_ok() {
                         removed += 1;
                     }
                 }
@@ -376,6 +427,103 @@ impl Supervisor {
                  rename-on-success sidecar)",
                 CACHE_MAX_AGE_SECS / 3600,
             );
+        }
+    }
+
+    /// Drop a stale working-dir capture **only** once its finished archive copy
+    /// is proven to hold at least as much footage.
+    ///
+    /// This is the single exception to "the sweep never removes a real
+    /// capture". Promotion normally moves the capture out of the working dir,
+    /// but a crash, a failed remux, or a re-attach can leave the original
+    /// behind — after which nothing ever cleans it up, because age alone isn't
+    /// evidence (a stale-looking `.ts` was once the only complete copy of a
+    /// recording, which is why [`is_sweepable_cache_litter`] is an allowlist).
+    /// 95 GB accumulated that way on one drive before this existed.
+    ///
+    /// The proof required is deliberately narrow:
+    /// 1. the stem maps to a take that has **finished** (in-flight captures
+    ///    aren't in the map at all), and
+    /// 2. that take's final file exists, and
+    /// 3. ffprobe says it is **at least as long** as the cache copy.
+    ///
+    /// Anything unprovable — no matching take, missing final, either probe
+    /// failing — leaves the file exactly where it is. Removal goes through
+    /// [`crate::disposal::dispose_media`] rather than a plain delete: this is
+    /// real footage, so it stays recoverable from the Trash view.
+    async fn drop_if_superseded(
+        &self,
+        path: &Path,
+        name: &str,
+        finals: &HashMap<String, (i64, PathBuf)>,
+    ) {
+        // `{stem}.ts` / `{stem}.mkv` only — a per-format SABR piece
+        // (`{stem}.f303.mkv`) is a fragment, not a playable capture, and its
+        // duration says nothing about completeness.
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".ts") || lower.ends_with(".mkv")) {
+            return;
+        }
+        let Some(stem) = Path::new(name).file_stem().and_then(|s| s.to_str()) else {
+            return;
+        };
+        if stem.rsplit('.').next().is_some_and(|last| {
+            last.starts_with('f') && last[1..].chars().all(|c| c.is_ascii_digit()) && last.len() > 1
+        }) {
+            return; // `{stem}.f303.mkv` and friends
+        }
+        let Some((rec_id, final_p)) = finals.get(stem) else {
+            return; // no finished take claims this capture — leave it alone
+        };
+        if crate::iomon::fs::metadata(Cat::CacheSweep, final_p).await.is_err() {
+            return; // the archive copy isn't there; this may be all that's left
+        }
+        let (Some(final_d), Some(cache_d)) =
+            (media_duration_secs(final_p).await, media_duration_secs(path).await)
+        else {
+            debug!(rec_id = *rec_id, "cache sweep: could not probe both copies of {name} — kept");
+            return;
+        };
+        // The archive copy may legitimately be LONGER (a head+live join), never
+        // meaningfully shorter. A truncated final is exactly the botched
+        // promotion this gate exists to catch.
+        if final_d <= 0 || cache_d <= 0 || final_d + 5 < cache_d {
+            warn!(
+                rec_id = *rec_id,
+                final_d,
+                cache_d,
+                "cache sweep: {name}'s archive copy is SHORTER than the working-dir capture — \
+                 keeping the capture (the promoted file may be truncated)"
+            );
+            return;
+        }
+        let scope = self
+            .store
+            .get_recording(*rec_id)
+            .ok()
+            .flatten()
+            .and_then(|r| self.store.get_monitor_with_channel(r.monitor_id).ok().flatten())
+            .map(|mw| (mw.channel.id, mw.monitor.id));
+        let Some((channel_id, monitor_id)) = scope else {
+            return;
+        };
+        match crate::disposal::dispose_media(
+            &self.store,
+            channel_id,
+            monitor_id,
+            path,
+            *rec_id,
+            "cache sweep: superseded working-dir capture",
+        )
+        .await
+        {
+            Ok(d) => info!(
+                rec_id = *rec_id,
+                "cache sweep: working-dir capture {name} ({cache_d}s) {} — the archive copy \
+                 ({final_d}s) supersedes it",
+                d.describe()
+            ),
+            Err(e) => warn!(rec_id = *rec_id, "cache sweep: disposing {name} failed: {e:#} (kept)"),
         }
     }
 }

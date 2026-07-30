@@ -991,6 +991,10 @@ pub(crate) struct SettingsForm {
     /// What happens to the pre-splice original + consumed patch files after
     /// a successful gapless splice. Default Keep — nothing auto-deleted.
     gap_splice_cleanup: crate::disposal::GapSpliceCleanup,
+    /// Let the capture-cache sweep remove a leftover working-dir capture once
+    /// its finished archive copy is ffprobe-verified to be at least as long.
+    /// Default on; the only sweep rule that may touch a real capture.
+    cache_drop_redundant: bool,
     /// Embed chapter markers into finalized recordings (title/category
     /// changes, raids, recovered/muted gap-splice segments). Default on —
     /// global default for the 3-level chain (channel/instance override via
@@ -1276,6 +1280,9 @@ pub struct StreamArchiverApp {
     rec_alert_badges: std::collections::HashMap<i64, crate::store::RecAlertBadge>,
     warn_refreshed: Option<std::time::Instant>,
     warn_badge: (i64, i64),
+    /// Files still sitting in a trash folder (restorable, and still costing
+    /// disk) — the 🗑 tab badge. Cached on the same throttle as `warn_badge`.
+    trash_badge: i64,
     warn_search: String,
     /// `None` = both severities; `Some(true)` = errors only, `Some(false)` =
     /// warnings only.
@@ -2266,8 +2273,21 @@ impl eframe::App for StreamArchiverApp {
                             + 2.0 * ui.spacing().button_padding.x
                             + ui.spacing().item_spacing.x
                     };
-                    let widths: Vec<f32> =
-                        all_tabs.iter().map(|(_, icon, ..)| item_w(ui, icon)).collect();
+                    // Tab labels are normally just the icon, but Trash carries a
+                    // count while files sit in a trash folder — those only leave
+                    // by hand, so an unvisited Trash view is exactly how a
+                    // drive quietly fills up. Computed once and used for BOTH
+                    // the width budget and the paint, so a badge appearing
+                    // can't desync the overflow calculation.
+                    let tab_label = |v: &View, icon: &str| -> String {
+                        match (v, self.trash_badge) {
+                            (View::Trash, n) if n > 0 => format!("{icon} {n}"),
+                            _ => icon.to_string(),
+                        }
+                    };
+                    let labels: Vec<String> =
+                        all_tabs.iter().map(|(v, icon, ..)| tab_label(v, icon)).collect();
+                    let widths: Vec<f32> = labels.iter().map(|l| item_w(ui, l)).collect();
                     let fixed_w: f32 = ["📖", "⚙", "⋯"].iter().map(|l| item_w(ui, l)).sum();
                     // The right cluster's width is only known from last frame
                     // (it renders after us); first frame reserves generously.
@@ -2288,14 +2308,29 @@ impl eframe::App for StreamArchiverApp {
                     self.topbar.visible = visible;
 
                     let mut switch: Option<View> = None;
-                    for (v, icon, name, hover) in all_tabs.iter().take(visible) {
-                        let hover_text =
+                    for ((v, _, name, hover), label) in
+                        all_tabs.iter().zip(labels.iter()).take(visible)
+                    {
+                        let mut hover_text =
                             if hover.is_empty() { name.to_string() } else { format!("{name}\n{hover}") };
+                        if *v == View::Trash && self.trash_badge > 0 {
+                            hover_text.push_str(&format!(
+                                "\n\n⚠ {} file(s) are sitting in a trash folder — still taking up \
+                                 space on the recordings drive until you restore or permanently \
+                                 delete them here.",
+                                self.trash_badge
+                            ));
+                        }
+                        let text = egui::RichText::new(label).font(big_font.clone());
+                        // Amber while the trash holds something, so it reads as
+                        // "there is something to deal with" at a glance.
+                        let text = if *v == View::Trash && self.trash_badge > 0 {
+                            text.color(egui::Color32::from_rgb(220, 160, 60))
+                        } else {
+                            text
+                        };
                         let resp = ui
-                            .selectable_label(
-                                self.view == *v,
-                                egui::RichText::new(*icon).font(big_font.clone()),
-                            )
+                            .selectable_label(self.view == *v, text)
                             .on_hover_text(hover_text);
                         let resp = if *v == View::Streams {
                             resp.inspect("View tab: Streams", &[])
@@ -2308,9 +2343,11 @@ impl eframe::App for StreamArchiverApp {
                     }
                     if visible < all_tabs.len() {
                         ui.menu_button(egui::RichText::new("»").font(big_font.clone()), |ui| {
-                            for (v, icon, name, _) in all_tabs.iter().skip(visible) {
+                            for ((v, _, name, _), label) in
+                                all_tabs.iter().zip(labels.iter()).skip(visible)
+                            {
                                 if ui
-                                    .selectable_label(self.view == *v, format!("{icon} {name}"))
+                                    .selectable_label(self.view == *v, format!("{label} {name}"))
                                     .clicked()
                                 {
                                     switch = Some(*v);
