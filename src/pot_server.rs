@@ -427,6 +427,22 @@ pub async fn ping(base_url: &str) -> Option<PingInfo> {
     ping_with(base_url, Duration::from_secs(4)).await
 }
 
+/// Whether `path` was modified within the last `window` — the liveness signal
+/// for a port owner that won't answer /ping during a rejection storm: a
+/// saturated-but-healthy server appends mint lines to [`log_path`] constantly,
+/// so recent growth proves it's working, just pegged. Missing file = not
+/// recent (fail toward the normal kill path).
+async fn file_recently_written(path: &std::path::Path, window: Duration) -> bool {
+    match crate::iomon::fs::metadata(crate::iomon::Cat::ToolLog, path).await {
+        Ok(m) => m
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age <= window),
+        Err(_) => false,
+    }
+}
+
 /// [`ping`] with an explicit timeout (the pre-kill last-chance probe waits
 /// far longer than the routine health check).
 async fn ping_with(base_url: &str, timeout: Duration) -> Option<PingInfo> {
@@ -689,9 +705,11 @@ async fn watchdog_loop(
                     // deep in BotGuard work answers slowly, not never — killing
                     // it mid-token-storm just replaces a warm server with a
                     // cold one that's even slower, which is how a kill/respawn
-                    // loop starts. Only a listener that stays silent for a
-                    // full 10s is treated as wedged.
-                    if let Some(pi) = ping_with(&cfg.base_url, Duration::from_secs(10)).await {
+                    // loop starts. During a rejection storm a healthy server is
+                    // EXPECTED to be pegged, so the probe waits longer still.
+                    let storm = storm_since.is_some();
+                    let last_chance = Duration::from_secs(if storm { 30 } else { 10 });
+                    if let Some(pi) = ping_with(&cfg.base_url, last_chance).await {
                         info!(
                             pid,
                             version = %pi.version,
@@ -701,6 +719,34 @@ async fn watchdog_loop(
                         ping_failures = 0;
                         notified_down = false;
                         set_status(PotMode::External, Some(pi));
+                        sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
+                        continue;
+                    }
+                    // Still silent — but during a storm, silence is exactly
+                    // what saturation looks like, so demand positive proof of
+                    // death before killing: a minting server writes to
+                    // pot_server.log constantly (orphans from crashed runs
+                    // keep their inherited handle to the same file), so recent
+                    // growth means alive, spare it. Our own failed spawn
+                    // attempts also touch the log, but skipping the kill also
+                    // skips the spawn, so a truly dead squatter goes stale
+                    // within the window and gets cleared a few ticks later
+                    // (2026-07-31 18:48: killed a busily-minting server 45s
+                    // after the storm was detected).
+                    if storm && file_recently_written(&log_path(), Duration::from_secs(300)).await
+                    {
+                        warn!(
+                            pid,
+                            "port owner is silent on /ping but pot_server.log is still \
+                             growing — presuming saturated by the ongoing rejection storm, \
+                             not killing; will keep probing"
+                        );
+                        set_status(
+                            PotMode::Failed {
+                                reason: "saturated (rejection storm) — retrying".to_string(),
+                            },
+                            None,
+                        );
                         sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
                         continue;
                     }
@@ -943,7 +989,22 @@ fn spawn_server(cfg: &PotConfig, truncate_log: bool) -> std::io::Result<tokio::p
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // test fixtures, not app I/O paths
     use super::*;
+
+    #[tokio::test]
+    async fn file_recently_written_fresh_vs_missing() {
+        let dir = std::env::temp_dir().join("sa_pot_mtime_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let fresh = dir.join("fresh.log");
+        std::fs::write(&fresh, "Generating POT for x").unwrap();
+        assert!(file_recently_written(&fresh, Duration::from_secs(300)).await);
+        // Zero window: even a just-written file is "stale" (mtime strictly in
+        // the past) — proves the threshold is actually applied.
+        assert!(!file_recently_written(&fresh, Duration::ZERO).await);
+        assert!(!file_recently_written(&dir.join("no_such.log"), Duration::from_secs(300)).await);
+        let _ = std::fs::remove_file(&fresh);
+    }
 
     #[test]
     fn pot_base_url_parses_default_args() {

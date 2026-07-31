@@ -680,7 +680,11 @@ POT-server watchdog's "started but never answered /ping" error notification
 is suppressed and its status reads *saturated (rejection storm) — retrying*
 instead: before this, a relaunch mid-storm raised a misleading "server not
 responding" alarm about a server that was busily minting the whole time.
-The storm clears (logged) after 15 quiet minutes.
+The watchdog's pre-spawn squatter kill is also storm-aware — the last-chance
+ping stretches to 30 s and a silent listener is spared entirely while
+`pot_server.log` keeps growing, since active minting proves it's alive (see
+*Managed GVS PO token server* below). The storm clears (logged) after 15
+quiet minutes.
 
 ### Automatic deletion
 
@@ -1476,7 +1480,10 @@ on that drive are found) and defers them until the drive reconnects.
 **In-tree badges & trends.** The Streams grid mirrors the alert state right
 on the rows (all clickable — they open the Warnings window): a take (and its
 stream row, summed over takes/dual-capture legs) shows **🚨 lost data
-(N/M recovered)** while damage is outstanding, **🩹 recovered** (green, with
+(N/M recovered)** while damage is outstanding, **⛔ capture error** for
+error alerts with no segment loss attached (a rejected PO token, a fatal
+tool error that killed the take — these used to render as a nonsensical
+"lost data: 0 segments"), **🩹 recovered** (green, with
 a *(muted)* note when the DMCA fallback was used) once every lost range was
 re-fetched, **🔁 superseded** (green) when a later completed take covers a
 failed one, or **⚠ tool warnings** for warning-only takes. Recovery progress
@@ -3457,18 +3464,25 @@ the app manages the server itself instead of assuming it's running:
   port situation is messy (all three fired for real on 2026-07-31, when a
   slow ping during a token storm led to a second server half-binding the
   other address family and every later spawn EADDRINUSE-looping):
-  - A live server's **first missed ping is tolerated** (heavy BotGuard
-    minting can peg node past the 2 s ping timeout) — it's re-checked ~5 s
-    later, and only a second miss triggers a respawn.
+  - A live server (the managed child, an adopted one, or any foreign
+    listener on the port) gets **three missed pings of grace** (4 s timeout
+    each, re-checked ~5 s apart) before any respawn — heavy BotGuard minting
+    can peg node past the ping timeout while the server is perfectly healthy.
   - A spawned child that **dies to a port race while something else answers
     `/ping`** is treated as finding an external server — adopted and used —
     instead of being mis-credited as "up" (which made the watchdog see its
     "managed server exit" 30 s later and respawn in a loop) or counted as a
     failed start.
   - If a respawn attempt has already failed once and a process is **still
-    squatting the port without answering `/ping`**, that wedged listener is
-    killed before the next spawn, so a duplicate/orphaned server can't wedge
-    token serving indefinitely.
+    squatting the port without answering `/ping`**, it gets one generous
+    last-chance ping (10 s; 30 s during a rejection storm) — answering means
+    it's adopted as external, not killed. During a storm a listener that
+    stays silent is *still* spared as long as `pot_server.log` keeps
+    growing, since active minting proves it's alive and merely saturated
+    (on 2026-07-31 the kill fired 45 s after a storm was declared and took
+    out a warm, busily-minting server). Only a listener that's silent *and*
+    not minting is killed before the next spawn, so a genuinely wedged
+    orphan still can't hold token serving hostage indefinitely.
 - **On-demand recovery**: when a capture dies with a PO-token error, the app
   brings the server up *first* and then lets the in-flight SABR retry resume
   the **same take** from its `.state` files — no orphaned fragments, no burned

@@ -1687,25 +1687,43 @@ pub(super) fn take_status_badges(
                 ));
             open_warnings |= resp.clicked();
         } else if a.errors && !gap_recover_running {
-            let text = if a.ranges_total > 0 {
-                format!("🚨 lost data ({}/{} recovered)", a.recovered, a.ranges_total)
+            // "Lost data" only when segments actually went missing — error
+            // alerts with no loss attached (a rejected PO token, a fatal tool
+            // error that killed the take) get their own badge; "0 segments
+            // (~00:00:00) missing" reads as nonsense.
+            if a.lost_segments > 0 || a.ranges_total > 0 {
+                let text = if a.ranges_total > 0 {
+                    format!("🚨 lost data ({}/{} recovered)", a.recovered, a.ranges_total)
+                } else {
+                    "🚨 lost data".to_string()
+                };
+                let resp = clickable(ui, egui::Color32::from_rgb(230, 100, 100), text)
+                    .on_hover_text(format!(
+                        "The capture tool reported data loss: {} segments (~{}) missing.{} \
+                         Click for the 🚨 Warnings details.",
+                        crate::models::group_thousands(a.lost_segments),
+                        fmt_duration(a.lost_segments * 2),
+                        if a.ranges_total > 0 {
+                            " VOD re-fetch of the lost ranges is queued/in progress."
+                        } else {
+                            ""
+                        }
+                    ));
+                open_warnings |= resp.clicked();
             } else {
-                "🚨 lost data".to_string()
-            };
-            let resp = clickable(ui, egui::Color32::from_rgb(230, 100, 100), text).on_hover_text(
-                format!(
-                    "The capture tool reported data loss: {} segments (~{}) missing.{} Click \
-                     for the 🚨 Warnings details.",
-                    crate::models::group_thousands(a.lost_segments),
-                    fmt_duration(a.lost_segments * 2),
-                    if a.ranges_total > 0 {
-                        " VOD re-fetch of the lost ranges is queued/in progress."
-                    } else {
-                        ""
-                    }
-                ),
-            );
-            open_warnings |= resp.clicked();
+                let resp = clickable(
+                    ui,
+                    egui::Color32::from_rgb(230, 100, 100),
+                    "⛔ capture error".to_string(),
+                )
+                .on_hover_text(
+                    "The capture tool reported a fatal error (e.g. YouTube rejecting its \
+                     PO token) and this take died — it may have ended earlier than the \
+                     broadcast, but no segment loss was reported within what it did \
+                     capture. Click for the 🚨 Warnings details.",
+                );
+                open_warnings |= resp.clicked();
+            }
         } else if a.superseded {
             let resp = clickable(ui, egui::Color32::from_rgb(110, 200, 130), "🔁 superseded".into())
                 .on_hover_text(
