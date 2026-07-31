@@ -657,10 +657,14 @@ keeps minting fresh, distinct tokens and YouTube refuses each one, so nothing
 on this side can fix it, and it clears by itself. The episodes vary wildly in
 length, though — the first observed one lifted after ~7 minutes, while an
 overnight wave rejected *every* token of two concurrent captures for over
-three hours. The ordinary failure ladder (30 s, 60 s, 90 s…) just burns takes
-against that wall, so a capture that dies this way gets an **escalating
+three hours. With the **🎫 PO-rejection fallback** (below) enabled — the
+default — the next attempt instead retries promptly via the token-free `tv`
+client, so the wall usually costs one short gap. When the fallback is off
+(or the fallback take itself was rejected), the ordinary failure ladder
+(30 s, 60 s, 90 s…) would just burn takes against that wall, so the capture
+gets an **escalating
 cooldown — 5, 10, then 15 minutes per consecutive rejection (capped at 15)**
-before the next automatic attempt, and files a **🎫 PO token rejected**
+before the next automatic attempt. Either way it files a **🎫 PO token rejected**
 entry — a red **error** row, since the killed take genuinely loses the
 footage until the next attempt (rows filed as warnings by older builds are
 upgraded in place) — in the 🚨 Warnings window (one per take)
@@ -695,11 +699,23 @@ rejected-token retry) now only bypasses the token cache — a fresh
 attestation is run at most every 30 s under sustained rejection. Before the
 patch, one storm day produced 1 518 mints with 1 492 full attestations;
 during storms the re-mints cost microseconds, the event loop stays
-responsive, and `/ping` keeps answering. If storms persist, an escape hatch
-worth testing is capturing via a client that needs no GVS PO token at all
-(yt-dlp's `tv` client has no PO-token policy): set *player-client=tv* in the
-SABR extractor args — unverified for live-from-start DVR depth, so trial it
-on one stream first.
+responsive, and `/ping` keeps answering.
+
+**And the rejections themselves have an automatic way out.** yt-dlp's `tv`
+(TVHTML5) client has no GVS PO-token policy at all — no token is minted or
+attached, so a rejection wave can't touch it (verified live 2026-07-31
+mid-storm: full-speed from-start SABR capture, same itags, deep rewind to
+the true stream start, while every web-client token was refused). With
+**Settings → Downloads → 🎫 PO-rejection fallback (tv client)** on (the
+default), a take that dies to a rejected PO token retries *promptly* on the
+ordinary short ladder — not the 5-15 minute cooldown — with
+*player-client=tv* swapped into the SABR extractor-args for that retry. Web
+stays the primary client: the swap is per-take, sticky across resumes and
+further failures, and the next successful capture returns the monitor to
+normal. The new take's fresh head backfill re-fetches what the failed take
+missed, so a storm typically costs one short gap at worst. The escalating
+cooldown remains as the last resort when the fallback is disabled or the
+fallback take itself gets rejected.
 
 ### Automatic deletion
 

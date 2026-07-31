@@ -77,6 +77,10 @@ const K_SABR_RAW_ARGS: &str = "ytdlp_sabr_raw_args";
 /// entry on the SABR command. Absent ⇒ bgutil default; explicit empty ⇒ disabled.
 /// `pub(crate)`: `pot_server` derives the managed server's base URL from it.
 pub(crate) const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
+/// PO-token fallback client (retry a PO-rejected take without a token).
+/// Absent ⇒ the `tv` default; explicit empty ⇒ disabled. Mirrors
+/// `downloader::K_SABR_PO_FALLBACK_CLIENT` — the supervisor reads it there.
+const K_SABR_PO_FALLBACK: &str = crate::downloader::K_SABR_PO_FALLBACK_CLIENT;
 /// Experimental: append `enable_live_deep_rewind=true` to the SABR extractor-args
 /// (rewinds past the normal DVR window; dev-build-only). Absent ⇒ off.
 const K_SABR_DEEP_REWIND: &str = "ytdlp_sabr_deep_rewind";
@@ -946,6 +950,9 @@ pub(crate) struct SettingsForm {
     sabr_raw_args: String,
     /// PO-token-provider `--extractor-args` (e.g. bgutil) for the SABR command.
     sabr_pot_args: String,
+    /// Retry a PO-rejected take via the no-token `tv` client (stored as the
+    /// client name in `K_SABR_PO_FALLBACK`, "" = disabled).
+    sabr_po_fallback: bool,
     /// GLOBAL default video codec/quality preference + its raw `-S` (when Custom).
     sabr_codec_pref: SabrCodecPref,
     sabr_codec_custom: String,

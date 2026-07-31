@@ -1474,7 +1474,13 @@ impl Supervisor {
             .flatten()
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
-        let ytdlp_bins = load_ytdlp_bins(&self.store);
+        let mut ytdlp_bins = load_ytdlp_bins(&self.store);
+        // Keep a PO-fallback take on its fallback client across a resume (the
+        // pending flag stays set until a capture *finalizes* successfully, so
+        // a resumed fallback take sees it too). Backoff state is in-memory:
+        // after an app restart a fallback take resumes with the web preset —
+        // rare, and the segments are the same media either way.
+        self.apply_po_fallback(&row, &mut ytdlp_bins);
         let extra = split_args(&row.monitor.extra_args);
         // Only from-start takes leave resumable SABR `.state` (the resume gates
         // in `resume_inflight`/`reconcile_detached` still require capture_from_start),

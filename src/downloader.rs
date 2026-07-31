@@ -343,6 +343,12 @@ pub struct Supervisor {
     ad_active: AdActive,
     sem: Arc<Semaphore>,
     backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
+    /// Monitors whose CURRENT take was spawned with the PO-fallback client
+    /// swapped in (see `BackoffEntry::po_rejected`). Read+removed at finalize
+    /// so the backoff logic knows whether a rejected take already was the
+    /// fallback attempt (escalate the cooldown) or still has the fallback
+    /// left to try (retry promptly).
+    po_fallback_takes: Arc<Mutex<HashSet<i64>>>,
     /// Streams where SABR live-from-start hit the DVR window limit ("not near
     /// live head"). The next attempt falls back to live-edge so we at least
     /// capture the ongoing stream instead of looping forever. Cleared on a
@@ -522,6 +528,12 @@ impl Drop for HeadBackfillAbortGuard {
 struct BackoffEntry {
     fails: u32,
     until: Instant,
+    /// The failure chain includes a rejected GVS PO token — the next attempt
+    /// captures via the PO-fallback client (`SabrConfig::po_fallback_client`)
+    /// instead of web. Sticky until a capture succeeds (which removes the
+    /// whole entry): a mid-chain non-PO failure doesn't forget that the wave
+    /// is on. In-memory only, like the rest of the backoff state.
+    po_rejected: bool,
 }
 /// Settings key: restart a young Twitch `best` capture when a better rendition
 /// appears after join (`"0"` disables; default on — see

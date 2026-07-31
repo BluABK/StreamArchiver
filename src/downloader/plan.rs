@@ -1057,6 +1057,7 @@ mod tests {
                 pot_args: SABR_DEFAULT_POT_ARGS.into(),
                 codec_pref: SabrCodecPref::Auto,
                 codec_custom: String::new(),
+                po_fallback_client: SABR_PO_FALLBACK_DEFAULT_CLIENT.into(),
             },
             custom: Vec::new(),
         }

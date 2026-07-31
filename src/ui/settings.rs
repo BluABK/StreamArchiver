@@ -1716,6 +1716,19 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
+                    ui.label("🎫 PO-rejection fallback (tv client)");
+                    ui.checkbox(&mut self.settings.sabr_po_fallback, "").on_hover_text(
+                        "When a take dies because YouTube rejected its GVS PO token \
+                         (ATTESTATION_REQUIRED), retry promptly via yt-dlp's 'tv' client, \
+                         which doesn't use PO tokens at all — rejection waves can't touch \
+                         it. The web client stays the primary; the fallback applies \
+                         per-retry and the next successful capture returns to normal. \
+                         When off, rejected takes instead wait out the escalating \
+                         5-15 minute cooldown before retrying (footage at the live edge \
+                         is lost for the wait's duration).",
+                    );
+                    ui.end_row();
+
                     ui.label("Video codec / quality");
                     egui::ComboBox::from_id_salt("settings_sabr_codec_pref")
                         .selected_text(self.settings.sabr_codec_pref.label())

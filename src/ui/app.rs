@@ -197,6 +197,11 @@ impl StreamArchiverApp {
                 Ok(Some(v)) => v,
                 _ => crate::downloader::SABR_DEFAULT_POT_ARGS.to_string(),
             },
+            // Absent ⇒ on ("tv"); present-but-empty ⇒ explicitly disabled.
+            sabr_po_fallback: match core.store.get_setting(K_SABR_PO_FALLBACK) {
+                Ok(Some(v)) => !v.trim().is_empty(),
+                _ => true,
+            },
             // GLOBAL codec/quality default: unknown/absent ⇒ Auto (never Inherit —
             // there is nothing above the global to inherit from).
             sabr_codec_pref: match SabrCodecPref::parse(&setting_or_empty(&core, K_SABR_CODEC_PREF)) {
@@ -1767,6 +1772,14 @@ impl StreamArchiverApp {
             (K_SABR_DEEP_REWIND, if s.sabr_deep_rewind { "1" } else { "0" }),
             (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
             (K_SABR_POT_ARGS, s.sabr_pot_args.trim()),
+            (
+                K_SABR_PO_FALLBACK,
+                if s.sabr_po_fallback {
+                    crate::downloader::SABR_PO_FALLBACK_DEFAULT_CLIENT
+                } else {
+                    ""
+                },
+            ),
             (K_SABR_CODEC_PREF, s.sabr_codec_pref.id()),
             (K_SABR_CODEC_CUSTOM, s.sabr_codec_custom.trim()),
             (K_DASH_FORMAT, s.dash_format.trim()),

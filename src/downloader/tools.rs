@@ -24,6 +24,55 @@ pub(super) const SABR_STALL_FALLBACK_TRIES: u32 = 2;
 /// Default DASH-companion format selector when the setting is unset/empty.
 pub const DASH_DEFAULT_FORMAT: &str = "bestvideo+bestaudio/best";
 
+/// Default PO-token fallback client: after a take dies to a rejected GVS PO
+/// token, the retry captures via this yt-dlp client instead of `web`. The
+/// `tv` (TVHTML5) client has no GVS PO-token policy at all — no token is
+/// minted or attached, so a platform-side rejection wave can't touch it.
+/// Verified live 2026-07-31 during an active wave: full-speed from-start
+/// SABR capture (same 140/303 itags, deep rewind to sq0) while every web
+/// token was refused with ATTESTATION_REQUIRED.
+pub const SABR_PO_FALLBACK_DEFAULT_CLIENT: &str = "tv";
+/// Settings key for the PO-token fallback client. Absent (never written) ⇒
+/// the default (`tv`); present but empty ⇒ fallback disabled (always web,
+/// with the escalating PO cooldown instead) — same present-vs-absent
+/// semantics as `ytdlp_sabr_pot_args`.
+pub const K_SABR_PO_FALLBACK_CLIENT: &str = "ytdlp_sabr_po_fallback_client";
+
+/// The configured PO-token fallback client ("" = disabled). Shared by
+/// [`load_ytdlp_bins`] and the supervisor's backoff logic (which must know
+/// whether a rejected take still has a fallback left before escalating the
+/// cooldown to 5-15 minutes).
+pub(crate) fn sabr_po_fallback_client(store: &Store) -> String {
+    match store.get_setting(K_SABR_PO_FALLBACK_CLIENT) {
+        Ok(Some(v)) => v.trim().to_string(),
+        _ => SABR_PO_FALLBACK_DEFAULT_CLIENT.to_string(),
+    }
+}
+
+/// Rewrite the `player-client=` entry inside a `youtube:...` extractor-args
+/// value (appending one if absent), leaving every other arg untouched.
+pub(crate) fn with_player_client(extractor_args: &str, client: &str) -> String {
+    let Some((ns, rest)) = extractor_args.split_once(':') else {
+        return format!("{extractor_args}:player-client={client}");
+    };
+    let mut found = false;
+    let mut parts: Vec<String> = rest
+        .split(';')
+        .map(|p| {
+            if p.trim_start().starts_with("player-client=") {
+                found = true;
+                format!("player-client={client}")
+            } else {
+                p.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        parts.push(format!("player-client={client}"));
+    }
+    format!("{ns}:{}", parts.join(";"))
+}
+
 /// SABR (Server Adaptive Bit Rate) capture configuration for YouTube. SABR is the
 /// only protocol that reliably supports `--live-from-start` today, but it lives in
 /// a yt-dlp dev fork (a separate binary). See the YouTube SABR settings section.
@@ -50,6 +99,9 @@ pub struct SabrConfig {
     pub codec_pref: SabrCodecPref,
     /// GLOBAL raw `-S` string when `codec_pref == Custom`.
     pub codec_custom: String,
+    /// yt-dlp client for the PO-token fallback retry ("" = disabled). Applied
+    /// by the supervisor per-take (see `po_fallback_pending`), never here.
+    pub po_fallback_client: String,
 }
 
 impl SabrConfig {
@@ -203,6 +255,7 @@ pub(crate) fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
             pot_args,
             codec_pref,
             codec_custom: setting_str(store, "ytdlp_sabr_codec_custom"),
+            po_fallback_client: sabr_po_fallback_client(store),
         },
         custom: load_custom_tools(store),
     }
@@ -338,5 +391,28 @@ mod tests {
         assert_eq!(bins.resolve_program(TOOL_BINARY_SABR), "yt-dlp");
         assert_eq!(bins.resolve_program("no-such-alias"), "yt-dlp");
         assert_eq!(bins.resolve_program(""), "yt-dlp");
+    }
+
+    #[test]
+    fn with_player_client_swaps_only_the_client() {
+        // The default preset: both player-client and webpage-client present —
+        // only the former is swapped, everything else survives verbatim.
+        assert_eq!(
+            with_player_client(SABR_DEFAULT_EXTRACTOR_ARGS, "tv"),
+            "youtube:formats=duplicate,missing_pot;player-client=tv;webpage-client=web"
+        );
+        // Deep-rewind (or any other appended arg) is untouched.
+        assert_eq!(
+            with_player_client(
+                "youtube:player-client=web,web_safari;enable_live_deep_rewind=true",
+                "tv"
+            ),
+            "youtube:player-client=tv;enable_live_deep_rewind=true"
+        );
+        // No player-client in the preset: one is appended.
+        assert_eq!(
+            with_player_client("youtube:formats=duplicate", "tv"),
+            "youtube:formats=duplicate;player-client=tv"
+        );
     }
 }

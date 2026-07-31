@@ -101,6 +101,7 @@ impl Supervisor {
             ad_active,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
             backoff: Arc::new(Mutex::new(HashMap::new())),
+            po_fallback_takes: Arc::new(Mutex::new(HashSet::new())),
             sabr_dvr_exceeded: Arc::new(Mutex::new(HashSet::new())),
             sabr_stall_count: Arc::new(Mutex::new(HashMap::new())),
             running_asset_fetches: Arc::new(Mutex::new(HashSet::new())),
@@ -1900,6 +1901,7 @@ progress_info: None,
                 BackoffEntry {
                     fails: 0,
                     until: Instant::now() + Duration::from_secs(120),
+                    po_rejected: false,
                 },
             );
             info!(monitor_id, "manual stop");
@@ -2070,7 +2072,11 @@ progress_info: None,
             }
             self.backoff.lock().unwrap().insert(
                 monitor_id,
-                BackoffEntry { fails: 0, until: Instant::now() + Duration::from_secs(10) },
+                BackoffEntry {
+                    fails: 0,
+                    until: Instant::now() + Duration::from_secs(10),
+                    po_rejected: false,
+                },
             );
             return;
         }
@@ -2657,7 +2663,14 @@ progress_info: None,
             .unwrap_or(false)
     }
 
-    fn note_result(&self, monitor_id: i64, duration_secs: i64, ok: bool, po_token_rejected: bool) {
+    fn note_result(
+        &self,
+        monitor_id: i64,
+        duration_secs: i64,
+        ok: bool,
+        po_token_rejected: bool,
+        used_po_fallback: bool,
+    ) {
         let mut map = self.backoff.lock().unwrap();
         // Back off on any capture that produced no footage (bytes == 0), even one
         // that ran a while before dying: a long run that wrote nothing is still a
@@ -2671,9 +2684,19 @@ progress_info: None,
             let entry = map.entry(monitor_id).or_insert(BackoffEntry {
                 fails: 0,
                 until: Instant::now(),
+                po_rejected: false,
             });
             entry.fails = entry.fails.saturating_add(1);
-            let wait = failure_backoff_secs(entry.fails, duration_secs, po_token_rejected);
+            entry.po_rejected = entry.po_rejected || po_token_rejected;
+            // The escalating 5-15m PO cooldown is a last resort for when
+            // there's nothing better to do than wait the wave out. When a
+            // fallback client is configured and this take didn't use it yet,
+            // retry on the ordinary short ladder instead — the fallback
+            // client needs no PO token, so the retry is expected to succeed,
+            // and every held-off minute is live-edge footage lost for good.
+            let escalate_po = po_token_rejected
+                && (used_po_fallback || sabr_po_fallback_client(&self.store).is_empty());
+            let wait = failure_backoff_secs(entry.fails, duration_secs, escalate_po);
             entry.until = Instant::now() + Duration::from_secs(wait);
             warn!(
                 monitor_id,
@@ -2681,9 +2704,53 @@ progress_info: None,
                 wait,
                 duration_secs,
                 po_token_rejected,
+                used_po_fallback,
                 "recording captured nothing; backing off"
             );
         }
+    }
+
+    /// Whether this monitor's next capture attempt should swap in the
+    /// PO-fallback client: its failure chain includes a rejected GVS PO
+    /// token and no capture has succeeded since. (Whether a fallback client
+    /// is actually configured is the caller's check — this is only the
+    /// per-monitor state.)
+    fn po_fallback_pending(&self, monitor_id: i64) -> bool {
+        self.backoff
+            .lock()
+            .unwrap()
+            .get(&monitor_id)
+            .map(|b| b.po_rejected)
+            .unwrap_or(false)
+    }
+
+    /// Swap the PO-fallback client into the loaded SABR preset when this
+    /// monitor's previous take died to a rejected GVS PO token. The `tv`
+    /// client (default) has no GVS PO-token policy in yt-dlp — no token is
+    /// minted or attached, so a platform-side rejection wave can't touch the
+    /// retry (verified live 2026-07-31: full-speed from-start SABR capture
+    /// via tv while every web token was refused). Web stays the primary:
+    /// the swap is per-take, and the next successful capture clears the
+    /// state. Also marks the take in `po_fallback_takes` so finalize knows
+    /// the fallback was already spent if the take still fails.
+    pub(super) fn apply_po_fallback(&self, row: &MonitorWithChannel, bins: &mut YtDlpBins) {
+        if row.monitor.platform() != Platform::YouTube
+            || !bins.sabr.usable()
+            || bins.sabr.po_fallback_client.is_empty()
+            || !self.po_fallback_pending(row.monitor.id)
+        {
+            return;
+        }
+        bins.sabr.extractor_args =
+            with_player_client(&bins.sabr.extractor_args, &bins.sabr.po_fallback_client);
+        self.po_fallback_takes.lock().unwrap().insert(row.monitor.id);
+        info!(
+            monitor_id = row.monitor.id,
+            client = %bins.sabr.po_fallback_client,
+            "🎫 previous take's GVS PO token was rejected {} — capturing via the \
+             no-token fallback client",
+            row.monitor.platform().tag()
+        );
     }
 
     /// Surface a PO-token rejection in the 🚨 Warnings window. Without this the
@@ -2691,10 +2758,32 @@ progress_info: None,
     /// just reads "failed", which looks identical to a hundred other causes
     /// and sends you looking for a local misconfiguration that isn't there.
     /// One alert per take (`take_key`), so a retry ladder doesn't spam.
-    fn file_po_token_alert(&self, row: &MonitorWithChannel, monitor_id: i64, rec_id: i64) {
+    fn file_po_token_alert(
+        &self,
+        row: &MonitorWithChannel,
+        monitor_id: i64,
+        rec_id: i64,
+        used_po_fallback: bool,
+    ) {
+        // What happens next depends on whether a PO-fallback client is still
+        // in reserve: a prompt no-token retry, or the escalating cooldown.
+        let fallback = sabr_po_fallback_client(&self.store);
+        let next = if !fallback.is_empty() && !used_po_fallback {
+            format!(
+                "The next attempt retries promptly via the '{fallback}' fallback client, \
+                 which doesn't use a GVS PO token at all."
+            )
+        } else {
+            format!(
+                "The next automatic attempt is held off with an escalating cooldown \
+                 ({}-{}m) rather than retrying immediately.",
+                PO_TOKEN_COOLDOWN_SECS / 60,
+                PO_TOKEN_COOLDOWN_MAX_SECS / 60,
+            )
+        };
         let alert = crate::store::NewCaptureAlert {
             kind: "po_token_rejected".to_string(),
-            severity: "warning".to_string(),
+            severity: "error".to_string(),
             source: "capture".to_string(),
             take_key: format!("po_token:rec{rec_id}"),
             monitor_id: Some(monitor_id),
@@ -2707,10 +2796,8 @@ progress_info: None,
                 "{} rejected this capture's GVS PO Token (stream protection status \
                  ATTESTATION_REQUIRED). The token server is working — it mints a fresh token \
                  per retry and the platform refuses each one — so this is a YouTube-side \
-                 condition that usually clears by itself within a few minutes. The next \
-                 automatic attempt is held off for {}m rather than retrying immediately.",
-                row.monitor.platform().tag(),
-                PO_TOKEN_COOLDOWN_SECS / 60,
+                 condition. {next}",
+                row.monitor.platform().label(),
             ),
         };
         match self.store.upsert_capture_alert(&alert) {
@@ -3099,9 +3186,13 @@ progress_info: None,
         // generic `capture_failed` error for any failed take that has no
         // error alert yet, so the more specific PO row must already exist or
         // the take ends up with both.
+        // Whether THIS take ran with the PO-fallback client swapped in
+        // (removed here unconditionally so the marker can't leak to the next
+        // take).
+        let used_po_fallback = self.po_fallback_takes.lock().unwrap().remove(&monitor_id);
         let po_rejected = !manually_stopped && !ok && po_token_rejected(&outcome.log);
         if po_rejected {
-            self.file_po_token_alert(&row, monitor_id, rec_id);
+            self.file_po_token_alert(&row, monitor_id, rec_id, used_po_fallback);
         }
         self.finalize_recording(
             &row,
@@ -3124,7 +3215,7 @@ progress_info: None,
         // otherwise reset the wait to 30s, and a captured one would clear it entirely,
         // either way re-triggering the moment the next LIVE signal arrives.
         if !manually_stopped {
-            self.note_result(monitor_id, duration, ok, po_rejected);
+            self.note_result(monitor_id, duration, ok, po_rejected, used_po_fallback);
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
     }
@@ -3181,7 +3272,8 @@ progress_info: None,
             .flatten()
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
-        let ytdlp_bins = load_ytdlp_bins(&self.store);
+        let mut ytdlp_bins = load_ytdlp_bins(&self.store);
+        self.apply_po_fallback(row, &mut ytdlp_bins);
         let started_at = now_unix();
         let plan = build_plan(row, started_at, auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
