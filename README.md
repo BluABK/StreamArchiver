@@ -662,7 +662,8 @@ against that wall, so a capture that dies this way gets an **escalating
 cooldown — 5, 10, then 15 minutes per consecutive rejection (capped at 15)**
 before the next automatic attempt, and files a **🎫 PO token rejected**
 entry — a red **error** row, since the killed take genuinely loses the
-footage until the next attempt — in the 🚨 Warnings window (one per take)
+footage until the next attempt (rows filed as warnings by older builds are
+upgraded in place) — in the 🚨 Warnings window (one per take)
 explaining what happened, rather than leaving a bare "failed" take whose
 only trace is a traceback in a per-capture log. The cap stays at 15 minutes on purpose: live-edge captures
 lose the held-off minutes for good once the wave lifts, so waiting longer

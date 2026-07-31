@@ -2340,6 +2340,24 @@ pub struct PollBucket {
     pub errors: u64,
 }
 
+/// Whether a dead capture's tool log says YouTube **rejected** its GVS PO
+/// Token, as opposed to any other failure.
+///
+/// Three independent spellings, because yt-dlp surfaces this at different
+/// layers: the SABR stream's own protection status (`sps:ATTESTATION_REQUIRED`
+/// in its debug line), the typed exception, and the human message. Matching
+/// any one of them is enough — the consumers only choose a backoff/alert
+/// kind, so a false positive costs a few minutes and a false negative costs
+/// a retry storm (or a mislabelled alert row).
+///
+/// Deliberately NOT matched: "Generating a gvs PO Token", which appears on
+/// every healthy capture too.
+pub(crate) fn po_token_rejected(log: &str) -> bool {
+    log.contains("ATTESTATION_REQUIRED")
+        || log.contains("PoTokenError")
+        || log.contains("requires a GVS PO Token")
+}
+
 /// One aggregated time bucket of download traffic for a single class, as
 /// returned by `Store::net_history` — the raw material for the Stats view's
 /// Network/downloads graphs. Backed by the `net_history` table (schema v80):

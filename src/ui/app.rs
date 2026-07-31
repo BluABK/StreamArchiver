@@ -1161,6 +1161,13 @@ impl StreamArchiverApp {
                 }
                 UiCommand::Quit => {
                     self.quitting = true;
+                    // The exit path (detach/stop + a bounded async-runtime
+                    // shutdown) deliberately blocks after the last frame —
+                    // stand the freeze watchdog down so quitting doesn't pop
+                    // a "Frozen for 10s" diagnostics dialog mid-shutdown
+                    // (observed 2026-07-31: tray Quit with chat sidecars and
+                    // detached captures live).
+                    self.heartbeat.set_active(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 UiCommand::QuitAndStop => {

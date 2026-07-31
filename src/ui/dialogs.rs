@@ -399,6 +399,10 @@ impl StreamArchiverApp {
                 .force_stop_on_quit
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self.quitting = true;
+            // Same watchdog stand-down as the tray Quit path — the
+            // stop-recordings exit blocks the UI thread even longer (kill +
+            // finalize drain before the runtime shutdown).
+            self.heartbeat.set_active(false);
             self.confirm_quit_stop = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if !open {

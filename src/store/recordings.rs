@@ -173,11 +173,19 @@ impl Store {
                 Some(c) => format!("capture process exited with code {c} (no log output)"),
                 None => "capture process died without log output".to_string(),
             });
+        // A failed take whose log shows a GVS PO-token rejection files as the
+        // same 🎫 kind the supervisor pre-files for zero-byte rejections —
+        // one cause, one title, whether or not the take captured bytes first.
+        let (kind, take_key) = if crate::models::po_token_rejected(log_excerpt) {
+            ("po_token_rejected", format!("po_token:rec{rec_id}"))
+        } else {
+            ("capture_failed", format!("capture_failed:rec{rec_id}"))
+        };
         self.upsert_capture_alert(&crate::store::NewCaptureAlert {
-            kind: "capture_failed".to_string(),
+            kind: kind.to_string(),
             severity: "error".to_string(),
             source: "capture".to_string(),
-            take_key: format!("capture_failed:rec{rec_id}"),
+            take_key,
             monitor_id: Some(monitor_id),
             recording_id: Some(rec_id),
             video_id: None,
@@ -2154,6 +2162,22 @@ mod tests {
         let a4 = store.list_capture_alerts(10).unwrap();
         let a4 = a4.iter().find(|a| a.recording_id == Some(r4)).unwrap();
         assert!(a4.last_line.contains("3221225477"), "{}", a4.last_line);
+
+        // A failed take whose excerpt shows a PO rejection files as the 🎫
+        // kind — same title as a zero-byte rejection's pre-filed row.
+        let r5 = store
+            .insert_recording(mid, 5_000, "C:/rec/e.mkv", Some(5_000), false, Some("s5"), None, "", "")
+            .unwrap();
+        store
+            .finish_recording(
+                r5, 5_100, 9_999, Some(1), "failed", "C:/rec/e.mkv",
+                "yt_dlp.utils.DownloadError: This stream requires a GVS PO Token to continue",
+            )
+            .unwrap();
+        let a5 = store.list_capture_alerts(10).unwrap();
+        let a5 = a5.iter().find(|a| a.recording_id == Some(r5)).unwrap();
+        assert_eq!(a5.kind, "po_token_rejected");
+        assert_eq!(a5.severity, "error");
     }
 
     /// Take numbering for notification headings: 1-based within one

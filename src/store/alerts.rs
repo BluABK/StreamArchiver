@@ -196,9 +196,9 @@ impl Store {
         let updated = conn.execute(
             "UPDATE capture_alert SET
                 last_at = ?3, count = count + ?4, lost_segments = lost_segments + ?5,
-                last_line = ?6, acked = 0
+                last_line = ?6, severity = ?7, acked = 0
              WHERE take_key = ?1 AND kind = ?2",
-            params![a.take_key, a.kind, now, a.count, a.lost_segments, last_line],
+            params![a.take_key, a.kind, now, a.count, a.lost_segments, last_line, a.severity],
         )?;
         if updated == 0 {
             conn.execute(

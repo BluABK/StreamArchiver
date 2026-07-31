@@ -44,6 +44,8 @@ fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
         "fetch_failed" => ("⛔", "Failed segment fetches"),
         "tool_error" => ("❌", "Tool errors"),
         "capture_failed" => ("⛔", "Capture failed"),
+        "po_token_rejected" => ("🎫", "PO token rejected"),
+        "youtube_experiment" => ("🧪", "Platform experiment"),
         _ => ("⚠", "Tool warnings"),
     }
 }

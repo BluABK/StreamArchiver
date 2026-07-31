@@ -1605,7 +1605,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 80)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 80);
+        if version < 81 {
+            // 🎫 PO-token rejections were filed as warnings until 2026-07-31
+            // (6d842b4): the rejection kills the take and the footage until
+            // the next attempt is genuinely missing, which is this app's
+            // definition of an error. New rows file as errors; this upgrades
+            // the persisted history so the Warnings window doesn't show the
+            // same failure in two colours depending on its date.
+            conn.execute_batch(
+                "UPDATE capture_alert SET severity = 'error' WHERE kind = 'po_token_rejected';",
+            )?;
+            conn.pragma_update(None, "user_version", 81)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 81);
         Ok(())
     }
 }
