@@ -69,6 +69,23 @@ pub(super) fn classify_line(line: &str) -> Option<LineHit> {
         return Some(LineHit { kind: "sequence_gap", severity: "error", lost: Some((p, 1)) });
     }
 
+    // yt-dlp `[debug] [youtube] <id>: Detected experiment to bind GVS PO Token
+    // to video ID for web client` — YouTube put this stream into a serving
+    // experiment. Nothing is lost and the capture usually proceeds normally,
+    // but these are the leading indicator for a whole class of sudden,
+    // account-wide capture failures: the GVS-PO-token-binding experiment was
+    // already active on the stream whose token YouTube then started refusing
+    // (2026-07-31, see `supervisor::po_token_rejected`). Buried at `[debug]`
+    // in a per-capture file, an experiment rollout is invisible until it
+    // breaks something; surfaced here it's a dated, per-channel record of
+    // exactly when the platform changed the rules.
+    //
+    // Matched before the ERROR/WARNING rules below because the line carries
+    // neither prefix — it would otherwise fall through as unclassified.
+    if l.contains("Detected experiment") {
+        return Some(LineHit { kind: "youtube_experiment", severity: "warning", lost: None });
+    }
+
     // Premature spawn: yt-dlp was pointed at an upcoming/offline channel
     // (`ERROR: [youtube] …: This live event will begin in 2 days.`). Nothing
     // was live, so nothing was lost — surfaced as a warning because it still
@@ -126,6 +143,7 @@ pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static st
         "fetch_failed" => return ("⛔", "Failed fetches"),
         "ad_probe_degraded" => return ("🛰", "Ad probe degraded"),
         "po_token_rejected" => return ("🎫", "PO token rejected"),
+        "youtube_experiment" => return ("🧪", "Platform experiment"),
         "offline_drive" => return ("💽", "Drive offline"),
         _ => {}
     }
@@ -704,6 +722,14 @@ fn alert_message(
             )
         }
         "tool_error" => (format!("Capture tool error — {label}"), last_line.to_string()),
+        "youtube_experiment" => (
+            format!("Platform experiment on {label}'s stream"),
+            format!(
+                "YouTube is serving this stream under an experiment. The capture is usually \
+                 unaffected — this is recorded so that IF captures start failing, there's a \
+                 dated record of when the platform changed the rules.\n{last_line}"
+            ),
+        ),
         _ => (format!("Capture tool warning — {label}"), last_line.to_string()),
     }
 }
@@ -777,6 +803,23 @@ mod tests {
         );
         assert_eq!(
             classify_line("WARNING: [youtube] Some formats are missing").unwrap().severity,
+            "warning"
+        );
+
+        // Platform experiments — the verbatim line from the 2026-07-31
+        // incident, whose stream YouTube then started refusing tokens for.
+        // It carries no ERROR:/WARNING: prefix and lives at [debug], so it
+        // has to be matched explicitly or it falls through unclassified.
+        assert_eq!(
+            classify_line(
+                "[debug] [youtube] 7EoBQWYGnXM: Detected experiment to bind GVS PO Token to \
+                 video ID for web client"
+            ),
+            Some(LineHit { kind: "youtube_experiment", severity: "warning", lost: None })
+        );
+        // Never an error: an experiment costs no footage by itself.
+        assert_eq!(
+            classify_line("[debug] [youtube] abc: Detected experiment foo").unwrap().severity,
             "warning"
         );
 

@@ -606,6 +606,17 @@ anywhere of why: a killed feeder, a throttle and a refused PO token all look
 identical from outside. Pruned on the same 7-day schedule as the capture logs,
 and a log that can't be opened never blocks playback.
 
+**🧪 Platform experiments.** yt-dlp reports when YouTube serves a stream under
+a serving experiment (e.g. *"Detected experiment to bind GVS PO Token to video
+ID"*). These are surfaced as warnings — in the 🚨 Warnings window and the main
+app log — even though an experiment costs no footage by itself. They're the
+leading indicator for a whole class of sudden capture failures: the
+token-binding experiment was already active on the stream whose tokens YouTube
+then started refusing. The line sits at `[debug]` level inside a per-capture
+log file, so without this an experiment rollout is invisible until it breaks
+something; surfaced, it's a dated per-channel record of when the platform
+changed the rules.
+
 **PO token rejections.** A YouTube SABR capture can die because the platform
 refuses its GVS PO Token (`sps:ATTESTATION_REQUIRED` — yt-dlp raises
 `PoTokenError`). This is **not** a local misconfiguration: the token server
