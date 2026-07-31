@@ -712,6 +712,25 @@ impl Store {
     }
 }
 
+impl Store {
+    /// How many 🎫 PO-token rejections were recorded in the window ending
+    /// now, as `(alert rows touched, distinct channels)` — the raw signal
+    /// behind rejection-STORM detection (see `pot_server`'s watchdog): one
+    /// row per take, `last_at` advancing while the take's rejections
+    /// continue, so "rows with recent activity" is exactly "takes recently
+    /// being refused".
+    pub fn po_rejections_since(&self, since_unix: i64) -> Result<(i64, i64)> {
+        self.db()
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT channel) FROM capture_alert
+                 WHERE kind = 'po_token_rejected' AND last_at >= ?1",
+                params![since_unix],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +755,29 @@ mod tests {
     /// ANSI colour codes (from tool logs, or the app's own pre-2026-07-31
     /// composed text) are stripped on ingest — the Warnings window must never
     /// render escape bytes as literal text.
+    /// Storm detection input: only 🎫 rows with RECENT activity count, and
+    /// channels dedupe — 20 takes of one channel is still one channel.
+    #[test]
+    fn po_rejections_since_counts_recent_rows_and_distinct_channels() {
+        let store = Store::open_in_memory().unwrap();
+        let now = crate::models::now_unix();
+        let mut a = gap_alert("po_token:rec1");
+        a.kind = "po_token_rejected".into();
+        a.channel = "chrchie".into();
+        store.upsert_capture_alert(&a).unwrap();
+        a.take_key = "po_token:rec2".into();
+        store.upsert_capture_alert(&a).unwrap(); // same channel, second take
+        a.take_key = "po_token:rec3".into();
+        a.channel = "girl_dm_".into();
+        store.upsert_capture_alert(&a).unwrap();
+        // A non-PO error row never counts.
+        store.upsert_capture_alert(&gap_alert(r"A:\other.ts.log")).unwrap();
+
+        assert_eq!(store.po_rejections_since(now - 900).unwrap(), (3, 2));
+        // Window excludes rows whose last activity is older than `since`.
+        assert_eq!(store.po_rejections_since(now + 10).unwrap(), (0, 0));
+    }
+
     #[test]
     fn alert_upsert_strips_ansi_from_last_line() {
         let store = Store::open_in_memory().unwrap();

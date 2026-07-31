@@ -669,6 +669,19 @@ only trace is a traceback in a per-capture log. The cap stays at 15 minutes on p
 lose the held-off minutes for good once the wave lifts, so waiting longer
 would trade take clutter for real footage.
 
+**Rejection storms are detected and named.** When ≥2 takes have been refused
+within 15 minutes, the app declares a **🎫 rejection storm**: one 🔔
+notification (and a WARN in the log) explains that YouTube is refusing
+tokens across channels, that the token server is *working but saturated* —
+under the token-binding experiment every mint needs a full attestation
+challenge, so the server can be too busy to answer health checks — and that
+captures are backing off automatically. While a storm is active, the
+POT-server watchdog's "started but never answered /ping" error notification
+is suppressed and its status reads *saturated (rejection storm) — retrying*
+instead: before this, a relaunch mid-storm raised a misleading "server not
+responding" alarm about a server that was busily minting the whole time.
+The storm clears (logged) after 15 quiet minutes.
+
 ### Automatic deletion
 
 A few features delete finished recordings on their own: the post-join parts

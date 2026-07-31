@@ -65,6 +65,16 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4416";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a freshly spawned server gets to answer `/ping` before the spawn
 /// counts as failed (node + jsdom startup is a few seconds on a busy disk).
+/// A YouTube PO-token rejection STORM is in progress when at least this many
+/// takes were refused within [`STORM_WINDOW_SECS`]. During one, the token
+/// server is typically healthy but saturated: the token-binding experiment
+/// forces a full BotGuard attestation per mint (the integrity-token cache
+/// never applies), node's event loop pegs, and /ping starves — which the
+/// watchdog used to misreport as "server not responding" (2026-07-31).
+const STORM_MIN_TAKES: i64 = 2;
+/// Look-back window for storm detection; also the quiet period that ends one.
+const STORM_WINDOW_SECS: i64 = 15 * 60;
+
 /// Re-check delay after a live server missed a single /ping (see
 /// `Action::Grace`) — short, so a genuinely wedged server still reaches the
 /// spawn path within ~seconds rather than a full poll interval.
@@ -512,6 +522,10 @@ async fn watchdog_loop(
     // Grace decision in `watch_action` (one missed ping of a live server is
     // tolerated; two means it's really wedged).
     let mut ping_failures: u32 = 0;
+    // Unix time a rejection storm was first detected; `None` = no storm.
+    // Drives one 🔔 per episode plus the accurate degraded-mode wording, and
+    // clears (with an info log) once the window goes quiet.
+    let mut storm_since: Option<i64> = None;
     // One 🔔 notification per down-episode, not one per failed attempt.
     let mut notified_down = false;
     let mut warned_missing_dir = false;
@@ -560,6 +574,48 @@ async fn watchdog_loop(
             && crate::platform::pid_listening_on(base_url_port(&cfg.base_url))
                 .is_some_and(|p| p != std::process::id());
         let child_alive = child.is_some() || adopted.is_some() || foreign_listener;
+
+        // Rejection-storm edge detection (one cheap indexed COUNT per tick).
+        let now = crate::models::now_unix();
+        let (storm_takes, storm_channels) =
+            store.po_rejections_since(now - STORM_WINDOW_SECS).unwrap_or((0, 0));
+        let storm = storm_takes >= STORM_MIN_TAKES;
+        match (storm, storm_since) {
+            (true, None) => {
+                storm_since = Some(now);
+                warn!(
+                    takes = storm_takes,
+                    channels = storm_channels,
+                    "YouTube PO-token rejection storm in progress — the token server is \
+                     healthy but every mint needs a full attestation challenge, so it may \
+                     answer slowly; captures back off with the escalating 5-15m cooldown"
+                );
+                let _ = events.send(crate::events::AppEvent::CaptureAlert {
+                    severity: "error".to_string(),
+                    title: "🎫 YouTube PO-token rejection storm".to_string(),
+                    body: format!(
+                        "{storm_takes} capture attempt(s) across {storm_channels} channel(s) \
+                         had their GVS PO tokens refused in the last 15 minutes. This is a \
+                         YouTube-side condition (ATTESTATION_REQUIRED) — the token server is \
+                         working, just saturated: each token now needs a full attestation \
+                         challenge, so it may answer health checks slowly. Captures retry \
+                         with an escalating 5-15 minute cooldown; no action needed."
+                    ),
+                    monitor_id: None,
+                    channel: String::new(),
+                    recording_id: None,
+                    ref_key: format!("po_storm:{now}"),
+                });
+            }
+            (false, Some(since)) => {
+                info!(
+                    lasted_mins = (now - since) / 60,
+                    "PO-token rejection storm cleared (no refusals in the last 15 minutes)"
+                );
+                storm_since = None;
+            }
+            _ => {}
+        }
 
         // A managed server that died since the last tick is worth a warning
         // with whatever it last wrote — even if an external one answered the
@@ -762,6 +818,7 @@ async fn watchdog_loop(
                                     &mut consecutive_failures,
                                     &mut notified_down,
                                     "started but never answered /ping",
+                                    storm_since.is_some(),
                                 );
                                 sleep_or_nudge(spawn_backoff(consecutive_failures), &shutdown).await;
                             }
@@ -773,6 +830,7 @@ async fn watchdog_loop(
                             &mut consecutive_failures,
                             &mut notified_down,
                             &format!("spawn failed: {e}"),
+                            storm_since.is_some(),
                         );
                         sleep_or_nudge(spawn_backoff(consecutive_failures), &shutdown).await;
                     }
@@ -783,14 +841,35 @@ async fn watchdog_loop(
 }
 
 /// Record a failed spawn attempt: status, log, and (once per down-episode) an
-/// in-app 🔔 notification.
+/// in-app 🔔 notification. `storm` = a rejection storm is in progress: the
+/// server is almost certainly saturated rather than down, so the log line
+/// says that instead, the status reads "saturated", and the misleading
+/// "server not responding" error notification is skipped entirely — the
+/// storm already raised its own, accurate 🔔 (2026-07-31 20:17: a relaunch
+/// mid-storm toasted "started but never answered /ping" about a server that
+/// was busily minting the whole time).
 fn spawn_failed(
     events: &crate::events::EventTx,
     consecutive_failures: &mut u32,
     notified_down: &mut bool,
     reason: &str,
+    storm: bool,
 ) {
     *consecutive_failures += 1;
+    if storm {
+        warn!(
+            attempts = *consecutive_failures,
+            "PO token server didn't answer ({reason}) — likely saturated by the ongoing \
+             PO-token rejection storm (every mint needs a full attestation challenge), \
+             not down; will keep re-checking (log: {})",
+            log_path().display()
+        );
+        set_status(
+            PotMode::Failed { reason: "saturated (rejection storm) — retrying".to_string() },
+            None,
+        );
+        return;
+    }
     warn!(
         attempts = *consecutive_failures,
         "PO token server failed to start: {reason} — SABR captures will lack GVS PO tokens \
