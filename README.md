@@ -686,6 +686,21 @@ ping stretches to 30 s and a silent listener is spared entirely while
 *Managed GVS PO token server* below). The storm clears (logged) after 15
 quiet minutes.
 
+**The saturation itself is fixed at the source.** The local bgutil server
+(branch `blu/minter-reuse` in the server repo) reuses its attested
+IntegrityToken *minter* across mints instead of running a full BotGuard
+challenge per request: the GenerateIT response itself declares one
+attestation good for ~100 mints, and yt-dlp's `bypass_cache` (sent on every
+rejected-token retry) now only bypasses the token cache — a fresh
+attestation is run at most every 30 s under sustained rejection. Before the
+patch, one storm day produced 1 518 mints with 1 492 full attestations;
+during storms the re-mints cost microseconds, the event loop stays
+responsive, and `/ping` keeps answering. If storms persist, an escape hatch
+worth testing is capturing via a client that needs no GVS PO token at all
+(yt-dlp's `tv` client has no PO-token policy): set *player-client=tv* in the
+SABR extractor args — unverified for live-from-start DVR depth, so trial it
+on one stream first.
+
 ### Automatic deletion
 
 A few features delete finished recordings on their own: the post-join parts
