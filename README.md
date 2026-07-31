@@ -649,13 +649,18 @@ changed the rules.
 refuses its GVS PO Token (`sps:ATTESTATION_REQUIRED` — yt-dlp raises
 `PoTokenError`). This is **not** a local misconfiguration: the token server
 keeps minting fresh, distinct tokens and YouTube refuses each one, so nothing
-on this side can fix it, and it typically clears by itself within a few
-minutes. The ordinary failure ladder (30 s, 60 s, 90 s…) just burns takes
-against it — three in a row, ~35 s each, when this was first seen. So a
-capture that dies this way gets a **5-minute cooldown** before the next
-automatic attempt, and files a **🎫 PO token rejected** entry in the 🚨
-Warnings window (one per take) explaining what happened, rather than leaving
-a bare "failed" take whose only trace is a traceback in a per-capture log.
+on this side can fix it, and it clears by itself. The episodes vary wildly in
+length, though — the first observed one lifted after ~7 minutes, while an
+overnight wave rejected *every* token of two concurrent captures for over
+three hours. The ordinary failure ladder (30 s, 60 s, 90 s…) just burns takes
+against that wall, so a capture that dies this way gets an **escalating
+cooldown — 5, 10, then 15 minutes per consecutive rejection (capped at 15)**
+before the next automatic attempt, and files a **🎫 PO token rejected** entry
+in the 🚨 Warnings window (one per take) explaining what happened, rather
+than leaving a bare "failed" take whose only trace is a traceback in a
+per-capture log. The cap stays at 15 minutes on purpose: live-edge captures
+lose the held-off minutes for good once the wave lifts, so waiting longer
+would trade take clutter for real footage.
 
 ### Automatic deletion
 

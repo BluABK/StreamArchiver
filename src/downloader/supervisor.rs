@@ -3,11 +3,24 @@
 
 use super::*;
 
-/// How long to hold off the next automatic attempt after YouTube rejected the
-/// capture's GVS PO Token. Long enough to let a platform-side attestation
-/// demand pass (it cleared in ~7 minutes when this was first seen), short
-/// enough that a long broadcast still gets captured.
+/// Base hold-off before the next automatic attempt after YouTube rejected the
+/// capture's GVS PO Token — the wait is this × the consecutive-failure count
+/// (see `note_result`), capped at [`PO_TOKEN_COOLDOWN_MAX_SECS`].
+///
+/// The first observed episode cleared in ~7 minutes, which a flat 5-minute
+/// cooldown fits. The night of 2026-07-31 didn't: two concurrent SABR
+/// captures (Dokibird, Zentreya) had every token rejected for over three
+/// hours straight — ~25 burned takes *each* under the generic ladder's
+/// 10-minute cap, with the provider demonstrably healthy the whole time
+/// (fresh distinct tokens per attempt; a healthy capture mints exactly one).
+/// Escalating to a 15-minute cap roughly halves the take churn in a long
+/// wave while still rejoining within 15 minutes of it lifting.
 const PO_TOKEN_COOLDOWN_SECS: u64 = 300;
+/// Ceiling for the escalating PO-token cooldown. Deliberately NOT higher:
+/// these monitors capture at the live edge (`--no-live-from-start`), so every
+/// extra minute of hold-off after the wave lifts is a permanent gap in the
+/// recording — 15 minutes trades take spam against lost footage about evenly.
+const PO_TOKEN_COOLDOWN_MAX_SECS: u64 = 900;
 
 /// Whether a dead capture's tool log says YouTube **rejected** its GVS PO
 /// Token, as opposed to any other failure.
@@ -24,6 +37,32 @@ pub(super) fn po_token_rejected(log: &str) -> bool {
     log.contains("ATTESTATION_REQUIRED")
         || log.contains("PoTokenError")
         || log.contains("requires a GVS PO Token")
+}
+
+/// The wait before the next automatic attempt after a capture that produced
+/// nothing, given how many times in a row it has now failed. Three tiers:
+///
+/// - The generic ladder: 30s × fails, capped at 10 minutes.
+/// - An instant death (a few seconds, e.g. "No video formats found" during a
+///   pre-roll-ad window, or an unrecordable configuration) floors at 5
+///   minutes — it must not re-spawn every ~30s for the whole stream.
+/// - A GVS PO-token rejection escalates 5/10/15 minutes then stays at 15.
+///   Nothing local can fix one — the provider is minting fresh, distinct
+///   tokens and the platform refuses them (`sps:ATTESTATION_REQUIRED`) — and
+///   the episodes range from ~7 minutes (2026-07-31 00:03) to 3+ hours
+///   rejecting two concurrent captures' every attempt (same night, 02:20).
+///   The ordinary ladder just burns takes against that wall.
+pub(super) fn failure_backoff_secs(fails: u32, duration_secs: i64, po_token_rejected: bool) -> u64 {
+    let mut wait = (30u64 * fails as u64).min(600);
+    const INSTANT_FAIL_SECS: i64 = 10;
+    if duration_secs < INSTANT_FAIL_SECS {
+        wait = wait.max(300);
+    }
+    if po_token_rejected {
+        wait = wait
+            .max((PO_TOKEN_COOLDOWN_SECS * fails as u64).min(PO_TOKEN_COOLDOWN_MAX_SECS));
+    }
+    wait
 }
 
 impl Supervisor {
@@ -2645,26 +2684,7 @@ progress_info: None,
                 until: Instant::now(),
             });
             entry.fails = entry.fails.saturating_add(1);
-            let mut wait = (30u64 * entry.fails as u64).min(600);
-            // A capture that died almost immediately having produced nothing (a
-            // few seconds — e.g. "No video formats found" during a transient
-            // no-format window / pre-roll ad, or an unrecordable configuration)
-            // shouldn't re-spawn every ~30s and tight-loop for the whole stream.
-            // Apply a higher floor for these instant failures.
-            const INSTANT_FAIL_SECS: i64 = 10;
-            if duration_secs < INSTANT_FAIL_SECS {
-                wait = wait.max(300);
-            }
-            // YouTube rejected the GVS PO token. Nothing local can fix that —
-            // the token provider is minting fresh, distinct tokens and the
-            // platform is refusing them (`sps:ATTESTATION_REQUIRED`) — and it
-            // clears on its own after a few minutes. The ordinary ladder
-            // (30s/60s/90s) just burns takes against a wall: on 2026-07-31 it
-            // spent three, ~35s each, before the fourth attempt succeeded
-            // untouched. Wait properly instead.
-            if po_token_rejected {
-                wait = wait.max(PO_TOKEN_COOLDOWN_SECS);
-            }
+            let wait = failure_backoff_secs(entry.fails, duration_secs, po_token_rejected);
             entry.until = Instant::now() + Duration::from_secs(wait);
             warn!(
                 monitor_id,
@@ -4093,6 +4113,29 @@ progress_info: None,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three backoff tiers, pinned against the incidents that shaped
+    /// them: the generic ladder, the instant-death floor, and the escalating
+    /// PO-token cooldown (2026-07-31 overnight: two concurrent captures, every
+    /// token rejected for 3+ hours, ~25 takes each under the old 10-min cap).
+    #[test]
+    fn failure_backoff_escalates_po_token_rejections_to_a_15_minute_cap() {
+        // Generic ladder: 30s × fails, capped at 10 min.
+        assert_eq!(failure_backoff_secs(1, 120, false), 30);
+        assert_eq!(failure_backoff_secs(3, 120, false), 90);
+        assert_eq!(failure_backoff_secs(25, 120, false), 600);
+        // Instant deaths floor at 5 min regardless of fail count.
+        assert_eq!(failure_backoff_secs(1, 3, false), 300);
+        // PO rejection: 5/10/15 then flat 15 — never the 30s burn, never
+        // unbounded either.
+        assert_eq!(failure_backoff_secs(1, 120, true), 300);
+        assert_eq!(failure_backoff_secs(2, 120, true), 600);
+        assert_eq!(failure_backoff_secs(3, 120, true), 900);
+        assert_eq!(failure_backoff_secs(25, 120, true), 900);
+        // Tiers compose: an instant PO death takes the larger wait.
+        assert_eq!(failure_backoff_secs(1, 3, true), 300);
+        assert_eq!(failure_backoff_secs(4, 3, true), 900);
+    }
 
     /// Detected from the real logs of the 2026-07-31 Dokibird incident. All
     /// three spellings appeared there, at different layers of yt-dlp.
