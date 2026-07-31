@@ -634,6 +634,31 @@ fn send_mpv_title(pipe: &mut std::fs::File, title: &str) -> std::io::Result<()> 
     pipe.write_all(b"\n")
 }
 
+/// Poll for mpv's `--input-ipc-server` pipe until it exists, and open it for
+/// writing. `None` = it never appeared within `connect_timeout` (mpv never
+/// came up, the launch failed, or the player isn't mpv after all), which is
+/// always best-effort: the window simply keeps the title it launched with.
+fn connect_mpv_ipc(
+    pipe_path: &str,
+    connect_timeout: std::time::Duration,
+) -> Option<std::fs::File> {
+    let deadline = std::time::Instant::now() + connect_timeout;
+    loop {
+        match crate::iomon::fs::open_with_sync(crate::iomon::Cat::Preview, pipe_path, |o| {
+            o.write(true);
+        }) {
+            Ok(f) => return Some(f),
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                warn!("live-title: mpv IPC pipe never came up, auto-update disabled: {e}");
+                return None;
+            }
+        }
+    }
+}
+
 /// Background loop started by [`apply_live_title_and_spawn_updater`] (and by
 /// the Streamlink branch of [`spawn_play_new_instance`]): connect to
 /// `pipe_path`, push the current title once the pipe is up, then poll
@@ -659,21 +684,7 @@ fn run_live_title_updater(
     mut last_game: String,
     connect_timeout: std::time::Duration,
 ) {
-    let deadline = std::time::Instant::now() + connect_timeout;
-    let mut pipe = loop {
-        match crate::iomon::fs::open_with_sync(crate::iomon::Cat::Preview, &pipe_path, |o| {
-            o.write(true);
-        }) {
-            Ok(f) => break f,
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(e) => {
-                warn!("live-title: mpv IPC pipe never came up, auto-update disabled: {e}");
-                return;
-            }
-        }
-    };
+    let Some(mut pipe) = connect_mpv_ipc(&pipe_path, connect_timeout) else { return };
     tracing::debug!(monitor_id, "live-title: mpv IPC connected, pushing title");
     let mut force = true;
     loop {
@@ -701,20 +712,29 @@ fn run_live_title_updater(
 fn apply_live_title_and_spawn_updater(
     cmd: &mut std::process::Command,
     player: &str,
-    monitor_id: i64,
-    channel: &str,
-    last_title: &str,
-    last_game: &str,
+    row: &crate::models::MonitorWithChannel,
     template: &str,
     auto_update: bool,
     store: &Arc<crate::store::Store>,
+    meta: Option<&LiveMetaCtx>,
 ) {
+    let (monitor_id, channel) = (row.monitor.id, row.channel.name.as_str());
+    let (last_title, last_game) = (row.last_title.as_str(), row.last_game.as_str());
     if !player_is_mpv(player) || template.is_empty() {
         return;
     }
     cmd.arg(format!("--title={}", mpv_live_title_value(template, channel, last_title, last_game)));
-    if !auto_update || monitor_id == 0 {
-        return; // 0 = a synthetic follow-raid row with no real monitor to poll
+    if !auto_update {
+        return;
+    }
+    // A synthetic row (id 0: follow-raid/collab partner) has no monitor to
+    // poll, so it gets the deferred Helix fetch instead of the DB updater.
+    if monitor_id == 0 {
+        if let Some(plan) = plan_untracked_title(meta, row, player, template) {
+            cmd.arg(format!("--input-ipc-server={}", plan.pipe_path));
+            plan.start(LIVE_TITLE_IPC_CONNECT_TIMEOUT);
+        }
+        return;
     }
     let pipe_path = new_mpv_ipc_pipe_path();
     cmd.arg(format!("--input-ipc-server={pipe_path}"));
@@ -722,6 +742,165 @@ fn apply_live_title_and_spawn_updater(
         pipe_path, store, monitor_id, template, last_title, last_game,
         LIVE_TITLE_IPC_CONNECT_TIMEOUT,
     );
+}
+
+// ----- Untracked-row (collab partner / raid target) title, fetched after launch -----
+
+/// What a deferred (post-launch) title fetch needs: the app's shared detection
+/// context — its HTTP client *and* its cached Twitch tokens — plus a runtime
+/// handle to drive the request on.
+///
+/// Threaded through the play actions as an `Option`, so every path degrades to
+/// exactly the old behavior (launch title only) when the app core hasn't
+/// published a context yet.
+#[derive(Clone)]
+pub(crate) struct LiveMetaCtx {
+    ctx: Arc<crate::detectors::DetectContext>,
+    rt: tokio::runtime::Handle,
+}
+
+impl LiveMetaCtx {
+    /// Build one from the app core, or `None` before [`crate::app_core::AppCore::start`]
+    /// has run.
+    pub(crate) fn from_core(core: &crate::app_core::AppCore) -> Option<Self> {
+        core.detect_ctx().map(|ctx| LiveMetaCtx { ctx, rt: core.rt.clone() })
+    }
+
+    /// Build one inside an async task that already holds a context (the
+    /// auto-play side of Follow raid).
+    pub(crate) fn from_ctx(ctx: &Arc<crate::detectors::DetectContext>) -> Self {
+        LiveMetaCtx { ctx: Arc::clone(ctx), rt: tokio::runtime::Handle::current() }
+    }
+}
+
+/// Fill in the window title of a player opened for a channel this app doesn't
+/// track — a collab partner or a raid target — *after* it has launched.
+///
+/// These rows are synthetic (`monitor.id == 0`, see [`spawn_play_collab_partner`]
+/// and [`spawn_follow_raid`]): there is no monitor row, so no stored title or
+/// game, so the configured template renders with `{game}`/`{title_trimmed}`
+/// empty and the window says little more than the channel name. The metadata
+/// exists — it's one Helix `GET /streams` away — but blocking the play action
+/// on a network round-trip to get it would be the wrong trade: tuning in must
+/// stay instant.
+///
+/// So the fetch happens here instead, on a background thread, and the result
+/// is pushed into the already-running player over mpv's IPC socket.
+///
+/// **The fetch runs before the pipe connect on purpose.** Connecting polls for
+/// mpv's pipe for up to a minute on the Streamlink path (Streamlink resolves
+/// the stream and *then* spawns the player), so the Helix round-trip hides
+/// inside a wait that was happening anyway — and the very first push then
+/// already carries real metadata, instead of writing a blank template and
+/// correcting it a moment later.
+///
+/// **One shot, deliberately.** A tracked row's [`run_live_title_updater`] can
+/// afford to poll forever because each round is a local DB read, and it stops
+/// when a push fails against a closed pipe. Neither holds here: every round
+/// would be a real Helix call, and a partner whose title never changes gives
+/// this loop nothing to write — so it would never learn the window closed and
+/// would keep querying the API behind it for the rest of the session. Poking
+/// the pipe to test that isn't free either: every mpv IPC command produces a
+/// reply, and this pipe is opened write-only and never drained. The cost of
+/// stopping is only that a partner who retitles mid-collab leaves this window
+/// showing the title it had at tune-in.
+fn run_untracked_title_updater(
+    meta: LiveMetaCtx,
+    pipe_path: String,
+    url: String,
+    channel: String,
+    template: String,
+    connect_timeout: std::time::Duration,
+) {
+    use crate::detectors::MetaFetch;
+
+    let fetched = meta.rt.block_on(meta.ctx.twitch_stream_meta(&url));
+    // `Offline`/`Failed` leave the launch title alone — an untracked partner
+    // that already ended, or a Helix hiccup, must not blank a window title
+    // that at least still names the channel.
+    let MetaFetch::Live(m) = fetched else {
+        tracing::debug!(%channel, "live-title: no live metadata for untracked row, keeping launch title");
+        return;
+    };
+    let Some(mut pipe) = connect_mpv_ipc(&pipe_path, connect_timeout) else { return };
+    let value = mpv_live_title_value(&template, &channel, &m.title, &m.game);
+    match send_mpv_title(&mut pipe, &value) {
+        Ok(()) => tracing::debug!(%channel, "live-title: pushed fetched title for untracked row"),
+        Err(_) => tracing::debug!(%channel, "live-title: untracked player closed before its title arrived"),
+    }
+}
+
+/// A decided-but-not-yet-started deferred title fetch: the IPC pipe path to
+/// hand the player, plus everything [`run_untracked_title_updater`] will need.
+///
+/// Deciding and starting are separate steps because the Streamlink path can't
+/// do both at once — it has to put `--input-ipc-server` on the command line
+/// *before* launching, but must not start the updater until it knows the
+/// launch succeeded (otherwise a failed spawn leaves a thread polling for a
+/// pipe that can never appear, ending in a misleading warning).
+struct UntrackedTitlePlan {
+    pipe_path: String,
+    meta: LiveMetaCtx,
+    url: String,
+    channel: String,
+    template: String,
+}
+
+/// Whether a deferred title fetch is worth doing for this row.
+///
+/// All four conditions are load-bearing:
+/// - `monitor.id == 0` — a *tracked* row already has stored title/game and its
+///   own updater polling the DB for free; fetching would duplicate that at
+///   Helix's expense.
+/// - non-empty template — with no template there is no title to render.
+/// - mpv — the IPC socket that carries the result is mpv-only.
+/// - Twitch — the fetch is Helix `GET /streams`. Collab partners are
+///   Twitch-only by construction, and so are raid targets, but a synthetic
+///   row inherits its tool from whichever instance it was launched from, so
+///   this is checked rather than assumed.
+fn row_wants_deferred_title(
+    row: &crate::models::MonitorWithChannel,
+    player: &str,
+    template: &str,
+) -> bool {
+    row.monitor.id == 0
+        && !template.is_empty()
+        && player_is_mpv(player)
+        && row.monitor.platform() == crate::models::Platform::Twitch
+}
+
+/// Decide whether this row can use a deferred title fetch (see
+/// [`row_wants_deferred_title`]) and the app core has published a detection
+/// context to do it with. Allocates the pipe path but starts nothing; call
+/// [`UntrackedTitlePlan::start`] for that.
+fn plan_untracked_title(
+    meta: Option<&LiveMetaCtx>,
+    row: &crate::models::MonitorWithChannel,
+    player: &str,
+    template: &str,
+) -> Option<UntrackedTitlePlan> {
+    let meta = meta?;
+    if !row_wants_deferred_title(row, player, template) {
+        return None;
+    }
+    Some(UntrackedTitlePlan {
+        pipe_path: new_mpv_ipc_pipe_path(),
+        meta: meta.clone(),
+        url: row.monitor.url.clone(),
+        channel: row.channel.name.clone(),
+        template: template.to_string(),
+    })
+}
+
+impl UntrackedTitlePlan {
+    /// Run [`run_untracked_title_updater`] on its own thread.
+    fn start(self, connect_timeout: std::time::Duration) {
+        std::thread::spawn(move || {
+            run_untracked_title_updater(
+                self.meta, self.pipe_path, self.url, self.channel, self.template, connect_timeout,
+            );
+        });
+    }
 }
 
 /// Start [`run_live_title_updater`] on its own thread. Shared by the paths
@@ -813,6 +992,7 @@ pub(super) fn spawn_live_preview(
     store: &Arc<crate::store::Store>,
     mute: bool,
     title_template_override: Option<&str>,
+    meta: Option<&LiveMetaCtx>,
 ) -> Option<String> {
     use crate::downloader::{load_ytdlp_bins, resolve_auth, sabr_preview_args, split_args, youtube_live_url, AuthSource};
     use crate::models::Platform;
@@ -912,12 +1092,14 @@ pub(super) fn spawn_live_preview(
     );
     let player = player.to_string();
     let channel = row.channel.name.clone();
-    let monitor_id = m.id;
-    let last_title = row.last_title.clone();
-    let last_game = row.last_game.clone();
+    // The whole row travels into the thread (rather than the four title fields
+    // separately) so the launch-time title helper can also decide whether this
+    // is an untracked row needing a deferred metadata fetch.
+    let title_row = row.clone();
     let title_template = title_template_override.unwrap_or(settings.live_title_template.trim()).to_string();
     let title_auto_update = settings.live_title_auto_update;
     let title_store = Arc::clone(store);
+    let title_meta = meta.cloned();
     std::thread::spawn(move || {
         let cleanup = |dl: &mut std::process::Child, tmp: &std::path::Path| {
             let pid = dl.id().to_string();
@@ -1032,8 +1214,8 @@ pub(super) fn spawn_live_preview(
                             cmd.arg("--mute");
                         }
                         apply_live_title_and_spawn_updater(
-                            &mut cmd, &player, monitor_id, &channel, &last_title, &last_game,
-                            &title_template, title_auto_update, &title_store,
+                            &mut cmd, &player, &title_row, &title_template, title_auto_update,
+                            &title_store, title_meta.as_ref(),
                         );
                         match cmd.spawn() {
                             Ok(p) => return Some((p, Some(hp))),
@@ -1050,8 +1232,8 @@ pub(super) fn spawn_live_preview(
                     cmd.arg("--mute");
                 }
                 apply_live_title_and_spawn_updater(
-                    &mut cmd, &player, monitor_id, &channel, &last_title, &last_game,
-                    &title_template, title_auto_update, &title_store,
+                    &mut cmd, &player, &title_row, &title_template, title_auto_update,
+                    &title_store, title_meta.as_ref(),
                 );
                 match cmd.spawn() {
                     Ok(p) => Some((p, None)),
@@ -1127,6 +1309,7 @@ pub(super) fn spawn_play_new_instance(
     store: &Arc<crate::store::Store>,
     mute: bool,
     title_template_override: Option<&str>,
+    meta: Option<&LiveMetaCtx>,
 ) -> Option<String> {
     use crate::downloader::{
         push_track_args, resolve_auth, resolved_quality, split_args, AuthSource,
@@ -1182,13 +1365,23 @@ pub(super) fn spawn_play_new_instance(
             // Streamlink owns the player process here, so mpv's IPC socket —
             // the only way to update the title after launch, since Streamlink
             // resolves its own --title once and never revisits it — has to be
-            // requested through --player-args. Skipped for a synthetic row
-            // (id 0: follow-raid/collab partner), which has no monitor to poll.
-            let ipc_pipe = (!title_template.is_empty()
-                && settings.live_title_auto_update
-                && player_is_mpv(player)
-                && m.id != 0)
-                .then(new_mpv_ipc_pipe_path);
+            // requested through --player-args.
+            //
+            // A synthetic row (id 0: follow-raid/collab partner) has no monitor
+            // to poll, so it takes the deferred-fetch updater instead: same
+            // socket, metadata from Helix rather than from the DB.
+            let untracked = settings
+                .live_title_auto_update
+                .then(|| plan_untracked_title(meta, row, player, title_template))
+                .flatten();
+            let ipc_pipe = match &untracked {
+                Some(plan) => Some(plan.pipe_path.clone()),
+                None => (!title_template.is_empty()
+                    && settings.live_title_auto_update
+                    && player_is_mpv(player)
+                    && m.id != 0)
+                    .then(new_mpv_ipc_pipe_path),
+            };
             // A separate --player-args flag, NOT embedded in --player's own
             // value: Streamlink re-splits `--player` as its own command line,
             // and on Windows a value handed to it as "<path> --mute" can come
@@ -1209,18 +1402,26 @@ pub(super) fn spawn_play_new_instance(
             // window into BOTH processes for the Twitch path.
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
             let status = spawn_logged(cmd, "streamlink");
-            // Only if Streamlink actually started — otherwise the updater would
-            // sit on a pipe that can never appear and log a spurious warning.
-            if let Some(pipe) = ipc_pipe.filter(|_| status.is_none()) {
-                spawn_live_title_updater(
-                    pipe, store, m.id, title_template, &row.last_title, &row.last_game,
-                    LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK,
-                );
+            // Both updaters start only if Streamlink actually started —
+            // otherwise one would sit on a pipe that can never appear and log
+            // a spurious warning a minute later.
+            if status.is_none() {
+                match untracked {
+                    Some(plan) => plan.start(LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK),
+                    None => {
+                        if let Some(pipe) = ipc_pipe {
+                            spawn_live_title_updater(
+                                pipe, store, m.id, title_template, &row.last_title,
+                                &row.last_game, LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK,
+                            );
+                        }
+                    }
+                }
             }
             status
         }
         Tool::YtDlp if m.platform() == Platform::YouTube => {
-            spawn_live_preview(row, player, settings, store, mute, title_template_override)
+            spawn_live_preview(row, player, settings, store, mute, title_template_override, meta)
         }
         Tool::YtDlp => {
             let ytdlp_bin = if settings.ytdlp_binary_path.trim().is_empty() {
@@ -1271,9 +1472,9 @@ pub(super) fn spawn_play_new_instance(
                         .stdin(Stdio::from(pipe))
                         .stderr(player_log(&row.channel.name, "player"));
                     apply_live_title_and_spawn_updater(
-                        &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
+                        &mut cmd, player, row,
                         title_template_override.unwrap_or(settings.live_title_template.trim()),
-                        settings.live_title_auto_update, store,
+                        settings.live_title_auto_update, store, meta,
                     );
                     if mute && player_is_mpv(player) {
                         cmd.arg("--mute");
@@ -1290,9 +1491,9 @@ pub(super) fn spawn_play_new_instance(
             let mut cmd = std::process::Command::new(player);
             cmd.stderr(player_log(&row.channel.name, "player"));
             apply_live_title_and_spawn_updater(
-                &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
+                &mut cmd, player, row,
                 title_template_override.unwrap_or(settings.live_title_template.trim()),
-                settings.live_title_auto_update, store,
+                settings.live_title_auto_update, store, meta,
             );
             if mute && player_is_mpv(player) {
                 cmd.arg("--mute");
@@ -1319,6 +1520,7 @@ pub(crate) fn spawn_follow_raid(
     player: &str,
     settings: &SettingsForm,
     store: &Arc<crate::store::Store>,
+    meta: Option<&LiveMetaCtx>,
 ) -> Option<String> {
     if to_login.is_empty() {
         return Some(format!(
@@ -1331,12 +1533,13 @@ pub(crate) fn spawn_follow_raid(
     // The title fields belong to the SOURCE (raiding) channel, not the raid
     // target — carrying them over would mislabel the live-edge title with
     // the wrong channel's stale metadata. We only know the target's display
-    // name, not its current title/game, so those are left blank rather than
-    // wrong.
+    // name at this point, so those are left blank rather than wrong; the
+    // deferred fetch (see `run_untracked_title_updater`) fills them in over
+    // mpv's IPC socket once Helix answers, without delaying the tune-in.
     row.channel.name = to_display_name.to_string();
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store, false, None)
+    spawn_play_new_instance(&row, player, settings, store, false, None, meta)
 }
 
 /// Tune into a verified-but-untracked collab partner at the live edge, no
@@ -1345,6 +1548,7 @@ pub(crate) fn spawn_follow_raid(
 /// `source_row`, the instance whose collab menu this partner came from).
 /// Collab partners are Twitch-only (see `models::CollabPartner`), so the
 /// URL is always a plain `twitch.tv` one, no platform dispatch needed.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_play_collab_partner(
     source_row: &crate::models::MonitorWithChannel,
     partner: &crate::ui::grid::UntrackedCollabPartner,
@@ -1353,14 +1557,18 @@ pub(super) fn spawn_play_collab_partner(
     store: &Arc<crate::store::Store>,
     mute: bool,
     title_template_override: Option<&str>,
+    meta: Option<&LiveMetaCtx>,
 ) -> Option<String> {
     let mut row = source_row.clone();
     row.monitor.id = 0;
     row.monitor.url = format!("https://twitch.tv/{}", partner.login);
     row.channel.name = partner.name.clone();
+    // Untracked, so there is no stored title/game — `meta` is what turns the
+    // template's {game}/{title_trimmed} into real text, fetched from Helix
+    // after launch rather than before it (`run_untracked_title_updater`).
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store, mute, title_template_override)
+    spawn_play_new_instance(&row, player, settings, store, mute, title_template_override, meta)
 }
 
 #[cfg(test)]
@@ -1687,6 +1895,36 @@ mod tests {
     fn streamlink_live_title_fixes_pos_at_zero() {
         let v = streamlink_live_title("{channel} [{pos}]", "Layna", "Hello !gg", "Just Chatting");
         assert_eq!(v, "Layna [00:00:00]");
+    }
+
+    #[test]
+    fn deferred_title_fetch_only_for_untracked_twitch_rows_in_mpv() {
+        use crate::downloader::test_util::row;
+        use crate::models::{Container, Platform, Tool};
+
+        let tracked = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
+        assert_ne!(tracked.monitor.id, 0);
+        // A tracked row already has stored title/game and an updater polling
+        // the DB for free — fetching would spend Helix quota on a duplicate.
+        assert!(!row_wants_deferred_title(&tracked, "mpv.exe", "{channel} {game}"));
+
+        // The synthetic shape both `spawn_play_collab_partner` and
+        // `spawn_follow_raid` build: id 0, no stored title/game.
+        let mut untracked = tracked.clone();
+        untracked.monitor.id = 0;
+        assert!(row_wants_deferred_title(&untracked, "mpv.exe", "{channel} {game}"));
+
+        // No template = nothing to render into; no mpv = no IPC socket to
+        // push the result over.
+        assert!(!row_wants_deferred_title(&untracked, "mpv.exe", ""));
+        assert!(!row_wants_deferred_title(&untracked, "vlc.exe", "{channel} {game}"));
+
+        // The fetch is Helix `GET /streams`. A synthetic row inherits its
+        // tool/url from whichever instance launched it, so a non-Twitch one
+        // is reachable and must be declined rather than mis-queried.
+        let mut yt = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        yt.monitor.id = 0;
+        assert!(!row_wants_deferred_title(&yt, "mpv.exe", "{channel} {game}"));
     }
 
     #[test]

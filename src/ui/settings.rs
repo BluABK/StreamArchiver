@@ -1211,8 +1211,17 @@ impl StreamArchiverApp {
                          including Twitch: Streamlink spawns the player there, so this \
                          asks it to hand mpv an IPC socket and then drives the title \
                          over that (also making {pos} tick, which Streamlink's own \
-                         fixed title can't). Requires mpv as the configured media \
-                         player; best-effort — if the socket never comes up the title \
+                         fixed title can't).\n\n\
+                         It also covers windows opened for channels you DON'T track — a \
+                         collab partner or a raid target. Those have no stored title or \
+                         game, so theirs is fetched from the Twitch API just after the \
+                         player opens (rather than before, which would delay tuning in) \
+                         and pushed in once. Unlike a tracked channel it isn't then kept \
+                         up to date: there's no monitor behind it, so every refresh \
+                         would be another API call — a partner who retitles mid-collab \
+                         leaves that window showing the title it had at tune-in.\n\n\
+                         Requires mpv as the configured media player; best-effort — if \
+                         the socket never comes up, or the API doesn't answer, the title \
                          just stays as opened.",
                     );
                     ui.checkbox(&mut self.settings.live_title_auto_update, "");
@@ -1228,11 +1237,15 @@ impl StreamArchiverApp {
                     ui.label("Untracked collab partner title").on_hover_text(
                         "Window title for a collab partner that ISN'T a channel you track \
                          (played via a synthetic instance borrowing this row's own tool/\
-                         quality/auth settings) — separate from \"Live-edge player title\" \
-                         above since there's no known title/game to fill those tokens with, \
-                         only {channel} is meaningful here. Leave blank to fall back to the \
-                         same template as a tracked instance (its {game}/{title_trimmed} \
-                         will just render empty).",
+                         quality/auth settings) — kept separate from \"Live-edge player \
+                         title\" above so these windows can be labelled differently. \
+                         {game} and {title_trimmed} DO resolve here: with \"Auto-update \
+                         live title\" on, the partner's title/game is fetched from the \
+                         Twitch API just after the player opens (never before — tuning \
+                         in is never held up by the API) and pushed into the window over \
+                         mpv's IPC socket, once. Without that setting, or in a non-mpv \
+                         player, only {channel} is filled in. Leave blank to fall back \
+                         to the same template as a tracked instance.",
                     );
                     ui.text_edit_singleline(&mut self.settings.collab_untracked_title_template);
                     ui.end_row();

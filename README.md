@@ -914,6 +914,34 @@ keeps current while a recording is in progress as well as while it's merely
 watching — a channel switching game two hours into a 12-hour stream retitles
 the open player, not just the [Streams grid](#streams-live-monitoring).
 
+#### Channels you don't track
+
+A player opened for a **collab partner** or a **raid target** you don't
+monitor runs on a synthetic instance with no monitor row behind it — so there
+is no stored title or game, and `{game}`/`{title_trimmed}` would render
+empty. The metadata is only one Twitch API call away, but making the play
+action wait for it would trade the thing that matters (tuning in instantly)
+for the thing that doesn't (a complete window title half a second sooner).
+
+So the call happens *after* launch, on the same IPC socket: the player opens
+immediately with whatever the template can fill in, a background thread asks
+Helix for the partner's current title and game, and the finished title is
+pushed into the running window when the answer arrives. On the Twitch path
+the fetch is effectively free — it overlaps the wait for Streamlink to
+resolve the stream and spawn mpv, which takes longer than the API call does.
+
+Unlike a tracked channel, that push happens **once** and the thread then
+exits. A tracked row's updater can afford to poll forever because each round
+is a local database read; here every round would be a real API call, and a
+partner whose title never changes would give the loop nothing to write — so
+it would never learn the window had been closed and would keep querying the
+API behind it for the rest of the session. The trade is that a partner who
+retitles mid-collab leaves that window showing the title it had at tune-in.
+
+Needs **Auto-update live title** on and mpv as the player, and fails soft in
+every direction — an untracked channel that has already gone offline, or an
+API hiccup, leaves the launch title alone rather than blanking it.
+
 ### Detection methods
 
 A monitor's **Detection** method is *how* the app learns a channel went live. The
@@ -2176,9 +2204,12 @@ live, and archived:
   right-clicked always keeps its normal audio — so several streams' worth of
   audio don't all play at once; and **Untracked collab partner title** is a
   separate window-title template used only for a synthetic (untracked
-  -partner) instance, since it has no known title/game to fill the normal
-  **Live-edge player title** template's tokens with (only `{channel}` is
-  meaningful here) — default `{channel} (collab)`.
+  -partner) instance, so those windows can be labelled differently from your
+  own channels — default `{channel} (collab)`. Its `{game}`/`{title_trimmed}`
+  tokens do resolve: the partner's title and game are fetched from the Twitch
+  API just *after* the player opens and pushed into the window over mpv's IPC
+  socket, so nothing about tuning in waits on the API — see
+  [Channels you don't track](#channels-you-dont-track).
 - **History** — every session is stored (who, host, when, how long, source)
   and linked to its broadcast. Right-click a stream row → **🤝 Collab
   history** for the channel's full list; the **Channel Stats** tab has a

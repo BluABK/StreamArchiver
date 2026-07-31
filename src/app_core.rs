@@ -123,6 +123,13 @@ pub struct AppCore {
     /// A one-shot message the UI shows once on first frame (e.g. how many detached
     /// downloads were recovered from a previous session). Taken by the UI.
     pub startup_notice: Mutex<Option<String>>,
+    /// The shared detection context (HTTP client + cached Twitch tokens) that
+    /// [`AppCore::start`] hands to the scheduler and supervisor, published here
+    /// so on-demand UI actions can make one-off platform API calls on the same
+    /// client and token cache instead of standing up their own. `None` until
+    /// `start` runs (and in tests / headless entry points that never call it) —
+    /// every consumer must degrade gracefully rather than assume it exists.
+    detect: Mutex<Option<Arc<crate::detectors::DetectContext>>>,
 }
 
 impl AppCore {
@@ -174,7 +181,14 @@ impl AppCore {
             schedule_refresh_channel: Arc::new(Mutex::new(None)),
             jobs: crate::events::job_registry(),
             startup_notice: Mutex::new(None),
+            detect: Mutex::new(None),
         }))
+    }
+
+    /// The shared [`crate::detectors::DetectContext`], once [`AppCore::start`]
+    /// has built it. See the field's own doc for why this can be `None`.
+    pub fn detect_ctx(&self) -> Option<Arc<crate::detectors::DetectContext>> {
+        self.detect.lock().unwrap().clone()
     }
 
     /// Subscribe to the event bus (used by the UI).
@@ -272,6 +286,10 @@ impl AppCore {
             self.store.clone(),
             self.events.clone(),
         ));
+        // Publish it for on-demand UI actions (see `detect_ctx`) — sharing the
+        // token cache matters as much as sharing the client: a fresh context
+        // per action would re-do the app-token handshake every time.
+        *self.detect.lock().unwrap() = Some(ctx.clone());
 
         // Scheduler: detection -> live signals.
         let events = self.events.clone();

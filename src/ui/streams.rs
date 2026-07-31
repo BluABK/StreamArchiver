@@ -2287,12 +2287,20 @@ impl StreamArchiverApp {
                 crate::platform::open_path(p);
             }
         }
+        // Shared by every play action below: lets a player opened for a channel
+        // this app doesn't track (collab partner, raid target) fetch its
+        // title/game from Helix after launch — see
+        // `player::run_untracked_title_updater`. `None` before the app core has
+        // started, in which case those windows keep their launch title.
+        let meta = crate::ui::player::LiveMetaCtx::from_core(&self.core);
         if let Some(mid) = play_new_instance_mid.or(acts.play_new_instance.take()) {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty()
                 && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
                 && let Some(msg) =
-                    spawn_play_new_instance(row, &player, &self.settings, &self.core.store, false, None)
+                    spawn_play_new_instance(
+                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
+                    )
             {
                 self.status = msg;
             }
@@ -2321,7 +2329,9 @@ impl StreamArchiverApp {
                 // respect the mute setting.
                 if let Some(row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
                     && let Some(msg) =
-                        spawn_play_new_instance(row, &player, &self.settings, &self.core.store, false, None)
+                        spawn_play_new_instance(
+                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
+                    )
                 {
                     self.status = msg;
                 }
@@ -2334,6 +2344,7 @@ impl StreamArchiverApp {
                             &self.core.store,
                             mute_partners,
                             None,
+                            meta.as_ref(),
                         )
                     {
                         self.status = msg;
@@ -2351,6 +2362,7 @@ impl StreamArchiverApp {
                             &self.core.store,
                             mute_partners,
                             untracked_override,
+                            meta.as_ref(),
                         ) {
                             self.status = msg;
                         }
@@ -2373,6 +2385,7 @@ impl StreamArchiverApp {
                     &self.core.store,
                     false,
                     untracked_override,
+                    meta.as_ref(),
                 )
             {
                 self.status = msg;
@@ -2385,6 +2398,7 @@ impl StreamArchiverApp {
                 && let Ok(Some(raid)) = self.core.store.latest_raid_out(mid)
                 && let Some(msg) = spawn_follow_raid(
                     row, &raid.detail, &raid.target, &player, &self.settings, &self.core.store,
+                    meta.as_ref(),
                 )
             {
                 self.status = msg;

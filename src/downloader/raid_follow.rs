@@ -119,6 +119,7 @@ impl Supervisor {
             player,
             &settings,
             &self.store,
+            Some(&crate::ui::player::LiveMetaCtx::from_ctx(&self.ctx)),
         ) {
             tracing::info!(
                 to = sig.to_display_name.as_str(),
