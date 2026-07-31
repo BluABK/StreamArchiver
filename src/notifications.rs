@@ -481,10 +481,13 @@ fn handle(store: &Store, ev: AppEvent) {
                 };
                 let mut content = content;
                 content.lines = body.lines().map(str::to_string).collect();
-                // No banner hero on error toasts: a decorative banner blown
-                // up over an error message reads as broken (girl_dm_'s
-                // near-black banner rendered as a huge empty box), and the
-                // avatar logo already identifies the channel.
+                // No banner hero on capture-alert toasts: the banner is
+                // decoration sized for a "went live" celebration, and on an
+                // error toast it just triples the height without adding
+                // information (it can also read as a broken image when the
+                // channel's banner happens to be a dark solid — girl_dm_'s
+                // legitimately is a black box). The avatar logo already
+                // identifies the channel.
                 content.hero = None;
                 show_toast(content);
             }
