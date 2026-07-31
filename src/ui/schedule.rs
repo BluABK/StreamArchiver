@@ -63,6 +63,10 @@ pub(super) const K_SCHEDULE_HIDDEN_CHANNELS: &str = "schedule_hidden_channels";
 /// drawn in the body of each non-compact Week/Day event block, sized to fit
 /// (shrunk on a narrow block, never upscaled past the source image).
 pub(super) const K_SCHEDULE_LARGE_AVATAR: &str = "schedule_large_avatar";
+/// Setting key for the Month view's "Icons only" toggle — day cells show one
+/// channel avatar per scheduled channel, uniformly scaled so ALL of them fit
+/// inside the cell, instead of the chip list + "+N more" overflow.
+pub(super) const K_SCHEDULE_MONTH_ICONS: &str = "schedule_month_icons";
 /// Local timestamp in the active [`DateFmt`] (empty if unset). Used for the
 /// Polled / Went Live / Started On columns and the history tree.
 /// A clickable row in the "Schedule sources" dialog's Available column: the
@@ -656,10 +660,14 @@ impl StreamArchiverApp {
         // built by `schedule_channel_avatars` (mutable) so the render
         // functions below (immutable) can just look them up by channel id.
         let avatars = self.schedule_channel_avatars(ui);
-        // Full-res avatars for the "Large avatars" event-body picture — only
-        // resolved when that toggle is on, since it's an extra pass over
-        // every visible channel beyond the small-icon map above.
-        let large_avatars = if self.schedule_large_avatar {
+        // Full-res avatars for the "Large avatars" event-body picture and the
+        // Month "Icons only" mosaic (whose tiles can be far bigger than the
+        // 64px thumbnails above) — only resolved when a consumer is actually
+        // on, since it's an extra pass over every visible channel beyond the
+        // small-icon map.
+        let large_avatars = if self.schedule_large_avatar
+            || (self.schedule_month_icons && self.schedule_mode == ScheduleMode::Month)
+        {
             self.schedule_channel_avatars_large(ui)
         } else {
             HashMap::new()
@@ -742,7 +750,8 @@ impl StreamArchiverApp {
             match mode {
                 ScheduleMode::Month => {
                     self.schedule_month_grid(
-                        ui, anchor, today, &by_day, &collide, &ptex, &avatars, &mut open_day, &signals,
+                        ui, anchor, today, &by_day, &collide, &ptex, &avatars, &large_avatars,
+                        &mut open_day, &signals,
                     )
                 }
                 ScheduleMode::Week => {
@@ -876,10 +885,11 @@ impl StreamArchiverApp {
     /// Full-resolution channel avatars (the same source `resolve_channel_icon`
     /// uses for the Properties thumbnail strip — up to the source profile
     /// pic's native size, not the 64px thumbnail `schedule_channel_avatars`
-    /// uses) — backs the "Large avatars" event-body picture, which needs a
-    /// sharper source since it's displayed much bigger than the small inline
-    /// icon. Only built when that toggle is on (see `schedule_view`), since
-    /// it's an extra resolve pass over every visible channel.
+    /// uses) — backs the "Large avatars" event-body picture and the Month
+    /// "Icons only" mosaic, both of which need a sharper source since they
+    /// display much bigger than the small inline icon. Only built when one of
+    /// those toggles is active (see `schedule_view`), since it's an extra
+    /// resolve pass over every visible channel.
     fn schedule_channel_avatars_large(&mut self, ui: &egui::Ui) -> HashMap<i64, egui::TextureHandle> {
         let mut avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
         let mut channel_ids: Vec<i64> = self.schedule_all.iter().map(|s| s.channel_id).collect();
@@ -1322,9 +1332,27 @@ impl StreamArchiverApp {
                             .store
                             .set_setting(K_SCHEDULE_LARGE_AVATAR, if large_avatar { "1" } else { "0" });
                     }
+                    let mut month_icons = self.schedule_month_icons;
+                    if ui
+                        .checkbox(&mut month_icons, "Icons only (Month)")
+                        .on_hover_text(
+                            "Fill each Month day cell with one channel picture per \
+                             scheduled channel, uniformly scaled so ALL of them fit — \
+                             instead of the chip list with its \"+N more\" overflow. \
+                             Hover a picture for that channel's streams that day; click \
+                             opens the day. Only affects the Month view.",
+                        )
+                        .changed()
+                    {
+                        self.schedule_month_icons = month_icons;
+                        let _ = self
+                            .core
+                            .store
+                            .set_setting(K_SCHEDULE_MONTH_ICONS, if month_icons { "1" } else { "0" });
+                    }
                 })
                 .response
-                .on_hover_text("Display options: collisions, Compact, Large avatars");
+                .on_hover_text("Display options: collisions, Compact, Large avatars, Icons only");
                 if self.schedule_collisions && collisions_in_view > 0 {
                     ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
                         .on_hover_text("Overlapping streams in view");
@@ -1702,6 +1730,9 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
         avatars: &HashMap<i64, egui::TextureHandle>,
+        // Full-res avatars for the "Icons only" mosaic (empty unless it's on);
+        // the mosaic prefers these and falls back to the 64px `avatars`.
+        large_avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -1779,6 +1810,7 @@ impl StreamArchiverApp {
                                         collide,
                                         ptex,
                                         avatars,
+                                        large_avatars,
                                         open_day,
                                         sched_rec_by_day.get(&day),
                                         signals,
@@ -2149,6 +2181,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
         avatars: &HashMap<i64, egui::TextureHandle>,
+        large_avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
         sched_recs: Option<&Vec<String>>,
         signals: &HashMap<i64, EventSignals>,
@@ -2164,34 +2197,45 @@ impl StreamArchiverApp {
         frame.show(ui, |ui| {
             ui.set_min_size(egui::vec2(col_w - 10.0, cell_h - 10.0));
             ui.vertical(|ui| {
-                // Day number: strong in-month (today is set off by its tinted
-                // cell background), dimmed for the leading/trailing days that spill
-                // in from the neighbouring months.
-                let num = egui::RichText::new(day.day().to_string());
-                let num = if is_today || in_month {
-                    num.strong()
-                } else {
-                    num.weak()
-                };
-                if ui
-                    .add(egui::Label::new(num).sense(egui::Sense::click()))
-                    .on_hover_text("Show this day's streams")
-                    .clicked()
-                {
-                    *open_day = Some(day);
-                }
-
-                // Scheduled-recording badge row (schema v51) — shown iff this day
-                // has ≥1 enabled rule due to fire, regardless of whether the
-                // calendar already has a matching stream entry.
-                if let Some(recs) = sched_recs.filter(|r| !r.is_empty()) {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("⏺ rec").small().color(egui::Color32::from_rgb(0xe0, 0x50, 0x50)),
-                    ))
-                    .on_hover_text(format!("Scheduled recording(s):\n{}", recs.join("\n")));
-                }
+                // Day-number line: the number, with the scheduled-recording
+                // badge (schema v51) inline beside it — shown iff this day has
+                // ≥1 enabled rule due to fire, regardless of whether the
+                // calendar already has a matching stream entry. Inline (not on
+                // its own row) so it never displaces a chip / shrinks the
+                // icons mosaic below.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    // Day number: strong in-month (today is set off by its
+                    // tinted cell background), dimmed for the leading/trailing
+                    // days that spill in from the neighbouring months.
+                    let num = egui::RichText::new(day.day().to_string());
+                    let num = if is_today || in_month {
+                        num.strong()
+                    } else {
+                        num.weak()
+                    };
+                    if ui
+                        .add(egui::Label::new(num).sense(egui::Sense::click()))
+                        .on_hover_text("Show this day's streams")
+                        .clicked()
+                    {
+                        *open_day = Some(day);
+                    }
+                    if let Some(recs) = sched_recs.filter(|r| !r.is_empty()) {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("⏺ rec").small().color(egui::Color32::from_rgb(0xe0, 0x50, 0x50)),
+                        ))
+                        .on_hover_text(format!("Scheduled recording(s):\n{}", recs.join("\n")));
+                    }
+                });
 
                 let entries = entries.map(Vec::as_slice).unwrap_or(&[]);
+                if self.schedule_month_icons {
+                    self.schedule_cell_icons(
+                        ui, day, entries, avatars, large_avatars, signals, open_day,
+                    );
+                    return;
+                }
                 let shown = entries.len().min(max_chips);
                 for &i in &entries[..shown] {
                     let colliding = collide.contains(&i);
@@ -2215,6 +2259,152 @@ impl StreamArchiverApp {
                 }
             });
         });
+    }
+
+    /// "Icons only" Month day-cell body: one tile per distinct channel with a
+    /// stream that day (a channel streaming twice appears once), uniformly
+    /// scaled by [`mosaic_fit`] so every tile fits inside the cell — the whole
+    /// point over chips is that nothing folds into "+N more". Channels whose
+    /// avatar hasn't loaded (or was never fetched) get a colored square with
+    /// their initial instead of silently vanishing from the day.
+    ///
+    /// Per-tile state mirrors what the chips convey: every-entry-hidden dims
+    /// the tile to a ghost, every-entry-auto-off tints it grey (same signal as
+    /// [`dim_for_no_auto`] on chip colors). Hover lists the channel's entries
+    /// for the day; click opens the day popup, exactly like a chip.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_cell_icons(
+        &self,
+        ui: &mut egui::Ui,
+        day: chrono::NaiveDate,
+        entries: &[usize],
+        avatars: &HashMap<i64, egui::TextureHandle>,
+        large_avatars: &HashMap<i64, egui::TextureHandle>,
+        signals: &HashMap<i64, EventSignals>,
+        open_day: &mut Option<chrono::NaiveDate>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        // Distinct channels in first-appearance (= start-time) order, each
+        // carrying all of its entry indices for the hover/dim rollup.
+        let mut chans: Vec<(i64, Vec<usize>)> = Vec::new();
+        for &i in entries {
+            let id = self.schedule_all[i].channel_id;
+            match chans.iter_mut().find(|(cid, _)| *cid == id) {
+                Some((_, list)) => list.push(i),
+                None => chans.push((id, vec![i])),
+            }
+        }
+
+        const GAP: f32 = 2.0;
+        let avail = ui.available_size_before_wrap();
+        let (cols, size) = mosaic_fit(chans.len(), avail.x, avail.y, GAP);
+        // A pathological cell (dozens of channels at minimum zoom) bottoms out
+        // at a still-clickable tile instead of a sub-pixel smear; the frame
+        // clips whatever that overflows.
+        let size = size.max(10.0);
+
+        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+        for row in chans.chunks(cols) {
+            ui.horizontal(|ui| {
+                for (cid, idxs) in row {
+                    let all_hidden = idxs
+                        .iter()
+                        .all(|i| self.schedule_hidden_segments.contains(&self.schedule_all[*i].segment_id));
+                    let all_no_auto = idxs.iter().all(|i| {
+                        signals
+                            .get(&self.schedule_all[*i].segment_id)
+                            .is_some_and(|sig| !sig.auto)
+                    });
+                    let tint = if all_hidden {
+                        // Ghosted, same intent as the chips' ⊘ + weak text.
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80)
+                    } else if all_no_auto {
+                        egui::Color32::from_gray(130)
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    let hover: String = idxs
+                        .iter()
+                        .map(|&i| {
+                            let s = &self.schedule_all[i];
+                            let ml = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
+                            schedule_detail_line_merged(s, ml)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    // Full-res first (tiles here dwarf the 64px thumbnails),
+                    // thumbnail as the fallback for a channel whose original
+                    // pic isn't cached.
+                    let resp = match large_avatars.get(cid).or_else(|| avatars.get(cid)) {
+                        Some(tex) => {
+                            let resp = ui.add(
+                                egui::Image::from_texture(tex)
+                                    .fit_to_exact_size(egui::vec2(size, size))
+                                    .corner_radius(egui::CornerRadius::same(3))
+                                    .tint(tint)
+                                    .sense(egui::Sense::click()),
+                            );
+                            // Standard image trio: Alt-hover full-size preview
+                            // (click + context menu are wired below).
+                            queue_alt_image_preview(ui.ctx(), &resp, tex);
+                            resp
+                        }
+                        None => {
+                            // No avatar: the channel's schedule color + initial.
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+                            let s = &self.schedule_all[idxs[0]];
+                            let mut color = self.sched_color(s);
+                            if all_no_auto {
+                                color = dim_for_no_auto(color);
+                            }
+                            if all_hidden {
+                                color = egui::Color32::from_rgba_unmultiplied(
+                                    color.r(), color.g(), color.b(), 80,
+                                );
+                            }
+                            ui.painter().rect_filled(rect, egui::CornerRadius::same(3), color);
+                            let initial = s
+                                .channel_name
+                                .chars()
+                                .next()
+                                .map(|c| c.to_uppercase().to_string())
+                                .unwrap_or_default();
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                initial,
+                                egui::FontId::proportional((size * 0.5).max(8.0)),
+                                egui::Color32::WHITE,
+                            );
+                            resp
+                        }
+                    };
+                    // Same right-click copy menu as a chip; a channel with
+                    // several streams that day gets one submenu per stream,
+                    // labelled by its time range.
+                    resp.context_menu(|ui| {
+                        for &i in idxs.iter() {
+                            let s = &self.schedule_all[i];
+                            let hidden = self.schedule_hidden_segments.contains(&s.segment_id);
+                            let ml = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
+                            if idxs.len() == 1 {
+                                schedule_copy_menu(ui, s, hidden, ml);
+                            } else {
+                                ui.menu_button(fmt_time_range(s.start_time, s.end_time), |ui| {
+                                    schedule_copy_menu(ui, s, hidden, ml);
+                                });
+                            }
+                        }
+                    });
+                    if resp.on_hover_text(hover).clicked() {
+                        *open_day = Some(day);
+                    }
+                }
+            });
+        }
     }
 
     /// Agenda view: date-grouped chronological list of all upcoming streams from `anchor`.

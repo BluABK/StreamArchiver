@@ -1951,7 +1951,7 @@ know the schedule of but don't want kept on Auto.
   naturally, or set a fixed number of minutes to auto-stop.
 - **Weekly rules** support an optional **until** date to stop the recurrence,
   and every day/time is evaluated in your local timezone.
-- The Schedule view's month grid shows a small **⏺ rec** badge under the day
+- The Schedule view's month grid shows a small **⏺ rec** badge beside the day
   number on any day with a scheduled recording (hover for details); the
   Streams grid has a matching **Scheduled rec** column (hidden by default —
   enable it from the column header).
@@ -2545,7 +2545,7 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   automatic palette. Every schedule surface — event blocks, month chips,
   agenda stripes, day lists, the sidebar legend — resolves through this one
   map, so an event is recognizable by color across views.
-- **⋯ Display** (header dropdown) holds three persisted toggles, collapsed
+- **⋯ Display** (header dropdown) holds four persisted toggles, collapsed
   into one menu so the header doesn't fight the date/heading for room:
   - **Highlight collisions** (on by default) flags with a `⚠` any streams
     whose times overlap — handy for spotting clashes across channels.
@@ -2567,6 +2567,21 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
     sharper source than the small inline icon, since it's shown much
     bigger. Off by default; has no effect in Compact mode (a one-line chip
     has no body to put it in).
+  - **Icons only (Month)** replaces each Month day cell's chip list with a
+    mosaic of channel pictures — one tile per distinct channel streaming
+    that day (a channel streaming twice appears once), uniformly scaled so
+    **all** of them fit inside the cell. That's the point over chips:
+    nothing ever folds into "+N more", so a busy Saturday reads as a wall
+    of faces at a glance. Hover a picture for that channel's streams that
+    day (times, titles, categories); click opens the day popup, exactly
+    like a chip. Channels whose profile picture isn't cached show a square
+    in their schedule color with the channel's initial instead of silently
+    vanishing. Tiles keep the calendar's state cues: a channel whose
+    entries are all hidden ghosts out, and one whose entries are all
+    auto-off dims grey (same signal as the chip tint). Uses the full-res
+    profile pictures (same sharp source as Large avatars), since tiles in
+    a roomy cell are far bigger than the 64px chip icons. Off by default;
+    only affects the Month view.
 - **Title wrapping**: a non-compact Week/Day block's title wraps across
   however many lines the block's actual height allows, instead of clipping
   to a single line — a tall block (a long stream, or few overlapping lanes)

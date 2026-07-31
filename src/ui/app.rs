@@ -91,6 +91,8 @@ impl StreamArchiverApp {
 
         let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
         let schedule_large_avatar = setting_or_empty(&core, K_SCHEDULE_LARGE_AVATAR) == "1";
+        let schedule_month_icons =
+            setting_or_empty(&core, crate::ui::schedule::K_SCHEDULE_MONTH_ICONS) == "1";
         let schedule_hidden: HashSet<i64> = setting_or_empty(&core, K_SCHEDULE_HIDDEN_CHANNELS)
             .split(',')
             .filter_map(|s| s.trim().parse::<i64>().ok())
@@ -667,6 +669,7 @@ impl StreamArchiverApp {
             schedule_chan_colors: HashMap::new(),
             schedule_compact,
             schedule_large_avatar,
+            schedule_month_icons,
             schedule_day_popup: None,
             show_schedule_sources: false,
             schedule_sources_draft: Vec::new(),

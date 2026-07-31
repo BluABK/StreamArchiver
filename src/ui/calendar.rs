@@ -736,6 +736,30 @@ pub(super) fn layout_all_day_lanes(
     placed
 }
 
+/// The largest uniform square-tile layout that fits `n` tiles into a `w`×`h`
+/// area with `gap` spacing between tiles: returns `(columns, tile_size)`.
+/// Tries every column count and keeps whichever yields the biggest tile —
+/// n is a day cell's channel count (single digits, occasionally tens), so
+/// the O(n) scan is nothing. Backs the Month view's "Icons only" mosaic,
+/// whose contract is that ALL avatars fit with none folded into an overflow.
+///
+/// Degenerate inputs stay sane rather than panicking: `n == 0` reports one
+/// empty column, and an area too small for even a 1×n stack just returns a
+/// tiny (possibly ≤0) size for the caller to clamp.
+pub(super) fn mosaic_fit(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
+    let n = n.max(1);
+    let mut best = (1usize, f32::MIN);
+    for cols in 1..=n {
+        let rows = n.div_ceil(cols);
+        let size = ((w - gap * (cols as f32 - 1.0)) / cols as f32)
+            .min((h - gap * (rows as f32 - 1.0)) / rows as f32);
+        if size > best.1 {
+            best = (cols, size);
+        }
+    }
+    best
+}
+
 /// Draw a 24-hour time-grid for one or more day columns. Called by both the Week
 /// and Day views. `days` lists the calendar dates; `col_w` is the per-column
 /// content width (excluding the time label column and gaps).
@@ -1178,6 +1202,38 @@ mod tests {
             auto_merge_excluded: false,
             collab: String::new(),
         }
+    }
+
+    /// The icons-only mosaic's core promise: every tile fits. Whatever
+    /// `(cols, size)` comes back must satisfy the geometry for all n tiles.
+    #[test]
+    fn mosaic_fit_always_fits_and_maximizes_tile_size() {
+        let fits = |n: usize, w: f32, h: f32, gap: f32| {
+            let (cols, size) = mosaic_fit(n, w, h, gap);
+            let rows = n.div_ceil(cols);
+            assert!(cols as f32 * size + (cols as f32 - 1.0) * gap <= w + 1e-3, "n={n} width");
+            assert!(rows as f32 * size + (rows as f32 - 1.0) * gap <= h + 1e-3, "n={n} height");
+            (cols, size)
+        };
+
+        // One tile in a square cell: the whole cell.
+        assert_eq!(fits(1, 100.0, 100.0, 2.0), (1, 100.0));
+        // Four in a square: 2×2 beats 1×4 and 4×1.
+        let (cols, size) = fits(4, 100.0, 100.0, 2.0);
+        assert_eq!(cols, 2);
+        assert!((size - 49.0).abs() < 1e-3); // (100 - 2) / 2
+        // The mockup's shape: 7 channels in a wide-ish cell → 4-column grid
+        // (4+3), not a 7-wide strip of slivers.
+        let (cols, size) = fits(7, 320.0, 180.0, 2.0);
+        assert_eq!(cols, 4);
+        assert!(size > 78.0);
+        // A tall narrow cell flips to fewer columns.
+        let (cols, _) = fits(4, 40.0, 200.0, 2.0);
+        assert_eq!(cols, 1);
+        // Degenerate: n = 0 doesn't panic, tiny area yields a clampable size.
+        assert_eq!(mosaic_fit(0, 100.0, 100.0, 2.0).0, 1);
+        let (_, size) = mosaic_fit(30, 8.0, 8.0, 2.0);
+        assert!(size < 10.0, "caller clamps, this just mustn't panic");
     }
 
     /// Compact mode: two long overlapping streams whose *starts* are far apart

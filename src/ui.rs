@@ -1657,6 +1657,11 @@ pub struct StreamArchiverApp {
     /// upscaled past the source image). Persisted under
     /// [`crate::ui::schedule::K_SCHEDULE_LARGE_AVATAR`].
     schedule_large_avatar: bool,
+    /// Month view "Icons only": day cells show one avatar per scheduled
+    /// channel, uniformly scaled so all of them fit, instead of chips +
+    /// "+N more". Persisted under
+    /// [`crate::ui::schedule::K_SCHEDULE_MONTH_ICONS`].
+    schedule_month_icons: bool,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
     /// Whether the "Schedule sources" dialog is open.
