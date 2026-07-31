@@ -988,7 +988,13 @@ resolved value, so mpv keeps it ticking with no polling on this app's side.
 With **Settings → Defaults → Auto-update live title** on (mpv only; default
 on), a background thread talks to mpv over its `--input-ipc-server` socket: it
 pushes the rendered title as soon as the socket is up, then re-renders it from
-the channel's current title/game and pushes again every 20 s. The push happens
+the channel's current title/game and pushes again every 20 s. Each push sets
+BOTH of mpv's title surfaces — they are separate properties, and updating
+only one leaves the other visibly stale: the window `title` (which property-
+expands, so it carries a live-ticking `${time-pos}`) and `force-media-title`
+(no expansion — `{pos}` renders as `00:00:00`), which feeds the `media-title`
+shown on the OSC seekbar, the stats overlay, and playlist labels. The push
+happens
 every round even when nothing changed — re-setting an identical title is a
 no-op for mpv, and the write doubles as a liveness probe, so the thread
 notices the window was closed and exits instead of polling behind it
@@ -998,9 +1004,12 @@ the pipe's reply buffer.)
 
 That first push is what makes Twitch work at all. Streamlink — not this app —
 spawns the player there, resolving its own `--title` once and handing mpv
-`--force-media-title`, which can neither tick nor be revisited; so the socket
-is requested *through* Streamlink (`--player-args`) and the title is taken
-over from it the moment mpv answers. Best-effort throughout: if the socket
+`--force-media-title`, which can neither tick nor revisit itself; so the
+socket is requested *through* Streamlink (`--player-args`) and both title
+surfaces are taken over from it the moment mpv answers (before the
+`force-media-title` half of the push existed, a mid-stream category change
+updated the window bar while the OSC and stats overlay kept the launch-time
+title forever). Best-effort throughout: if the socket
 never comes up, the title simply stays as opened.
 
 The pushed title tracks the *channel's* current title/game, which the app

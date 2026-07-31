@@ -556,7 +556,10 @@ pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option
 /// as `--force-media-title`, so the title it sets can never tick or update —
 /// which is why that path asks Streamlink for an mpv IPC socket (see
 /// [`streamlink_player_args`]) and replaces the whole title over IPC the
-/// moment mpv is up, with a real `${time-pos}` in it.
+/// moment mpv is up, with a real `${time-pos}` in it. Every IPC push updates
+/// BOTH title surfaces — the window `title` (ticking) and
+/// `force-media-title` (static), the latter feeding the OSC/stats
+/// `media-title` display (see [`send_mpv_title`]).
 pub(super) fn render_live_title(template: &str, channel: &str, game: &str, title_trimmed: &str, pos: &str) -> String {
     template
         .replace("{channel}", channel)
@@ -576,15 +579,17 @@ fn mpv_live_title_value(template: &str, channel: &str, last_title: &str, last_ga
     render_live_title(template, channel, last_game, &trimmed, "${time-pos}")
 }
 
-/// The Streamlink `--title` VALUE (not an mpv flag — Streamlink translates
-/// it internally) for a live-edge tune-in. Resolved once from this app's own
-/// known metadata (not Streamlink's own scrape) so the same template means
-/// the same thing on every launch path; `{pos}` is a fixed `00:00:00` because
-/// Streamlink's title can't tick. It only shows for the moment before mpv's
-/// IPC socket comes up, after which [`run_live_title_updater`]'s first push
-/// replaces it with the ticking form — and with a blank template, or
-/// auto-update off, it stays the whole time.
-fn streamlink_live_title(template: &str, channel: &str, last_title: &str, last_game: &str) -> String {
+/// The static (non-ticking) render of the live title: `{pos}` is a fixed
+/// `00:00:00` because neither consumer can expand properties. Used for two
+/// things that must agree:
+/// - the Streamlink `--title` VALUE at launch (not an mpv flag — Streamlink
+///   resolves it once and forwards it to mpv as `--force-media-title`),
+///   resolved from this app's own known metadata (not Streamlink's scrape)
+///   so the same template means the same thing on every launch path;
+/// - the `force-media-title` value pushed over IPC on every title update
+///   (see [`send_mpv_title`]) — the OSC/stats "media title" surface, which
+///   would otherwise stay frozen at the launch value forever.
+fn static_live_title(template: &str, channel: &str, last_title: &str, last_game: &str) -> String {
     let trimmed = crate::downloader::trim_title_commands(last_title);
     render_live_title(template, channel, last_game, &trimmed, "00:00:00")
 }
@@ -638,11 +643,25 @@ fn send_mpv_line(pipe: &mut std::fs::File, cmd: serde_json::Value) -> std::io::R
     Ok(())
 }
 
-/// Send `set_property title <value>` — mpv treats setting a property to its
-/// current value as a no-op, so re-sending an unchanged title is a safe way
-/// to double as a liveness probe.
-fn send_mpv_title(pipe: &mut std::fs::File, title: &str) -> std::io::Result<()> {
-    send_mpv_line(pipe, serde_json::json!({"command": ["set_property", "title", title]}))
+/// Push both of mpv's title surfaces — they are SEPARATE properties and
+/// updating only one leaves the other visibly stale (2026-07-31: a Twitch
+/// category change updated the win32 title bar but the OSC seekbar and the
+/// stats overlay kept showing the launch-time title):
+/// - `title` — the OS window title. Supports `${...}` property expansion, so
+///   it gets the ticking `${time-pos}` render.
+/// - `force-media-title` — feeds the `media-title` property that the OSC,
+///   the stats overlay, and playlist labels display. No property expansion,
+///   so it gets the static render (`{pos}` as `00:00:00`), same as the
+///   Streamlink launch value it replaces.
+///
+/// mpv treats setting a property to its current value as a no-op, so
+/// re-sending unchanged titles is a safe way to double as a liveness probe.
+fn send_mpv_title(pipe: &mut std::fs::File, title: &str, media_title: &str) -> std::io::Result<()> {
+    send_mpv_line(pipe, serde_json::json!({"command": ["set_property", "title", title]}))?;
+    send_mpv_line(
+        pipe,
+        serde_json::json!({"command": ["set_property", "force-media-title", media_title]}),
+    )
 }
 
 /// A liveness probe that changes nothing: any complete command line gets
@@ -730,15 +749,16 @@ fn run_live_title_updater(
 ) {
     let Some(mut pipe) = connect_mpv_ipc(&pipe_path, connect_timeout) else { return };
     tracing::debug!(monitor_id, "live-title: mpv IPC connected, pushing title");
-    let mut pushed: Option<String> = None;
+    let mut pushed: Option<(String, String)> = None;
     loop {
         // Fresh render while the monitor row is readable; the last pushed
-        // value once it isn't (monitor deleted mid-play) — something must go
+        // values once it isn't (monitor deleted mid-play) — something must go
         // down the pipe every round or the close goes unnoticed again.
         let value = match store.get_monitor_with_channel(monitor_id) {
-            Ok(Some(row)) => {
-                mpv_live_title_value(&template, &row.channel.name, &row.last_title, &row.last_game)
-            }
+            Ok(Some(row)) => (
+                mpv_live_title_value(&template, &row.channel.name, &row.last_title, &row.last_game),
+                static_live_title(&template, &row.channel.name, &row.last_title, &row.last_game),
+            ),
             _ => match pushed.clone() {
                 Some(v) => v,
                 // Row unreadable before anything was ever pushed: no channel
@@ -746,7 +766,7 @@ fn run_live_title_updater(
                 None => return,
             },
         };
-        if send_mpv_title(&mut pipe, &value).is_err() {
+        if send_mpv_title(&mut pipe, &value.0, &value.1).is_err() {
             return; // player closed
         }
         pushed = Some(value);
@@ -877,7 +897,8 @@ fn run_untracked_title_updater(
         if let MetaFetch::Live(m) = &fetched {
             let value = mpv_live_title_value(&template, &channel, &m.title, &m.game);
             if value != pushed {
-                if send_mpv_title(&mut pipe, &value).is_err() {
+                let media = static_live_title(&template, &channel, &m.title, &m.game);
+                if send_mpv_title(&mut pipe, &value, &media).is_err() {
                     return; // player closed
                 }
                 tracing::debug!(%channel, "live-title: pushed fetched title for untracked row");
@@ -1413,7 +1434,7 @@ pub(super) fn spawn_play_new_instance(
             let title_template = title_template_override.unwrap_or(settings.live_title_template.trim());
             if !title_template.is_empty() {
                 args.push("--title".into());
-                args.push(streamlink_live_title(
+                args.push(static_live_title(
                     title_template, &row.channel.name, &row.last_title, &row.last_game,
                 ));
             }
@@ -1949,8 +1970,8 @@ mod tests {
     }
 
     #[test]
-    fn streamlink_live_title_fixes_pos_at_zero() {
-        let v = streamlink_live_title("{channel} [{pos}]", "Layna", "Hello !gg", "Just Chatting");
+    fn static_live_title_fixes_pos_at_zero() {
+        let v = static_live_title("{channel} [{pos}]", "Layna", "Hello !gg", "Just Chatting");
         assert_eq!(v, "Layna [00:00:00]");
     }
 
