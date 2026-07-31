@@ -2663,7 +2663,7 @@ progress_info: None,
             .unwrap_or(false)
     }
 
-    fn note_result(
+    pub(super) fn note_result(
         &self,
         monitor_id: i64,
         duration_secs: i64,
@@ -2758,7 +2758,7 @@ progress_info: None,
     /// just reads "failed", which looks identical to a hundred other causes
     /// and sends you looking for a local misconfiguration that isn't there.
     /// One alert per take (`take_key`), so a retry ladder doesn't spam.
-    fn file_po_token_alert(
+    pub(super) fn file_po_token_alert(
         &self,
         row: &MonitorWithChannel,
         monitor_id: i64,

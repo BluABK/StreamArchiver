@@ -1536,6 +1536,7 @@ impl Supervisor {
             plan.final_path.display()
         );
 
+        let resume_started = now_unix();
         let outcome = self
             .run_process(
                 &self.active,
@@ -1671,6 +1672,23 @@ impl Supervisor {
         } else {
             "failed"
         };
+        // A resumed take that died to a rejected GVS PO token must feed the
+        // same per-monitor state as a fresh one: the 🎫 alert (before
+        // finish_recording's generic capture_failed fallback), the backoff
+        // entry, and the po_rejected flag that swaps the next take onto the
+        // PO-fallback client. This path used to skip all three — after a
+        // relaunch mid-rejection-wave, every monitor's resumed take died
+        // silently and the follow-up fresh take went out on the web client
+        // again (2026-07-31 19:53).
+        let used_po_fallback = self.po_fallback_takes.lock().unwrap().remove(&monitor_id);
+        let po_rejected =
+            !manually_stopped && !ok && crate::models::po_token_rejected(&outcome.log);
+        if po_rejected {
+            self.file_po_token_alert(&row, monitor_id, rec_id, used_po_fallback);
+        }
+        if !manually_stopped && !shutting_down {
+            self.note_result(monitor_id, ended - resume_started, ok, po_rejected, used_po_fallback);
+        }
         let _ = self.store.finish_recording(
             rec_id,
             ended,
