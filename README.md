@@ -2661,7 +2661,13 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   schedule is a permanent dummy placeholder stays hidden without re-hiding it
   every launch). Each row carries the channel's **calendar color** as a
   swatch + tinted name, so the sidebar doubles as the legend for the event
-  blocks.
+  blocks. A channel with schedules from **more than one instance** gets an
+  expander (⏵): each instance inside has its **own hide checkbox** (also
+  persisted), for when one instance publishes permanent filler/dummy slots
+  every day forever while the other carries the real schedule — the
+  instance hide ANDs with the channel checkbox, the collapsed row shows
+  **(shown/total)** whenever instance hides are filtering something, and
+  ticking *All channels* clears both levels.
 - **Channel avatars** appear on the sidebar list, every all-day bar, every
   timed event block, Month-view chips, and Agenda-view rows — so a channel is
   identifiable by its picture at a glance, not just its name or color. On a

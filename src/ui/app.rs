@@ -99,6 +99,11 @@ impl StreamArchiverApp {
             .split(',')
             .filter_map(|s| s.trim().parse::<i64>().ok())
             .collect();
+        let schedule_hidden_monitors: HashSet<i64> =
+            setting_or_empty(&core, crate::ui::schedule::K_SCHEDULE_HIDDEN_MONITORS)
+                .split(',')
+                .filter_map(|s| s.trim().parse::<i64>().ok())
+                .collect();
 
         let default_out = core
             .store
@@ -670,6 +675,8 @@ impl StreamArchiverApp {
             schedule_mode,
             schedule_anchor: None,
             schedule_hidden,
+            schedule_hidden_monitors,
+            schedule_sidebar_open: HashSet::new(),
             schedule_channel_filter: String::new(),
             schedule_hidden_segments: HashSet::new(),
             schedule_show_hidden: false,

@@ -236,15 +236,22 @@ pub(super) fn merge_source_priority(source: &str) -> u8 {
     }
 }
 
-/// Indices into `all` whose visible (channel not in `hidden`) time window overlaps
-/// another visible stream's — i.e. two streams scheduled at the same time. A
-/// stream with no/invalid end time is treated as [`COLLISION_DEFAULT_SECS`] long.
-pub(super) fn schedule_collisions(all: &[UpcomingStream], hidden: &HashSet<i64>) -> HashSet<usize> {
+/// Indices into `all` whose visible (channel not in `hidden`, instance not in
+/// `hidden_monitors`) time window overlaps another visible stream's — i.e. two
+/// streams scheduled at the same time. A stream with no/invalid end time is
+/// treated as [`COLLISION_DEFAULT_SECS`] long.
+pub(super) fn schedule_collisions(
+    all: &[UpcomingStream],
+    hidden: &HashSet<i64>,
+    hidden_monitors: &HashSet<i64>,
+) -> HashSet<usize> {
     // (original index, start, effective end) for visible streams, sorted by start.
     let mut spans: Vec<(usize, i64, i64)> = all
         .iter()
         .enumerate()
-        .filter(|(_, s)| !hidden.contains(&s.channel_id))
+        .filter(|(_, s)| {
+            !hidden.contains(&s.channel_id) && !hidden_monitors.contains(&s.monitor_id)
+        })
         .map(|(i, s)| (i, s.start_time, effective_end(s)))
         .collect();
     spans.sort_by_key(|&(_, start, _)| start);

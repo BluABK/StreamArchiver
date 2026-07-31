@@ -59,6 +59,9 @@ pub(super) const K_SCHEDULE_COMPACT: &str = "schedule_compact_events";
 /// Setting key for the sidebar's per-channel hide list (`schedule_hidden`) —
 /// a comma-joined list of hidden channel ids.
 pub(super) const K_SCHEDULE_HIDDEN_CHANNELS: &str = "schedule_hidden_channels";
+/// Setting key for the sidebar's per-instance hide list (`schedule_hidden_monitors`)
+/// — comma-joined monitor ids, same format as the channel list above.
+pub(super) const K_SCHEDULE_HIDDEN_MONITORS: &str = "schedule_hidden_monitors";
 /// Setting key for the "Large avatars" toggle — a bigger channel picture
 /// drawn in the body of each non-compact Week/Day event block, sized to fit
 /// (shrunk on a narrow block, never upscaled past the source image).
@@ -694,6 +697,8 @@ impl StreamArchiverApp {
         let mut clear_hidden = false;
         let mut hide_all = false;
         let mut toggle_channel: Option<i64> = None;
+        let mut toggle_monitor: Option<i64> = None;
+        let mut toggle_expand: Option<i64> = None;
         let mut set_collisions: Option<bool> = None;
         let mut set_show_hidden: Option<bool> = None;
 
@@ -705,6 +710,8 @@ impl StreamArchiverApp {
             &mut clear_hidden,
             &mut hide_all,
             &mut toggle_channel,
+            &mut toggle_monitor,
+            &mut toggle_expand,
             &mut set_show_hidden,
         );
 
@@ -779,6 +786,8 @@ impl StreamArchiverApp {
             clear_hidden,
             hide_all,
             toggle_channel,
+            toggle_monitor,
+            toggle_expand,
             set_collisions,
             open_day,
             do_refresh,
@@ -928,7 +937,11 @@ impl StreamArchiverApp {
         Vec<usize>,
     ) {
         let collide: HashSet<usize> = if self.schedule_collisions {
-            schedule_collisions(&self.schedule_all, &self.schedule_hidden)
+            schedule_collisions(
+                &self.schedule_all,
+                &self.schedule_hidden,
+                &self.schedule_hidden_monitors,
+            )
         } else {
             HashSet::new()
         };
@@ -938,7 +951,9 @@ impl StreamArchiverApp {
         // instead of (or in addition to) their normal `by_day` chip/block.
         let mut all_day_events: Vec<usize> = Vec::new();
         for (i, s) in self.schedule_all.iter().enumerate() {
-            if self.schedule_hidden.contains(&s.channel_id) {
+            if self.schedule_hidden.contains(&s.channel_id)
+                || self.schedule_hidden_monitors.contains(&s.monitor_id)
+            {
                 continue;
             }
             // Skip soft-hidden segments unless the user has toggled "show hidden".
@@ -972,6 +987,8 @@ impl StreamArchiverApp {
         clear_hidden: &mut bool,
         hide_all: &mut bool,
         toggle_channel: &mut Option<i64>,
+        toggle_monitor: &mut Option<i64>,
+        toggle_expand: &mut Option<i64>,
         set_show_hidden: &mut Option<bool>,
     ) {
         egui::Panel::left("schedule_sidebar")
@@ -1038,16 +1055,38 @@ impl StreamArchiverApp {
                     .show(ui, |ui| {
                         for (id, name) in &chans {
                             let cid = *id;
-                            // Count + distinct platforms for this channel's upcoming streams.
+                            // Count + distinct platforms + distinct instances for
+                            // this channel's upcoming streams. The instance list
+                            // is what makes the row expandable: some instances
+                            // publish a permanent filler schedule (the same
+                            // dummy slots every day forever) that drowns out the
+                            // real one, so each gets its own hide checkbox.
                             let mut count = 0usize;
                             let mut plats: Vec<Platform> = Vec::new();
+                            let mut insts: Vec<(i64, String, Platform, usize)> = Vec::new();
                             for s in self.schedule_all.iter().filter(|s| s.channel_id == cid) {
                                 count += 1;
                                 let p = s.platform();
                                 if !plats.contains(&p) {
                                     plats.push(p);
                                 }
+                                match insts.iter_mut().find(|(mid, ..)| *mid == s.monitor_id) {
+                                    Some((.., n)) => *n += 1,
+                                    None => insts.push((s.monitor_id, s.url.clone(), p, 1)),
+                                }
                             }
+                            insts.sort_by(|a, b| a.1.cmp(&b.1));
+                            let hidden_insts = insts
+                                .iter()
+                                .filter(|(mid, ..)| self.schedule_hidden_monitors.contains(mid))
+                                .count();
+                            let shown_count: usize = insts
+                                .iter()
+                                .filter(|(mid, ..)| !self.schedule_hidden_monitors.contains(mid))
+                                .map(|(.., n)| *n)
+                                .sum();
+                            let expandable = insts.len() > 1;
+                            let expanded = expandable && self.schedule_sidebar_open.contains(&cid);
                             // Pre-compute for context-menu closure (can't re-borrow self inside).
                             let ch_is_hidden = self.schedule_hidden.contains(&cid);
                             // The channel's calendar colour — swatch + tinted
@@ -1058,6 +1097,28 @@ impl StreamArchiverApp {
                                 .copied()
                                 .unwrap_or_else(|| channel_event_color(cid, ""));
                             let row = ui.horizontal(|ui| {
+                                // Expander for multi-instance channels; a fixed
+                                // blank slot otherwise so every row's checkbox
+                                // stays column-aligned.
+                                if expandable {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(if expanded { "⏷" } else { "⏵" })
+                                                .small()
+                                                .frame(false),
+                                        )
+                                        .on_hover_text(
+                                            "Show this channel's instances — each can be \
+                                             hidden on its own (e.g. one instance's \
+                                             permanent filler schedule)",
+                                        )
+                                        .clicked()
+                                    {
+                                        *toggle_expand = Some(cid);
+                                    }
+                                } else {
+                                    ui.add_space(14.0);
+                                }
                                 let mut vis = !ch_is_hidden;
                                 if ui.checkbox(&mut vis, "").changed() {
                                     *toggle_channel = Some(cid);
@@ -1083,13 +1144,27 @@ impl StreamArchiverApp {
                                 }
                                 let name_color =
                                     readable_color(color, ui.visuals().panel_fill);
-                                ui.add(
+                                // "(shown/total)" the moment instance hides bite,
+                                // so a collapsed row still betrays that part of
+                                // this channel's schedule is filtered out.
+                                let count_txt = if hidden_insts > 0 {
+                                    format!("{name}  ({shown_count}/{count})")
+                                } else {
+                                    format!("{name}  ({count})")
+                                };
+                                let lbl = ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(format!("{name}  ({count})"))
-                                            .color(name_color),
+                                        egui::RichText::new(count_txt).color(name_color),
                                     )
                                     .truncate(),
                                 );
+                                if hidden_insts > 0 {
+                                    lbl.on_hover_text(format!(
+                                        "{hidden_insts} of {} instance(s) hidden — expand \
+                                         (⏵) to manage",
+                                        insts.len()
+                                    ));
+                                }
                             }).response;
                             // Context menu — captures only Copy values, uses temp data.
                             row.context_menu(|ui| {
@@ -1116,6 +1191,52 @@ impl StreamArchiverApp {
                                     ui.close();
                                 }
                             });
+                            // Expanded: one indented row per instance with its
+                            // own hide checkbox. Instance hides AND with the
+                            // channel checkbox above (either hides the events).
+                            if expanded {
+                                for (mid, url, plat, n) in &insts {
+                                    let inst_hidden =
+                                        self.schedule_hidden_monitors.contains(mid);
+                                    let inst_row = ui.horizontal(|ui| {
+                                        ui.add_space(28.0);
+                                        let mut vis = !inst_hidden;
+                                        if ui.checkbox(&mut vis, "").changed() {
+                                            *toggle_monitor = Some(*mid);
+                                        }
+                                        platform_icon(ui, ptex, *plat)
+                                            .on_hover_text(plat.label());
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "{}  ({n})",
+                                                    super::grid::instance_label(url)
+                                                ))
+                                                .weak(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(url);
+                                    })
+                                    .response;
+                                    inst_row.context_menu(|ui| {
+                                        let label = if inst_hidden {
+                                            "👁  Show instance"
+                                        } else {
+                                            "🙈  Hide instance"
+                                        };
+                                        if ui.button(label).clicked() {
+                                            ui.ctx().data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new("sched_mon_toggle"),
+                                                    *mid,
+                                                )
+                                            });
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                            }
                         }
 
                         // Hidden-segment toggle (shown only when any exist).
@@ -1440,6 +1561,8 @@ impl StreamArchiverApp {
         clear_hidden: bool,
         hide_all: bool,
         toggle_channel: Option<i64>,
+        toggle_monitor: Option<i64>,
+        toggle_expand: Option<i64>,
         set_collisions: Option<bool>,
         open_day: Option<chrono::NaiveDate>,
         do_refresh: bool,
@@ -1458,7 +1581,11 @@ impl StreamArchiverApp {
         // launch) without writing to the DB on every frame this fn runs.
         let mut hidden_changed = false;
         if clear_hidden {
+            // "All channels" ticked = show everything — including any
+            // instance-level hides, which would otherwise keep silently
+            // filtering events out from under an all-visible sidebar.
             self.schedule_hidden.clear();
+            self.schedule_hidden_monitors.clear();
             hidden_changed = true;
         }
         if hide_all {
@@ -1474,6 +1601,18 @@ impl StreamArchiverApp {
                 self.schedule_hidden.insert(id);
             }
             hidden_changed = true;
+        }
+        if let Some(mid) = toggle_monitor {
+            // Toggle one instance's visibility (ANDed with its channel's).
+            if !self.schedule_hidden_monitors.remove(&mid) {
+                self.schedule_hidden_monitors.insert(mid);
+            }
+            hidden_changed = true;
+        }
+        if let Some(cid) = toggle_expand
+            && !self.schedule_sidebar_open.remove(&cid)
+        {
+            self.schedule_sidebar_open.insert(cid);
         }
         if let Some(v) = set_collisions {
             self.schedule_collisions = v;
@@ -1555,9 +1694,26 @@ impl StreamArchiverApp {
             }
             hidden_changed = true;
         }
+        // Context-menu instance toggle (mirrors the checkbox path above).
+        if let Some(mid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_mon_toggle")))
+        {
+            if !self.schedule_hidden_monitors.remove(&mid) {
+                self.schedule_hidden_monitors.insert(mid);
+            }
+            hidden_changed = true;
+        }
         if hidden_changed {
             let joined = self.schedule_hidden.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
             let _ = self.core.store.set_setting(K_SCHEDULE_HIDDEN_CHANNELS, &joined);
+            let joined_m = self
+                .schedule_hidden_monitors
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = self.core.store.set_setting(K_SCHEDULE_HIDDEN_MONITORS, &joined_m);
         }
         if let Some(cid) = ui
             .ctx()
@@ -2569,11 +2725,15 @@ impl StreamArchiverApp {
             .platform_tex
             .get_or_insert_with(|| PlatformTextures::load(ctx))
             .clone();
-        // Visible streams on that local date (respects the sidebar filter).
+        // Visible streams on that local date (respects the sidebar filter,
+        // channel- and instance-level).
         let entries: Vec<&UpcomingStream> = self
             .schedule_all
             .iter()
-            .filter(|s| !self.schedule_hidden.contains(&s.channel_id))
+            .filter(|s| {
+                !self.schedule_hidden.contains(&s.channel_id)
+                    && !self.schedule_hidden_monitors.contains(&s.monitor_id)
+            })
             .filter(|s| local_date(s.start_time) == Some(date))
             .collect();
         // Weekday + the user's chosen date format (so the heading matches the chips).

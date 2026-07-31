@@ -1649,6 +1649,17 @@ pub struct StreamArchiverApp {
     /// preference (e.g. a channel whose schedule is a permanent dummy
     /// placeholder), not a soft per-event hide meant to reset.
     schedule_hidden: HashSet<i64>,
+    /// Monitor (instance) ids hidden from the Schedule calendar — the same
+    /// deliberate preference as `schedule_hidden`, one level down: some
+    /// instances publish a permanent filler/dummy schedule (the same slots
+    /// every day forever) while the channel's other instance has the real
+    /// one. ANDed with the channel-level hide (either hides the event).
+    /// Persisted under [`crate::ui::schedule::K_SCHEDULE_HIDDEN_MONITORS`];
+    /// stale ids (deleted monitors) are harmless and simply never match.
+    schedule_hidden_monitors: HashSet<i64>,
+    /// Channels whose sidebar row is expanded to show per-instance
+    /// checkboxes. Session-only.
+    schedule_sidebar_open: HashSet<i64>,
     /// Live substring filter over the sidebar's channel list (case-insensitive,
     /// name match) — session-only, not persisted.
     schedule_channel_filter: String,
