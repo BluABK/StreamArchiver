@@ -46,9 +46,9 @@ pub struct CaptureAlertRow {
     pub severity: String,
     pub source: String,
     pub take_key: String,
-    // Click-through metadata not yet read by the Warnings UI (mirrors
-    // `NotificationRow`'s convention).
-    #[allow(dead_code)]
+    /// Drives the row's channel avatar/name-colour lookup (shared identity
+    /// resolver with the 🔔 feed); a name-only fallback covers rows whose
+    /// monitor was deleted.
     pub monitor_id: Option<i64>,
     /// Drives the 🩹 Patches row action (open the recovered files' folder).
     pub recording_id: Option<i64>,

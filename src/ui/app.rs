@@ -93,6 +93,8 @@ impl StreamArchiverApp {
         let schedule_large_avatar = setting_or_empty(&core, K_SCHEDULE_LARGE_AVATAR) == "1";
         let schedule_month_icons =
             setting_or_empty(&core, crate::ui::schedule::K_SCHEDULE_MONTH_ICONS) == "1";
+        let warn_bgcolor = setting_or_empty(&core, crate::ui::issues::K_WARN_BGCOLOR) != "0";
+        let notif_bgcolor = setting_or_empty(&core, crate::ui::issues::K_NOTIF_BGCOLOR) != "0";
         let schedule_hidden: HashSet<i64> = setting_or_empty(&core, K_SCHEDULE_HIDDEN_CHANNELS)
             .split(',')
             .filter_map(|s| s.trim().parse::<i64>().ok())
@@ -552,6 +554,8 @@ impl StreamArchiverApp {
             warn_search: String::new(),
             warn_sev_filter: None,
             warn_hide_acked: false,
+            warn_bgcolor,
+            notif_bgcolor,
             show_posts_window: false,
             posts: Vec::new(),
             posts_refreshed: None,

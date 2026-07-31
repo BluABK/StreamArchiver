@@ -1352,6 +1352,15 @@ pub struct StreamArchiverApp {
     /// Hide acknowledged rows in the Warnings window (session-only, not
     /// persisted — the window always opens showing everything).
     warn_hide_acked: bool,
+    /// 🚨 Warnings window: paint rows in their severity/state colours
+    /// (red/yellow/green tints). Persisted (`warnings_row_bgcolor`, default
+    /// on); off = plain rows, the accent-coloured icons/titles still carry
+    /// the state.
+    warn_bgcolor: bool,
+    /// 🔔 Notifications window: paint rows in their per-kind colours.
+    /// Persisted (`notif_row_bgcolor`, default on) — same idea as the
+    /// Warnings toggle above.
+    notif_bgcolor: bool,
     /// The YouTube posts feed (a top-level tab AND a pop-out window sharing one
     /// render fn): loaded rows, load throttle, session-only channel + text
     /// filters, and a lazy visible-only texture cache keyed by content hash.

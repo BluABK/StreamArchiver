@@ -1414,11 +1414,23 @@ bad night) and the filter box matches category names. A **Hide acknowledged**
 checkbox keeps the list down to what still needs attention — rows drop out
 once acked and reappear only if fresh damage un-acknowledges them. The menu
 also leads with a **✅ Fixed** group — one click acknowledges every *green* row (fully
-recovered or superseded) while leaving unhealed red and yellow rows alone. Each row links
-straight to the tool log (📂), shows the last matching line on hover, and
-the first occurrence per take also lands in the 🔔 feed (errors additionally
-raise a desktop toast, DND-gated as usual). Alerts idle for 60 days age out
-at startup.
+recovered or superseded) while leaving unhealed red and yellow rows alone.
+
+Rows are built for reading and copying: each shows the channel's **profile
+picture** (Alt-hover for full resolution) and names the channel in its **own
+colour** — the same identity the Streams grid and 🔔 feed use — with the
+metadata (occurrence count as **×N**, first — last occurrence, source tool,
+category chip) **inline on the title line** at full size rather than in small
+print on a separate line. The **matched log line sits in the row itself** as
+selectable text — right-click it to copy the line or the whole alert — where
+it used to hide in a hover tooltip (uncopyable, invisible in screenshots,
+easily dismissed). A **Row colors** checkbox (persisted, default on) turns
+the red/yellow/green tints off for a plainer list; the coloured icon and
+title still carry the state. Each row links straight to the tool log (📂),
+and the first occurrence per take also lands in the 🔔 feed as a compact
+title-only row whose **🚨 Details** button jumps back to this window (errors
+additionally raise a desktop toast, DND-gated as usual). Alerts idle for 60
+days age out at startup.
 
 **Superseded failures heal themselves.** When a capture attempt dies (e.g.
 an antivirus-held rename, a disk-full night that later cleared), the
@@ -1702,7 +1714,12 @@ independent detectors feeding the same table:
   where they set one, same as the Streams grid — with the timestamp leading the
   title line. Rows are **tinted by kind and severity** the way 🚨 Warnings rows
   are (red errors, amber warnings, purple went-live, green trigger matched, …);
-  already-read rows keep the hue but fade back. The action buttons are:
+  already-read rows keep the hue but fade back, and a **Row colors** checkbox
+  (persisted, default on) turns the tints off entirely. Capture-alert rows
+  stay **compact — title only**: the 🚨 Warnings window is the authoritative
+  view of the same alert (explanation, matched log line, Ack/Log actions), so
+  the feed stopped repeating its whole paragraph per row — the **🚨 Details**
+  button on those rows opens it instead. The action buttons are:
   - **Watch on Web** — opens the channel/VOD/post page in the browser.
   - **Watch in player** — on live-stream rows (went live, trigger matched or
     blocked, quality upgrade) whose instance still exists, tunes into the live

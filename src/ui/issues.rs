@@ -29,6 +29,14 @@ pub(super) struct IssuesScan {
 /// listed in Issues as stale (a live capture writes continuously).
 const STALE_RECORDING_SECS: i64 = 600;
 
+/// Setting key for the 🚨 Warnings window's "Row colors" toggle (default on):
+/// paint each row in its severity/state tint. Off = plain rows; the
+/// accent-coloured icon/title still carry the state.
+pub(super) const K_WARN_BGCOLOR: &str = "warnings_row_bgcolor";
+/// Setting key for the 🔔 Notifications window's "Row colors" toggle
+/// (default on) — same idea for the feed's per-kind tints.
+pub(super) const K_NOTIF_BGCOLOR: &str = "notif_row_bgcolor";
+
 /// (icon, human label) per capture-alert kind (the 🚨 Warnings window rows).
 fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
     match kind {
@@ -39,14 +47,13 @@ fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// One-line summary for a capture-alert row: occurrence count, lost time, and
-/// recovery progress where applicable.
-fn alert_summary(r: &crate::store::CaptureAlertRow) -> String {
-    let mut parts = vec![format!(
-        "{} occurrence{}",
-        crate::models::group_thousands(r.count),
-        if r.count == 1 { "" } else { "s" }
-    )];
+/// Damage/recovery summary line for a capture-alert row — lost time and
+/// recovery progress, `None` when there's neither (the common PO-token /
+/// experiment / plain-warning rows). The occurrence count used to lead this
+/// line; it now sits inline in the title row as `×N`, so a damage-less alert
+/// is a two-line row instead of three.
+fn alert_damage_summary(r: &crate::store::CaptureAlertRow) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
     if r.lost_segments > 0 {
         // Twitch live segments are 2 s; for yt-dlp fragments this is still a
         // usable order-of-magnitude estimate.
@@ -70,7 +77,7 @@ fn alert_summary(r: &crate::store::CaptureAlertRow) -> String {
             ));
         }
     }
-    parts.join(" · ")
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// A human explanation when a capture/resume died on a network/DNS failure —
@@ -214,13 +221,28 @@ fn notif_post_id(r: &crate::store::NotificationRow) -> Option<String> {
 /// as `"{channel} is live"`, `"⚡ {channel} — trigger matched"`, … so the name
 /// is a plain substring; rows without one (generic errors, schedule changes)
 /// render the title whole.
-fn notif_title(ui: &mut egui::Ui, title: &str, channel: &str, name_color: Option<egui::Color32>) {
+/// `base` colours the non-channel parts (the 🚨 Warnings window uses its
+/// severity accent there); `None` = the default strong text colour.
+fn notif_title(
+    ui: &mut egui::Ui,
+    title: &str,
+    channel: &str,
+    name_color: Option<egui::Color32>,
+    base: Option<egui::Color32>,
+) {
+    let styled = |text: &str| {
+        let rich = egui::RichText::new(text).strong();
+        match base {
+            Some(c) => rich.color(c),
+            None => rich,
+        }
+    };
     let hit = name_color
         .filter(|_| !channel.is_empty())
         .zip(title.find(channel))
         .map(|(c, at)| (at, c));
     let Some((at, color)) = hit else {
-        ui.label(egui::RichText::new(title).strong());
+        ui.label(styled(title));
         return;
     };
     let (head, rest) = title.split_at(at);
@@ -228,11 +250,11 @@ fn notif_title(ui: &mut egui::Ui, title: &str, channel: &str, name_color: Option
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         if !head.is_empty() {
-            ui.label(egui::RichText::new(head).strong());
+            ui.label(styled(head));
         }
         ui.label(egui::RichText::new(name).strong().color(color));
         if !tail.is_empty() {
-            ui.label(egui::RichText::new(tail).strong());
+            ui.label(styled(tail));
         }
     });
 }
@@ -245,6 +267,68 @@ const STUCK_IN_CACHE_DETAILS: &str =
      yet.";
 
 impl StreamArchiverApp {
+    /// Resolve per-row channel identity — the instance's own avatar plus the
+    /// name colour the Streams grid gives that channel — for a feed of rows
+    /// keyed by row id (`(key, monitor_id, channel name)`). Shared by the 🔔
+    /// Notifications and 🚨 Warnings windows so both label rows with the same
+    /// face and colour a channel has everywhere else. Rows whose monitor was
+    /// deleted still match by channel name where one is still tracked.
+    /// Resolved once per distinct instance, not per row — either feed holds up
+    /// to 500 rows and this runs every frame its window is open.
+    fn feed_identities(
+        &mut self,
+        ctx: &egui::Context,
+        keys: &[(i64, Option<i64>, String)],
+    ) -> HashMap<i64, (Option<egui::TextureHandle>, (egui::Color32, bool))> {
+        let by_mid: HashMap<i64, usize> =
+            self.rows.iter().enumerate().map(|(i, r)| (r.monitor.id, i)).collect();
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
+        for (i, r) in self.rows.iter().enumerate() {
+            by_name.entry(r.channel.name.as_str()).or_insert(i);
+        }
+        let resolved: Vec<(i64, usize)> = keys
+            .iter()
+            .filter_map(|(key, mid, name)| {
+                let ri = mid
+                    .and_then(|m| by_mid.get(&m).copied())
+                    .or_else(|| {
+                        (!name.is_empty())
+                            .then(|| by_name.get(name.as_str()).copied())
+                            .flatten()
+                    })?;
+                Some((*key, ri))
+            })
+            .collect();
+        let mut avatars: HashMap<usize, egui::TextureHandle> = HashMap::new();
+        let mut colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
+        for &(_, ri) in &resolved {
+            let (mid, cid) = (self.rows[ri].monitor.id, self.rows[ri].channel.id);
+            if let std::collections::hash_map::Entry::Vacant(e) = avatars.entry(ri) {
+                if !self.instance_icons_small.contains_key(&mid) {
+                    let tex = resolve_instance_icon_small(&self.rows[ri], ctx);
+                    self.instance_icons_small.insert(mid, tex);
+                }
+                if let Some(tex) = self.instance_icons_small.get(&mid).and_then(|t| t.clone()) {
+                    e.insert(tex);
+                }
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = colors.entry(cid) {
+                // Can't `or_insert_with` — resolving a name colour needs `&mut
+                // self` (it fills the fetched-colour cache) and the closure
+                // would already be holding the map.
+                let color = self.channel_name_color(cid);
+                e.insert(color);
+            }
+        }
+        resolved
+            .iter()
+            .map(|&(key, ri)| {
+                let cid = self.rows[ri].channel.id;
+                (key, (avatars.get(&ri).cloned(), colors[&cid]))
+            })
+            .collect()
+    }
+
     /// Returns the list of active (non-dismissed) quota warning keys.
     /// Each key is a stable string used for both display and dismissal tracking.
     pub(super) fn active_quota_warnings(&self) -> Vec<String> {
@@ -307,6 +391,7 @@ impl StreamArchiverApp {
         }
 
         let now = crate::models::now_unix();
+        let bg_before = self.notif_bgcolor;
         let mut open = true;
         // Deferred actions (applied after the viewport closure releases &self).
         enum Act {
@@ -316,71 +401,30 @@ impl StreamArchiverApp {
             ViewPost(String),
             /// Tune into a channel's live edge in the media player (`monitor_id`).
             WatchInPlayer(i64),
+            /// Open the 🚨 Capture warnings window (a capture-alert row's
+            /// "Details" — the feed no longer repeats the alert body).
+            OpenWarnings,
         }
         let mut act: Option<Act> = None;
 
-        // Per-row channel identity — the instance's own avatar plus the name
-        // colour the Streams grid gives that channel. Resolved out here because
-        // the viewport closure below borrows `self` for the row data and so
-        // can't also fill the texture/colour caches. Rows whose monitor was
-        // deleted still match by channel name where one is still tracked.
-        // Resolved once per distinct instance rather than per feed row — the
-        // feed holds up to 500 rows and this runs every frame the window is open.
-        let by_mid: HashMap<i64, usize> =
-            self.rows.iter().enumerate().map(|(i, r)| (r.monitor.id, i)).collect();
-        let mut by_name: HashMap<&str, usize> = HashMap::new();
-        for (i, r) in self.rows.iter().enumerate() {
-            by_name.entry(r.channel.name.as_str()).or_insert(i);
-        }
-        // notification id → (row index, that row's own monitor id when the
-        // notification actually named it — a name-only match resolves a colour,
-        // not a source URL to tune into).
-        let resolved: Vec<(i64, usize, Option<i64>)> = self
+        // Per-row channel identity (avatar + name colour), via the resolver
+        // shared with the 🚨 Warnings window.
+        let keys: Vec<(i64, Option<i64>, String)> = self
             .notifications
             .iter()
-            .filter_map(|r| {
-                let ri = r
-                    .monitor_id
-                    .and_then(|mid| by_mid.get(&mid).copied())
-                    .or_else(|| {
-                        (!r.channel.is_empty())
-                            .then(|| by_name.get(r.channel.as_str()).copied())
-                            .flatten()
-                    })?;
-                Some((r.id, ri, r.monitor_id.filter(|mid| by_mid.contains_key(mid))))
-            })
+            .map(|r| (r.id, r.monitor_id, r.channel.clone()))
             .collect();
-        let mut avatars: HashMap<usize, egui::TextureHandle> = HashMap::new();
-        let mut colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
-        for &(_, ri, _) in &resolved {
-            let (mid, cid) = (self.rows[ri].monitor.id, self.rows[ri].channel.id);
-            if let std::collections::hash_map::Entry::Vacant(e) = avatars.entry(ri) {
-                if !self.instance_icons_small.contains_key(&mid) {
-                    let tex = resolve_instance_icon_small(&self.rows[ri], ctx);
-                    self.instance_icons_small.insert(mid, tex);
-                }
-                if let Some(tex) = self.instance_icons_small.get(&mid).and_then(|t| t.clone()) {
-                    e.insert(tex);
-                }
-            }
-            if let std::collections::hash_map::Entry::Vacant(e) = colors.entry(cid) {
-                // Can't `or_insert_with` — resolving a name colour needs `&mut
-                // self` (it fills the fetched-colour cache) and the closure
-                // would already be holding the map.
-                let color = self.channel_name_color(cid);
-                e.insert(color);
-            }
-        }
-        let ident: HashMap<i64, (Option<&egui::TextureHandle>, (egui::Color32, bool))> = resolved
+        let ident = self.feed_identities(ctx, &keys);
+        // Which feed rows can offer "Watch in player" — only rows that NAMED a
+        // still-tracked monitor (a name-only identity match resolves a colour,
+        // not a source URL to tune into).
+        let tracked: std::collections::HashSet<i64> =
+            self.rows.iter().map(|r| r.monitor.id).collect();
+        let live_mids: HashMap<i64, i64> = self
+            .notifications
             .iter()
-            .map(|&(nid, ri, _)| {
-                let cid = self.rows[ri].channel.id;
-                (nid, (avatars.get(&ri), colors[&cid]))
-            })
+            .filter_map(|r| Some((r.id, r.monitor_id.filter(|m| tracked.contains(m))?)))
             .collect();
-        // Which feed rows can offer "Watch in player".
-        let live_mids: HashMap<i64, i64> =
-            resolved.iter().filter_map(|&(nid, _, mid)| Some((nid, mid?))).collect();
         let have_player = !self.settings.media_player_path.trim().is_empty();
 
         // Session-only category + text filter over the loaded rows → surviving
@@ -438,6 +482,9 @@ impl StreamArchiverApp {
                         {
                             self.notif_search.clear();
                         }
+                        ui.checkbox(&mut self.notif_bgcolor, "Row colors").on_hover_text(
+                            "Paint each row in its kind's colour (live purple, finished                              blue, error red, …) so the feed can be skimmed by colour.                              Off = plain rows; the coloured icons and dots still carry                              the kind.",
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✔ Mark all read").clicked() {
                                 act = Some(Act::MarkAllRead);
@@ -469,12 +516,16 @@ impl StreamArchiverApp {
                                 // a list rather than a wall of paint.
                                 let (rgb, accent) = notif_colors(kind, &r.severity);
                                 let alpha = if r.read { 22 } else { 70 };
-                                let tint = egui::Color32::from_rgba_unmultiplied(
-                                    rgb.0, rgb.1, rgb.2, alpha,
-                                );
+                                let tint = if self.notif_bgcolor {
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        rgb.0, rgb.1, rgb.2, alpha,
+                                    )
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
                                 let (avatar, name_color) = match ident.get(&r.id) {
                                     Some((a, (base, adjust))) => (
-                                        *a,
+                                        a.as_ref(),
                                         Some(if *adjust {
                                             readable_color(*base, tint)
                                         } else {
@@ -516,9 +567,21 @@ impl StreamArchiverApp {
                                                 if !when.is_empty() {
                                                     ui.label(egui::RichText::new(when).weak());
                                                 }
-                                                notif_title(ui, &r.title, &r.channel, name_color);
+                                                notif_title(ui, &r.title, &r.channel, name_color, None);
                                             });
-                                            if !r.body.is_empty() {
+                                            // Capture alerts keep their body OUT
+                                            // of the feed: the 🚨 Warnings window
+                                            // is the authoritative view of the
+                                            // same alert (explanation, log line,
+                                            // Ack/Log actions), and repeating its
+                                            // whole paragraph per feed row just
+                                            // duplicated it. The 🚨 Details
+                                            // button on the right jumps there.
+                                            let is_capture_alert = kind
+                                                == Some(
+                                                    crate::models::NotificationKind::CaptureAlert,
+                                                );
+                                            if !r.body.is_empty() && !is_capture_alert {
                                                 ui.label(egui::RichText::new(&r.body).weak());
                                             }
                                         });
@@ -558,6 +621,19 @@ impl StreamArchiverApp {
                                                 {
                                                     act = Some(Act::ViewPost(pid));
                                                 }
+                                                if kind
+                                                    == Some(
+                                                        crate::models::NotificationKind::CaptureAlert,
+                                                    )
+                                                    && ui
+                                                        .button("🚨 Details")
+                                                        .on_hover_text(
+                                                            "Open the 🚨 Capture warnings                                                              window — the full view of this                                                              alert (explanation, matched log                                                              line, Ack / Log actions).",
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    act = Some(Act::OpenWarnings);
+                                                }
                                                 if have_player
                                                     && notif_is_live_stream(kind)
                                                     && let Some(&mid) = live_mids.get(&r.id)
@@ -587,6 +663,12 @@ impl StreamArchiverApp {
             },
         );
 
+        if bg_before != self.notif_bgcolor {
+            let _ = self
+                .core
+                .store
+                .set_setting(K_NOTIF_BGCOLOR, if self.notif_bgcolor { "1" } else { "0" });
+        }
         if !open {
             self.show_notifications = false;
         }
@@ -629,6 +711,9 @@ impl StreamArchiverApp {
                     }
                 }
             }
+            Some(Act::OpenWarnings) => {
+                self.show_warnings = true;
+            }
             None => {}
         }
     }
@@ -664,6 +749,16 @@ impl StreamArchiverApp {
         if !self.show_warnings {
             return;
         }
+
+        // Per-row channel identity (avatar + name colour), via the resolver
+        // shared with the 🔔 Notifications window.
+        let keys: Vec<(i64, Option<i64>, String)> = self
+            .warnings_rows
+            .iter()
+            .map(|r| (r.id, r.monitor_id, r.channel.clone()))
+            .collect();
+        let ident = self.feed_identities(ctx, &keys);
+        let bg_before = self.warn_bgcolor;
 
         let mut open = true;
         // Deferred actions (applied after the viewport closure releases &self).
@@ -765,6 +860,12 @@ impl StreamArchiverApp {
                              (including healed/superseded ones you've cleared) drop out of \
                              the list until new damage un-acknowledges them again.",
                         );
+                        ui.checkbox(&mut self.warn_bgcolor, "Row colors").on_hover_text(
+                            "Paint each row in its state colour — red = data missing, \
+                             yellow = warning, green = recovered/superseded; dimmed once \
+                             acknowledged. Off = plain rows; the coloured icon and title \
+                             still carry the state.",
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .button("✔ Acknowledge all")
@@ -859,7 +960,20 @@ impl StreamArchiverApp {
                                 ((120, 95, 10), egui::Color32::from_rgb(220, 175, 60))
                             };
                             let alpha = if r.acked { 25 } else { 70 };
-                            let tint = egui::Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha);
+                            let tint = if self.warn_bgcolor {
+                                egui::Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            // Channel identity: avatar + the channel's own name
+                            // colour (same as the Streams grid / 🔔 feed).
+                            let (avatar, name_color) = match ident.get(&r.id) {
+                                Some((a, (base, adjust))) => (
+                                    a.as_ref(),
+                                    Some(if *adjust { readable_color(*base, tint) } else { *base }),
+                                ),
+                                None => (None, None),
+                            };
                             egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let (icon, kind_label) = alert_kind_label(&r.kind);
@@ -890,6 +1004,15 @@ impl StreamArchiverApp {
                                         } else {
                                             "Warning — the tool complained, no data loss detected."
                                         });
+                                    if let Some(tex) = avatar {
+                                        let resp = ui.add(
+                                            egui::Image::from_texture(tex)
+                                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                                .corner_radius(egui::CornerRadius::same(4)),
+                                        );
+                                        queue_alt_image_preview(ui.ctx(), &resp, tex);
+                                        ui.add_space(2.0);
+                                    }
                                     ui.vertical(|ui| {
                                         let mut title = if r.channel.is_empty() {
                                             kind_label.to_string()
@@ -905,45 +1028,103 @@ impl StreamArchiverApp {
                                         } else if superseded {
                                             title.push_str(" — superseded by a later take");
                                         }
-                                        let mut rich = egui::RichText::new(title).strong();
-                                        if !r.acked {
-                                            rich = rich.color(accent);
-                                        }
-                                        ui.label(rich);
-                                        ui.label(egui::RichText::new(alert_summary(r)).weak())
-                                            .on_hover_text(format!(
-                                                "Last matching log line:\n{}",
-                                                r.last_line
-                                            ));
-                                        ui.horizontal(|ui| {
-                                            let span = if r.last_at > r.first_at {
-                                                format!(
-                                                    "{} — {}",
-                                                    fmt_datetime_short(r.first_at),
-                                                    fmt_datetime_short(r.last_at)
+                                        // Title line with the metadata inline
+                                        // at normal size (wrapping on a narrow
+                                        // window) — the old three-line layout
+                                        // put this in small print at the
+                                        // bottom, and the occurrence count on
+                                        // its own line whose detail only lived
+                                        // in a tooltip.
+                                        let span = if r.last_at > r.first_at {
+                                            format!(
+                                                "{} — {}",
+                                                fmt_datetime_short(r.first_at),
+                                                fmt_datetime_short(r.last_at)
+                                            )
+                                        } else {
+                                            fmt_datetime_short(r.first_at)
+                                        };
+                                        let (cicon, clabel) = crate::downloader::alert_category(
+                                            &r.kind,
+                                            &r.last_line,
+                                        );
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            let base = (!r.acked).then_some(accent);
+                                            notif_title(ui, &title, &r.channel, name_color, base);
+                                            if r.count > 1 {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "×{}",
+                                                        crate::models::group_thousands(r.count)
+                                                    ))
+                                                    .weak(),
                                                 )
-                                            } else {
-                                                fmt_datetime_short(r.first_at)
-                                            };
-                                            ui.small(span).on_hover_text(
-                                                "First and most recent occurrence.",
-                                            );
-                                            if !r.source.is_empty() {
-                                                ui.small(format!("· {}", r.source))
-                                                    .on_hover_text("The capture tool whose log reported this.");
+                                                .on_hover_text("Occurrences folded into this row.");
                                             }
-                                            let (cicon, clabel) = crate::downloader::alert_category(
-                                                &r.kind,
-                                                &r.last_line,
-                                            );
-                                            ui.small(format!("· {cicon} {clabel}"))
+                                            ui.label(egui::RichText::new(format!("·  {span}")).weak())
+                                                .on_hover_text("First and most recent occurrence.");
+                                            if !r.source.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(format!("·  {}", r.source))
+                                                        .weak(),
+                                                )
                                                 .on_hover_text(
-                                                    "Alert category — the ✔ Ack group menu \
-                                                     acknowledges every alert of one category \
-                                                     at once, and the filter box matches \
-                                                     category names.",
+                                                    "The capture tool whose log reported this.",
                                                 );
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(format!("·  {cicon} {clabel}"))
+                                                    .weak(),
+                                            )
+                                            .on_hover_text(
+                                                "Alert category — the ✔ Ack group menu \
+                                                 acknowledges every alert of one category \
+                                                 at once, and the filter box matches \
+                                                 category names.",
+                                            );
                                         });
+                                        // Damage/recovery summary, only when
+                                        // there is any (lost segments, VOD
+                                        // recovery progress).
+                                        if let Some(damage) = alert_damage_summary(r) {
+                                            ui.label(egui::RichText::new(damage).weak());
+                                        }
+                                        // The matched log line, IN the row —
+                                        // selectable text (tooltips made it
+                                        // uncopyable), right-click to copy.
+                                        if !r.last_line.is_empty() {
+                                            let resp = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&r.last_line).weak(),
+                                                    )
+                                                    .truncate()
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(&r.last_line);
+                                            resp.context_menu(|ui| {
+                                                if ui.button("📋 Copy log line").clicked() {
+                                                    ui.ctx().copy_text(r.last_line.clone());
+                                                    ui.close();
+                                                }
+                                                if ui.button("📋 Copy alert details").clicked() {
+                                                    ui.ctx().copy_text(format!(
+                                                        "{title}\n{span} · {}{cicon} {clabel}\n{}{}",
+                                                        if r.source.is_empty() {
+                                                            String::new()
+                                                        } else {
+                                                            format!("{} · ", r.source)
+                                                        },
+                                                        alert_damage_summary(r)
+                                                            .map(|d| format!("{d}\n"))
+                                                            .unwrap_or_default(),
+                                                        r.last_line
+                                                    ));
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
                                     });
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -990,9 +1171,18 @@ impl StreamArchiverApp {
                         }
                     });
                 });
+                // Child viewports draw their own copy of the Alt-hover overlay —
+                // the main viewport's draw call can't reach here.
+                draw_alt_image_preview(ctx);
             },
         );
 
+        if bg_before != self.warn_bgcolor {
+            let _ = self
+                .core
+                .store
+                .set_setting(K_WARN_BGCOLOR, if self.warn_bgcolor { "1" } else { "0" });
+        }
         if !open {
             self.show_warnings = false;
         }
