@@ -2923,6 +2923,14 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
 
+While a chat capture is running, its row shows the **💬 badge** (bubbled up
+to the instance and collapsed channel rows) and the context menu offers
+**💬 Stop chat download** — for *all three* shapes: a YouTube recording's
+external yt-dlp sidecar, a chat-only session, and a Twitch recording's
+built-in logger. The Twitch-recording case is a 2026-08-01 fix: the in-process
+logger never registered itself as a running chat, so recording Twitch rows
+showed no 💬 while YouTube ones did, and Stop had nothing to act on.
+
 #### Chat without a recording
 
 **Auto-record off doesn't mean chat off.** Auto-record is a *disk-space*

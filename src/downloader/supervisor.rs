@@ -92,6 +92,7 @@ impl Supervisor {
             chapter_jobs: Arc::new(Mutex::new(HashSet::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
+            take_chat_done: Arc::new(Mutex::new(HashMap::new())),
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
             chat_only: Arc::new(Mutex::new(HashSet::new())),
             chat_only_user_stopped: Arc::new(Mutex::new(HashMap::new())),
@@ -2083,15 +2084,19 @@ progress_info: None,
     }
 
     /// Stop the live-chat sidecar download for a monitor, if one is running.
-    /// A registered PID of 0 (a chat-only session's in-process Twitch logger —
-    /// see `chat_only.rs`) has nothing to kill; the stop is delivered purely
-    /// through `stopping_chats`, which that session's watcher polls.
+    /// A registered PID of 0 (an in-process Twitch logger) has nothing to
+    /// kill; the stop is delivered through flags instead — `stopping_chats`
+    /// for a chat-only session (its watcher polls it), and the take logger's
+    /// own `chat_done` flag (registered in `take_chat_done`) for a sidecar
+    /// running alongside a recording.
     pub(super) fn stop_chat_download(&self, monitor_id: i64) {
         let pid = self.active_chats.lock().unwrap().get(&monitor_id).copied();
         let Some(pid) = pid else { return };
         self.stopping_chats.lock().unwrap().insert(monitor_id);
         if pid > 0 {
             crate::platform::kill_process_tree(pid);
+        } else if let Some(done) = self.take_chat_done.lock().unwrap().get(&monitor_id) {
+            done.store(true, Ordering::SeqCst);
         }
         info!(monitor_id, "stop chat download");
     }
@@ -2099,9 +2104,12 @@ progress_info: None,
     /// Stop the YouTube chat sidecar for `monitor_id` (if running) and wait
     /// up to `timeout` for it to release its `live_chat.json` file handle.
     /// Called before `rename_companion_sidecars` so the rename isn't blocked
-    /// by an actively-writing chat process (Windows os error 32).
+    /// by an actively-writing chat process (Windows os error 32). PID-0
+    /// entries (in-process Twitch loggers) are deliberately ignored: they
+    /// hold no rename-blocking handle, and a finalize for an OLD take must
+    /// not stop the chat logger a newer take of the same monitor owns.
     pub(super) async fn stop_and_wait_for_chat(&self, monitor_id: i64, timeout: Duration) {
-        if !self.active_chats.lock().unwrap().contains_key(&monitor_id) {
+        if self.active_chats.lock().unwrap().get(&monitor_id).is_none_or(|&pid| pid == 0) {
             return;
         }
         self.stop_chat_download(monitor_id);
@@ -3674,7 +3682,31 @@ progress_info: None,
         let chat_task = (row.monitor.chat_log && row.monitor.platform() == Platform::Twitch)
             .then(|| {
                 let chat_path = plan.final_path.with_extension("chat.jsonl");
-                tokio::spawn(crate::chat::log_twitch_chat(
+                // Register the in-process logger in `active_chats` (pid 0, the
+                // chat-only convention) so a recording Twitch row gets the same
+                // 💬 badge, "Stop chat download" action, and shutdown accounting
+                // as a YouTube recording's external sidecar — before this, only
+                // YouTube recordings and chat-only sessions ever showed chat as
+                // running (2026-08-01). The guard travels INSIDE the spawned
+                // task so cleanup runs however the task ends — normal exit,
+                // `chat_done`, or the force-abort in `stop_record_watchers` —
+                // and its Arc::ptr_eq ownership check keeps an old take's
+                // teardown from unregistering the logger a newer take of the
+                // same monitor already owns.
+                self.active_chats.lock().unwrap().insert(monitor_id, 0);
+                self.take_chat_done.lock().unwrap().insert(monitor_id, chat_done.clone());
+                let _ = self.events.send(AppEvent::MonitorState {
+                    monitor_id,
+                    state: "chat_active".into(),
+                });
+                let guard = TakeChatGuard {
+                    active_chats: self.active_chats.clone(),
+                    take_chat_done: self.take_chat_done.clone(),
+                    stopping_chats: self.stopping_chats.clone(),
+                    monitor_id,
+                    flag: chat_done.clone(),
+                };
+                let fut = crate::chat::log_twitch_chat(
                     row.monitor.url.clone(),
                     chat_path,
                     chat_done.clone(),
@@ -3685,7 +3717,11 @@ progress_info: None,
                         monitor_id,
                         stream_id: stream_id.to_string(),
                     }),
-                ))
+                );
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    fut.await;
+                })
             });
 
         // YouTube chat -> separate yt-dlp sidecar process with --skip-download

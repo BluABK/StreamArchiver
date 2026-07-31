@@ -313,6 +313,11 @@ pub struct Supervisor {
     /// monitor_id -> child PID of in-flight live-chat sidecar downloads.
     /// Shared with AppCore so the UI can show the chat-active indicator.
     pub active_chats: Arc<Mutex<HashMap<i64, u32>>>,
+    /// Stop flags for recording takes' in-process Twitch chat loggers (their
+    /// `active_chats` entries are pid 0, so "Stop chat download" has nothing
+    /// to kill — it sets this flag instead). Keyed by monitor id; ownership
+    /// on unregister is by `Arc::ptr_eq` (see [`TakeChatGuard`]).
+    take_chat_done: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     /// Capture-ended-but-finalize-pending takes (see [`Finalizing`]).
     /// Shared with AppCore so the UI shows "finalizing" instead of "recording".
     finalizing: Finalizing,
@@ -520,6 +525,33 @@ impl Drop for HeadBackfillAbortGuard {
         let mut map = self.map.lock().unwrap();
         if map.get(&self.id).is_some_and(|current| Arc::ptr_eq(current, &self.flag)) {
             map.remove(&self.id);
+        }
+    }
+}
+
+/// RAII unregistration for a recording take's in-process Twitch chat logger
+/// (`active_chats` pid-0 entry + its `take_chat_done` stop flag). Lives inside
+/// the logger's tokio task so cleanup runs however the task ends — including
+/// the force-abort in `stop_record_watchers`, which skips any code after the
+/// `.await`. The `Arc::ptr_eq` ownership check matters because both maps are
+/// keyed by monitor id alone: a new take's logger overwrites the entries, and
+/// the old take's teardown must then leave them alone (same shape as
+/// [`HeadBackfillAbortGuard`]).
+struct TakeChatGuard {
+    active_chats: Arc<Mutex<HashMap<i64, u32>>>,
+    take_chat_done: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    stopping_chats: Arc<Mutex<HashSet<i64>>>,
+    monitor_id: i64,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for TakeChatGuard {
+    fn drop(&mut self) {
+        let mut owners = self.take_chat_done.lock().unwrap();
+        if owners.get(&self.monitor_id).is_some_and(|f| Arc::ptr_eq(f, &self.flag)) {
+            owners.remove(&self.monitor_id);
+            self.active_chats.lock().unwrap().remove(&self.monitor_id);
+            self.stopping_chats.lock().unwrap().remove(&self.monitor_id);
         }
     }
 }
@@ -778,5 +810,40 @@ mod tests {
         assert_eq!(pts_capture_offset(371.433, 0.033, 377.0, 5.0), None);
         // A close-enough disagreement still passes the tight tolerance.
         assert!(pts_capture_offset(375.0, 0.0, 377.0, 5.0).is_some());
+    }
+
+    #[test]
+    fn take_chat_guard_old_take_does_not_unregister_new_takes_logger() {
+        let active_chats = Arc::new(Mutex::new(HashMap::new()));
+        let take_chat_done = Arc::new(Mutex::new(HashMap::new()));
+        let stopping_chats = Arc::new(Mutex::new(HashSet::new()));
+        let mid = 61;
+        let make = |flag: &Arc<AtomicBool>| {
+            active_chats.lock().unwrap().insert(mid, 0u32);
+            take_chat_done.lock().unwrap().insert(mid, flag.clone());
+            TakeChatGuard {
+                active_chats: active_chats.clone(),
+                take_chat_done: take_chat_done.clone(),
+                stopping_chats: stopping_chats.clone(),
+                monitor_id: mid,
+                flag: flag.clone(),
+            }
+        };
+        // Take 1 registers, then take 2 supersedes it (same key, new flag).
+        let flag1 = Arc::new(AtomicBool::new(false));
+        let guard1 = make(&flag1);
+        let flag2 = Arc::new(AtomicBool::new(false));
+        let guard2 = make(&flag2);
+        // Take 1's teardown fires after take 2 took over: both maps keep
+        // take 2's registration (the 💬 badge must not vanish mid-recording).
+        drop(guard1);
+        assert_eq!(active_chats.lock().unwrap().get(&mid), Some(&0));
+        assert!(take_chat_done.lock().unwrap().contains_key(&mid));
+        // Take 2's own teardown is the owner and unregisters everything.
+        stopping_chats.lock().unwrap().insert(mid);
+        drop(guard2);
+        assert!(active_chats.lock().unwrap().is_empty());
+        assert!(take_chat_done.lock().unwrap().is_empty());
+        assert!(stopping_chats.lock().unwrap().is_empty());
     }
 }
