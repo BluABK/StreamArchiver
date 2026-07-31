@@ -3404,7 +3404,22 @@ the app manages the server itself instead of assuming it's running:
 - **Health watchdog**: pings every 30 s. A managed server that crashes is
   restarted (exponential backoff 30 s → 5 min if it keeps dying), with **one**
   🔔 notification per down-episode and the exit status + last log lines in the
-  app log.
+  app log. Three guards keep the watchdog from making things *worse* when the
+  port situation is messy (all three fired for real on 2026-07-31, when a
+  slow ping during a token storm led to a second server half-binding the
+  other address family and every later spawn EADDRINUSE-looping):
+  - A live server's **first missed ping is tolerated** (heavy BotGuard
+    minting can peg node past the 2 s ping timeout) — it's re-checked ~5 s
+    later, and only a second miss triggers a respawn.
+  - A spawned child that **dies to a port race while something else answers
+    `/ping`** is treated as finding an external server — adopted and used —
+    instead of being mis-credited as "up" (which made the watchdog see its
+    "managed server exit" 30 s later and respawn in a loop) or counted as a
+    failed start.
+  - If a respawn attempt has already failed once and a process is **still
+    squatting the port without answering `/ping`**, that wedged listener is
+    killed before the next spawn, so a duplicate/orphaned server can't wedge
+    token serving indefinitely.
 - **On-demand recovery**: when a capture dies with a PO-token error, the app
   brings the server up *first* and then lets the in-flight SABR retry resume
   the **same take** from its `.state` files — no orphaned fragments, no burned

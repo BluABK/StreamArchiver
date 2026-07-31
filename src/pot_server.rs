@@ -65,6 +65,10 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:4416";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a freshly spawned server gets to answer `/ping` before the spawn
 /// counts as failed (node + jsdom startup is a few seconds on a busy disk).
+/// Re-check delay after a live server missed a single /ping (see
+/// `Action::Grace`) — short, so a genuinely wedged server still reaches the
+/// spawn path within ~seconds rather than a full poll interval.
+const GRACE_INTERVAL: Duration = Duration::from_secs(5);
 const STARTUP_WAIT: Duration = Duration::from_secs(15);
 /// Idle re-check interval when the server isn't wanted (nudges cut it short).
 const IDLE_INTERVAL: Duration = Duration::from_secs(300);
@@ -351,11 +355,21 @@ enum Action {
     Healthy,
     /// Wanted but down: (re)spawn.
     Spawn,
+    /// Wanted, not answering, but our own server process is still alive and
+    /// this is its first missed ping — re-check shortly instead of spawning
+    /// a duplicate over it (see the body's comment).
+    Grace,
     /// Not wanted but our child is alive: kill it.
     Kill,
 }
 
-fn watch_action(desired: Desired, autostart: bool, ping_ok: bool, child_alive: bool) -> Action {
+fn watch_action(
+    desired: Desired,
+    autostart: bool,
+    ping_ok: bool,
+    child_alive: bool,
+    ping_failures: u32,
+) -> Action {
     let wanted = match desired {
         Desired::ForcedOn => true,
         Desired::ForcedOff => false,
@@ -365,6 +379,15 @@ fn watch_action(desired: Desired, autostart: bool, ping_ok: bool, child_alive: b
         if child_alive { Action::Kill } else { Action::Idle }
     } else if ping_ok {
         Action::Healthy
+    } else if child_alive && ping_failures < 2 {
+        // Our own (or adopted) server is alive but missed one /ping. That is
+        // NOT yet grounds to spawn a replacement: heavy BotGuard minting can
+        // peg node's event loop past the 2s ping timeout while the server is
+        // perfectly healthy — and spawning over a live server is exactly how
+        // the 2026-07-31 duplicate-server pileup started (the second instance
+        // half-binds the other address family, both stay up, and every later
+        // spawn EADDRINUSE-loops). Give it another tick first.
+        Action::Grace
     } else {
         Action::Spawn
     }
@@ -471,6 +494,10 @@ async fn watchdog_loop(
     // restarts — a restart must not destroy the previous crash's evidence.
     let mut truncated_this_run = false;
     let mut consecutive_failures: u32 = 0;
+    // Consecutive watchdog ticks whose /ping went unanswered — feeds the
+    // Grace decision in `watch_action` (one missed ping of a live server is
+    // tolerated; two means it's really wedged).
+    let mut ping_failures: u32 = 0;
     // One 🔔 notification per down-episode, not one per failed attempt.
     let mut notified_down = false;
     let mut warned_missing_dir = false;
@@ -507,6 +534,11 @@ async fn watchdog_loop(
         }
 
         let ping_info = ping(&cfg.base_url).await;
+        if ping_info.is_some() {
+            ping_failures = 0;
+        } else {
+            ping_failures = ping_failures.saturating_add(1);
+        }
         let child_alive = child.is_some() || adopted.is_some();
 
         // A managed server that died since the last tick is worth a warning
@@ -520,7 +552,8 @@ async fn watchdog_loop(
             );
         }
 
-        match watch_action(desired, cfg.autostart, ping_info.is_some(), child_alive) {
+        match watch_action(desired, cfg.autostart, ping_info.is_some(), child_alive, ping_failures)
+        {
             Action::Idle => {
                 set_status(
                     if desired == Desired::ForcedOff { PotMode::Down } else { PotMode::Disabled },
@@ -533,6 +566,7 @@ async fn watchdog_loop(
                     info!("PO token server healthy again");
                 }
                 consecutive_failures = 0;
+                ping_failures = 0;
                 notified_down = false;
                 warned_missing_dir = false;
                 let mode = match owned_pid_now(&child, adopted) {
@@ -541,6 +575,11 @@ async fn watchdog_loop(
                 };
                 set_status(mode, ping_info);
                 sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
+            }
+            Action::Grace => {
+                // Alive but slow — re-check soon, don't spawn over it.
+                debug!(ping_failures, "PO token server missed a ping; re-checking before acting");
+                sleep_or_nudge(GRACE_INTERVAL, &shutdown).await;
             }
             Action::Kill => {
                 if let Some(pid) = owned_pid_now(&child, adopted) {
@@ -558,6 +597,26 @@ async fn watchdog_loop(
                 set_status(PotMode::Down, None);
             }
             Action::Spawn => {
+                // A previous attempt this episode already failed and something
+                // is STILL squatting the port without answering /ping (a
+                // wedged or half-bound leftover server — e.g. one stuck deep
+                // in BotGuard work, or an orphan from a crashed run). Spawning
+                // under it just EADDRINUSE-loops forever, so clear it first.
+                // Never reached on the first attempt of an episode, and never
+                // for a server that answers pings (that's Action::Healthy).
+                if consecutive_failures >= 1
+                    && let Some(pid) = crate::platform::pid_listening_on(base_url_port(&cfg.base_url))
+                    && pid != std::process::id()
+                    && owned_pid_now(&child, adopted) != Some(pid)
+                {
+                    warn!(
+                        pid,
+                        "a PO token server is squatting the port without answering /ping — \
+                         killing it before respawning"
+                    );
+                    crate::platform::kill_process_tree(pid);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
                 let main_js = std::path::Path::new(&cfg.dir).join("main.js");
                 if !crate::iomon::fs::is_file_sync(crate::iomon::Cat::Startup, &main_js) {
                     if !warned_missing_dir {
@@ -592,38 +651,81 @@ async fn watchdog_loop(
                         *OWNED_PID.lock().unwrap() = Some(pid);
                         // Give it a startup window to answer /ping.
                         let mut up = None;
+                        let mut child_exited = false;
                         let deadline = tokio::time::Instant::now() + STARTUP_WAIT;
                         while tokio::time::Instant::now() < deadline {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             if let Ok(Some(status)) = c.try_wait() {
                                 warn!("PO token server exited during startup ({status})");
+                                child_exited = true;
                                 break;
                             }
                             up = ping(&cfg.base_url).await;
                             if up.is_some() {
+                                // Only creditable to OUR child if it's still
+                                // alive — a child that lost the port race
+                                // exits, and the answer then came from whoever
+                                // holds the port. Claiming "up pid=<child>"
+                                // for that (as this used to) meant the
+                                // watchdog next tick saw its "managed server"
+                                // exit and respawned in a loop, filling the
+                                // log — the 2026-07-31 relaunch churn.
+                                if matches!(c.try_wait(), Ok(Some(_))) {
+                                    child_exited = true;
+                                }
                                 break;
                             }
                         }
-                        if let Some(pi) = up {
-                            info!(pid, version = %pi.version, "PO token server up");
-                            child = Some(c);
-                            consecutive_failures = 0;
-                            notified_down = false;
-                            set_status(PotMode::Managed { pid }, Some(pi));
-                            sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
-                        } else {
-                            // Startup failed: kill the half-started child (it
-                            // never answered, so nothing depends on it yet).
-                            crate::platform::kill_process_tree(pid);
-                            let _ = c.wait().await;
-                            *OWNED_PID.lock().unwrap() = None;
-                            spawn_failed(
-                                &events,
-                                &mut consecutive_failures,
-                                &mut notified_down,
-                                "started but never answered /ping",
-                            );
-                            sleep_or_nudge(spawn_backoff(consecutive_failures), &shutdown).await;
+                        if child_exited && up.is_none() {
+                            // The child is gone; if something else answers the
+                            // port, that's an adoptable server, not a failure.
+                            up = ping(&cfg.base_url).await;
+                        }
+                        match up {
+                            Some(pi) if !child_exited => {
+                                info!(pid, version = %pi.version, "PO token server up");
+                                child = Some(c);
+                                consecutive_failures = 0;
+                                ping_failures = 0;
+                                notified_down = false;
+                                set_status(PotMode::Managed { pid }, Some(pi));
+                                sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
+                            }
+                            Some(pi) => {
+                                // Our child died to the port race but a live
+                                // server IS answering there — use it instead
+                                // of counting a failure and looping.
+                                info!(
+                                    version = %pi.version,
+                                    "another PO token server already answers on this port — \
+                                     using it (external)"
+                                );
+                                let _ = c.wait().await;
+                                *OWNED_PID.lock().unwrap() = None;
+                                let _ = store.set_setting(K_POT_SERVER_PID, "");
+                                let _ = store.set_setting(K_POT_SERVER_PID_START, "");
+                                consecutive_failures = 0;
+                                ping_failures = 0;
+                                notified_down = false;
+                                set_status(PotMode::External, Some(pi));
+                                sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
+                            }
+                            None => {
+                                // Startup failed: kill the half-started child (it
+                                // never answered, so nothing depends on it yet).
+                                crate::platform::kill_process_tree(pid);
+                                let _ = c.wait().await;
+                                *OWNED_PID.lock().unwrap() = None;
+                                let _ = store.set_setting(K_POT_SERVER_PID, "");
+                                let _ = store.set_setting(K_POT_SERVER_PID_START, "");
+                                spawn_failed(
+                                    &events,
+                                    &mut consecutive_failures,
+                                    &mut notified_down,
+                                    "started but never answered /ping",
+                                );
+                                sleep_or_nudge(spawn_backoff(consecutive_failures), &shutdown).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -761,26 +863,33 @@ mod tests {
     fn watch_action_decision_table() {
         use Action::*;
         use Desired::*;
-        // desired, autostart, ping_ok, child_alive => expected
+        // desired, autostart, ping_ok, child_alive, ping_failures => expected
         let table = [
-            (Auto, true, true, true, Healthy),
-            (Auto, true, true, false, Healthy), // external server answering
-            (Auto, true, false, false, Spawn),
-            (Auto, true, false, true, Spawn), // our child up but not answering yet
-            (Auto, false, false, false, Idle),
-            (Auto, false, true, false, Idle), // external running, we don't manage
-            (Auto, false, false, true, Kill), // autostart turned off with child up
-            (ForcedOn, false, false, false, Spawn),
-            (ForcedOn, false, true, false, Healthy),
-            (ForcedOff, true, true, true, Kill),
-            (ForcedOff, true, true, false, Idle), // external stays untouched
-            (ForcedOff, true, false, false, Idle),
+            (Auto, true, true, true, 0, Healthy),
+            (Auto, true, true, false, 0, Healthy), // external server answering
+            (Auto, true, false, false, 1, Spawn),  // nothing alive: no grace
+            // A live server's first missed ping is tolerated (a heavy BotGuard
+            // mint can peg node past the ping timeout); the second is not —
+            // spawning over a live-but-slow server is how the 2026-07-31
+            // duplicate-server pileup started.
+            (Auto, true, false, true, 1, Grace),
+            (Auto, true, false, true, 2, Spawn),
+            (Auto, false, false, false, 1, Idle),
+            (Auto, false, true, false, 0, Idle), // external running, we don't manage
+            (Auto, false, false, true, 1, Kill), // autostart turned off with child up
+            (ForcedOn, false, false, false, 1, Spawn),
+            (ForcedOn, false, true, false, 0, Healthy),
+            (ForcedOn, false, false, true, 1, Grace),
+            (ForcedOff, true, true, true, 0, Kill),
+            (ForcedOff, true, true, false, 0, Idle), // external stays untouched
+            (ForcedOff, true, false, false, 1, Idle),
         ];
-        for (desired, autostart, ping_ok, child_alive, expected) in table {
+        for (desired, autostart, ping_ok, child_alive, ping_failures, expected) in table {
             assert_eq!(
-                watch_action(desired, autostart, ping_ok, child_alive),
+                watch_action(desired, autostart, ping_ok, child_alive, ping_failures),
                 expected,
-                "desired={desired:?} autostart={autostart} ping={ping_ok} child={child_alive}"
+                "desired={desired:?} autostart={autostart} ping={ping_ok} \
+                 child={child_alive} ping_failures={ping_failures}"
             );
         }
     }
