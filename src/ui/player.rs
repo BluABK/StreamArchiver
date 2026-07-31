@@ -486,6 +486,44 @@ pub(super) fn build_player_command(player: &str, t: &StreamTarget) -> std::proce
     cmd
 }
 
+/// Per-launch stderr sink for a live-edge tune-in's tools, under
+/// `logs\player\{channel} - {time} - {tool}.log`.
+///
+/// These tools' stderr used to go straight to `Stdio::null()`, which meant a
+/// live-edge mpv that froze or died left **no evidence anywhere** of why: the
+/// yt-dlp feeding its pipe could have been killed, throttled, or refused a PO
+/// token, and from outside all three look identical — a stopped picture (hit
+/// 2026-07-31). The capture path has had per-tool logs for exactly this reason
+/// all along; the player path never did.
+///
+/// Playback never depends on this: any failure to open the file degrades to
+/// discarding the output, precisely the old behaviour.
+fn player_log(channel: &str, tool: &str) -> std::process::Stdio {
+    use std::process::Stdio;
+    let safe: String = channel
+        .chars()
+        .map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' })
+        .collect();
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+    let dir = crate::app_paths::logs_dir().join("player");
+    if crate::iomon::fs::create_dir_all_sync(crate::iomon::Cat::ToolLog, &dir).is_err() {
+        return Stdio::null();
+    }
+    let path = dir.join(format!("{} - {stamp} - {tool}.log", safe.trim()));
+    match crate::iomon::fs::open_with_sync(crate::iomon::Cat::ToolLog, &path, |o| {
+        o.create(true).append(true);
+    }) {
+        Ok(f) => {
+            tracing::debug!("play-new-instance: {tool} stderr -> {}", path.display());
+            Stdio::from(f)
+        }
+        Err(e) => {
+            warn!("play-new-instance: could not open a {tool} log ({e}) — discarding its output");
+            Stdio::null()
+        }
+    }
+}
+
 /// Log and spawn a player/downloader command built for "play new instance",
 /// returning a status-bar error message on spawn failure.
 pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option<String> {
@@ -1167,7 +1205,9 @@ pub(super) fn spawn_play_new_instance(
             args.push(m.url.clone());
             args.push(resolved_quality(&m.quality));
             let mut cmd = std::process::Command::new("streamlink");
-            cmd.args(&args);
+            // Streamlink spawns mpv itself here, so its stderr is the only
+            // window into BOTH processes for the Twitch path.
+            cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
             let status = spawn_logged(cmd, "streamlink");
             // Only if Streamlink actually started — otherwise the updater would
             // sit on a pipe that can never appear and log a spurious warning.
@@ -1216,16 +1256,20 @@ pub(super) fn spawn_play_new_instance(
             use std::process::Stdio;
             let line = format!("{ytdlp_bin} {}", args.join(" "));
             tracing::info!(%line, "play-new-instance: spawning yt-dlp pipe");
+            // stdout stays piped (it IS the video going into the player);
+            // stderr is the only diagnostic this path has, so keep it.
             match std::process::Command::new(&ytdlp_bin)
                 .args(&args)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(player_log(&row.channel.name, "yt-dlp"))
                 .spawn()
             {
                 Ok(mut child) => {
                     let pipe = child.stdout.take()?;
                     let mut cmd = std::process::Command::new(player);
-                    cmd.arg("-").stdin(Stdio::from(pipe));
+                    cmd.arg("-")
+                        .stdin(Stdio::from(pipe))
+                        .stderr(player_log(&row.channel.name, "player"));
                     apply_live_title_and_spawn_updater(
                         &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
                         title_template_override.unwrap_or(settings.live_title_template.trim()),
@@ -1244,6 +1288,7 @@ pub(super) fn spawn_play_new_instance(
         }
         Tool::Ffmpeg => {
             let mut cmd = std::process::Command::new(player);
+            cmd.stderr(player_log(&row.channel.name, "player"));
             apply_live_title_and_spawn_updater(
                 &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
                 title_template_override.unwrap_or(settings.live_title_template.trim()),

@@ -597,6 +597,15 @@ one), which is removed via the configured
 still kept, just never used to replace anything, so nothing is ever lost to a
 bad check.
 
+**Live-edge player logs.** Every "play at the live edge" tune-in writes its
+tools' stderr to `logs\player\{channel} - {time} - {tool}.log` — the yt-dlp
+feeding the player's pipe and the player itself for YouTube/Kick, or
+Streamlink (which spawns the player itself) for Twitch. These used to be
+discarded, which meant a live-edge window that froze or died left no evidence
+anywhere of why: a killed feeder, a throttle and a refused PO token all look
+identical from outside. Pruned on the same 7-day schedule as the capture logs,
+and a log that can't be opened never blocks playback.
+
 **PO token rejections.** A YouTube SABR capture can die because the platform
 refuses its GVS PO Token (`sps:ATTESTATION_REQUIRED` — yt-dlp raises
 `PoTokenError`). This is **not** a local misconfiguration: the token server

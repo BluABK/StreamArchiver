@@ -148,5 +148,8 @@ pub fn maybe_prune_old_logs(store: &crate::store::Store, now: i64) {
     let log_dir = logs_dir();
     crate::prune_old_logs(&log_dir, 7);
     crate::prune_old_logs(&log_dir.join("captures"), 7);
+    // One file per live-edge tune-in (see `ui::player::player_log`) — small,
+    // but one per click adds up without the same retention as the rest.
+    crate::prune_old_logs(&log_dir.join("player"), 7);
     crate::prune_old_logs(&log_dir.join("iomon"), crate::iomon::SAMPLE_LOG_KEEP_DAYS);
 }
