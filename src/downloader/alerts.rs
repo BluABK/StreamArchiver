@@ -95,6 +95,16 @@ pub(super) fn classify_line(line: &str) -> Option<LineHit> {
         return Some(LineHit { kind: "tool_warning", severity: "warning", lost: None });
     }
 
+    // GVS PO-token rejections, matched BEFORE the generic hard-error rule
+    // (the PoTokenError traceback contains `yt_dlp.utils.DownloadError` and
+    // would otherwise toast as a raw "Capture tool error" — observed
+    // 2026-07-31). Their own kind gets the friendly platform-side
+    // explanation in `alert_message`, and the scanner keys them to the same
+    // per-take row the supervisor's 🎫 filing uses (see `on_output`).
+    if crate::models::po_token_rejected(l) {
+        return Some(LineHit { kind: "po_token_rejected", severity: "error", lost: None });
+    }
+
     // yt-dlp hard errors.
     if l.starts_with("ERROR:") || l.contains("yt_dlp.utils.DownloadError") {
         return Some(LineHit { kind: "tool_error", severity: "error", lost: None });
@@ -371,6 +381,11 @@ impl Supervisor {
             // that fires again after an Ack still resurfaces.
             let take_key = if *hit_kind == "youtube_experiment" {
                 experiment_take_key(st.monitor_id, ref_id, last_line)
+            } else if *hit_kind == "po_token_rejected" && kind == DetachedKind::Recording {
+                // Same key the supervisor's 🎫 filing and the finalize
+                // catch-all use — every path that notices this take's PO
+                // rejection lands on ONE row.
+                format!("po_token:rec{ref_id}")
             } else {
                 log_path.to_string_lossy().into_owned()
             };
@@ -736,6 +751,13 @@ fn alert_message(
             )
         }
         "tool_error" => (format!("Capture tool error — {label}"), last_line.to_string()),
+        "po_token_rejected" => (
+            format!("🎫 PO token rejected — {label}"),
+            format!(
+                "YouTube refused the capture's GVS PO token (ATTESTATION_REQUIRED) — a                  platform-side condition that clears on its own; the token server keeps                  minting fresh tokens. The capture retries with an escalating 5–15 minute                  cooldown.
+{last_line}"
+            ),
+        ),
         "youtube_experiment" => (
             format!("Platform experiment on {label}'s stream"),
             format!(
@@ -841,6 +863,18 @@ mod tests {
         assert_eq!(
             classify_line("WARNING: [youtube] Some formats are missing").unwrap().severity,
             "warning"
+        );
+
+        // PO-token rejections classify as their own kind — NOT the generic
+        // tool_error, whose raw-traceback toast they used to wear — even
+        // though the traceback also matches the DownloadError rule below.
+        assert_eq!(
+            classify_line(
+                "yt_dlp.utils.DownloadError: This stream requires a GVS PO Token to continue                  and the one provided is invalid"
+            )
+            .unwrap()
+            .kind,
+            "po_token_rejected"
         );
 
         // Platform experiments — the verbatim line from the 2026-07-31

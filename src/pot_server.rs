@@ -367,7 +367,12 @@ fn watch_action(
     desired: Desired,
     autostart: bool,
     ping_ok: bool,
-    child_alive: bool,
+    // A server process is live: our child, an adopted pid, OR any foreign
+    // listener on the configured port. A busy external server deserves the
+    // same missed-ping grace as our own — relaunching mid-token-storm used
+    // to spawn over the previous session's still-working server on its
+    // first missed ping (2026-07-31 20:17).
+    server_present: bool,
     ping_failures: u32,
 ) -> Action {
     let wanted = match desired {
@@ -376,17 +381,17 @@ fn watch_action(
         Desired::Auto => autostart,
     };
     if !wanted {
-        if child_alive { Action::Kill } else { Action::Idle }
+        if server_present { Action::Kill } else { Action::Idle }
     } else if ping_ok {
         Action::Healthy
-    } else if child_alive && ping_failures < 2 {
-        // Our own (or adopted) server is alive but missed one /ping. That is
-        // NOT yet grounds to spawn a replacement: heavy BotGuard minting can
-        // peg node's event loop past the 2s ping timeout while the server is
-        // perfectly healthy — and spawning over a live server is exactly how
-        // the 2026-07-31 duplicate-server pileup started (the second instance
-        // half-binds the other address family, both stay up, and every later
-        // spawn EADDRINUSE-loops). Give it another tick first.
+    } else if server_present && ping_failures < 3 {
+        // A live server missed a /ping (or two). That is NOT yet grounds to
+        // spawn a replacement: a BotGuard mint pegs node's event loop for
+        // seconds at a time while the server is perfectly healthy — and
+        // spawning over a live server is exactly how the 2026-07-31
+        // duplicate-server pileup started (the second instance half-binds
+        // the other address family, both stay up, and every later spawn
+        // EADDRINUSE-loops). Three strikes before acting.
         Action::Grace
     } else {
         Action::Spawn
@@ -405,9 +410,18 @@ fn spawn_backoff(consecutive_failures: u32) -> Duration {
 }
 
 /// `GET {base}/ping` — `Some(PingInfo)` iff a bgutil server answered.
+/// 4s, not 2: a healthy server can spend seconds inside one BotGuard mint
+/// (node's event loop pegs), and every false ping miss walks the watchdog one
+/// step toward replacing a working server.
 pub async fn ping(base_url: &str) -> Option<PingInfo> {
+    ping_with(base_url, Duration::from_secs(4)).await
+}
+
+/// [`ping`] with an explicit timeout (the pre-kill last-chance probe waits
+/// far longer than the routine health check).
+async fn ping_with(base_url: &str, timeout: Duration) -> Option<PingInfo> {
     let url = format!("{}/ping", base_url.trim_end_matches('/'));
-    let resp = http().get(&url).timeout(Duration::from_secs(2)).send().await.ok()?;
+    let resp = http().get(&url).timeout(timeout).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -539,7 +553,13 @@ async fn watchdog_loop(
         } else {
             ping_failures = ping_failures.saturating_add(1);
         }
-        let child_alive = child.is_some() || adopted.is_some();
+        // A foreign listener on the port counts as a present server for the
+        // missed-ping grace (only looked up when the ping just failed — one
+        // TCP-table read per degraded tick, nothing on the happy path).
+        let foreign_listener = ping_info.is_none()
+            && crate::platform::pid_listening_on(base_url_port(&cfg.base_url))
+                .is_some_and(|p| p != std::process::id());
+        let child_alive = child.is_some() || adopted.is_some() || foreign_listener;
 
         // A managed server that died since the last tick is worth a warning
         // with whatever it last wrote — even if an external one answered the
@@ -609,6 +629,25 @@ async fn watchdog_loop(
                     && pid != std::process::id()
                     && owned_pid_now(&child, adopted) != Some(pid)
                 {
+                    // Last chance before the kill: one generous ping. A server
+                    // deep in BotGuard work answers slowly, not never — killing
+                    // it mid-token-storm just replaces a warm server with a
+                    // cold one that's even slower, which is how a kill/respawn
+                    // loop starts. Only a listener that stays silent for a
+                    // full 10s is treated as wedged.
+                    if let Some(pi) = ping_with(&cfg.base_url, Duration::from_secs(10)).await {
+                        info!(
+                            pid,
+                            version = %pi.version,
+                            "port owner answered a slow ping — adopting as external instead of killing"
+                        );
+                        consecutive_failures = 0;
+                        ping_failures = 0;
+                        notified_down = false;
+                        set_status(PotMode::External, Some(pi));
+                        sleep_or_nudge(POLL_INTERVAL, &shutdown).await;
+                        continue;
+                    }
                     warn!(
                         pid,
                         "a PO token server is squatting the port without answering /ping — \
@@ -863,33 +902,35 @@ mod tests {
     fn watch_action_decision_table() {
         use Action::*;
         use Desired::*;
-        // desired, autostart, ping_ok, child_alive, ping_failures => expected
+        // desired, autostart, ping_ok, server_present, ping_failures => expected
         let table = [
             (Auto, true, true, true, 0, Healthy),
             (Auto, true, true, false, 0, Healthy), // external server answering
             (Auto, true, false, false, 1, Spawn),  // nothing alive: no grace
-            // A live server's first missed ping is tolerated (a heavy BotGuard
-            // mint can peg node past the ping timeout); the second is not —
-            // spawning over a live-but-slow server is how the 2026-07-31
-            // duplicate-server pileup started.
+            // A live server (ours, adopted, OR a foreign listener on the
+            // port) gets three missed pings of grace before any spawn — a
+            // BotGuard mint pegs node for seconds, and both halves of the
+            // 2026-07-31 incidents started with a premature spawn over a
+            // busy-but-healthy server.
             (Auto, true, false, true, 1, Grace),
-            (Auto, true, false, true, 2, Spawn),
+            (Auto, true, false, true, 2, Grace),
+            (Auto, true, false, true, 3, Spawn),
             (Auto, false, false, false, 1, Idle),
             (Auto, false, true, false, 0, Idle), // external running, we don't manage
             (Auto, false, false, true, 1, Kill), // autostart turned off with child up
             (ForcedOn, false, false, false, 1, Spawn),
             (ForcedOn, false, true, false, 0, Healthy),
-            (ForcedOn, false, false, true, 1, Grace),
+            (ForcedOn, false, false, true, 2, Grace),
             (ForcedOff, true, true, true, 0, Kill),
             (ForcedOff, true, true, false, 0, Idle), // external stays untouched
             (ForcedOff, true, false, false, 1, Idle),
         ];
-        for (desired, autostart, ping_ok, child_alive, ping_failures, expected) in table {
+        for (desired, autostart, ping_ok, server_present, ping_failures, expected) in table {
             assert_eq!(
-                watch_action(desired, autostart, ping_ok, child_alive, ping_failures),
+                watch_action(desired, autostart, ping_ok, server_present, ping_failures),
                 expected,
                 "desired={desired:?} autostart={autostart} ping={ping_ok} \
-                 child={child_alive} ping_failures={ping_failures}"
+                 present={server_present} ping_failures={ping_failures}"
             );
         }
     }

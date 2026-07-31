@@ -481,6 +481,11 @@ fn handle(store: &Store, ev: AppEvent) {
                 };
                 let mut content = content;
                 content.lines = body.lines().map(str::to_string).collect();
+                // No banner hero on error toasts: a decorative banner blown
+                // up over an error message reads as broken (girl_dm_'s
+                // near-black banner rendered as a huge empty box), and the
+                // avatar logo already identifies the channel.
+                content.hero = None;
                 show_toast(content);
             }
             return;

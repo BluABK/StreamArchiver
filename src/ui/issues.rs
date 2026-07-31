@@ -537,6 +537,9 @@ impl StreamArchiverApp {
                                     ),
                                     None => (None, None),
                                 };
+                                // Same stable-id treatment as the Warnings
+                                // rows — see the comment there.
+                                ui.push_id(r.id, |ui| {
                                 egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         // Unread rows show a filled accent dot; read rows a dim one.
@@ -656,6 +659,7 @@ impl StreamArchiverApp {
                                             },
                                         );
                                     });
+                                });
                                 });
                             }
                         });
@@ -986,6 +990,13 @@ impl StreamArchiverApp {
                                 ),
                                 None => (None, None),
                             };
+                            // Stable per-row id scope: without it, every
+                            // widget id below derives from the row's ORDER,
+                            // so a new alert arriving on the 3s refresh
+                            // shifted every id and egui dropped any text
+                            // selection in progress — copying was impossible
+                            // while alerts were coming in.
+                            ui.push_id(r.id, |ui| {
                             egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let (icon, kind_label) = alert_kind_label(&r.kind);
@@ -1191,6 +1202,7 @@ impl StreamArchiverApp {
                                         },
                                     );
                                 });
+                            });
                             });
                         }
                     });
