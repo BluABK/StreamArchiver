@@ -111,6 +111,21 @@ plainly visible on its sub-row yet filtering for it found nothing, because
 the top-level row only carries the primary instance's *current* title —
 blank while offline.
 
+The grid then shows you **where the hit lives**, since a surviving channel
+row alone can't tell you which of its instances matched:
+
+- The **instance / stream / take rows that contain the match are tinted
+  teal** — including a collapsed instance whose hit sits inside its
+  unexpanded stream history, so "expand the tinted rows" is the whole
+  trail from channel to matching stream. An instance whose own data
+  *doesn't* match stays untinted (a channel kept visible by its YouTube
+  instance's stream title no longer makes its Twitch instance look equally
+  relevant), and a filter satisfied purely at channel level (e.g. the
+  channel name) tints no instance at all.
+- The **matched substring itself is highlighted** in the Game/Title cells
+  that display it, on every row level, so you can see at a glance *why* a
+  row is in the result.
+
 ### Streams (live monitoring)
 
 A **channel** is a *container* (just a name) holding one or more **instances**.

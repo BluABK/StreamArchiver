@@ -11,6 +11,15 @@ pub(super) const SUCCESS_GREEN: egui::Color32 = egui::Color32::from_rgb(0x57, 0x
 /// (red). Recording + keyboard-selected rows reuse the theme's selection accent.
 pub(super) const HL_AD: egui::Color32 = egui::Color32::from_rgb(0x7a, 0x5a, 0x12);
 pub(super) const HL_ERROR: egui::Color32 = egui::Color32::from_rgb(0x6e, 0x2f, 0x2f);
+/// Row tint for a sub-row that CONTAINS a deep-filter match (see
+/// [`FilterHits`]) — a dim teal, deliberately distinct from the ad amber,
+/// error red, and the theme-accent recording/selection tints it can sit
+/// among. Lowest priority: any state tint wins over it.
+pub(super) const HL_FILTER_HIT: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x4f, 0x52);
+/// Background painted behind the matched substring itself inside a text cell
+/// (see [`highlight_text_label`]) — brighter than [`HL_FILTER_HIT`] so the
+/// match pops even on an already-tinted row.
+pub(super) const HL_FILTER_TEXT_BG: egui::Color32 = egui::Color32::from_rgb(0x2e, 0x86, 0x8c);
 /// Readable red for inline error/validation *text* (the row tint [`HL_ERROR`] is
 /// too dark to read as a foreground colour).
 pub(super) const HL_ERROR_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
@@ -366,11 +375,13 @@ pub(super) fn tags_cell(ui: &mut egui::Ui, tags: &str, language: &str) {
     ui.add(egui::Label::new(tags).truncate()).on_hover_text(hover);
 }
 
-pub(super) fn meta_value_cell(ui: &mut egui::Ui, value: &str) {
+pub(super) fn meta_value_cell(ui: &mut egui::Ui, value: &str, hl: Option<&str>) {
     if value.is_empty() {
         return;
     }
-    ui.add(egui::Label::new(value).truncate());
+    // `hl` = the column's active filter needle — the matched substring gets
+    // the highlight pill so a filtered grid shows WHY this row is here.
+    highlight_text_label(ui, value, hl);
 }
 
 /// Render a name as a plain label, or — when `cid` is `Some` (it resolves to
@@ -996,6 +1007,176 @@ pub(super) fn ordered_rows(rows: &[Vec<Cell>], sort: &SortState, filters: &[Stri
     idx
 }
 
+/// The Streams grid's active column filters, resolved to `(column id,
+/// lowercase needle)` pairs — the render-side companion to the deep filter in
+/// [`ordered_rows`]. Where that decides which channel rows *survive*, this
+/// marks where the match actually *lives* once you look at the survivors:
+/// which instance/stream/take rows contain it (row tint, [`HL_FILTER_HIT`])
+/// and which substring matched (text highlight, [`highlight_text_label`]).
+/// Without it, a channel kept visible by a collapsed YouTube instance's
+/// stream title looks identical to one kept by its Twitch instance — exactly
+/// the reported confusion.
+pub(super) struct FilterHits {
+    /// One entry per non-empty filter box.
+    active: Vec<(&'static str, String)>,
+}
+
+/// `Some(matched)` when a column's filter has row-level data to test on this
+/// row kind, `None` when the column only exists at channel level (neutral —
+/// it can neither confirm nor rule out this row).
+type ColMatch = Option<bool>;
+
+impl FilterHits {
+    /// Resolve the header filter boxes (indexed by `STREAM_COLUMNS` position)
+    /// into active `(id, lowercase needle)` pairs. `None` when no filter is
+    /// set — callers skip all hit work in the common case.
+    pub(super) fn from_filters(filters: &[String]) -> Option<FilterHits> {
+        let active: Vec<(&'static str, String)> = filters
+            .iter()
+            .enumerate()
+            .filter_map(|(c, f)| {
+                let f = f.trim().to_lowercase();
+                (!f.is_empty()).then(|| (STREAM_COLUMNS.get(c).map(|col| col.id).unwrap_or(""), f))
+            })
+            .collect();
+        (!active.is_empty()).then_some(FilterHits { active })
+    }
+
+    /// The lowercase needle filtering `col_id`, if any — for highlighting the
+    /// matched substring inside that column's text cells.
+    pub(super) fn needle(&self, col_id: &str) -> Option<&str> {
+        self.active.iter().find(|(id, _)| *id == col_id).map(|(_, n)| n.as_str())
+    }
+
+    /// Fold one column's verdict into the row decision. The row is a hit when
+    /// every active filter is matched-or-neutral AND at least one actually
+    /// matched at this row's level — all-neutral means the filters were
+    /// satisfied purely by channel-level values (e.g. the channel name), and
+    /// tinting every sub-row for that would just be noise.
+    fn resolve(verdicts: impl Iterator<Item = ColMatch>) -> bool {
+        let mut any = false;
+        for v in verdicts {
+            match v {
+                Some(true) => any = true,
+                Some(false) => return false,
+                None => {}
+            }
+        }
+        any
+    }
+
+    /// Does THIS instance contain the filters' matches — its own values plus
+    /// its logged title/category history (`rec_texts`, the same per-monitor
+    /// haystacks the deep filter uses), so a hit inside a *collapsed* stream
+    /// history still marks the instance row that holds it.
+    pub(super) fn instance_hit(
+        &self,
+        m: &MonitorWithChannel,
+        rec_texts: Option<&(String, String)>,
+    ) -> bool {
+        let has = |s: &str, f: &str| s.to_lowercase().contains(f);
+        Self::resolve(self.active.iter().map(|(id, f)| -> ColMatch {
+            match *id {
+                "name" => Some(has(&m.monitor.url, f)),
+                "platform" => Some(has(m.monitor.platform().label(), f)),
+                "tool" => Some(has(m.monitor.tool.label(), f)),
+                "detection" => Some(has(m.monitor.detection_method.label(), f)),
+                "game" => Some(
+                    has(&m.last_game, f)
+                        || has(&m.last_recording_category, f)
+                        || rec_texts.is_some_and(|(_, c)| c.contains(f.as_str())),
+                ),
+                "title" => Some(
+                    has(&m.last_title, f)
+                        || has(&m.last_recording_title, f)
+                        || rec_texts.is_some_and(|(t, _)| t.contains(f.as_str())),
+                ),
+                "collab" => Some(m.live_collab.as_ref().is_some_and(|c| has(&c.names(), f))),
+                "tags" => Some(has(&m.last_tags, f)),
+                _ => None,
+            }
+        }))
+    }
+
+    /// Does this stream row (any of its takes) contain the matches. `collab`
+    /// is the broadcast's stored collab names, when known.
+    pub(super) fn stream_hit(&self, g: &crate::models::StreamGroup, collab: Option<&str>) -> bool {
+        Self::resolve(self.active.iter().map(|(id, f)| -> ColMatch {
+            match *id {
+                "game" => Some(g.takes.iter().any(|t| t.category.to_lowercase().contains(f.as_str()))),
+                "title" => Some(g.takes.iter().any(|t| t.title.to_lowercase().contains(f.as_str()))),
+                "collab" => Some(collab.is_some_and(|c| c.to_lowercase().contains(f.as_str()))),
+                _ => None,
+            }
+        }))
+    }
+
+    /// Does this single take contain the matches.
+    pub(super) fn take_hit(&self, t: &crate::models::Recording) -> bool {
+        Self::resolve(self.active.iter().map(|(id, f)| -> ColMatch {
+            match *id {
+                "game" => Some(t.category.to_lowercase().contains(f.as_str())),
+                "title" => Some(t.title.to_lowercase().contains(f.as_str())),
+                _ => None,
+            }
+        }))
+    }
+}
+
+/// A truncating label that paints every case-insensitive occurrence of
+/// `needle` in `text` on a [`HL_FILTER_TEXT_BG`] pill — how a filtered grid
+/// shows *which part* of a cell matched. Falls back to a plain label when
+/// there's no needle or no occurrence, so unfiltered rendering pays nothing.
+pub(super) fn highlight_text_label(ui: &mut egui::Ui, text: &str, needle: Option<&str>) {
+    let Some(needle) = needle.filter(|n| !n.is_empty()) else {
+        ui.add(egui::Label::new(text).truncate());
+        return;
+    };
+    let lower = text.to_lowercase();
+    if !lower.contains(needle) {
+        ui.add(egui::Label::new(text).truncate());
+        return;
+    }
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui
+        .style()
+        .visuals
+        .override_text_color
+        .unwrap_or_else(|| ui.visuals().text_color());
+    let mut job = egui::text::LayoutJob::default();
+    let mut pos = 0;
+    // Walk the LOWERCASED text for match positions, slice the ORIGINAL text
+    // at the same byte offsets — `to_lowercase` can change byte length for a
+    // handful of scripts, but per-char lowercasing of the kinds of text here
+    // (titles/categories) is length-stable; a mismatch would only ever skew
+    // which chars get the pill, never panic, since `find` offsets are always
+    // char boundaries of `lower` and `get` guards the original slice.
+    while let Some(rel) = lower[pos..].find(needle) {
+        let (start, end) = (pos + rel, pos + rel + needle.len());
+        let (Some(before), Some(hit)) = (text.get(pos..start), text.get(start..end)) else {
+            break; // boundary skew — bail to plain text for the rest
+        };
+        job.append(before, 0.0, egui::TextFormat::simple(font_id.clone(), color));
+        job.append(
+            hit,
+            0.0,
+            egui::TextFormat {
+                font_id: font_id.clone(),
+                color: egui::Color32::WHITE,
+                background: HL_FILTER_TEXT_BG,
+                ..Default::default()
+            },
+        );
+        pos = end;
+    }
+    job.append(
+        text.get(pos..).unwrap_or(""),
+        0.0,
+        egui::TextFormat::simple(font_id, color),
+    );
+    ui.add(egui::Label::new(job).truncate());
+}
+
 /// Render one sortable + optionally filterable header cell for column `idx`: a
 /// click-to-sort title (with ▲/▼ when active, plus a plain-digit level ordinal
 /// when the sort is multi-level) above a filter box. Plain click = sole key;
@@ -1054,7 +1235,10 @@ pub(super) fn sort_filter_header(
                  sub-rows (Streams), it also matches values on collapsed \
                  sub-rows — an instance's URL/tool, and every title/category \
                  its stream history ever logged — keeping the channel row \
-                 visible; expand it to see the matching entry.",
+                 visible. The instance / stream / take rows that actually \
+                 contain the match are tinted teal (expand to follow the \
+                 trail), and the matched text itself is highlighted in the \
+                 cells that show it.",
             );
         }
     });
@@ -2083,6 +2267,9 @@ pub(super) fn render_instance_row(
     // read from this snapshot, to avoid acting on a stale target).
     raid_out: Option<&crate::models::StreamEventRow>,
     order: &[usize],
+    // Active header filters, for the matched-substring highlight in the
+    // game/title cells.
+    fhits: Option<&FilterHits>,
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -2720,11 +2907,11 @@ pub(super) fn render_instance_row(
                 // to the last-detected game so a live-not-recording channel
                 // still shows it.
                 let v = if rec.active { &row.last_recording_category } else { &row.last_game };
-                meta_value_cell(ui, v);
+                meta_value_cell(ui, v, fhits.and_then(|f| f.needle("game")));
             }
             "title" => {
                 let v = if rec.active { &row.last_recording_title } else { &row.last_title };
-                meta_value_cell(ui, v);
+                meta_value_cell(ui, v, fhits.and_then(|f| f.needle("title")));
             }
             "collab" => {
                 if let Some(c) = &row.live_collab {
@@ -2940,6 +3127,64 @@ mod tests {
         filters[idx("name")].clear();
         filters[idx("tool")] = "streamlink".into();
         assert_eq!(ordered_rows(&model, &sort, &filters), vec![0], "instance tool matches");
+    }
+
+    /// Hit marking answers "the channel survived — WHERE is the match?":
+    /// only the instance whose data (incl. collapsed history) contains it
+    /// gets marked, and channel-level-only matches mark no instance at all.
+    #[test]
+    fn filter_hits_mark_the_instance_that_contains_the_match() {
+        let filters_for = |col: &str, needle: &str| {
+            let mut f = vec![String::new(); STREAM_COLS];
+            f[STREAM_COLUMNS.iter().position(|c| c.id == col).unwrap()] = needle.into();
+            FilterHits::from_filters(&f).expect("one active filter")
+        };
+        assert!(FilterHits::from_filters(&vec![String::new(); STREAM_COLS]).is_none());
+
+        // Two instances of one channel; the match lives in the second one's
+        // (collapsed) stream history — the user's Nihmune shape.
+        let twitch = test_row(1, "offline", None, None, None, false);
+        let mut youtube = test_row(2, "offline", None, None, None, false);
+        youtube.monitor.url = "https://youtube.com/channel/UC_x".into();
+        let yt_history = ("【hololive dreams】 pwetty vtubers…".to_string(), String::new());
+
+        let fh = filters_for("title", "hololive dreams");
+        assert!(!fh.instance_hit(&twitch, None), "no title data → not marked");
+        assert!(fh.instance_hit(&youtube, Some(&yt_history)), "history hit → marked");
+
+        // An instance whose title data exists but doesn't match is ruled OUT
+        // even if another column would be neutral.
+        let mut twitch_titled = twitch.clone();
+        twitch_titled.last_recording_title = "CYBERPUNK FINALE!!".into();
+        assert!(!fh.instance_hit(&twitch_titled, None));
+
+        // A channel-level-only filter (e.g. a date column) marks nothing:
+        // all-neutral must not read as "hit".
+        let fh_added = filters_for("added", "2026");
+        assert!(!fh_added.instance_hit(&youtube, Some(&yt_history)));
+
+        // Instance-level Name data is the URL.
+        let fh_name = filters_for("name", "youtube.com");
+        assert!(fh_name.instance_hit(&youtube, None));
+        assert!(!fh_name.instance_hit(&twitch, None));
+
+        // Stream/take hits read the takes' own logged values.
+        let mut t = crate::models::Recording::test_stub();
+        t.title = "【Hololive Dreams】 pwetty vtubers…".into();
+        t.category = "Just Chatting".into();
+        assert!(fh.take_hit(&t));
+        let g = crate::models::StreamGroup {
+            key: "k".into(),
+            stream_id: None,
+            went_live_at: None,
+            went_live_approx: true,
+            takes: vec![t],
+        };
+        assert!(fh.stream_hit(&g, None));
+        assert!(!filters_for("game", "dark souls").stream_hit(&g, None));
+        // Needle lookup drives the text highlight.
+        assert_eq!(fh.needle("title"), Some("hololive dreams"));
+        assert_eq!(fh.needle("game"), None);
     }
 
     /// The deep haystack is filter-only plumbing: values can't run together

@@ -1639,6 +1639,22 @@ impl StreamArchiverApp {
         if filters.len() != STREAM_COLS {
             filters = vec![String::new(); STREAM_COLS];
         }
+        // Active filters resolved for hit marking (row tints + matched-text
+        // highlight), and the set of instances whose data — including the
+        // collapsed stream history — contains the matches. Recomputed per
+        // frame only while a filter is set; a plain grid skips all of it.
+        let fhits = FilterHits::from_filters(&filters);
+        let hit_instances: HashSet<i64> = match &fhits {
+            Some(fh) => {
+                let deep = self.deep_filter_texts.as_ref().map(|(_, t)| t);
+                self.rows
+                    .iter()
+                    .filter(|r| fh.instance_hit(r, deep.and_then(|d| d.get(&r.monitor.id))))
+                    .map(|r| r.monitor.id)
+                    .collect()
+            }
+            None => HashSet::new(),
+        };
         // Whether status row tints are drawn (top-bar "Status bgcolor" toggle).
         let status_bgcolor = self.status_bgcolor;
         // Whether the Actions column is shown (Settings → Display). When off it's
@@ -1795,7 +1811,7 @@ impl StreamArchiverApp {
                                     active_ids, &finalizing_ids, &active_chat_ids,
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
-                                    &mut out, &cache.platform_pref,
+                                    fhits.as_ref(), &mut out, &cache.platform_pref,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -1809,6 +1825,8 @@ impl StreamArchiverApp {
                                     &exp_instances, instance_avatars,
                                     &stop_holds_snapshot, &ad_running, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
+                                    hit_instances.contains(&self.rows[ri].monitor.id),
+                                    fhits.as_ref(),
                                     &mut out,
                                 );
                             }
@@ -1828,7 +1846,7 @@ impl StreamArchiverApp {
                                     current_recording_group.as_ref().map(|(id, name)| (*id, name.as_str())),
                                     now,
                                     &col_order, &self.rec_alert_badges,
-                                    active_ids, &finalizing_ids, &mut out,
+                                    active_ids, &finalizing_ids, fhits.as_ref(), &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -1842,7 +1860,7 @@ impl StreamArchiverApp {
                                     &mut self.rename_preview,
                                     &mut self.show_rename_dialog, now, &col_order,
                                     &self.rec_alert_badges,
-                                    active_ids, &finalizing_ids, &mut out,
+                                    active_ids, &finalizing_ids, fhits.as_ref(), &mut out,
                                 );
                             }
                             Vis::VodJob { mid, gi, ti, kind, depth } => {
@@ -2729,6 +2747,10 @@ impl StreamArchiverApp {
         col_order: &[usize],
         // Recent viewer samples per monitor for the 👁 sparkline (last hour).
         spark: &HashMap<i64, Vec<(i64, i64)>>,
+        // Active header filters — the channel row itself is never hit-tinted
+        // (surviving the filter IS its marker), but its game/title text still
+        // gets the matched-substring highlight.
+        fhits: Option<&FilterHits>,
         out: &mut StreamsOut,
         platform_pref: &crate::platform_pref::PlatformPrefCtx,
     ) {
@@ -3111,10 +3133,10 @@ impl StreamArchiverApp {
                         }
                     }
                     "game" => {
-                        meta_value_cell(ui, &cur_category);
+                        meta_value_cell(ui, &cur_category, fhits.and_then(|f| f.needle("game")));
                     }
                     "title" => {
-                        meta_value_cell(ui, &cur_title);
+                        meta_value_cell(ui, &cur_title, fhits.and_then(|f| f.needle("title")));
                     }
                     "collab" => {
                         if let Some(pcid) =
@@ -3352,6 +3374,12 @@ impl StreamArchiverApp {
         col_order: &[usize],
         // Recent viewer samples per monitor for the 👁 sparkline (last hour).
         spark: &HashMap<i64, Vec<(i64, i64)>>,
+        // Whether THIS instance contains the active filters' matches
+        // (precomputed `FilterHits::instance_hit` — needs the deep history
+        // map, which lives on `self`), plus the filters themselves for the
+        // text highlight inside cells.
+        filter_hit: bool,
+        fhits: Option<&FilterHits>,
         out: &mut StreamsOut,
     ) {
         let mid = row.monitor.id;
@@ -3372,7 +3400,11 @@ impl StreamArchiverApp {
             is_selected,
             sel_color,
             status_bgcolor,
-        );
+        )
+        // Lowest priority: mark the instance whose (possibly collapsed)
+        // data contains the active filters' matches — the answer to "the
+        // channel survived the filter, but WHERE is the hit?".
+        .or_else(|| filter_hit.then_some(HL_FILTER_HIT));
         let inst_needs_remux = groups.get(&mid)
             .map(|gs| {
                 gs.iter()
@@ -3466,7 +3498,7 @@ impl StreamArchiverApp {
             rows,
             channel_name_colors,
             latest_raid_out.get(&mid),
-            col_order, &mut out.acts,
+            col_order, fhits, &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
         }
@@ -3611,13 +3643,29 @@ impl StreamArchiverApp {
         // than a possibly-stale DB status).
         active_ids: &HashSet<i64>,
         finalizing_ids: &HashSet<i64>,
+        // Active header filters, for marking rows/text that contain the
+        // match (`None` = no filter set).
+        fhits: Option<&FilterHits>,
         out: &mut StreamsOut,
     ) {
+        // The broadcast's stored collab names — shared by the collab cell
+        // below and the filter-hit check here.
+        let stream_collab = g
+            .stream_id
+            .as_ref()
+            .and_then(|sid| collab_by_stream.get(&(mid, sid.clone())));
         // Multi-select tint (ctrl/shift-click) — see `selected_streams`'s doc
-        // comment. Stream rows otherwise carry no background tint at all
-        // (status is conveyed by the state icon column only), so this is
-        // the only case that paints one.
-        let tint = selected_streams.contains_key(&g.key).then_some(sel_color);
+        // comment. Stream rows otherwise carry no tint, EXCEPT when a header
+        // filter's match lives in this stream (deep filter) — then the row
+        // gets the dim hit tint so the match is traceable after expanding.
+        let tint = selected_streams
+            .contains_key(&g.key)
+            .then_some(sel_color)
+            .or_else(|| {
+                fhits
+                    .is_some_and(|f| f.stream_hit(g, stream_collab.map(String::as_str)))
+                    .then_some(HL_FILTER_HIT)
+            });
         // Both must agree: the DB status ties the live process to THIS
         // broadcast specifically (the monitor could already be capturing a
         // newer one while an older StreamGroup's row is still on screen),
@@ -3877,16 +3925,15 @@ impl StreamArchiverApp {
                         }
                     }
                     "game" => {
-                        meta_value_cell(ui, g.category());
+                        meta_value_cell(ui, g.category(), fhits.and_then(|f| f.needle("game")));
                     }
                     "title" => {
-                        meta_value_cell(ui, g.title());
+                        meta_value_cell(ui, g.title(), fhits.and_then(|f| f.needle("title")));
                     }
                     "collab" => {
                         // Stored collab of this past/current broadcast, from
                         // the preloaded (monitor, stream id) → names map.
-                        if let Some(sid) = &g.stream_id
-                            && let Some(names) = collab_by_stream.get(&(mid, sid.clone()))
+                        if let Some(names) = stream_collab
                         {
                             ui.add(egui::Label::new(names).truncate()).on_hover_text(
                                 "Who this broadcast was streamed together with \
@@ -4292,9 +4339,15 @@ impl StreamArchiverApp {
         // comment on `stream_row`'s copy of these parameters.
         active_ids: &HashSet<i64>,
         finalizing_ids: &HashSet<i64>,
+        // Active header filters, for marking rows/text that contain the
+        // match (`None` = no filter set).
+        fhits: Option<&FilterHits>,
         out: &mut StreamsOut,
     ) {
         let t = &g.takes[ti];
+        // Take rows normally carry no tint at all; the deep-filter hit tint
+        // is the one exception (same rationale as `stream_row`'s).
+        let tint = fhits.is_some_and(|f| f.take_hit(t)).then_some(HL_FILTER_HIT);
         // This specific take must be the DB's current "recording" one (not
         // an older take of the same multi-take stream) AND the live
         // process/finalize state must agree — see `stream_row`'s comment.
@@ -4310,7 +4363,7 @@ impl StreamArchiverApp {
         let media_player = settings.media_player_path.trim().to_string();
         {
             for &ci2 in col_order {
-                tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci2].id {
                     "actions" => {
                         ui.push_id(t.id, |ui| {
                             if ui
@@ -4513,10 +4566,10 @@ impl StreamArchiverApp {
                         }
                     }
                     "game" => {
-                        meta_value_cell(ui, &t.category);
+                        meta_value_cell(ui, &t.category, fhits.and_then(|f| f.needle("game")));
                     }
                     "title" => {
-                        meta_value_cell(ui, &t.title);
+                        meta_value_cell(ui, &t.title, fhits.and_then(|f| f.needle("title")));
                     }
                     "collab" => {
                         if let Some(sid) = &t.stream_id
@@ -4586,7 +4639,7 @@ impl StreamArchiverApp {
                     // "next_stream"/"went_live"/"ad_free"/"added" are
                     // n/a per take.
                     _ => {}
-                });
+                }});
             }
             tr.response().context_menu(|ui| {
                 ui.set_min_width(180.0);

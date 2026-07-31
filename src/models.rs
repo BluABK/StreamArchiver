@@ -2840,6 +2840,58 @@ pub struct RecoverableTake {
     pub vod_id: Option<String>,
 }
 
+#[cfg(test)]
+impl Recording {
+    /// All-empty test scaffold — construct, then set only the fields the
+    /// test cares about. Kept here (not in a tests mod) so every module's
+    /// tests can share it instead of copying the 40-field initializer.
+    pub(crate) fn test_stub() -> Recording {
+        Recording {
+            id: 0,
+            monitor_id: 1,
+            started_at: 0,
+            ended_at: None,
+            status: "completed".into(),
+            bytes: 0,
+            exit_code: None,
+            output_path: String::new(),
+            went_live_at: None,
+            went_live_approx: true,
+            lost_secs: None,
+            stream_id: None,
+            take_group: None,
+            ad_count: 0,
+            ad_secs: 0,
+            meta_change_count: 0,
+            title: String::new(),
+            category: String::new(),
+            log_excerpt: String::new(),
+            notes: String::new(),
+            vod_id: None,
+            vod_state: None,
+            vod_muted_secs: None,
+            vod_views: None,
+            recovery_state: None,
+            recovered_path: None,
+            vod_dl_state: None,
+            vod_dl_path: None,
+            vod_dl_video_id: None,
+            backfill_path: None,
+            full_path: None,
+            trigger_info: String::new(),
+            head_backfill_state: String::new(),
+            gap_splice_state: String::new(),
+            trigger_rule_json: String::new(),
+            err_ack: false,
+            sabr_live_edge_fallback: false,
+            chapters_state: String::new(),
+            chapters_json: String::new(),
+            chapters_attempts: 0,
+            chat_path: String::new(),
+        }
+    }
+}
+
 impl Recording {
     pub fn is_active(&self) -> bool {
         self.status == "recording"
@@ -3332,49 +3384,14 @@ mod tests {
     }
 
     fn rec(id: i64, started: i64, ended: Option<i64>, stream_id: Option<&str>) -> Recording {
-        Recording {
-            id,
-            monitor_id: 1,
-            started_at: started,
-            ended_at: ended,
-            status: if ended.is_some() { "completed".into() } else { "recording".into() },
-            bytes: 1,
-            exit_code: None,
-            output_path: String::new(),
-            went_live_at: None,
-            went_live_approx: true,
-            lost_secs: None,
-            stream_id: stream_id.map(str::to_string),
-            take_group: None,
-            ad_count: 0,
-            ad_secs: 0,
-            meta_change_count: 0,
-            title: String::new(),
-            category: String::new(),
-            log_excerpt: String::new(),
-            notes: String::new(),
-            vod_id: None,
-            vod_state: None,
-            vod_muted_secs: None,
-            vod_views: None,
-            recovery_state: None,
-            recovered_path: None,
-            vod_dl_state: None,
-            vod_dl_path: None,
-            vod_dl_video_id: None,
-            backfill_path: None,
-            full_path: None,
-            trigger_info: String::new(),
-            head_backfill_state: String::new(),
-            gap_splice_state: String::new(),
-            trigger_rule_json: String::new(),
-            err_ack: false,
-            sabr_live_edge_fallback: false,
-            chapters_state: String::new(),
-            chapters_json: String::new(),
-            chapters_attempts: 0,
-            chat_path: String::new(),
-        }
+        let mut t = Recording::test_stub();
+        t.id = id;
+        t.started_at = started;
+        t.ended_at = ended;
+        t.status = if ended.is_some() { "completed".into() } else { "recording".into() };
+        t.bytes = 1;
+        t.stream_id = stream_id.map(str::to_string);
+        t
     }
 
     /// Build a finished take with a specific status (and no footage).
