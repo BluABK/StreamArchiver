@@ -643,7 +643,12 @@ token-binding experiment was already active on the stream whose tokens YouTube
 then started refusing. The line sits at `[debug]` level inside a per-capture
 log file, so without this an experiment rollout is invisible until it breaks
 something; surfaced, it's a dated per-channel record of when the platform
-changed the rules.
+changed the rules. Each channel gets **one rolling row per experiment**, not
+one per take: a retry wave re-logs the same experiment on every attempt and
+the channel's next broadcast logs it again, so the row's count and last-seen
+advance instead of stacking near-identical 🧪 entries (an acknowledged row
+re-surfaces if the experiment fires again later). The row's 📜 Log stays
+pinned to the first take that saw it.
 
 **PO token rejections.** A YouTube SABR capture can die because the platform
 refuses its GVS PO Token (`sps:ATTESTATION_REQUIRED` — yt-dlp raises

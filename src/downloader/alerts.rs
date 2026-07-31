@@ -360,6 +360,20 @@ impl Supervisor {
         let (label, twitch) = st.labels.clone().unwrap_or_default();
 
         for (hit_kind, severity, count, lost, last_line) in &summary.hits {
+            // The generic key scopes an alert to its take (the log path): a
+            // burst inside one capture folds into one row, a new take starts a
+            // fresh one. Platform experiments need the opposite — a retry wave
+            // re-logs the same experiment on EVERY take, and the same channel's
+            // next broadcast logs it again — so they roll up into one row per
+            // (monitor, experiment) whose count/last-seen keep advancing
+            // (2026-07-31: one evening put ~10 identical 🧪 rows in the
+            // Warnings window). The upsert re-arms `acked`, so an experiment
+            // that fires again after an Ack still resurfaces.
+            let take_key = if *hit_kind == "youtube_experiment" {
+                experiment_take_key(st.monitor_id, ref_id, last_line)
+            } else {
+                log_path.to_string_lossy().into_owned()
+            };
             let alert = crate::store::NewCaptureAlert {
                 kind: hit_kind.to_string(),
                 severity: severity.to_string(),
@@ -368,7 +382,7 @@ impl Supervisor {
                 } else {
                     st.source.clone()
                 },
-                take_key: log_path.to_string_lossy().into_owned(),
+                take_key,
                 monitor_id: st.monitor_id,
                 recording_id: (kind == DetachedKind::Recording).then_some(ref_id),
                 video_id: (kind == DetachedKind::Video).then_some(ref_id),
@@ -734,6 +748,29 @@ fn alert_message(
     }
 }
 
+/// Rolling alert key for a `youtube_experiment` hit: one row per
+/// `(monitor, experiment message)` rather than per take. The experiment's
+/// identity is everything after "Detected experiment" — the line's prefix
+/// carries the VIDEO id, which changes every broadcast while the experiment
+/// stays the same. Hashed (FNV-1a, the crate's stable hasher) so the key
+/// stays short and can't collide with a log path. A monitor-less capture
+/// falls back to the ref id, keeping distinct downloads distinct.
+///
+/// One trade documented: the row's `recording_id` (and so its 📜 Log button)
+/// stays pinned to the FIRST take that saw the experiment — later
+/// occurrences only advance count/last-seen.
+pub(super) fn experiment_take_key(monitor_id: Option<i64>, ref_id: i64, line: &str) -> String {
+    let experiment = line
+        .split_once("Detected experiment")
+        .map(|(_, tail)| tail.trim())
+        .unwrap_or(line);
+    format!(
+        "yt_experiment:{}:{:016x}",
+        monitor_id.unwrap_or(ref_id),
+        crate::detectors::fnv64(experiment.as_bytes())
+    )
+}
+
 /// Read the log's newly appended bytes (from `st.offset`), honoring the
 /// first-cycle adopt rule, the per-cycle cap, and truncation resets. `None`
 /// when there's nothing new. Advances `st.offset`.
@@ -822,6 +859,30 @@ mod tests {
             classify_line("[debug] [youtube] abc: Detected experiment foo").unwrap().severity,
             "warning"
         );
+    }
+
+    /// Experiment alerts roll up per (monitor, experiment) — a retry wave and
+    /// the channel's next broadcast bump ONE row instead of stacking a fresh
+    /// 🧪 row per take (2026-07-31: ~10 identical rows in one evening).
+    #[test]
+    fn experiment_alert_key_folds_takes_and_videos_but_splits_channels() {
+        let line_a = "[debug] [youtube] 7EoBQWYGnXM: Detected experiment to bind GVS PO Token \
+                      to video ID for web client";
+        // Same experiment, DIFFERENT video id (the channel's next broadcast).
+        let line_b = "[debug] [youtube] 2wGTBp7Xr8U: Detected experiment to bind GVS PO Token \
+                      to video ID for web client";
+        let k = experiment_take_key(Some(7), 1, line_a);
+        assert_eq!(k, experiment_take_key(Some(7), 2, line_b), "video id must not split rows");
+        // A different experiment or a different monitor is its own row.
+        assert_ne!(
+            k,
+            experiment_take_key(Some(7), 1, "[debug] [youtube] x: Detected experiment other")
+        );
+        assert_ne!(k, experiment_take_key(Some(8), 1, line_a));
+        // Monitor-less (ad-hoc download) falls back to the ref id.
+        assert_ne!(experiment_take_key(None, 1, line_a), experiment_take_key(None, 2, line_a));
+        // Key shape can never collide with a log-path take_key.
+        assert!(k.starts_with("yt_experiment:7:"));
 
         // Benign / non-alert lines stay silent.
         assert_eq!(classify_line("[cli][info] Opening stream: 1080p60 (hls)"), None);
