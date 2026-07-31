@@ -182,6 +182,24 @@ pub async fn run(mut rx: EventRx, store: Arc<Store>) {
     }
 }
 
+/// Heading suffix naming the platform and (past the first) the take number:
+/// `" (YouTube)"` / `" (YouTube, take 3)"`. A channel with several instances
+/// makes a bare "X is live" ambiguous, and a retry wave makes the third
+/// "X is live" of one broadcast read like a bug without the take count.
+fn heading_context(
+    store: &Store,
+    platform: crate::models::Platform,
+    recording_id: Option<i64>,
+) -> String {
+    let take = recording_id
+        .and_then(|id| store.take_number(id).ok().flatten())
+        .filter(|&n| n > 1);
+    match take {
+        Some(n) => format!(" ({}, take {n})", platform.label()),
+        None => format!(" ({})", platform.label()),
+    }
+}
+
 /// Per-event feed metadata that [`ToastContent`] doesn't itself carry.
 struct NotifMeta {
     kind: crate::models::NotificationKind,
@@ -209,7 +227,11 @@ fn handle(store: &Store, ev: AppEvent) {
             let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
                 return;
             };
-            let heading = format!("{} is live", row.channel.name);
+            let heading = format!(
+                "{} is live{}",
+                row.channel.name,
+                heading_context(store, row.monitor.platform(), Some(recording_id))
+            );
             let mut content = content_for(&row, heading, "Watch on Web");
             // Prefer the stream thumbnail as the hero image when the monitor
             // opts in and the file has been fetched. The fetch is concurrent so
@@ -248,7 +270,11 @@ fn handle(store: &Store, ev: AppEvent) {
             let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
                 return;
             };
-            let heading = format!("⚡ {} — trigger matched", row.channel.name);
+            let heading = format!(
+                "⚡ {} — trigger matched ({})",
+                row.channel.name,
+                row.monitor.platform().label()
+            );
             let mut content = content_for(&row, heading, "Watch on Web");
             content.lines = vec![
                 format!("\u{201c}{matched}\u{201d}"),
@@ -274,7 +300,11 @@ fn handle(store: &Store, ev: AppEvent) {
             let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
                 return;
             };
-            let heading = format!("🚫 {} — blacklist blocked recording", row.channel.name);
+            let heading = format!(
+                "🚫 {} — blacklist blocked recording ({})",
+                row.channel.name,
+                row.monitor.platform().label()
+            );
             let mut content = content_for(&row, heading, "Watch on Web");
             content.lines = vec![
                 format!("\u{201c}{matched}\u{201d}"),
@@ -310,7 +340,11 @@ fn handle(store: &Store, ev: AppEvent) {
             let mid = resolved.as_ref().map(|(mid, _)| *mid);
             let (content, chan_name) = match row {
                 Some(row) => {
-                    let heading = format!("{} — {status}", row.channel.name);
+                    let heading = format!(
+                        "{} — {status}{}",
+                        row.channel.name,
+                        heading_context(store, row.monitor.platform(), Some(recording_id))
+                    );
                     let vod_url = match row.monitor.platform() {
                         // YouTube: open the specific video when we have the stream id.
                         crate::models::Platform::YouTube => {

@@ -189,6 +189,43 @@ impl Store {
         Ok(())
     }
 
+    /// 1-based position of this take among its broadcast's takes (ordered by
+    /// start, id-tiebroken) — "take 3" in notification headings. `None` when
+    /// the recording has no platform stream id to group by (id-less takes
+    /// group fuzzily by time; a wrong number is worse than none) or the row
+    /// is gone.
+    pub fn take_number(&self, rec_id: i64) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.db();
+        let Some((monitor_id, stream_id, started_at)) = conn
+            .query_row(
+                "SELECT monitor_id, stream_id, started_at FROM recording WHERE id = ?1",
+                params![rec_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let Some(sid) = stream_id.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM recording
+             WHERE monitor_id = ?1 AND stream_id = ?2
+               AND (started_at < ?3 OR (started_at = ?3 AND id <= ?4))",
+            params![monitor_id, sid, started_at, rec_id],
+            |r| r.get(0),
+        )?;
+        Ok(Some(n))
+    }
+
     /// Update the output path of a finished recording — used after a manual
     /// re-remux succeeds to replace the `.ts` capture path with the final `.mkv`.
     pub fn update_recording_output_path(&self, id: i64, path: &str) -> Result<()> {
@@ -2117,6 +2154,36 @@ mod tests {
         let a4 = store.list_capture_alerts(10).unwrap();
         let a4 = a4.iter().find(|a| a.recording_id == Some(r4)).unwrap();
         assert!(a4.last_line.contains("3221225477"), "{}", a4.last_line);
+    }
+
+    /// Take numbering for notification headings: 1-based within one
+    /// broadcast (same stream id), ordered by start; id-less takes get None
+    /// (fuzzy time-grouping must not produce a confidently wrong number).
+    #[test]
+    fn take_number_counts_within_one_stream_only() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let t1 = store
+            .insert_recording(mid, 1_000, "C:/rec/a.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        let t2 = store
+            .insert_recording(mid, 2_000, "C:/rec/b.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        // A different broadcast and an id-less take don't count in.
+        let other = store
+            .insert_recording(mid, 1_500, "C:/rec/c.mkv", Some(1_500), false, Some("s2"), None, "", "")
+            .unwrap();
+        let idless = store
+            .insert_recording(mid, 1_600, "C:/rec/d.mkv", Some(1_600), false, None, None, "", "")
+            .unwrap();
+        assert_eq!(store.take_number(t1).unwrap(), Some(1));
+        assert_eq!(store.take_number(t2).unwrap(), Some(2));
+        assert_eq!(store.take_number(other).unwrap(), Some(1));
+        assert_eq!(store.take_number(idless).unwrap(), None);
+        assert_eq!(store.take_number(999_999).unwrap(), None);
     }
 
     #[test]

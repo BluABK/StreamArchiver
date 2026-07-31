@@ -714,6 +714,15 @@ impl StreamArchiverApp {
             }
             Some(Act::OpenWarnings) => {
                 self.show_warnings = true;
+                // The window is often ALREADY open — just buried under the
+                // notifications window that hosts this button — and setting
+                // the flag again is invisible. Raise and focus it explicitly
+                // (a not-yet-open window gets the command next frame, once
+                // `warnings_window` has created the viewport; commands to a
+                // nonexistent viewport id are dropped harmlessly).
+                let vp = egui::ViewportId::from_hash_of("warnings_vp");
+                ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::Focus);
             }
             None => {}
         }

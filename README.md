@@ -1721,7 +1721,11 @@ independent detectors feeding the same table:
   the channel's **profile picture** (Alt-hover for the full-resolution one) and
   names it in that channel's **own colour** — the streamer's Twitch chat colour
   where they set one, same as the Streams grid — with the timestamp leading the
-  title line. Rows are **tinted by kind and severity** the way 🚨 Warnings rows
+  title line. Went-live / finished / trigger rows name the **platform** in the
+  title (a channel with several instances makes a bare "X is live" ambiguous),
+  and a re-capture of the same broadcast carries its **take number** ("X is
+  live (YouTube, take 3)") so a retry wave's repeated rows read as what they
+  are instead of looking like a bug. Rows are **tinted by kind and severity** the way 🚨 Warnings rows
   are (red errors, amber warnings, purple went-live, green trigger matched, …);
   already-read rows keep the hue but fade back, and a **Row colors** checkbox
   (persisted, default on) turns the tints off entirely. Capture-alert rows
