@@ -2068,6 +2068,37 @@ progress_info: None,
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
+        // At most ONE chat sidecar per monitor. Both handles on this process —
+        // `active_chats` and the `detached_process` row — are keyed by
+        // `monitor_id` alone, so starting a second one for the same monitor
+        // overwrites both and the first becomes unreachable: no registry row,
+        // no PID in `active_chats`, nothing that can ever stop it or reap it
+        // at shutdown. It just keeps running, writing its own now-abandoned
+        // `.live_chat.json` and re-fetching PO tokens forever.
+        //
+        // That is not hypothetical: a YouTube stream failing repeatedly
+        // (invalid GVS PO token) restarted the take every ~2 minutes, and each
+        // restart orphaned the previous take's sidecar — three live, untracked
+        // yt-dlp processes for one monitor inside eight minutes, all appending
+        // the same chat to different files (found 2026-07-31).
+        //
+        // The take that starts last owns the monitor's chat, so stop the
+        // incumbent and wait for it to release before claiming the slot.
+        if self.active_chats.lock().unwrap().contains_key(&monitor_id) {
+            /// Long enough for the old sidecar to die and run its own cleanup
+            /// (which is what frees the `active_chats` slot); past that we
+            /// proceed anyway — a missing chat log beats no chat log at all.
+            const SUPERSEDE_GRACE: Duration = Duration::from_secs(10);
+            info!(monitor_id, "chat download: superseding the previous sidecar for this monitor");
+            self.stop_and_wait_for_chat(monitor_id, SUPERSEDE_GRACE).await;
+            if self.active_chats.lock().unwrap().contains_key(&monitor_id) {
+                warn!(
+                    monitor_id,
+                    "chat download: the previous sidecar didn't exit within {SUPERSEDE_GRACE:?} — \
+                     starting the new one anyway (the old process may linger untracked)"
+                );
+            }
+        }
         let tag = platform.tag();
         // Detached like every other download: a named job without kill-on-close,
         // no kill_on_drop, and output to a log file so the sidecar survives an app
