@@ -670,6 +670,7 @@ impl StreamArchiverApp {
             schedule_compact,
             schedule_large_avatar,
             schedule_month_icons,
+            deep_filter_texts: None,
             schedule_day_popup: None,
             show_schedule_sources: false,
             schedule_sources_draft: Vec::new(),

@@ -98,6 +98,19 @@ you hit **Apply**, so moving a column across many positions doesn't cause a
 resize/flicker on every intermediate step. **⇔** (Streams toolbar) re-fits
 all columns to their content.
 
+Column filters are case-insensitive substring matches — and in the Streams
+list they search **deep**: a filter matches not just the channel row's own
+(rollup) value but everything its sub-rows show, *whether or not they're
+expanded* — each instance's URL, tool, and detection method, every
+instance's current title/game (not only the one instance the rollup
+follows), and **every title and category its stream history ever logged**
+(sourced from the same change log the 📝 history shows, so mid-stream
+retitles match too). The matching channel row stays visible; expand it to
+find the matching stream. Without this, a finished stream's title was
+plainly visible on its sub-row yet filtering for it found nothing, because
+the top-level row only carries the primary instance's *current* title —
+blank while offline.
+
 ### Streams (live monitoring)
 
 A **channel** is a *container* (just a name) holding one or more **instances**.

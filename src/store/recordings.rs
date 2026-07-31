@@ -995,6 +995,51 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every distinct stream title and category ever logged against each
+    /// monitor's recordings, as per-monitor lowercase `(titles, categories)`
+    /// haystacks (newline-joined). Backs the Streams grid's deep filter: the
+    /// values a collapsed instance's stream/take rows *would* show must still
+    /// be matchable, and `rec_cache` only ever loads recordings for expanded
+    /// instances. Sourced from `stream_meta_change` because that's where a
+    /// recording's title/category actually live (the `Recording.title`/
+    /// `.category` fields are just the latest change) — so mid-stream retitles
+    /// are searchable too, same as the 📝 history that displays them.
+    pub fn monitor_meta_filter_texts(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, (String, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.monitor_id, smc.kind, smc.new_value
+             FROM stream_meta_change smc
+             JOIN recording r ON r.id = smc.recording_id
+             WHERE smc.kind IN ('title', 'category') AND smc.new_value != ''",
+        )?;
+        let mut out: std::collections::HashMap<i64, (String, String)> =
+            std::collections::HashMap::new();
+        // Dedupe in Rust rather than GROUP_CONCAT(DISTINCT …) — SQLite's
+        // DISTINCT aggregate can't take a custom separator, and the comma
+        // default would let a filter straddle two adjacent values.
+        let mut seen: std::collections::HashSet<(i64, bool, String)> = std::collections::HashSet::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        for row in rows {
+            let (mid, kind, value) = row?;
+            let value = value.to_lowercase();
+            let is_title = kind == "title";
+            if !seen.insert((mid, is_title, value.clone())) {
+                continue;
+            }
+            let slot = out.entry(mid).or_default();
+            let s = if is_title { &mut slot.0 } else { &mut slot.1 };
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&value);
+        }
+        Ok(out)
+    }
+
     /// All recording takes for a monitor (oldest first), for the history tree.
     pub fn recordings_for_monitor(&self, monitor_id: i64) -> Result<Vec<crate::models::Recording>> {
         let conn = self.db();
@@ -1936,6 +1981,46 @@ impl Store {
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    #[test]
+    fn monitor_meta_filter_texts_groups_dedupes_and_lowercases() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let r1 = store
+            .insert_recording(mid, 1_000, "C:/rec/a.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        let r2 = store
+            .insert_recording(mid, 2_000, "C:/rec/b.mkv", Some(2_000), false, Some("s2"), None, "", "")
+            .unwrap();
+        store.insert_meta_change(r1, 0, "title", "", "Jesse and Doogs Play:").unwrap();
+        store.insert_meta_change(r1, 0, "category", "", "Lost in Tandem").unwrap();
+        // The same title on a later take dedupes; a mid-take retitle adds;
+        // empty values never land in the haystack.
+        store.insert_meta_change(r2, 0, "title", "", "Jesse and Doogs Play:").unwrap();
+        store.insert_meta_change(r2, 10, "title", "Jesse and Doogs Play:", "Patch Day!").unwrap();
+        store.insert_meta_change(r2, 0, "category", "", "").unwrap();
+
+        let texts = store.monitor_meta_filter_texts().unwrap();
+        let (titles, categories) = texts.get(&mid).expect("monitor present");
+        assert_eq!(
+            titles.matches("jesse and doogs play:").count(),
+            1,
+            "deduped across takes: {titles:?}"
+        );
+        assert!(titles.contains("patch day!"), "mid-take retitle included: {titles:?}");
+        assert_eq!(categories, "lost in tandem", "empty category dropped");
+
+        // A monitor with no logged metadata simply has no entry.
+        let m2 = {
+            let mut m = sample_monitor(cid);
+            m.channel_id = cid;
+            store.insert_monitor(&m).unwrap()
+        };
+        assert!(!store.monitor_meta_filter_texts().unwrap().contains_key(&m2));
+    }
 
     #[test]
     fn err_ack_excludes_from_issues_but_survives_in_db() {

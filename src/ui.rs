@@ -404,6 +404,10 @@ impl RecordingsPeriod {
     }
 }
 
+/// Per-monitor lowercase `(titles, categories)` filter haystacks — the shape
+/// `Store::monitor_meta_filter_texts` returns (see `deep_filter_texts`).
+type DeepFilterTexts = std::collections::HashMap<i64, (String, String)>;
+
 /// The Stats view's "downloading right now" readout, derived from the newest
 /// `iomon` sample. Cached rather than recomputed per frame — the sampler only
 /// produces one of these a second.
@@ -1662,6 +1666,12 @@ pub struct StreamArchiverApp {
     /// "+N more". Persisted under
     /// [`crate::ui::schedule::K_SCHEDULE_MONTH_ICONS`].
     schedule_month_icons: bool,
+    /// Per-monitor lowercase (titles, categories) haystacks for the Streams
+    /// grid's deep filter (`Store::monitor_meta_filter_texts`), cached against
+    /// the `streams_cache_rev` it was fetched at — the recording history only
+    /// changes when the grid data reloads, while the streams cache itself also
+    /// rebuilds every second during an active capture.
+    deep_filter_texts: Option<(u64, DeepFilterTexts)>,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
     /// Whether the "Schedule sources" dialog is open.

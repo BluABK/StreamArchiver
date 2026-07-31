@@ -843,10 +843,17 @@ pub(super) enum SortKey {
 }
 
 /// A precomputed cell: `text` is what's shown/filtered (case-insensitive
-/// substring), `key` is what's sorted.
+/// substring), `key` is what's sorted. `deep` extends the *filter* haystack
+/// with what this row's collapsed descendants would show in the same column —
+/// see [`Cell::push_deep`].
 pub(super) struct Cell {
     pub(super) text: String,
     pub(super) key: SortKey,
+    /// Additional lowercase filter haystack (never sorted or displayed):
+    /// newline-joined values from the row's sub-rows, so filtering matches a
+    /// value that lives on a collapsed instance/stream row instead of only
+    /// the top-level rollup. Empty for flat tables (Videos).
+    pub(super) deep: String,
 }
 
 impl Cell {
@@ -856,6 +863,7 @@ impl Cell {
         Cell {
             key: SortKey::Text(s.to_lowercase()),
             text: s,
+            deep: String::new(),
         }
     }
     /// A numeric cell — sorts by `n`, filters/shows `display`.
@@ -863,7 +871,21 @@ impl Cell {
         Cell {
             text: display.into(),
             key: SortKey::Num(n),
+            deep: String::new(),
         }
+    }
+    /// Append a descendant's value to the filter haystack (lowercased,
+    /// newline-separated so no substring can straddle two values). Empty
+    /// strings are dropped rather than stacking blank lines.
+    pub(super) fn push_deep(&mut self, s: &str) {
+        let s = s.trim();
+        if s.is_empty() {
+            return;
+        }
+        if !self.deep.is_empty() {
+            self.deep.push('\n');
+        }
+        self.deep.push_str(&s.to_lowercase());
     }
 }
 
@@ -936,12 +958,18 @@ pub(super) fn ordered_rows(rows: &[Vec<Cell>], sort: &SortState, filters: &[Stri
                 active.iter().all(|(c, f)| {
                     rows[i]
                         .get(*c)
-                        .map(|cell| match &cell.key {
-                            // Text cells store a pre-lowercased sort key —
-                            // match it instead of re-lowercasing the display
-                            // text per row per frame.
-                            SortKey::Text(k) => k.contains(f.as_str()),
-                            SortKey::Num(_) => cell.text.to_lowercase().contains(f.as_str()),
+                        .map(|cell| {
+                            let own = match &cell.key {
+                                // Text cells store a pre-lowercased sort key —
+                                // match it instead of re-lowercasing the display
+                                // text per row per frame.
+                                SortKey::Text(k) => k.contains(f.as_str()),
+                                SortKey::Num(_) => cell.text.to_lowercase().contains(f.as_str()),
+                            };
+                            // A value on a collapsed sub-row counts too (the
+                            // `deep` haystack) — the top-level rollup often
+                            // shows none of what its descendants do.
+                            own || cell.deep.contains(f.as_str())
                         })
                         .unwrap_or(true)
                 })
@@ -1020,6 +1048,13 @@ pub(super) fn sort_filter_header(
                 egui::TextEdit::singleline(filter)
                     .hint_text("filter")
                     .desired_width(f32::INFINITY),
+            )
+            .on_hover_text(
+                "Case-insensitive text filter for this column. In tables with \
+                 sub-rows (Streams), it also matches values on collapsed \
+                 sub-rows — an instance's URL/tool, and every title/category \
+                 its stream history ever logged — keeping the channel row \
+                 visible; expand it to see the matching entry.",
             );
         }
     });
@@ -1700,6 +1735,11 @@ pub(super) fn channel_cells(
     active: &HashSet<i64>,
     now: i64,
     platform_pref: &crate::platform_pref::PlatformPrefCtx,
+    // Per-monitor lowercase (titles, categories) of every value the monitor's
+    // stream/take rows have ever logged (`Store::monitor_meta_filter_texts`)
+    // — feeds the deep-filter haystacks below. Empty map = no deep history
+    // matching (tests).
+    rec_texts: &HashMap<i64, (String, String)>,
 ) -> Vec<Cell> {
     if monitors.is_empty() {
         // Empty container: just the name + "added"; everything else blank. Index
@@ -1739,7 +1779,7 @@ pub(super) fn channel_cells(
     // silently shifts every later column's sort/filter onto the wrong data
     // instead of erroring (this exact bug: sorting by "state" was actually
     // sorting by "next_stream" because "scheduled_rec" had no cell here).
-    vec![
+    let mut cells = vec![
         Cell::num(
             if channel.automation_enabled { 1.0 } else { 0.0 },
             if channel.automation_enabled { "on" } else { "off" },
@@ -1828,7 +1868,47 @@ pub(super) fn channel_cells(
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
         // Tags — the primary live instance's current tag list.
         Cell::text(primary.last_tags.clone()),
-    ]
+    ];
+
+    // ── Deep-filter haystacks ────────────────────────────────────────────
+    // A column filter must match what the row's collapsed descendants show,
+    // not only the channel rollup above — the rollup follows ONE primary
+    // instance and (for Game/Title) only its current/live values, so e.g. a
+    // finished stream's title was visible on its sub-row yet unfindable.
+    // Indices below are STREAM_COLUMNS positions (same 1:1 contract as the
+    // vec above). Deep values never affect sorting or display.
+    let idx = |id: &str| {
+        STREAM_COLUMNS
+            .iter()
+            .position(|c| c.id == id)
+            .unwrap_or_else(|| unreachable!("unknown column id {id}"))
+    };
+    let (i_plat, i_name, i_tool, i_det) = (idx("platform"), idx("name"), idx("tool"), idx("detection"));
+    let (i_game, i_title, i_collab, i_tags) = (idx("game"), idx("title"), idx("collab"), idx("tags"));
+    for m in monitors {
+        // Instance rows: URL under Name; tool/detection/platform as labels
+        // (the cells render icons/abbreviations, hover shows these names).
+        cells[i_plat].push_deep(m.monitor.platform().label());
+        cells[i_name].push_deep(&m.monitor.url);
+        cells[i_tool].push_deep(m.monitor.tool.label());
+        cells[i_det].push_deep(m.monitor.detection_method.label());
+        // Live + last-recording metadata of EVERY instance, not just the
+        // rollup's primary — plus the full logged title/category history of
+        // the instance's stream/take rows, expanded or not.
+        cells[i_game].push_deep(&m.last_game);
+        cells[i_game].push_deep(&m.last_recording_category);
+        cells[i_title].push_deep(&m.last_title);
+        cells[i_title].push_deep(&m.last_recording_title);
+        if let Some((titles, categories)) = rec_texts.get(&m.monitor.id) {
+            cells[i_title].push_deep(titles);
+            cells[i_game].push_deep(categories);
+        }
+        if let Some(c) = &m.live_collab {
+            cells[i_collab].push_deep(&c.names());
+        }
+        cells[i_tags].push_deep(&m.last_tags);
+    }
+    cells
 }
 
 /// Renders the "Stop recording" and "Stop (allow triggers)" submenus — each
@@ -2812,6 +2892,72 @@ mod tests {
         }
     }
 
+    // ----- deep filtering (collapsed sub-rows must stay matchable) -----
+
+    /// The reported bug's shape: a finished stream's title was visible on a
+    /// (collapsed) stream row yet the Title filter matched nothing, because
+    /// the channel rollup carries only the primary instance's live title —
+    /// blank while offline. The deep haystacks make every descendant value
+    /// matchable regardless of expansion.
+    #[test]
+    fn deep_filter_matches_collapsed_sub_row_values() {
+        let now = 1_000_100;
+        let mut row = test_row(1, "offline", None, None, None, false);
+        row.last_recording_title = "Patch Day! - Plus Mount for 3 Subs!".into();
+        let channel = row.channel.clone();
+        let mut rec_texts: HashMap<i64, (String, String)> = HashMap::new();
+        rec_texts.insert(
+            1,
+            (
+                "jesse and doogs play:\npatch day! - plus mount for 3 subs!".into(),
+                "lost in tandem\nfinal fantasy xiv online".into(),
+            ),
+        );
+        let no_pref = crate::platform_pref::PlatformPrefCtx::default();
+        let model =
+            vec![channel_cells(&channel, &[&row], &HashSet::new(), now, &no_pref, &rec_texts)];
+
+        let idx = |id: &str| STREAM_COLUMNS.iter().position(|c| c.id == id).unwrap();
+        let sort = SortState::default();
+        let mut filters = vec![String::new(); STREAM_COLS];
+
+        filters[idx("title")] = "doog".into();
+        assert_eq!(ordered_rows(&model, &sort, &filters), vec![0], "history title matches");
+        filters[idx("title")] = "Patch Day".into();
+        assert_eq!(ordered_rows(&model, &sort, &filters), vec![0], "case-insensitive");
+        filters[idx("title")] = "no such stream".into();
+        assert!(ordered_rows(&model, &sort, &filters).is_empty(), "misses still filter out");
+        filters[idx("title")].clear();
+
+        filters[idx("game")] = "final fantasy".into();
+        assert_eq!(ordered_rows(&model, &sort, &filters), vec![0], "history category matches");
+        filters[idx("game")].clear();
+
+        // Instance-row values count too: the URL shown under Name, the tool
+        // label an instance row abbreviates.
+        filters[idx("name")] = "twitch.tv/test".into();
+        assert_eq!(ordered_rows(&model, &sort, &filters), vec![0], "instance URL matches");
+        filters[idx("name")].clear();
+        filters[idx("tool")] = "streamlink".into();
+        assert_eq!(ordered_rows(&model, &sort, &filters), vec![0], "instance tool matches");
+    }
+
+    /// The deep haystack is filter-only plumbing: values can't run together
+    /// across the separator, and the sort key stays the cell's own text.
+    #[test]
+    fn deep_haystack_separates_values_and_never_affects_sort() {
+        let mut a = Cell::text("Alpha");
+        a.push_deep("abc");
+        a.push_deep("DEF");
+        a.push_deep("  "); // blank values are dropped, not stacked
+        assert_eq!(a.deep, "abc\ndef", "lowercased, newline-joined");
+        assert!(!a.deep.contains("cdef"), "no match across value boundaries");
+        match &a.key {
+            SortKey::Text(k) => assert_eq!(k, "alpha", "sort key untouched by deep pushes"),
+            SortKey::Num(_) => panic!("text cell"),
+        }
+    }
+
     // ----- live-state bubbling (Went Live/Started On/Duration w/ Auto off, and
     // channel-row live indicator/count) -----
 
@@ -2993,7 +3139,7 @@ mod tests {
         let state_idx = STREAM_COLUMNS.iter().position(|c| c.id == "state").unwrap();
         let no_pref = crate::platform_pref::PlatformPrefCtx::default();
         let state_priority = |m: &MonitorWithChannel, active: &HashSet<i64>| {
-            let cells = channel_cells(&channel, &[m], active, now, &no_pref);
+            let cells = channel_cells(&channel, &[m], active, now, &no_pref, &HashMap::new());
             assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
             match cells[state_idx].key {
                 SortKey::Num(n) => n,

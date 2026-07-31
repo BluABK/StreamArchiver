@@ -1519,13 +1519,31 @@ impl StreamArchiverApp {
             // rebuild (not per channel row per frame — see `PlatformPrefCtx`).
             let platform_pref = crate::platform_pref::PlatformPrefCtx::load(&self.core.store);
 
+            // Per-monitor logged title/category history for the deep filter —
+            // covers stream/take rows of monitors that were never expanded
+            // (`rec_cache` only loads those on expansion). Cached against
+            // `streams_cache_rev`, NOT the per-second stamp: while a capture
+            // is active this rebuild runs every second, and the history only
+            // changes when the data reloads (which bumps the rev).
+            if self.deep_filter_texts.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
+            {
+                let texts = self.core.store.monitor_meta_filter_texts().unwrap_or_default();
+                self.deep_filter_texts = Some((self.streams_cache_rev, texts));
+            }
+            let rec_texts = self
+                .deep_filter_texts
+                .as_ref()
+                .map(|(_, t)| t)
+                .cloned()
+                .unwrap_or_default();
+
             // Channel-level sort/filter model (one entry per top-level channel row).
             let model: Vec<Vec<Cell>> = chan_entries
                 .iter()
                 .map(|e| {
                     let mons: Vec<&MonitorWithChannel> =
                         e.rows.iter().map(|&i| &self.rows[i]).collect();
-                    channel_cells(&e.channel, &mons, active_ids, now, &platform_pref)
+                    channel_cells(&e.channel, &mons, active_ids, now, &platform_pref, &rec_texts)
                 })
                 .collect();
 
