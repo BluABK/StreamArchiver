@@ -3,6 +3,29 @@
 
 use super::*;
 
+/// How long to hold off the next automatic attempt after YouTube rejected the
+/// capture's GVS PO Token. Long enough to let a platform-side attestation
+/// demand pass (it cleared in ~7 minutes when this was first seen), short
+/// enough that a long broadcast still gets captured.
+const PO_TOKEN_COOLDOWN_SECS: u64 = 300;
+
+/// Whether a dead capture's tool log says YouTube **rejected** its GVS PO
+/// Token, as opposed to any other failure.
+///
+/// Three independent spellings, because yt-dlp surfaces this at different
+/// layers: the SABR stream's own protection status (`sps:ATTESTATION_REQUIRED`
+/// in its debug line), the typed exception, and the human message. Matching
+/// any one of them is enough — this only chooses a backoff, so a false
+/// positive costs a few minutes and a false negative costs a retry storm.
+///
+/// Deliberately NOT matched: "Generating a gvs PO Token", which appears on
+/// every healthy capture too.
+pub(super) fn po_token_rejected(log: &str) -> bool {
+    log.contains("ATTESTATION_REQUIRED")
+        || log.contains("PoTokenError")
+        || log.contains("requires a GVS PO Token")
+}
+
 impl Supervisor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -2605,7 +2628,7 @@ progress_info: None,
             .unwrap_or(false)
     }
 
-    fn note_result(&self, monitor_id: i64, duration_secs: i64, ok: bool) {
+    fn note_result(&self, monitor_id: i64, duration_secs: i64, ok: bool, po_token_rejected: bool) {
         let mut map = self.backoff.lock().unwrap();
         // Back off on any capture that produced no footage (bytes == 0), even one
         // that ran a while before dying: a long run that wrote nothing is still a
@@ -2631,14 +2654,61 @@ progress_info: None,
             if duration_secs < INSTANT_FAIL_SECS {
                 wait = wait.max(300);
             }
+            // YouTube rejected the GVS PO token. Nothing local can fix that —
+            // the token provider is minting fresh, distinct tokens and the
+            // platform is refusing them (`sps:ATTESTATION_REQUIRED`) — and it
+            // clears on its own after a few minutes. The ordinary ladder
+            // (30s/60s/90s) just burns takes against a wall: on 2026-07-31 it
+            // spent three, ~35s each, before the fourth attempt succeeded
+            // untouched. Wait properly instead.
+            if po_token_rejected {
+                wait = wait.max(PO_TOKEN_COOLDOWN_SECS);
+            }
             entry.until = Instant::now() + Duration::from_secs(wait);
             warn!(
                 monitor_id,
                 fails = entry.fails,
                 wait,
                 duration_secs,
+                po_token_rejected,
                 "recording captured nothing; backing off"
             );
+        }
+    }
+
+    /// Surface a PO-token rejection in the 🚨 Warnings window. Without this the
+    /// only trace is a traceback buried in a per-capture log file: the take
+    /// just reads "failed", which looks identical to a hundred other causes
+    /// and sends you looking for a local misconfiguration that isn't there.
+    /// One alert per take (`take_key`), so a retry ladder doesn't spam.
+    fn file_po_token_alert(&self, row: &MonitorWithChannel, monitor_id: i64, rec_id: i64) {
+        let alert = crate::store::NewCaptureAlert {
+            kind: "po_token_rejected".to_string(),
+            severity: "warning".to_string(),
+            source: "capture".to_string(),
+            take_key: format!("po_token:rec{rec_id}"),
+            monitor_id: Some(monitor_id),
+            recording_id: Some(rec_id),
+            video_id: None,
+            channel: row.channel.name.clone(),
+            count: 1,
+            lost_segments: 0,
+            last_line: format!(
+                "{} rejected this capture's GVS PO Token (stream protection status \
+                 ATTESTATION_REQUIRED). The token server is working — it mints a fresh token \
+                 per retry and the platform refuses each one — so this is a YouTube-side \
+                 condition that usually clears by itself within a few minutes. The next \
+                 automatic attempt is held off for {}m rather than retrying immediately.",
+                row.monitor.platform().tag(),
+                PO_TOKEN_COOLDOWN_SECS / 60,
+            ),
+        };
+        match self.store.upsert_capture_alert(&alert) {
+            Ok((id, true)) => {
+                info!(rec_id, "filed PO-token rejection alert #{id} for {}", row.channel.name)
+            }
+            Ok(_) => {}
+            Err(e) => warn!(rec_id, "failed to file PO-token alert: {e:#}"),
         }
     }
 
@@ -3036,7 +3106,11 @@ progress_info: None,
         // otherwise reset the wait to 30s, and a captured one would clear it entirely,
         // either way re-triggering the moment the next LIVE signal arrives.
         if !manually_stopped {
-            self.note_result(monitor_id, duration, ok);
+            let po_rejected = !ok && po_token_rejected(&outcome.log);
+            if po_rejected {
+                self.file_po_token_alert(&row, monitor_id, rec_id);
+            }
+            self.note_result(monitor_id, duration, ok, po_rejected);
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
     }
@@ -4018,6 +4092,36 @@ progress_info: None,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Detected from the real logs of the 2026-07-31 Dokibird incident. All
+    /// three spellings appeared there, at different layers of yt-dlp.
+    #[test]
+    fn po_token_rejection_is_recognised_but_healthy_captures_are_not() {
+        // The SABR stream's own protection status (the earliest signal).
+        assert!(po_token_rejected(
+            "[debug] [SABR Debug Info]: v:7EoBQWYGnXM c:WEB t:353900 rn:20 sr:0 act:N pot:Y \
+             sps:ATTESTATION_REQUIRED live 2s bid:1 hs:177"
+        ));
+        // The typed exception.
+        assert!(po_token_rejected(
+            "yt_dlp.extractor.youtube._streaming.sabr.exceptions.PoTokenError: This stream \
+             requires a GVS PO Token to continue and the one provided is invalid"
+        ));
+        // The plain message (no traceback, e.g. a truncated tail).
+        assert!(po_token_rejected(
+            "ERROR: This stream requires a GVS PO Token to continue and the one provided is invalid"
+        ));
+
+        // A HEALTHY capture mints tokens too — that must never look like a
+        // rejection, or every YouTube capture would get a 5-minute cooldown.
+        assert!(!po_token_rejected(
+            "[youtube] [pot:bgutil:http] Generating a gvs PO Token for web client via bgutil \
+             HTTP server\n[debug] [youtube] 7EoBQWYGnXM: Retrieved a gvs PO Token for web client"
+        ));
+        // Unrelated failures keep the ordinary backoff ladder.
+        assert!(!po_token_rejected("ERROR: No video formats found!"));
+        assert!(!po_token_rejected(""));
+    }
 
     /// The fix for the DyaRikku incident (2026-07-24): a stall-killed
     /// recording must refuse a new AUTOMATIC start for a short cooldown

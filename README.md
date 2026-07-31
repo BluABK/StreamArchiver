@@ -597,6 +597,18 @@ one), which is removed via the configured
 still kept, just never used to replace anything, so nothing is ever lost to a
 bad check.
 
+**PO token rejections.** A YouTube SABR capture can die because the platform
+refuses its GVS PO Token (`sps:ATTESTATION_REQUIRED` — yt-dlp raises
+`PoTokenError`). This is **not** a local misconfiguration: the token server
+keeps minting fresh, distinct tokens and YouTube refuses each one, so nothing
+on this side can fix it, and it typically clears by itself within a few
+minutes. The ordinary failure ladder (30 s, 60 s, 90 s…) just burns takes
+against it — three in a row, ~35 s each, when this was first seen. So a
+capture that dies this way gets a **5-minute cooldown** before the next
+automatic attempt, and files a **🎫 PO token rejected** entry in the 🚨
+Warnings window (one per take) explaining what happened, rather than leaving
+a bare "failed" take whose only trace is a traceback in a per-capture log.
+
 ### Automatic deletion
 
 A few features delete finished recordings on their own: the post-join parts

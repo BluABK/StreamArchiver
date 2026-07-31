@@ -125,6 +125,7 @@ pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static st
         "sequence_gap" => return ("⛔", "Lost segments"),
         "fetch_failed" => return ("⛔", "Failed fetches"),
         "ad_probe_degraded" => return ("🛰", "Ad probe degraded"),
+        "po_token_rejected" => return ("🎫", "PO token rejected"),
         "offline_drive" => return ("💽", "Drive offline"),
         _ => {}
     }
