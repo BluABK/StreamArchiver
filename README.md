@@ -2671,6 +2671,53 @@ table) and kept for 60 days; coarser views are aggregated at query time.
 **Reset** clears the counters, the recent-error list, and the graph history
 together; everything otherwise persists across restarts.
 
+#### Network / downloads
+
+**Network / downloads 🌐** (same tab) answers "what is the uplink actually
+doing, and where did all those bytes come from?" — split by what the traffic
+was *for*, because a live capture, a manual video download, and a VOD repair
+pass have very different reasons to be saturating the line:
+
+| Class | What it covers |
+| --- | --- |
+| **Recordings** | Live stream captures — streamlink/yt-dlp pulling a broadcast's live edge, including companion captures of the same stream. |
+| **Downloads** | On-demand downloads started from the **Videos** view (and ones re-attached after a restart). |
+| **Chat** | Chat sidecars that run as their own tool process. Twitch chat is logged in-process, so it lands in the app's own traffic instead. |
+| **Recovery** | CDN-fed repair traffic: head backfill, lost-segment gap recovery, and VOD recovery. |
+
+Three panels, all fed from the same numbers:
+
+- **Live table** — current rate per class, how many tool processes are in it
+  right now, and the total downloaded per class **this session** (including
+  tools that have since finished). If the I/O sampler stalls, the age of the
+  last sample is called out rather than silently reading as `0 B/s`.
+- **Download rate graph** — average B/s per class over a selectable timespan
+  (**1 m** through **All**), one colored line per class, with the same
+  bucket-width behavior as the detection graphs above. Idle minutes store no
+  row at all, so gaps are bridged — a flat stretch equally means "nothing
+  downloading" or "app not running".
+- **Breakdown** — bytes per class by calendar period, with the same
+  **Day / Week / Month / Year** selector as the Recordings breakdown (Day
+  lists the 7 days of the current week; the others show the current period
+  and the last fully-elapsed one).
+
+Measurement comes from each spawned tool's own process I/O counters — the
+same source the **🖴 I/O** tab uses — whose read side while downloading is
+essentially its CDN throughput. Two things are excluded on purpose so this
+reads as *network* traffic rather than "bytes the tools moved": local
+post-processing (remux, concat, embedding), which reads off disk, and a
+download tool's own child ffmpeg, which is the **merge** pass reading the
+finished parts back in (counting it would roughly double a multi-format
+download). The app's own API polls and image fetches aren't included either —
+those show up as *unattributed* in the I/O tab. Because the class can't be
+inferred reliably from a tool name (the same `ffmpeg` binary both fetches from
+a CDN and remuxes locally), it's declared explicitly where each tool is
+spawned.
+
+History is stored at minute resolution (`net_history` table) and kept for 60
+days, same as the detection graphs; **Reset** clears it, while the live rates
+and session totals keep running.
+
 ![Stats tab — Claude OCR usage/cost and YouTube Data API quota](doc/screenshots/stats-ocr.png)
 
 ### Chat logs

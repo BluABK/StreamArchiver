@@ -637,6 +637,11 @@ impl Supervisor {
                         _ => "live capture (re-attached)".to_string(),
                     },
                     region: crate::iomon::classify(Path::new(&row.capture_path)),
+                    net: match row.kind {
+                        DetachedKind::Video => crate::iomon::NetKind::Download,
+                        DetachedKind::Chat => crate::iomon::NetKind::Chat,
+                        _ => crate::iomon::NetKind::Recording,
+                    },
                     proc_start: row.proc_start,
                 },
             )
@@ -1791,6 +1796,11 @@ impl Supervisor {
                         "live capture".to_string()
                     },
                     region: crate::iomon::classify(&plan.capture_path),
+                    net: match detach.kind {
+                        DetachedKind::Video => crate::iomon::NetKind::Download,
+                        DetachedKind::Chat => crate::iomon::NetKind::Chat,
+                        _ => crate::iomon::NetKind::Recording,
+                    },
                     proc_start,
                 },
             )

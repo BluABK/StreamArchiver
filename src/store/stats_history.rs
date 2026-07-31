@@ -20,7 +20,9 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::models::{ChannelStatsRow, StreamEventRow, StreamStatRow, ViewerBucket};
+use crate::models::{
+    ChannelStatsRow, DailyNetStat, NetBucket, StreamEventRow, StreamStatRow, ViewerBucket,
+};
 
 /// Raw sampling resolution (one minute; matches the poll/meta cadence).
 pub const VH_RAW_BUCKET_SECS: i64 = 60;
@@ -665,7 +667,103 @@ impl Store {
         }
         Ok(())
     }
+
+    // ----- download/network history (schema v80) -----
+
+    /// Fold drained [`crate::iomon::take_net_buckets`] entries into the
+    /// minute-bucket `net_history` table, then prune past the retention
+    /// window. `rows` = `(bucket start unix secs, kind key, bytes)`; the
+    /// bucket timestamps come from the sampler, *not* from the drain, so a
+    /// late fold still lands the traffic in the minute it happened.
+    pub fn record_net_history(&self, rows: &[(i64, &str, u64)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.db();
+        let mut newest = i64::MIN;
+        for (bucket_t, kind, bytes) in rows {
+            newest = newest.max(*bucket_t);
+            conn.execute(
+                "INSERT INTO net_history(bucket_t, kind, bytes)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(bucket_t, kind) DO UPDATE SET bytes = bytes + excluded.bytes",
+                params![bucket_t, kind, *bytes as i64],
+            )?;
+        }
+        // Range delete on the PK's leading column — cheap even when nothing
+        // is old enough yet, so just run it every fold (same as poll_history).
+        conn.execute(
+            "DELETE FROM net_history WHERE bucket_t < ?1",
+            params![newest - NET_HISTORY_RETENTION_SECS],
+        )?;
+        Ok(())
+    }
+
+    /// Download history since `since_unix`, re-aggregated into `bucket_secs`-
+    /// wide buckets per traffic class, oldest first.
+    ///
+    /// Buckets with no traffic have no row at all (rather than a zero) — the
+    /// table only ever stores what actually moved, so a gap in the series
+    /// means "idle, or the app wasn't running", which the graphs bridge.
+    pub fn net_history(&self, since_unix: i64, bucket_secs: i64) -> Result<Vec<NetBucket>> {
+        let bucket_secs = bucket_secs.max(NET_HISTORY_RAW_BUCKET_SECS);
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT (bucket_t / ?1) * ?1 AS tb, kind, SUM(bytes)
+             FROM net_history
+             WHERE bucket_t >= ?2
+             GROUP BY tb, kind
+             ORDER BY tb",
+        )?;
+        let rows = stmt
+            .query_map(params![bucket_secs, since_unix], |r| {
+                Ok(NetBucket {
+                    t: r.get(0)?,
+                    kind: r.get(1)?,
+                    bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Downloaded bytes per `(UTC day, traffic class)` over the whole retained
+    /// window, oldest day first — backs the Stats view's period breakdown
+    /// (today / this week / this month / …), which needs calendar boundaries
+    /// rather than the graphs' relative-to-now buckets.
+    pub fn net_history_daily(&self) -> Result<Vec<DailyNetStat>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT date(bucket_t, 'unixepoch') AS day, kind, SUM(bytes)
+             FROM net_history
+             GROUP BY day, kind
+             ORDER BY day",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DailyNetStat {
+                    day: r.get(0)?,
+                    kind: r.get(1)?,
+                    bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Drop all download history (the Stats section's Reset button).
+    pub fn clear_net_history(&self) -> Result<()> {
+        self.db().execute("DELETE FROM net_history", [])?;
+        Ok(())
+    }
 }
+
+/// Raw storage resolution of the `net_history` table (one minute) — must match
+/// `iomon`'s own bucket width.
+pub const NET_HISTORY_RAW_BUCKET_SECS: i64 = 60;
+/// How much minute-resolution download history is kept before pruning
+/// (60 days, matching the poll history next to it in the Stats view).
+const NET_HISTORY_RETENTION_SECS: i64 = 60 * 86_400;
 
 #[cfg(test)]
 mod tests {
@@ -677,6 +775,66 @@ mod tests {
         let m = sample_monitor(cid);
         let mid = store.insert_monitor(&m).unwrap();
         (cid, mid)
+    }
+
+    #[test]
+    fn net_history_accumulates_aggregates_and_prunes() {
+        let store = Store::open_in_memory().unwrap();
+        let t0: i64 = 1_000_000 - 1_000_000_i64.rem_euclid(3600); // hour-aligned
+
+        // Two folds into the same (minute, kind) increment one row — the
+        // drain is incremental, so a partially elapsed bucket gets topped up.
+        store.record_net_history(&[(t0, "recording", 1_000)]).unwrap();
+        store.record_net_history(&[(t0, "recording", 500), (t0, "download", 200)]).unwrap();
+        store.record_net_history(&[(t0 + 60, "recording", 300)]).unwrap();
+
+        let raw = store.net_history(t0, 60).unwrap();
+        assert_eq!(raw.len(), 3, "two kinds in the first minute, one in the second");
+        let first =
+            raw.iter().find(|b| b.t == t0 && b.kind == "recording").expect("first minute");
+        assert_eq!(first.bytes, 1_500, "same-bucket folds accumulated");
+
+        // Query-time aggregation folds the minutes into one hour bucket.
+        let hourly = store.net_history(t0, 3600).unwrap();
+        assert_eq!(hourly.len(), 2, "one row per kind");
+        let rec = hourly.iter().find(|b| b.kind == "recording").unwrap();
+        assert_eq!((rec.t, rec.bytes), (t0, 1_800));
+
+        // `since` filters.
+        assert!(store.net_history(t0 + 3_600, 60).unwrap().is_empty());
+
+        // Daily rollup groups by UTC calendar day, per kind.
+        let daily = store.net_history_daily().unwrap();
+        assert_eq!(daily.len(), 2);
+        let d_rec = daily.iter().find(|d| d.kind == "recording").unwrap();
+        assert_eq!(d_rec.bytes, 1_800);
+        assert_eq!(d_rec.day.len(), 10, "YYYY-MM-DD");
+
+        // A fold past the retention window prunes everything before it.
+        store.record_net_history(&[(t0 + 61 * 86_400, "download", 7)]).unwrap();
+        let all = store.net_history(0, 60).unwrap();
+        assert_eq!(all.len(), 1, "everything from t0 aged out");
+
+        store.clear_net_history().unwrap();
+        assert!(store.net_history(0, 60).unwrap().is_empty());
+        assert!(store.net_history_daily().unwrap().is_empty());
+    }
+
+    /// The drain hands over bucket timestamps stamped when the traffic
+    /// happened, so an out-of-order or long-delayed fold must not prune rows
+    /// that are newer than the batch's oldest entry.
+    #[test]
+    fn net_history_prunes_relative_to_the_batch_newest_not_its_first() {
+        let store = Store::open_in_memory().unwrap();
+        let t0: i64 = 1_000_000 - 1_000_000_i64.rem_euclid(60);
+        store.record_net_history(&[(t0, "recording", 10)]).unwrap();
+        // Batch listing the *old* bucket first, then one 61 days later.
+        store
+            .record_net_history(&[(t0 + 120, "recording", 20), (t0 + 61 * 86_400, "chat", 5)])
+            .unwrap();
+        let all = store.net_history(0, 60).unwrap();
+        assert_eq!(all.len(), 1, "pruned against the newest bucket in the batch");
+        assert_eq!(all[0].kind, "chat");
     }
 
     #[test]

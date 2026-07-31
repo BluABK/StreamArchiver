@@ -2201,6 +2201,7 @@ progress_info: None,
                         .unwrap_or_else(|| plan.program.clone()),
                     purpose: "chat capture".to_string(),
                     region: crate::iomon::classify(&plan.capture_path),
+                    net: crate::iomon::NetKind::Chat,
                     proc_start: crate::platform::process_start_time(pid).unwrap_or(0),
                 },
             )

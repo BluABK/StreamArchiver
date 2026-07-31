@@ -388,6 +388,52 @@ impl RecordingsPeriod {
     }
 }
 
+/// The Stats view's "downloading right now" readout, derived from the newest
+/// `iomon` sample. Cached rather than recomputed per frame — the sampler only
+/// produces one of these a second.
+#[derive(Clone, Default)]
+struct NetLive {
+    /// Current B/s and live tool count, indexed by `iomon::NetKind` position.
+    per_kind: [(u64, u32); crate::iomon::NET_KIND_COUNT],
+    /// Bytes downloaded per class since the app started.
+    session: [u64; crate::iomon::NET_KIND_COUNT],
+    /// Age of the underlying sample in ms — a stalled sampler must not be
+    /// read as "nothing is downloading".
+    age_ms: i64,
+    /// False until the sampler has produced its first sample.
+    have_sample: bool,
+}
+
+impl NetLive {
+    /// Fold the newest sample's per-process rates into per-class totals.
+    fn capture() -> Self {
+        let mut out = NetLive {
+            session: crate::iomon::net_session_totals(),
+            ..Default::default()
+        };
+        if let Some(s) = crate::iomon::latest() {
+            out.have_sample = true;
+            out.age_ms = chrono::Utc::now().timestamp_millis() - s.at_ms;
+            for p in &s.procs {
+                let slot = &mut out.per_kind[p.net as usize];
+                // `net_bps`, not `read_bps`: the graph and the history are fed
+                // from the same root-only number, so the two must agree.
+                slot.0 += p.net_bps;
+                slot.1 += 1;
+            }
+        }
+        out
+    }
+
+    /// Total current download rate across every network class.
+    fn total_bps(&self) -> u64 {
+        crate::iomon::NetKind::NETWORK
+            .iter()
+            .map(|k| self.per_kind[*k as usize].0)
+            .sum()
+    }
+}
+
 mod app;
 mod assets_helpers;
 mod background;
@@ -1882,6 +1928,21 @@ pub struct StreamArchiverApp {
     /// next Stats render. Invalidated separately from `stats_snapshot` so
     /// flipping the span doesn't re-run the other stats queries.
     stats_history: Option<Vec<crate::models::PollBucket>>,
+    /// Selected timespan for the Stats view's download graph (session-only,
+    /// defaults to 24 h). Independent of `stats_poll_span` — the two sections
+    /// are usually read at different zoom levels.
+    stats_net_span: PollSpan,
+    /// Cached `net_history` rows for `stats_net_span`; None = (re)query on the
+    /// next Stats render.
+    stats_net_history: Option<Vec<crate::models::NetBucket>>,
+    /// Per-day downloaded bytes per traffic class backing the Network
+    /// Day/Week/Month/Year breakdown — loaded/refreshed with `stats_snapshot`.
+    stats_net_daily: Option<Vec<crate::models::DailyNetStat>>,
+    /// Selected period for the Network breakdown (session-only).
+    net_period: RecordingsPeriod,
+    /// Live per-class download rates, refreshed at most 1×/s while the Stats
+    /// tab is open (an `iomon::latest()` clone per frame would be wasteful).
+    stats_net_live: Option<(std::time::Instant, NetLive)>,
     /// Channel Stats view: selected channel (`None` = all-channels overview).
     chstats_channel: Option<i64>,
     /// Channel Stats view: selected timespan (session-only, defaults 30 d).

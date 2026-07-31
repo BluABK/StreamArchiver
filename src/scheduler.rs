@@ -50,6 +50,10 @@ pub async fn run(
     let mut active_desync_since: HashMap<i64, Instant> = HashMap::new();
     let mut active_desync_warned: HashSet<i64> = HashSet::new();
     while !shutdown.load(Ordering::SeqCst) {
+        // Ahead of the pause check on purpose: manual video downloads keep
+        // running while live polling is paused, and their traffic still has
+        // to reach the Stats view's history.
+        fold_net_history(&ctx.store);
         // Live poll can be disabled from the Background view (a global pause of
         // detection/recording); idle-check for re-enable without polling.
         if !ctx.store.job_enabled("job_live_poll") {
@@ -67,6 +71,23 @@ pub async fn run(
         .await;
         crate::events::mark_job(&jobs, "Live poll", wait as i64);
         crate::app_core::sleep_cancellable(Duration::from_secs(wait), &shutdown).await;
+    }
+}
+
+/// Drain the I/O sampler's per-minute download totals into `net_history`
+/// (Stats view → Network / downloads). The sampler stamps each bucket with the
+/// minute the traffic actually happened in, so folding on the scheduler's own
+/// irregular cadence never smears the series — this just has to run often
+/// enough to keep the undrained accumulator small.
+fn fold_net_history(store: &crate::store::Store) {
+    let net = crate::iomon::take_net_buckets();
+    if net.is_empty() {
+        return;
+    }
+    let rows: Vec<(i64, &str, u64)> =
+        net.iter().map(|(t, kind, bytes)| (*t, kind.key(), *bytes)).collect();
+    if let Err(e) = store.record_net_history(&rows) {
+        warn!("scheduler: failed to persist download history: {e:#}");
     }
 }
 

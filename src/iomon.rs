@@ -184,6 +184,86 @@ impl Region {
     }
 }
 
+/// What a spawned tool's *read* traffic represents. The per-process
+/// `IO_COUNTERS` the sampler reads count socket transfers as well as file
+/// ones, so a capture tool's read side is essentially its CDN download rate —
+/// but only for tools that actually pull from the network. A local remux or
+/// concat pass reads gigabytes off the recordings drive and would otherwise
+/// masquerade as a download, so classification is declared explicitly at each
+/// spawn site rather than guessed from the tool name.
+///
+/// Feeds the Stats view's Network/downloads section and the `net_history`
+/// table (see `Store::record_net_history`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[repr(usize)]
+pub enum NetKind {
+    /// Reads are local disk, not network: remux, concat, embed, merge, probe.
+    #[default]
+    Local,
+    /// Live stream capture — the Streams grid's recordings (streamlink/yt-dlp
+    /// pulling an HLS/DASH live edge), including companion captures.
+    Recording,
+    /// On-demand video download — the Videos tab's downloads.
+    Download,
+    /// Live chat sidecar (a yt-dlp `--live-chat` process; Twitch chat is
+    /// logged in-process and therefore lands in the app's own traffic).
+    Chat,
+    /// CDN-fed repair traffic: head backfill, gap recovery, VOD recovery.
+    Recovery,
+}
+
+/// How many [`NetKind`] variants exist (array sizing for the accumulator).
+pub const NET_KIND_COUNT: usize = 5;
+
+impl NetKind {
+    pub const ALL: [NetKind; NET_KIND_COUNT] = [
+        NetKind::Local,
+        NetKind::Recording,
+        NetKind::Download,
+        NetKind::Chat,
+        NetKind::Recovery,
+    ];
+
+    /// The network-carrying kinds, in the order the Stats view lists them.
+    /// [`NetKind::Local`] is deliberately absent: it is disk traffic.
+    pub const NETWORK: [NetKind; 4] =
+        [NetKind::Recording, NetKind::Download, NetKind::Chat, NetKind::Recovery];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NetKind::Local => "local",
+            NetKind::Recording => "Recordings",
+            NetKind::Download => "Downloads",
+            NetKind::Chat => "Chat",
+            NetKind::Recovery => "Recovery",
+        }
+    }
+
+    /// Stable key persisted in the `net_history` table — never change these
+    /// without a migration; the labels above are free to be reworded.
+    pub fn key(self) -> &'static str {
+        match self {
+            NetKind::Local => "local",
+            NetKind::Recording => "recording",
+            NetKind::Download => "download",
+            NetKind::Chat => "chat",
+            NetKind::Recovery => "recovery",
+        }
+    }
+
+    /// Inverse of [`NetKind::key`]; unknown keys (a row written by a newer
+    /// build) map to `None` so the UI can skip them instead of mis-plotting.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.key() == key)
+    }
+
+    /// Whether this kind's read side is network traffic (everything but
+    /// [`NetKind::Local`]).
+    pub fn is_network(self) -> bool {
+        self != NetKind::Local
+    }
+}
+
 /// The kind of filesystem operation (for the ops ring; counters only split
 /// read/write/meta).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -641,6 +721,9 @@ pub struct ChildInfo {
     pub purpose: String,
     /// Region of the file the tool works against.
     pub region: Region,
+    /// What this tool's read side is: network download (and of which kind) or
+    /// local disk. Drives the Stats view's Network/downloads accounting.
+    pub net: NetKind,
     /// OS process creation time (see `platform::process_start_time`) so a
     /// recycled PID is never attributed; 0 = unknown (skip the check).
     pub proc_start: u64,
@@ -684,11 +767,27 @@ pub fn track_child(pid: u32, info: ChildInfo) -> ChildGuard {
 /// Convenience for post-processing passes: register a just-spawned tool
 /// against the file it works on. `None` pid (spawn raced its exit) → no-op.
 /// Skips the PID-recycle guard — these are held for one child's lifetime.
+///
+/// Assumes the tool reads from local disk ([`NetKind::Local`]); a pass that
+/// pulls from the network (the CDN-fed muxes) must use [`track_net_tool`] so
+/// its bytes reach the download stats instead of being written off as disk
+/// reads.
 pub fn track_tool(
     pid: Option<u32>,
     tool: &str,
     purpose: &str,
     target: &Path,
+) -> Option<ChildGuard> {
+    track_net_tool(pid, tool, purpose, target, NetKind::Local)
+}
+
+/// [`track_tool`] for a pass whose reads come off the network.
+pub fn track_net_tool(
+    pid: Option<u32>,
+    tool: &str,
+    purpose: &str,
+    target: &Path,
+    net: NetKind,
 ) -> Option<ChildGuard> {
     pid.map(|pid| {
         track_child(
@@ -701,6 +800,7 @@ pub fn track_tool(
                 tool: tool.to_string(),
                 purpose: purpose.to_string(),
                 region: classify(target),
+                net,
                 proc_start: 0,
             },
         )
@@ -744,6 +844,17 @@ pub struct ProcSample {
     pub tool: String,
     pub purpose: String,
     pub region: Region,
+    /// What this tool's read side is (network download kind, or local disk).
+    /// `#[serde(default)]` = `Local`, so sample logs written before this field
+    /// existed still deserialize.
+    #[serde(default)]
+    pub net: NetKind,
+    /// Download bytes/sec attributed to this tool: the *root* process's read
+    /// delta when [`ProcSample::net`] is a network class, else 0. Deliberately
+    /// narrower than `read_bps` — see [`SeenProc::last_root`] for why the
+    /// descendants are excluded here but not there.
+    #[serde(default)]
+    pub net_bps: u64,
     /// Bytes/sec since the previous sample. Read side of capture tools is
     /// mostly network (CDN) — the write side is the disk-relevant number.
     pub read_bps: u64,
@@ -808,6 +919,54 @@ pub struct FinishedChildTotals {
     pub count: u64,
 }
 
+/// Raw storage resolution of the persisted download history (one minute) —
+/// must match `store::NET_HISTORY_RAW_BUCKET_SECS`.
+const NET_BUCKET_SECS: i64 = 60;
+
+/// Downloaded bytes per [`NetKind`], accumulated into minute buckets by the
+/// sampler and drained into the `net_history` table by the scheduler tick
+/// (see [`take_net_buckets`]).
+///
+/// Bucketing here rather than at drain time is what makes the persisted
+/// series honest: the scheduler folds at most every 30s but can be idle far
+/// longer (live polling paused, a long tick), and stamping a whole backlog
+/// with the drain's own timestamp would pile hours of traffic into one minute.
+static NET_BUCKETS: Mutex<std::collections::BTreeMap<i64, [u64; NET_KIND_COUNT]>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Session-cumulative downloaded bytes per [`NetKind`] (never drained) — the
+/// "this session" readout, which must not shrink when buckets are persisted.
+static NET_SESSION: Mutex<[u64; NET_KIND_COUNT]> = Mutex::new([0; NET_KIND_COUNT]);
+
+/// Cap on undrained buckets. The drain runs from the scheduler, which is
+/// disabled outright when live polling is paused — without a bound, a
+/// long paused session would grow this map forever. 3 days of minutes is far
+/// past any real drain gap while still being ~4k tiny entries.
+const NET_BUCKETS_MAX: usize = 3 * 24 * 60;
+
+/// Drain the accumulated per-minute download totals, oldest first. Each entry
+/// is `(bucket start unix secs, kind, bytes)`; only non-zero kinds appear.
+/// The caller is expected to persist them (increment-upsert), so a partially
+/// elapsed final bucket is fine — the next drain adds the rest to the same row.
+pub fn take_net_buckets() -> Vec<(i64, NetKind, u64)> {
+    let taken = std::mem::take(&mut *NET_BUCKETS.lock());
+    let mut out = Vec::new();
+    for (t, per_kind) in taken {
+        for (i, bytes) in per_kind.iter().enumerate() {
+            if *bytes > 0 {
+                out.push((t, NetKind::ALL[i], *bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Session-cumulative downloaded bytes per [`NetKind`], indexed by the
+/// variant's discriminant (use [`NetKind::ALL`] to iterate in step).
+pub fn net_session_totals() -> [u64; NET_KIND_COUNT] {
+    *NET_SESSION.lock()
+}
+
 static HISTORY: Mutex<std::collections::VecDeque<Sample>> =
     Mutex::new(std::collections::VecDeque::new());
 static FINISHED: Mutex<FinishedChildTotals> = Mutex::new(FinishedChildTotals {
@@ -843,7 +1002,17 @@ pub fn sample_log_dir() -> PathBuf {
 /// Per-PID state the sampler carries between ticks (last cumulative counters,
 /// for delta rates and for folding into the finished totals on exit).
 struct SeenProc {
+    /// Whole live tree, root + descendants — the I/O tab's rates.
     last: crate::platform::ProcIo,
+    /// The registered root process alone. Download accounting uses this
+    /// rather than the tree total: every capture/download tool here fetches
+    /// from its own process (streamlink, and yt-dlp's native downloader with
+    /// `-o <file>`), while the descendant ffmpeg a download spawns is the
+    /// *merge* pass — which reads the just-downloaded parts back off disk and
+    /// would otherwise be double-counted as network traffic roughly equal to
+    /// the download itself. The CDN-fed ffmpeg muxes are registered as roots
+    /// in their own right, so they are unaffected.
+    last_root: crate::platform::ProcIo,
 }
 
 /// Start the background sampler thread (idempotent).
@@ -924,6 +1093,10 @@ fn sampler_loop() {
         };
         let mut procs: Vec<ProcSample> = Vec::with_capacity(registered.len());
         let (mut child_read_bps, mut child_write_bps) = (0u64, 0u64);
+        // This tick's raw read-byte deltas per network class (not a rate —
+        // the persisted history stores bytes, and rates are derived from the
+        // bucket width at render time).
+        let mut net_delta = [0u64; NET_KIND_COUNT];
         for (pid, info) in registered {
             // PID-recycle guard: a mismatching creation time means a new
             // process wears this number now — drop the registration.
@@ -951,6 +1124,7 @@ fn sampler_loop() {
                 i += 1;
             }
             let mut now = crate::platform::ProcIo::default();
+            let mut now_root = crate::platform::ProcIo::default();
             let mut alive = 0u32;
             // Exe names of the live tree, root first, deduped in BFS order.
             let mut tree_names: Vec<&str> = Vec::new();
@@ -960,6 +1134,9 @@ fn sampler_loop() {
                     now.write_bytes += io.write_bytes;
                     now.read_ops += io.read_ops;
                     now.write_ops += io.write_ops;
+                    if p == pid {
+                        now_root = io;
+                    }
                     alive += 1;
                     if let Some(e) = snap.iter().find(|e| e.pid == p)
                         && !e.name.is_empty()
@@ -977,21 +1154,29 @@ fn sampler_loop() {
             // its counters are cumulative since the process started, so
             // delta-from-nothing would report e.g. a re-attached capture's
             // whole 12 GB as one second's throughput (a 37 GB/s graph spike).
-            let (read_bps, write_bps) = match seen.insert(pid, SeenProc { last: now }) {
-                Some(prev) => (
-                    now.read_bytes.saturating_sub(prev.last.read_bytes),
-                    now.write_bytes.saturating_sub(prev.last.write_bytes),
-                ),
-                None => (0, 0),
-            };
+            let (read_bps, write_bps, root_read) =
+                match seen.insert(pid, SeenProc { last: now, last_root: now_root }) {
+                    Some(prev) => (
+                        now.read_bytes.saturating_sub(prev.last.read_bytes),
+                        now.write_bytes.saturating_sub(prev.last.write_bytes),
+                        now_root.read_bytes.saturating_sub(prev.last_root.read_bytes),
+                    ),
+                    None => (0, 0, 0),
+                };
             child_read_bps += read_bps;
             child_write_bps += write_bps;
+            // Only the network classes contribute; a local pass's reads are
+            // disk (see `NetKind`), and only the root's (see `SeenProc`).
+            let net_bps = if info.net.is_network() { root_read } else { 0 };
+            net_delta[info.net as usize] += net_bps;
             procs.push(ProcSample {
                 pid,
                 label: info.label,
                 tool: info.tool,
                 purpose: info.purpose,
                 region: info.region,
+                net: info.net,
+                net_bps,
                 read_bps,
                 write_bps,
                 total_read: now.read_bytes,
@@ -1001,6 +1186,31 @@ fn sampler_loop() {
             });
         }
         procs.sort_by_key(|p| std::cmp::Reverse(p.write_bps + p.read_bps));
+
+        // --- download accounting (per minute bucket, drained by the scheduler) ---
+        if net_delta.iter().any(|b| *b > 0) {
+            let now_s = chrono::Utc::now().timestamp();
+            let bucket_t = now_s - now_s.rem_euclid(NET_BUCKET_SECS);
+            {
+                let mut acc = NET_BUCKETS.lock();
+                // Drop the oldest bucket rather than the newest when nothing is
+                // draining: recent traffic is what the live view needs.
+                if acc.len() >= NET_BUCKETS_MAX
+                    && !acc.contains_key(&bucket_t)
+                    && let Some(&oldest) = acc.keys().next()
+                {
+                    acc.remove(&oldest);
+                }
+                let slot = acc.entry(bucket_t).or_insert([0; NET_KIND_COUNT]);
+                for (i, b) in net_delta.iter().enumerate() {
+                    slot[i] += b;
+                }
+            }
+            let mut session = NET_SESSION.lock();
+            for (i, b) in net_delta.iter().enumerate() {
+                session[i] += b;
+            }
+        }
 
         // --- db + wal size (C:) ---
         let db_path = crate::app_paths::db_path();
@@ -1606,6 +1816,8 @@ mod tests {
                 tool: "streamlink".into(),
                 purpose: "live capture".into(),
                 region: Region::Recordings,
+                net: NetKind::Recording,
+                net_bps: 10,
                 read_bps: 11,
                 write_bps: 12,
                 total_read: 13,
@@ -1625,6 +1837,48 @@ mod tests {
         assert_eq!(back.procs[0].pid, 1234);
         assert_eq!(back.disks[0].letter, 'A');
         assert_eq!(back.disks[0].queue_depth, 2);
+        assert_eq!(back.procs[0].net, NetKind::Recording);
+    }
+
+    /// Sample logs written before `ProcSample.net` existed must still load —
+    /// the I/O tab reads 14 days of them across app upgrades.
+    #[test]
+    fn proc_sample_without_net_field_defaults_to_local() {
+        let legacy = r#"{"pid":1,"label":"x","tool":"ffmpeg","purpose":"remux",
+            "region":"Recordings","read_bps":1,"write_bps":2,"total_read":3,
+            "total_write":4,"descendants":0,"tree":"ffmpeg"}"#;
+        let p: ProcSample = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.net, NetKind::Local);
+        assert_eq!(p.net_bps, 0);
+    }
+
+    #[test]
+    fn net_kind_keys_round_trip_and_exclude_local_from_network() {
+        for k in NetKind::ALL {
+            assert_eq!(NetKind::from_key(k.key()), Some(k), "{k:?} key round-trips");
+        }
+        assert_eq!(NetKind::from_key("nonsense"), None);
+        assert!(!NetKind::Local.is_network());
+        assert!(NetKind::NETWORK.iter().all(|k| k.is_network()));
+        assert_eq!(NetKind::NETWORK.len(), NET_KIND_COUNT - 1);
+    }
+
+    #[test]
+    fn net_buckets_drain_empty_and_report_only_nonzero_kinds() {
+        // Draining is destructive, so seed and drain within one test to avoid
+        // racing the sampler thread (which only ever adds).
+        let t = 1_752_000_000 - 1_752_000_000_i64.rem_euclid(NET_BUCKET_SECS);
+        {
+            let mut acc = NET_BUCKETS.lock();
+            let slot = acc.entry(t).or_insert([0; NET_KIND_COUNT]);
+            slot[NetKind::Download as usize] += 500;
+        }
+        let drained = take_net_buckets();
+        let mine: Vec<_> = drained.iter().filter(|(bt, _, _)| *bt == t).collect();
+        assert_eq!(mine.len(), 1, "only the non-zero kind is emitted");
+        assert_eq!((mine[0].1, mine[0].2), (NetKind::Download, 500));
+        // A second drain sees nothing of ours — the accumulator was taken.
+        assert!(take_net_buckets().iter().all(|(bt, _, _)| *bt != t));
     }
 
     #[test]
@@ -1634,6 +1888,7 @@ mod tests {
             tool: "ffmpeg".into(),
             purpose: "test".into(),
             region: Region::Other,
+            net: NetKind::Local,
             proc_start: 0,
         };
         {

@@ -818,7 +818,16 @@ pub async fn mux_playlist_to_mkv(
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn()?;
-    let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", purpose, dst);
+    // Every caller feeds this a *remote* playlist (head backfill, gap
+    // recovery, VOD recovery — see the cdn-mux gate above), so its read side
+    // is CDN download traffic, not disk.
+    let _io_guard = crate::iomon::track_net_tool(
+        child.id(),
+        "ffmpeg",
+        purpose,
+        dst,
+        crate::iomon::NetKind::Recovery,
+    );
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 

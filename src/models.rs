@@ -2340,6 +2340,34 @@ pub struct PollBucket {
     pub errors: u64,
 }
 
+/// One aggregated time bucket of download traffic for a single class, as
+/// returned by `Store::net_history` — the raw material for the Stats view's
+/// Network/downloads graphs. Backed by the `net_history` table (schema v80):
+/// stored at minute resolution, aggregated to the requested bucket width at
+/// query time. Bytes rather than a rate, so re-bucketing is a plain SUM; the
+/// UI divides by the bucket width to plot B/s.
+#[derive(Clone)]
+pub struct NetBucket {
+    /// Bucket start (unix secs, aligned down to the queried bucket width).
+    pub t: i64,
+    /// Traffic class key (`iomon::NetKind::key`).
+    pub kind: String,
+    /// Bytes downloaded within the bucket.
+    pub bytes: u64,
+}
+
+/// Downloaded bytes for one `(UTC day, traffic class)` pair, as returned by
+/// `Store::net_history_daily` — the calendar-aligned counterpart to
+/// [`NetBucket`], backing the Stats view's period breakdown.
+#[derive(Clone)]
+pub struct DailyNetStat {
+    /// `YYYY-MM-DD` (UTC), which sorts lexicographically as a date.
+    pub day: String,
+    /// Traffic class key (`iomon::NetKind::key`).
+    pub kind: String,
+    pub bytes: u64,
+}
+
 /// One aggregated time bucket of a monitor's viewer/follower history, as
 /// returned by `Store::viewer_history_range` — the raw material for the
 /// Channel Stats graphs. Backed by the `viewer_history` table (schema v59):

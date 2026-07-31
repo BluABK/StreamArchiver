@@ -270,6 +270,9 @@ pub(super) async fn adopt_or_clear_prior_ffmpeg_job(
                 tool: "ffmpeg".to_string(),
                 purpose: format!("{} (re-attached)", kind.as_str()),
                 region: crate::iomon::classify(tmp_path),
+                // Remux/concat/embed passes read the local capture, not the
+                // network — see `NetKind::Local`.
+                net: crate::iomon::NetKind::Local,
                 proc_start: row.proc_start,
             },
         );

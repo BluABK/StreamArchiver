@@ -831,6 +831,7 @@ impl StreamArchiverApp {
             ));
             self.stats_recordings_daily =
                 Some(self.core.store.recordings_daily_stats().unwrap_or_default());
+            self.stats_net_daily = Some(self.core.store.net_history_daily().unwrap_or_default());
         }
         let (ocr, global, poll) = match self.stats_snapshot.clone() {
             Some(s) => s,
@@ -847,6 +848,7 @@ impl StreamArchiverApp {
                     if ui.button("⟳  Refresh").clicked() {
                         self.stats_snapshot = None;
                         self.stats_history = None;
+                        self.stats_net_history = None;
                     }
                     if ui.button("🗑  Reset").on_hover_text("Clear all accumulated OCR stats").clicked() {
                         let _ = self.core.store.set_setting(K_OCR_STATS, "{}");
@@ -1390,11 +1392,7 @@ impl StreamArchiverApp {
                         });
                 }
                 super::RecordingsPeriod::Week | super::RecordingsPeriod::Month | super::RecordingsPeriod::Year => {
-                    let summaries = match self.recordings_period {
-                        super::RecordingsPeriod::Week => recordings_week_summaries(&daily_rec, today),
-                        super::RecordingsPeriod::Month => recordings_month_summaries(&daily_rec, today),
-                        _ => recordings_year_summaries(&daily_rec, today),
-                    };
+                    let summaries = recordings_summaries(&daily_rec, today, self.recordings_period);
                     egui::Grid::new("recordings_breakdown_summary")
                         .num_columns(5)
                         .striped(true)
@@ -1417,6 +1415,10 @@ impl StreamArchiverApp {
                         });
                 }
             }
+
+            ui.add_space(16.0);
+
+            self.stats_network_section(ui);
 
             ui.add_space(16.0);
 
@@ -1533,6 +1535,364 @@ impl StreamArchiverApp {
             // this view is app/system health only.)
         });
     }
+
+    /// Stats view → **Network / downloads**: what the capture and download
+    /// tools are pulling off the network right now, and how much they have
+    /// pulled historically, split by traffic class.
+    ///
+    /// The numbers come from the same per-process `IO_COUNTERS` sampling the
+    /// I/O tab uses (`iomon`), whose *read* side for a downloading tool is
+    /// essentially its network throughput — see [`crate::iomon::NetKind`] for
+    /// why the class has to be declared at spawn time rather than inferred.
+    fn stats_network_section(&mut self, ui: &mut egui::Ui) {
+        use crate::iomon::NetKind;
+        use super::io_view::fmt_bytes;
+
+        let bps = |v: u64| format!("{}/s", fmt_bytes(v as i64));
+
+        ui.horizontal(|ui| {
+            ui.heading("Network / downloads 🌐").on_hover_text(
+                "How much data the capture and download tools pull off the \
+                 network, split by what the traffic is for. Measured from each \
+                 spawned tool's own process I/O counters (the same source as \
+                 the I/O tab), whose read side while downloading is its CDN \
+                 throughput.\n\n\
+                 Two things are deliberately excluded, so this reads as \
+                 network traffic rather than 'bytes the tools moved': local \
+                 post-processing (remux, concat, embedding), which reads from \
+                 disk, and a download tool's own child ffmpeg, which is the \
+                 merge pass reading the finished parts back. The app's own API \
+                 polls and image fetches aren't counted here either — they \
+                 land in the I/O tab's 'unattributed' figure.",
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("🗑  Reset")
+                    .on_hover_text(
+                        "Clear the stored download history (graph + breakdown). \
+                         The live rates and the session totals keep running.",
+                    )
+                    .clicked()
+                {
+                    let _ = self.core.store.clear_net_history();
+                    self.stats_net_history = None;
+                    self.stats_net_daily = Some(Vec::new());
+                }
+            });
+        });
+        ui.separator();
+
+        // ── Current rates (refreshed at most 1×/s) ───────────────────────
+        let stale = self
+            .stats_net_live
+            .as_ref()
+            .map(|(t, _)| t.elapsed().as_millis() >= 900)
+            .unwrap_or(true);
+        if stale {
+            self.stats_net_live = Some((std::time::Instant::now(), super::NetLive::capture()));
+        }
+        let live = self.stats_net_live.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
+        // Only repaint on a timer while something is actually moving —
+        // an idle Stats tab shouldn't hold the UI at 1 fps forever.
+        if live.total_bps() > 0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            if !live.have_sample {
+                ui.weak("I/O sampler warming up…");
+            } else {
+                ui.label("Downloading now:");
+                ui.strong(bps(live.total_bps()));
+                if live.age_ms > 5_000 {
+                    ui.separator();
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("sampler stalled? last sample {}s ago", live.age_ms / 1000),
+                    )
+                    .on_hover_text(
+                        "The rates below are from that stale sample — treat a \
+                         reading of 0 as 'unknown', not 'idle'.",
+                    );
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+        egui::Grid::new("net_live_grid")
+            .num_columns(4)
+            .striped(true)
+            .spacing([24.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("Traffic");
+                ui.strong("Now");
+                ui.strong("Tools").on_hover_text(
+                    "Live tool processes in this class right now (a capture and \
+                     its companion count separately).",
+                );
+                ui.strong("This session").on_hover_text(
+                    "Downloaded since the app started — including tools that \
+                     have already finished.",
+                );
+                ui.end_row();
+
+                for k in NetKind::NETWORK {
+                    let (rate, tools) = live.per_kind[k as usize];
+                    let (swatch, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(swatch, 2.0, net_kind_color(k));
+                    ui.horizontal(|ui| {
+                        ui.label(k.label()).on_hover_text(net_kind_hover(k));
+                    });
+                    if rate > 0 {
+                        ui.strong(bps(rate));
+                    } else {
+                        ui.weak("—");
+                    }
+                    if tools > 0 {
+                        ui.label(tools.to_string());
+                    } else {
+                        ui.weak("—");
+                    }
+                    ui.label(fmt_bytes(live.session[k as usize] as i64));
+                    ui.end_row();
+                }
+            });
+
+        // ── History graph ────────────────────────────────────────────────
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("History:").on_hover_text(
+                "Minute-resolution download history is kept for 60 days \
+                 (net_history table); pick how far back the graph looks. \
+                 Wider spans use wider buckets, so a spike that filled one \
+                 minute reads as a lower average across an hour-wide bucket.",
+            );
+            for s in super::PollSpan::ALL {
+                let resp = ui
+                    .selectable_label(self.stats_net_span == s, s.label())
+                    .on_hover_text(format!(
+                        "Show the last {} in {} buckets",
+                        s.label(),
+                        s.bucket_label()
+                    ));
+                if resp.clicked() && self.stats_net_span != s {
+                    self.stats_net_span = s;
+                    self.stats_net_history = None;
+                }
+            }
+        });
+
+        let span = self.stats_net_span;
+        if self.stats_net_history.is_none() {
+            let since = chrono::Utc::now().timestamp() - span.secs();
+            self.stats_net_history = Some(
+                self.core.store.net_history(since, span.bucket_secs()).unwrap_or_default(),
+            );
+        }
+        let history = self.stats_net_history.clone().unwrap_or_default();
+        if history.is_empty() {
+            ui.weak(
+                "No download history in this timespan yet — it accumulates \
+                 while captures and downloads run.",
+            );
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            let to_x = |t: i64| (t - now) as f64 / 3600.0; // hours before now (negative)
+            let days = span.axis_in_days();
+            let fx = move |h: f64| {
+                if days { format!("{:+.1}d", h / 24.0) } else { format!("{h:+.1}h") }
+            };
+            let bucket_secs = span.bucket_secs() as f64;
+            let bucket_label = span.bucket_label();
+
+            // kind key -> time-ordered bytes.
+            let mut per_kind: std::collections::BTreeMap<&str, std::collections::BTreeMap<i64, u64>> =
+                Default::default();
+            for b in &history {
+                // Rows written by a newer build with an unknown class are
+                // skipped rather than plotted under a wrong name.
+                let Some(k) = NetKind::from_key(&b.kind) else { continue };
+                if !k.is_network() {
+                    continue;
+                }
+                *per_kind.entry(k.key()).or_default().entry(b.t).or_insert(0) += b.bytes;
+            }
+            ui.add_space(4.0);
+            ui.label("Download rate:").on_hover_text(format!(
+                "Average bytes/second per traffic class, in {bucket_label} \
+                 buckets. Idle buckets store no row at all, so flat gaps are \
+                 bridged with straight segments — a gap can equally mean \
+                 'nothing downloading' or 'app not running'.",
+            ));
+            egui_plot::Plot::new("net_rate_plot")
+                .height(180.0)
+                .legend(egui_plot::Legend::default())
+                .allow_scroll(false)
+                .include_y(0.0)
+                // `fx` captures only a `bool`, so the closure is `Copy` and can
+                // be moved into both formatters.
+                .x_axis_formatter(move |mark, _| fx(mark.value))
+                .y_axis_formatter(|mark, _| format!("{}/s", fmt_bytes(mark.value as i64)))
+                .label_formatter(move |name, v| {
+                    format!("{name}\n{}: {}/s", fx(v.x), fmt_bytes(v.y as i64))
+                })
+                .show(ui, |plot_ui| {
+                    for k in NetKind::NETWORK {
+                        let Some(buckets) = per_kind.get(k.key()) else { continue };
+                        let pts: Vec<[f64; 2]> = buckets
+                            .iter()
+                            .map(|(t, bytes)| [to_x(*t), *bytes as f64 / bucket_secs])
+                            .collect();
+                        plot_ui.line(
+                            egui_plot::Line::new(k.label(), egui_plot::PlotPoints::from(pts))
+                                .color(net_kind_color(k)),
+                        );
+                    }
+                });
+        }
+
+        // ── Period breakdown ─────────────────────────────────────────────
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Breakdown:").on_hover_text(
+                "Downloaded bytes per traffic class, by calendar period (UTC). \
+                 Limited by the 60-day history retention — 'Year' can only \
+                 show what's still stored.",
+            );
+            for p in super::RecordingsPeriod::ALL {
+                if ui.selectable_label(self.net_period == p, p.label()).clicked() {
+                    self.net_period = p;
+                }
+            }
+        });
+        let daily_net = self.stats_net_daily.clone().unwrap_or_default();
+        let today = chrono::Utc::now().date_naive();
+        egui::Grid::new("net_breakdown_grid")
+            .num_columns(2 + NetKind::NETWORK.len())
+            .striped(true)
+            .spacing([24.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong(match self.net_period {
+                    super::RecordingsPeriod::Day => "Day",
+                    _ => "",
+                });
+                for k in NetKind::NETWORK {
+                    ui.strong(k.label()).on_hover_text(net_kind_hover(k));
+                }
+                ui.strong("Total");
+                ui.end_row();
+
+                let row = |ui: &mut egui::Ui,
+                           label: String,
+                           sums: [u64; crate::iomon::NET_KIND_COUNT],
+                           dim: bool| {
+                    if dim {
+                        ui.weak(label);
+                    } else {
+                        ui.label(label);
+                    }
+                    let mut total = 0u64;
+                    for k in NetKind::NETWORK {
+                        let v = sums[k as usize];
+                        total += v;
+                        if dim || v == 0 {
+                            ui.weak("—");
+                        } else {
+                            ui.label(fmt_bytes(v as i64));
+                        }
+                    }
+                    if dim || total == 0 {
+                        ui.weak("—");
+                    } else {
+                        ui.strong(fmt_bytes(total as i64));
+                    }
+                    ui.end_row();
+                };
+
+                match self.net_period {
+                    super::RecordingsPeriod::Day => {
+                        let start = super::calendar::week_start(today);
+                        for i in 0..7 {
+                            let d = start + chrono::Duration::days(i);
+                            row(
+                                ui,
+                                d.format("%a %Y-%m-%d").to_string(),
+                                sum_net_days(&daily_net, d, d),
+                                d > today,
+                            );
+                        }
+                    }
+                    period => {
+                        for (label, start, end, _) in summary_periods(period, today) {
+                            row(ui, label.to_string(), sum_net_days(&daily_net, start, end), false);
+                        }
+                    }
+                }
+            });
+    }
+}
+
+/// Plot/legend color for a traffic class. Chosen to read as distinct lines on
+/// both light and dark backgrounds, and reused for the swatches in the live
+/// table so the two panels are visually keyed to each other.
+fn net_kind_color(k: crate::iomon::NetKind) -> egui::Color32 {
+    use crate::iomon::NetKind;
+    match k {
+        NetKind::Recording => egui::Color32::from_rgb(226, 96, 96),
+        NetKind::Download => egui::Color32::from_rgb(92, 156, 232),
+        NetKind::Chat => egui::Color32::from_rgb(154, 124, 224),
+        NetKind::Recovery => egui::Color32::from_rgb(228, 172, 74),
+        NetKind::Local => egui::Color32::GRAY,
+    }
+}
+
+/// Hover text explaining what traffic a class actually covers.
+fn net_kind_hover(k: crate::iomon::NetKind) -> &'static str {
+    use crate::iomon::NetKind;
+    match k {
+        NetKind::Recording => {
+            "Live stream captures — streamlink/yt-dlp pulling a broadcast's \
+             live edge, including companion captures of the same stream."
+        }
+        NetKind::Download => {
+            "On-demand downloads started from the Videos view (and the \
+             re-attached ones adopted after a restart)."
+        }
+        NetKind::Chat => {
+            "Live chat sidecars run as a separate tool process. Twitch chat is \
+             logged in-process instead, so it lands in the app's own traffic \
+             rather than here."
+        }
+        NetKind::Recovery => {
+            "CDN-fed repair traffic: head backfill, lost-segment gap recovery, \
+             and VOD recovery — all of which re-fetch from the platform's CDN."
+        }
+        NetKind::Local => "Local disk work (remux, concat, embed) — not network traffic.",
+    }
+}
+
+/// Sum of downloaded bytes per traffic class for the days in the inclusive
+/// `[start, end]` range. ISO `YYYY-MM-DD` strings sort lexicographically the
+/// same as the dates they represent, so no per-row parsing is needed (same
+/// trick as [`sum_recording_days`]).
+fn sum_net_days(
+    daily: &[crate::models::DailyNetStat],
+    start: chrono::NaiveDate,
+    end: chrono::NaiveDate,
+) -> [u64; crate::iomon::NET_KIND_COUNT] {
+    let s = start.format("%Y-%m-%d").to_string();
+    let e = end.format("%Y-%m-%d").to_string();
+    let mut out = [0u64; crate::iomon::NET_KIND_COUNT];
+    for d in daily
+        .iter()
+        .filter(|d| d.day.as_str() >= s.as_str() && d.day.as_str() <= e.as_str())
+    {
+        if let Some(k) = crate::iomon::NetKind::from_key(&d.kind) {
+            out[k as usize] += d.bytes;
+        }
+    }
+    out
 }
 
 /// One Recordings-breakdown summary row (e.g. "This week" / "Last month").
@@ -1586,54 +1946,65 @@ fn recording_year_start(d: chrono::NaiveDate) -> chrono::NaiveDate {
     chrono::NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d)
 }
 
-/// "This week"/"Last week" (Monday-start). "This week" averages over the
-/// days elapsed so far, not a flat 7 — a Tuesday's daily average shouldn't be
-/// dragged down by 5 days that haven't happened yet.
-fn recordings_week_summaries(
-    daily: &[crate::models::DailyRecordingStat],
-    today: chrono::NaiveDate,
-) -> [RecordingsPeriodSummary; 2] {
-    let this_start = super::calendar::week_start(today);
-    let elapsed = (today - this_start).num_days() + 1;
-    let last_start = this_start - chrono::Duration::days(7);
-    let last_end = this_start - chrono::Duration::days(1);
-    [
-        recording_period_summary("This week", sum_recording_days(daily, this_start, today), elapsed),
-        recording_period_summary("Last week", sum_recording_days(daily, last_start, last_end), 7),
-    ]
-}
+/// One row of a summary table: `(label, first day, last day, days to average
+/// over)`. The current period ends at `today` and averages over the days
+/// *elapsed so far*, not the period's full width — a Tuesday's daily average
+/// shouldn't be dragged down by 5 days that haven't happened yet.
+type SummaryPeriod = (&'static str, chrono::NaiveDate, chrono::NaiveDate, i64);
 
-/// "This month"/"Last month", same partial-period averaging as the week version.
-fn recordings_month_summaries(
-    daily: &[crate::models::DailyRecordingStat],
+/// The two periods a summary table shows: the current, still-elapsing one and
+/// the last fully-elapsed one. Shared by the Recordings and Network
+/// breakdowns so the calendar arithmetic exists once.
+///
+/// [`RecordingsPeriod::Day`] has no summary form (it lists the 7 individual
+/// days of the current week instead) and is treated as `Year` here; callers
+/// branch on it before getting this far.
+fn summary_periods(
+    period: super::RecordingsPeriod,
     today: chrono::NaiveDate,
-) -> [RecordingsPeriodSummary; 2] {
-    let this_start = recording_month_start(today);
-    let elapsed = (today - this_start).num_days() + 1;
-    let last_end = this_start - chrono::Duration::days(1);
-    let last_start = recording_month_start(last_end);
-    let last_days = (last_end - last_start).num_days() + 1;
-    [
-        recording_period_summary("This month", sum_recording_days(daily, this_start, today), elapsed),
-        recording_period_summary("Last month", sum_recording_days(daily, last_start, last_end), last_days),
-    ]
-}
-
-/// "This year"/"Last year", same partial-period averaging as week/month.
-fn recordings_year_summaries(
-    daily: &[crate::models::DailyRecordingStat],
-    today: chrono::NaiveDate,
-) -> [RecordingsPeriodSummary; 2] {
+) -> [SummaryPeriod; 2] {
     use chrono::Datelike;
-    let this_start = recording_year_start(today);
-    let elapsed = (today - this_start).num_days() + 1;
-    let last_start = chrono::NaiveDate::from_ymd_opt(today.year() - 1, 1, 1).unwrap_or(this_start);
-    let last_end = this_start - chrono::Duration::days(1);
-    let last_days = (last_end - last_start).num_days() + 1;
-    [
-        recording_period_summary("This year", sum_recording_days(daily, this_start, today), elapsed),
-        recording_period_summary("Last year", sum_recording_days(daily, last_start, last_end), last_days),
-    ]
+    match period {
+        super::RecordingsPeriod::Week => {
+            let this_start = super::calendar::week_start(today);
+            let last_start = this_start - chrono::Duration::days(7);
+            let last_end = this_start - chrono::Duration::days(1);
+            [
+                ("This week", this_start, today, (today - this_start).num_days() + 1),
+                ("Last week", last_start, last_end, 7),
+            ]
+        }
+        super::RecordingsPeriod::Month => {
+            let this_start = recording_month_start(today);
+            let last_end = this_start - chrono::Duration::days(1);
+            let last_start = recording_month_start(last_end);
+            [
+                ("This month", this_start, today, (today - this_start).num_days() + 1),
+                ("Last month", last_start, last_end, (last_end - last_start).num_days() + 1),
+            ]
+        }
+        _ => {
+            let this_start = recording_year_start(today);
+            let last_start =
+                chrono::NaiveDate::from_ymd_opt(today.year() - 1, 1, 1).unwrap_or(this_start);
+            let last_end = this_start - chrono::Duration::days(1);
+            [
+                ("This year", this_start, today, (today - this_start).num_days() + 1),
+                ("Last year", last_start, last_end, (last_end - last_start).num_days() + 1),
+            ]
+        }
+    }
+}
+
+/// The Recordings breakdown's two summary rows for `period`.
+fn recordings_summaries(
+    daily: &[crate::models::DailyRecordingStat],
+    today: chrono::NaiveDate,
+    period: super::RecordingsPeriod,
+) -> [RecordingsPeriodSummary; 2] {
+    summary_periods(period, today).map(|(label, start, end, days)| {
+        recording_period_summary(label, sum_recording_days(daily, start, end), days)
+    })
 }
 
 /// The 7 days (Monday..Sunday) of the calendar week containing `today`, each
@@ -1670,6 +2041,52 @@ mod tests {
         chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
+    fn net_day(day: &str, kind: &str, bytes: u64) -> crate::models::DailyNetStat {
+        crate::models::DailyNetStat { day: day.into(), kind: kind.into(), bytes }
+    }
+
+    #[test]
+    fn net_days_sum_per_kind_within_the_range_only() {
+        use crate::iomon::NetKind;
+        let daily = vec![
+            net_day("2026-07-19", "recording", 9_000), // before the range
+            net_day("2026-07-20", "recording", 1_000),
+            net_day("2026-07-20", "download", 500),
+            net_day("2026-07-22", "recording", 250),
+            net_day("2026-07-23", "download", 7_000), // after the range
+        ];
+        let sums = sum_net_days(&daily, ymd(2026, 7, 20), ymd(2026, 7, 22));
+        assert_eq!(sums[NetKind::Recording as usize], 1_250);
+        assert_eq!(sums[NetKind::Download as usize], 500);
+        assert_eq!(sums[NetKind::Chat as usize], 0);
+    }
+
+    /// A class this build doesn't know (a row written by a newer version)
+    /// must be dropped, not folded into an arbitrary slot.
+    #[test]
+    fn net_days_ignore_unknown_kinds() {
+        let daily = vec![net_day("2026-07-20", "quantum-tunnel", 42)];
+        let sums = sum_net_days(&daily, ymd(2026, 7, 20), ymd(2026, 7, 20));
+        assert!(sums.iter().all(|b| *b == 0));
+    }
+
+    /// Both breakdowns share this arithmetic, so the boundaries are asserted
+    /// once here rather than per consumer.
+    #[test]
+    fn summary_periods_bound_current_period_at_today() {
+        let [this_w, last_w] = summary_periods(super::super::RecordingsPeriod::Week, ymd(2026, 7, 22));
+        assert_eq!((this_w.0, this_w.1, this_w.2, this_w.3), ("This week", ymd(2026, 7, 20), ymd(2026, 7, 22), 3));
+        assert_eq!((last_w.1, last_w.2, last_w.3), (ymd(2026, 7, 13), ymd(2026, 7, 19), 7));
+
+        let [this_m, last_m] = summary_periods(super::super::RecordingsPeriod::Month, ymd(2026, 1, 1));
+        assert_eq!((this_m.1, this_m.2, this_m.3), (ymd(2026, 1, 1), ymd(2026, 1, 1), 1));
+        assert_eq!((last_m.1, last_m.2, last_m.3), (ymd(2025, 12, 1), ymd(2025, 12, 31), 31));
+
+        let [this_y, last_y] = summary_periods(super::super::RecordingsPeriod::Year, ymd(2026, 7, 22));
+        assert_eq!((this_y.1, this_y.2, this_y.3), (ymd(2026, 1, 1), ymd(2026, 7, 22), 203));
+        assert_eq!((last_y.1, last_y.2, last_y.3), (ymd(2025, 1, 1), ymd(2025, 12, 31), 365));
+    }
+
     #[test]
     fn week_days_covers_monday_to_sunday_and_fills_gaps() {
         // Wednesday 2026-07-22 anchors the week of Mon 2026-07-20..Sun 2026-07-26.
@@ -1692,7 +2109,7 @@ mod tests {
             day("2026-07-20", 2, 200), // this week (Mon)
             day("2026-07-22", 2, 200), // this week (Wed, today)
         ];
-        let [this_week, last_week] = recordings_week_summaries(&daily, ymd(2026, 7, 22));
+        let [this_week, last_week] = recordings_summaries(&daily, ymd(2026, 7, 22), super::RecordingsPeriod::Week);
         assert_eq!(this_week.label, "This week");
         assert_eq!(this_week.count, 4);
         assert_eq!(this_week.bytes, 400);
@@ -1705,7 +2122,7 @@ mod tests {
     #[test]
     fn week_summaries_exclude_days_outside_either_week() {
         let daily = vec![day("2026-07-06", 9, 900)]; // two weeks before
-        let [this_week, last_week] = recordings_week_summaries(&daily, ymd(2026, 7, 22));
+        let [this_week, last_week] = recordings_summaries(&daily, ymd(2026, 7, 22), super::RecordingsPeriod::Week);
         assert_eq!(this_week.count, 0);
         assert_eq!(last_week.count, 0);
     }
@@ -1718,7 +2135,7 @@ mod tests {
             day("2026-07-01", 1, 100),
             day("2026-07-22", 1, 100),
         ];
-        let [this_month, last_month] = recordings_month_summaries(&daily, ymd(2026, 7, 22));
+        let [this_month, last_month] = recordings_summaries(&daily, ymd(2026, 7, 22), super::RecordingsPeriod::Month);
         assert_eq!(this_month.count, 2);
         assert_eq!(last_month.count, 3);
         assert!((this_month.avg_count_per_day - 2.0 / 22.0).abs() < 1e-9);
@@ -1729,7 +2146,7 @@ mod tests {
     #[test]
     fn month_summaries_handle_january_rollover_to_prior_december() {
         let daily = vec![day("2025-12-31", 5, 500), day("2026-01-01", 2, 200)];
-        let [this_month, last_month] = recordings_month_summaries(&daily, ymd(2026, 1, 1));
+        let [this_month, last_month] = recordings_summaries(&daily, ymd(2026, 1, 1), super::RecordingsPeriod::Month);
         assert_eq!(this_month.count, 2);
         assert_eq!(last_month.count, 5);
         // December has 31 days.
@@ -1743,7 +2160,7 @@ mod tests {
             day("2026-01-01", 1, 100),
             day("2026-07-22", 1, 100),
         ];
-        let [this_year, last_year] = recordings_year_summaries(&daily, ymd(2026, 7, 22));
+        let [this_year, last_year] = recordings_summaries(&daily, ymd(2026, 7, 22), super::RecordingsPeriod::Year);
         assert_eq!(this_year.count, 2);
         assert_eq!(last_year.count, 4);
         // 2026-01-01 through 2026-07-22 inclusive = 203 days.
