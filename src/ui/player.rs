@@ -625,19 +625,61 @@ fn new_mpv_ipc_pipe_path() -> String {
     )
 }
 
-/// Send one `set_property title <value>` command over an already-open mpv
-/// JSON-IPC pipe (newline-delimited JSON, mpv's documented IPC protocol).
-fn send_mpv_title(pipe: &mut std::fs::File, title: &str) -> std::io::Result<()> {
+/// Write one command line to an already-open mpv JSON-IPC pipe
+/// (newline-delimited JSON, mpv's documented IPC protocol), then drain any
+/// queued replies. mpv answers *every* command, and this client never
+/// otherwise reads — without the drain, each write would leave one more reply
+/// rotting in the pipe's outbound buffer for the life of the window.
+fn send_mpv_line(pipe: &mut std::fs::File, cmd: serde_json::Value) -> std::io::Result<()> {
     use std::io::Write;
-    let line = serde_json::json!({"command": ["set_property", "title", title]}).to_string();
-    pipe.write_all(line.as_bytes())?;
-    pipe.write_all(b"\n")
+    pipe.write_all(cmd.to_string().as_bytes())?;
+    pipe.write_all(b"\n")?;
+    drain_mpv_replies(pipe);
+    Ok(())
 }
 
-/// Poll for mpv's `--input-ipc-server` pipe until it exists, and open it for
-/// writing. `None` = it never appeared within `connect_timeout` (mpv never
-/// came up, the launch failed, or the player isn't mpv after all), which is
-/// always best-effort: the window simply keeps the title it launched with.
+/// Send `set_property title <value>` — mpv treats setting a property to its
+/// current value as a no-op, so re-sending an unchanged title is a safe way
+/// to double as a liveness probe.
+fn send_mpv_title(pipe: &mut std::fs::File, title: &str) -> std::io::Result<()> {
+    send_mpv_line(pipe, serde_json::json!({"command": ["set_property", "title", title]}))
+}
+
+/// A liveness probe that changes nothing: any complete command line gets
+/// answered (and the answer drained by [`send_mpv_line`]), and a failed write
+/// is the only "window closed" signal a client that pushes titles ever gets —
+/// once mpv exits, its end of the pipe is gone and the write errors.
+fn poke_mpv(pipe: &mut std::fs::File) -> std::io::Result<()> {
+    send_mpv_line(pipe, serde_json::json!({"command": ["get_property", "pid"]}))
+}
+
+/// Read-and-discard whatever replies mpv has queued on the pipe, without
+/// blocking (`PeekNamedPipe` first, then exact-size reads). Replies arrive
+/// asynchronously, so the drain right after a write usually collects the
+/// *previous* write's reply — which is the point: the buffer stays at most
+/// one reply deep instead of growing for the life of the window.
+fn drain_mpv_replies(pipe: &mut std::fs::File) {
+    use std::io::Read;
+    let mut scratch = [0u8; 512];
+    loop {
+        let avail = crate::platform::pipe_bytes_available(pipe) as usize;
+        if avail == 0 {
+            return;
+        }
+        // Reading exactly what Peek reported can never block.
+        let take = avail.min(scratch.len());
+        if pipe.read_exact(&mut scratch[..take]).is_err() {
+            return;
+        }
+    }
+}
+
+/// Poll for mpv's `--input-ipc-server` pipe until it exists, and open it
+/// read+write — write for the commands, read so [`drain_mpv_replies`] can
+/// keep the reply buffer empty. `None` = it never appeared within
+/// `connect_timeout` (mpv never came up, the launch failed, or the player
+/// isn't mpv after all), which is always best-effort: the window simply keeps
+/// the title it launched with.
 fn connect_mpv_ipc(
     pipe_path: &str,
     connect_timeout: std::time::Duration,
@@ -645,7 +687,7 @@ fn connect_mpv_ipc(
     let deadline = std::time::Instant::now() + connect_timeout;
     loop {
         match crate::iomon::fs::open_with_sync(crate::iomon::Cat::Preview, pipe_path, |o| {
-            o.write(true);
+            o.read(true).write(true);
         }) {
             Ok(f) => return Some(f),
             Err(_) if std::time::Instant::now() < deadline => {
@@ -661,44 +703,53 @@ fn connect_mpv_ipc(
 
 /// Background loop started by [`apply_live_title_and_spawn_updater`] (and by
 /// the Streamlink branch of [`spawn_play_new_instance`]): connect to
-/// `pipe_path`, push the current title once the pipe is up, then poll
-/// `monitor_id`'s title/game every [`LIVE_TITLE_POLL`] and push a freshly
-/// rendered title whenever either changed since the last push. Exits silently
-/// once the pipe write fails (mpv closed its IPC server, meaning the player
-/// quit) or `connect_timeout` elapses (mpv never came up, or doesn't support
-/// `--input-ipc-server`).
+/// `pipe_path`, then re-render `monitor_id`'s title from its row and push it
+/// every [`LIVE_TITLE_POLL`]. Exits once a pipe write fails (mpv closed its
+/// IPC server, meaning the player quit) or `connect_timeout` elapses (mpv
+/// never came up, or doesn't support `--input-ipc-server`).
 ///
 /// The push-on-connect isn't redundant: on the Streamlink path our `--title`
 /// never reaches mpv at all (Streamlink resolves its own `--title` once and
 /// hands mpv `--force-media-title`, verified against Streamlink 8's
 /// `PlayerArgsMPV::get_title`), so this first push is what puts the configured
-/// template on the window — and starts `{pos}` ticking. On the paths that do
-/// pass `--title=` themselves it re-sends the value already showing, which
-/// costs one pipe write.
+/// template on the window — and starts `{pos}` ticking.
+///
+/// The push is deliberately unconditional, not gated on a title/game change:
+/// the write doubles as the liveness probe. A change-gated loop only ever
+/// noticed the player closing when the channel next retitled, so a stable
+/// 12-hour stream left this thread polling the DB behind a long-closed window
+/// for the rest of the session. Re-sending an unchanged title is an mpv-side
+/// no-op, and [`send_mpv_line`]'s reply drain keeps the writes from
+/// accumulating anything.
 fn run_live_title_updater(
     pipe_path: String,
     store: Arc<crate::store::Store>,
     monitor_id: i64,
     template: String,
-    mut last_title: String,
-    mut last_game: String,
     connect_timeout: std::time::Duration,
 ) {
     let Some(mut pipe) = connect_mpv_ipc(&pipe_path, connect_timeout) else { return };
     tracing::debug!(monitor_id, "live-title: mpv IPC connected, pushing title");
-    let mut force = true;
+    let mut pushed: Option<String> = None;
     loop {
-        if let Ok(Some(row)) = store.get_monitor_with_channel(monitor_id)
-            && (force || row.last_title != last_title || row.last_game != last_game)
-        {
-            force = false;
-            last_title = row.last_title.clone();
-            last_game = row.last_game.clone();
-            let value = mpv_live_title_value(&template, &row.channel.name, &last_title, &last_game);
-            if send_mpv_title(&mut pipe, &value).is_err() {
-                return; // player closed
+        // Fresh render while the monitor row is readable; the last pushed
+        // value once it isn't (monitor deleted mid-play) — something must go
+        // down the pipe every round or the close goes unnoticed again.
+        let value = match store.get_monitor_with_channel(monitor_id) {
+            Ok(Some(row)) => {
+                mpv_live_title_value(&template, &row.channel.name, &row.last_title, &row.last_game)
             }
+            _ => match pushed.clone() {
+                Some(v) => v,
+                // Row unreadable before anything was ever pushed: no channel
+                // name to render with, and nothing to probe with either.
+                None => return,
+            },
+        };
+        if send_mpv_title(&mut pipe, &value).is_err() {
+            return; // player closed
         }
+        pushed = Some(value);
         std::thread::sleep(LIVE_TITLE_POLL);
     }
 }
@@ -738,13 +789,16 @@ fn apply_live_title_and_spawn_updater(
     }
     let pipe_path = new_mpv_ipc_pipe_path();
     cmd.arg(format!("--input-ipc-server={pipe_path}"));
-    spawn_live_title_updater(
-        pipe_path, store, monitor_id, template, last_title, last_game,
-        LIVE_TITLE_IPC_CONNECT_TIMEOUT,
-    );
+    spawn_live_title_updater(pipe_path, store, monitor_id, template, LIVE_TITLE_IPC_CONNECT_TIMEOUT);
 }
 
 // ----- Untracked-row (collab partner / raid target) title, fetched after launch -----
+
+/// How often [`run_untracked_title_updater`] re-queries Helix for a partner's
+/// current title/game. Deliberately far slower than [`LIVE_TITLE_POLL`]: a
+/// tracked monitor's updater reads a row this app already keeps fresh, while
+/// every tick here is a real Helix call against the shared quota.
+const UNTRACKED_TITLE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What a deferred (post-launch) title fetch needs: the app's shared detection
 /// context — its HTTP client *and* its cached Twitch tokens — plus a runtime
@@ -787,23 +841,21 @@ impl LiveMetaCtx {
 /// So the fetch happens here instead, on a background thread, and the result
 /// is pushed into the already-running player over mpv's IPC socket.
 ///
-/// **The fetch runs before the pipe connect on purpose.** Connecting polls for
-/// mpv's pipe for up to a minute on the Streamlink path (Streamlink resolves
-/// the stream and *then* spawns the player), so the Helix round-trip hides
-/// inside a wait that was happening anyway — and the very first push then
-/// already carries real metadata, instead of writing a blank template and
-/// correcting it a moment later.
+/// **The first fetch runs before the pipe connect on purpose.** Connecting
+/// polls for mpv's pipe for up to a minute on the Streamlink path (Streamlink
+/// resolves the stream and *then* spawns the player), so the Helix round-trip
+/// hides inside a wait that was happening anyway — and the very first push
+/// then already carries real metadata, instead of writing a blank template
+/// and correcting it a moment later.
 ///
-/// **One shot, deliberately.** A tracked row's [`run_live_title_updater`] can
-/// afford to poll forever because each round is a local DB read, and it stops
-/// when a push fails against a closed pipe. Neither holds here: every round
-/// would be a real Helix call, and a partner whose title never changes gives
-/// this loop nothing to write — so it would never learn the window closed and
-/// would keep querying the API behind it for the rest of the session. Poking
-/// the pipe to test that isn't free either: every mpv IPC command produces a
-/// reply, and this pipe is opened write-only and never drained. The cost of
-/// stopping is only that a partner who retitles mid-collab leaves this window
-/// showing the title it had at tune-in.
+/// **Poke first, fetch second.** Each refresh round probes the pipe
+/// ([`poke_mpv`]) before touching Helix, so a window that has been closed
+/// costs exactly zero further API calls — the poke fails and the thread
+/// exits. That ordering is what makes an API-backed refresh loop safe to run
+/// at all; it still ticks at the deliberately slow [`UNTRACKED_TITLE_POLL`]
+/// (vs. [`LIVE_TITLE_POLL`]) because a tracked row's refresh is a local DB
+/// read while every round here is a real Helix call, and "Play all collab
+/// instances" can open four of these windows in one click.
 fn run_untracked_title_updater(
     meta: LiveMetaCtx,
     pipe_path: String,
@@ -814,19 +866,29 @@ fn run_untracked_title_updater(
 ) {
     use crate::detectors::MetaFetch;
 
-    let fetched = meta.rt.block_on(meta.ctx.twitch_stream_meta(&url));
-    // `Offline`/`Failed` leave the launch title alone — an untracked partner
-    // that already ended, or a Helix hiccup, must not blank a window title
-    // that at least still names the channel.
-    let MetaFetch::Live(m) = fetched else {
-        tracing::debug!(%channel, "live-title: no live metadata for untracked row, keeping launch title");
-        return;
-    };
+    let mut fetched = meta.rt.block_on(meta.ctx.twitch_stream_meta(&url));
     let Some(mut pipe) = connect_mpv_ipc(&pipe_path, connect_timeout) else { return };
-    let value = mpv_live_title_value(&template, &channel, &m.title, &m.game);
-    match send_mpv_title(&mut pipe, &value) {
-        Ok(()) => tracing::debug!(%channel, "live-title: pushed fetched title for untracked row"),
-        Err(_) => tracing::debug!(%channel, "live-title: untracked player closed before its title arrived"),
+    let mut pushed = String::new();
+    loop {
+        // `Offline`/`Failed` leave the launch title alone — an untracked
+        // partner that already ended, or a Helix hiccup, must not blank a
+        // window title that at least still names the channel. The next round
+        // retries, so a hiccup at tune-in still resolves.
+        if let MetaFetch::Live(m) = &fetched {
+            let value = mpv_live_title_value(&template, &channel, &m.title, &m.game);
+            if value != pushed {
+                if send_mpv_title(&mut pipe, &value).is_err() {
+                    return; // player closed
+                }
+                tracing::debug!(%channel, "live-title: pushed fetched title for untracked row");
+                pushed = value;
+            }
+        }
+        std::thread::sleep(UNTRACKED_TITLE_POLL);
+        if poke_mpv(&mut pipe).is_err() {
+            return; // player closed — this round costs no API call
+        }
+        fetched = meta.rt.block_on(meta.ctx.twitch_stream_meta(&url));
     }
 }
 
@@ -911,17 +973,12 @@ fn spawn_live_title_updater(
     store: &Arc<crate::store::Store>,
     monitor_id: i64,
     template: &str,
-    last_title: &str,
-    last_game: &str,
     connect_timeout: std::time::Duration,
 ) {
     let store = Arc::clone(store);
-    let (template, last_title, last_game) =
-        (template.to_string(), last_title.to_string(), last_game.to_string());
+    let template = template.to_string();
     std::thread::spawn(move || {
-        run_live_title_updater(
-            pipe_path, store, monitor_id, template, last_title, last_game, connect_timeout,
-        );
+        run_live_title_updater(pipe_path, store, monitor_id, template, connect_timeout);
     });
 }
 
@@ -1411,8 +1468,8 @@ pub(super) fn spawn_play_new_instance(
                     None => {
                         if let Some(pipe) = ipc_pipe {
                             spawn_live_title_updater(
-                                pipe, store, m.id, title_template, &row.last_title,
-                                &row.last_game, LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK,
+                                pipe, store, m.id, title_template,
+                                LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK,
                             );
                         }
                     }
@@ -1925,6 +1982,79 @@ mod tests {
         let mut yt = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         yt.monitor.id = 0;
         assert!(!row_wants_deferred_title(&yt, "mpv.exe", "{channel} {game}"));
+    }
+
+    /// The reply drain must empty everything queued (including more than its
+    /// scratch buffer holds) and return immediately on an empty pipe instead
+    /// of blocking — exercised against a real Win32 pipe, since PeekNamedPipe
+    /// is the whole mechanism.
+    #[cfg(windows)]
+    #[test]
+    fn drain_mpv_replies_empties_the_pipe_without_blocking() {
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Pipes::CreatePipe;
+
+        let (mut read, mut write) = unsafe {
+            let mut r = HANDLE::default();
+            let mut w = HANDLE::default();
+            CreatePipe(&mut r, &mut w, None, 0).unwrap();
+            (
+                std::fs::File::from_raw_handle(r.0 as _),
+                std::fs::File::from_raw_handle(w.0 as _),
+            )
+        };
+        assert_eq!(crate::platform::pipe_bytes_available(&read), 0);
+        // Simulate a backlog of mpv replies bigger than the drain's 512-byte
+        // scratch, so the multi-pass path is covered too.
+        write.write_all(&vec![b'x'; 700]).unwrap();
+        write.write_all(b"\n").unwrap();
+        assert!(crate::platform::pipe_bytes_available(&read) > 0);
+        drain_mpv_replies(&mut read);
+        assert_eq!(crate::platform::pipe_bytes_available(&read), 0, "backlog fully drained");
+        // Empty pipe: returns without ever issuing a (blocking) read.
+        drain_mpv_replies(&mut read);
+    }
+
+    /// A non-pipe handle must read as "nothing available" — that failed-peek
+    /// contract is what keeps [`drain_mpv_replies`] from ever reaching a
+    /// blocking read on a handle it doesn't understand.
+    #[cfg(windows)]
+    #[test]
+    fn pipe_bytes_available_is_zero_for_non_pipe_handles() {
+        let dir = std::env::temp_dir().join(format!(
+            "sa_peek_{}_{}",
+            std::process::id(),
+            crate::models::now_unix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("not-a-pipe.txt");
+        std::fs::write(&path, b"plenty of bytes in here").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        assert_eq!(crate::platform::pipe_bytes_available(&f), 0);
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both readers of the auto-update setting must agree, including on the
+    /// unset default (ON) — they used to decode it differently (`== "1"` vs
+    /// `!= "0"`), leaving the feature off in the UI but on for auto-played
+    /// raid windows of the same fresh install.
+    #[test]
+    fn live_title_auto_update_defaults_on_and_readers_agree() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        for (value, expect) in [(None, true), (Some("0"), false), (Some("1"), true)] {
+            if let Some(v) = value {
+                store.set_setting(crate::ui::K_LIVE_TITLE_AUTO_UPDATE, v).unwrap();
+            }
+            assert_eq!(crate::ui::live_title_auto_update_setting(&store), expect, "{value:?}");
+            assert_eq!(
+                crate::ui::SettingsForm::for_auto_play(&store).live_title_auto_update,
+                expect,
+                "for_auto_play must match the settings form for {value:?}"
+            );
+        }
     }
 
     #[test]

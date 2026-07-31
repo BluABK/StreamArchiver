@@ -897,10 +897,16 @@ depends on which tool is actually launching the player:
 
 `{pos}` becomes mpv's own `${time-pos}` property-expansion token rather than a
 resolved value, so mpv keeps it ticking with no polling on this app's side.
-With **Settings → Defaults → Auto-update live title** on (mpv only), a
-background thread talks to mpv over its `--input-ipc-server` socket: it pushes
-the rendered title once as soon as the socket is up, then re-checks the
-channel's title/game every 20s and pushes again whenever either changed.
+With **Settings → Defaults → Auto-update live title** on (mpv only; default
+on), a background thread talks to mpv over its `--input-ipc-server` socket: it
+pushes the rendered title as soon as the socket is up, then re-renders it from
+the channel's current title/game and pushes again every 20 s. The push happens
+every round even when nothing changed — re-setting an identical title is a
+no-op for mpv, and the write doubles as a liveness probe, so the thread
+notices the window was closed and exits instead of polling behind it
+indefinitely. (The socket is also read back and drained after every command:
+mpv answers each one, and a client that only ever writes would slowly fill
+the pipe's reply buffer.)
 
 That first push is what makes Twitch work at all. Streamlink — not this app —
 spawns the player there, resolving its own `--title` once and handing mpv
@@ -930,17 +936,17 @@ pushed into the running window when the answer arrives. On the Twitch path
 the fetch is effectively free — it overlaps the wait for Streamlink to
 resolve the stream and spawn mpv, which takes longer than the API call does.
 
-Unlike a tracked channel, that push happens **once** and the thread then
-exits. A tracked row's updater can afford to poll forever because each round
-is a local database read; here every round would be a real API call, and a
-partner whose title never changes would give the loop nothing to write — so
-it would never learn the window had been closed and would keep querying the
-API behind it for the rest of the session. The trade is that a partner who
-retitles mid-collab leaves that window showing the title it had at tune-in.
+It then keeps refreshing, but **every 2 minutes rather than every 20 seconds**
+— a tracked channel's updater re-reads a row the app already keeps fresh,
+while every round here is a real API call, and "Play all collab instances"
+can open four of these windows at once. Each round probes the IPC socket
+*before* touching the API, so a window that has been closed costs exactly
+zero further calls: the probe fails and the thread exits.
 
 Needs **Auto-update live title** on and mpv as the player, and fails soft in
 every direction — an untracked channel that has already gone offline, or an
-API hiccup, leaves the launch title alone rather than blanking it.
+API hiccup, leaves the launch title alone rather than blanking it (and the
+next round retries, so a hiccup at tune-in still resolves).
 
 ### Detection methods
 

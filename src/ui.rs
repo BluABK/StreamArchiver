@@ -119,7 +119,23 @@ pub(crate) const K_MEDIA_PLAYER: &str = "media_player_path";
 const K_LIVE_TITLE_TEMPLATE: &str = "live_edge_title_template";
 /// Keep pushing an updated title (over mpv's IPC socket) as the monitor's
 /// title/game changes, for the launch paths this app spawns mpv directly for.
+/// Read via [`live_title_auto_update_setting`], never raw — the two readers
+/// (settings form, follow-raid auto-play) once decoded the unset case
+/// differently (`== "1"` vs `!= "0"`), so the same fresh install had the
+/// feature off in the UI but on for auto-played raid windows.
 const K_LIVE_TITLE_AUTO_UPDATE: &str = "live_edge_title_auto_update";
+
+/// The one decoding of [`K_LIVE_TITLE_AUTO_UPDATE`]: on unless explicitly
+/// `"0"`. Default-on is the right side of the old inconsistency to keep —
+/// the feature is best-effort, mpv-only, and invisible unless a title
+/// template is set (which has a non-empty default).
+pub(crate) fn live_title_auto_update_setting(store: &crate::store::Store) -> bool {
+    store
+        .get_setting(K_LIVE_TITLE_AUTO_UPDATE)
+        .ok()
+        .flatten()
+        .is_none_or(|v| v != "0")
+}
 /// Mute every non-clicked-on instance opened by "Play all collab instances
 /// (live edge)".
 const K_MUTE_COLLAB_INSTANCES: &str = "mute_collab_instances";
@@ -1185,11 +1201,7 @@ impl SettingsForm {
                 .ok()
                 .flatten()
                 .unwrap_or_default(),
-            live_title_auto_update: store
-                .get_setting(K_LIVE_TITLE_AUTO_UPDATE)
-                .ok()
-                .flatten()
-                .is_none_or(|v| v != "0"),
+            live_title_auto_update: live_title_auto_update_setting(store),
             ..Default::default()
         }
     }

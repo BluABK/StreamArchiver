@@ -455,6 +455,38 @@ pub fn recycle_path(_path: &std::path::Path) -> std::io::Result<()> {
     Err(std::io::Error::other("recycle bin is Windows-only"))
 }
 
+/// Bytes currently queued for reading on a named-pipe handle, without blocking
+/// or consuming them (`PeekNamedPipe`). `0` for both "nothing waiting" and
+/// "couldn't ask" — the caller is a best-effort drain, and treating a failed
+/// peek as empty just means it drains on a later round instead.
+///
+/// Exists for mpv's JSON-IPC pipe: every command written to it produces a
+/// reply, so a client that writes without ever reading slowly fills the pipe's
+/// outbound buffer. See `ui::player::drain_mpv_replies`.
+#[cfg(windows)]
+pub fn pipe_bytes_available(file: &std::fs::File) -> u32 {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+    let mut avail = 0u32;
+    unsafe {
+        let _ = PeekNamedPipe(
+            HANDLE(file.as_raw_handle() as *mut _),
+            None,
+            0,
+            None,
+            Some(&mut avail),
+            None,
+        );
+    }
+    avail
+}
+
+#[cfg(not(windows))]
+pub fn pipe_bytes_available(_file: &std::fs::File) -> u32 {
+    0
+}
+
 #[cfg(not(windows))]
 pub fn pid_listening_on(_port: u16) -> Option<u32> {
     None

@@ -258,7 +258,7 @@ impl StreamArchiverApp {
                 let v = setting_or_empty(&core, K_LIVE_TITLE_TEMPLATE);
                 if v.is_empty() { "{channel}: 【{game}】- {title_trimmed}".into() } else { v }
             },
-            live_title_auto_update: setting_or_empty(&core, K_LIVE_TITLE_AUTO_UPDATE) == "1",
+            live_title_auto_update: super::live_title_auto_update_setting(&core.store),
             mute_collab_instances: setting_or_empty(&core, K_MUTE_COLLAB_INSTANCES) != "0",
             collab_untracked_title_template: {
                 let v = setting_or_empty(&core, K_COLLAB_UNTRACKED_TITLE_TEMPLATE);

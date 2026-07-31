@@ -1207,19 +1207,19 @@ impl StreamArchiverApp {
                     ui.label("Auto-update live title").on_hover_text(
                         "Push an updated title over mpv's IPC socket whenever this app \
                          detects the channel's title/game changed, for as long as the \
-                         live-edge player stays open. Works on every launch path, \
-                         including Twitch: Streamlink spawns the player there, so this \
-                         asks it to hand mpv an IPC socket and then drives the title \
-                         over that (also making {pos} tick, which Streamlink's own \
-                         fixed title can't).\n\n\
+                         live-edge player stays open (default: on). Works on every \
+                         launch path, including Twitch: Streamlink spawns the player \
+                         there, so this asks it to hand mpv an IPC socket and then \
+                         drives the title over that (also making {pos} tick, which \
+                         Streamlink's own fixed title can't).\n\n\
                          It also covers windows opened for channels you DON'T track — a \
                          collab partner or a raid target. Those have no stored title or \
                          game, so theirs is fetched from the Twitch API just after the \
                          player opens (rather than before, which would delay tuning in) \
-                         and pushed in once. Unlike a tracked channel it isn't then kept \
-                         up to date: there's no monitor behind it, so every refresh \
-                         would be another API call — a partner who retitles mid-collab \
-                         leaves that window showing the title it had at tune-in.\n\n\
+                         and then refreshed every 2 minutes — a slower cadence than a \
+                         tracked channel's 20 s, because each refresh is a real API \
+                         call. A closed window is noticed before the API is asked, so \
+                         it never keeps spending calls on a player that's gone.\n\n\
                          Requires mpv as the configured media player; best-effort — if \
                          the socket never comes up, or the API doesn't answer, the title \
                          just stays as opened.",
@@ -1242,10 +1242,11 @@ impl StreamArchiverApp {
                          {game} and {title_trimmed} DO resolve here: with \"Auto-update \
                          live title\" on, the partner's title/game is fetched from the \
                          Twitch API just after the player opens (never before — tuning \
-                         in is never held up by the API) and pushed into the window over \
-                         mpv's IPC socket, once. Without that setting, or in a non-mpv \
-                         player, only {channel} is filled in. Leave blank to fall back \
-                         to the same template as a tracked instance.",
+                         in is never held up by the API), pushed into the window over \
+                         mpv's IPC socket, and refreshed every 2 minutes. Without that \
+                         setting, or in a non-mpv player, only {channel} is filled in. \
+                         Leave blank to fall back to the same template as a tracked \
+                         instance.",
                     );
                     ui.text_edit_singleline(&mut self.settings.collab_untracked_title_template);
                     ui.end_row();
