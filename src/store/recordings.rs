@@ -114,11 +114,78 @@ impl Store {
         output_path: &str,
         log_excerpt: &str,
     ) -> Result<()> {
-        let conn = self.db();
-        conn.execute(
-            "UPDATE recording SET ended_at=?2, bytes=?3, exit_code=?4, status=?5, output_path=?6, log_excerpt=?7 WHERE id=?1",
-            params![id, ended_at, bytes, exit_code, status, output_path, log_excerpt],
+        {
+            let conn = self.db();
+            conn.execute(
+                "UPDATE recording SET ended_at=?2, bytes=?3, exit_code=?4, status=?5, output_path=?6, log_excerpt=?7 WHERE id=?1",
+                params![id, ended_at, bytes, exit_code, status, output_path, log_excerpt],
+            )?;
+        }
+        // Every FAILED take must be visible in the 🚨 Warnings window, not
+        // only in the 🔔 feed's "— failed" rows: takes that die without a
+        // scanner-matched log line (killed process, unrecognised wording)
+        // previously left no alert at all. Filed here — the one choke point
+        // every finalize path (supervisor + detached/adopted re-attach) goes
+        // through — and only when no error-severity alert already covers the
+        // take, so a 🎫 PO-token or tool-error row isn't duplicated.
+        // Deliberately only 'failed': user-initiated aborts are not damage.
+        if status == "failed" {
+            self.maybe_file_capture_failed_alert(id, exit_code, log_excerpt)?;
+        }
+        Ok(())
+    }
+
+    /// See [`Store::finish_recording`]: one `capture_failed` error alert per
+    /// failed take with no other error alert to its name. `last_line` = the
+    /// log tail's last non-empty line (the actual reason, when the tool said
+    /// one), else the exit code.
+    fn maybe_file_capture_failed_alert(
+        &self,
+        rec_id: i64,
+        exit_code: Option<i64>,
+        log_excerpt: &str,
+    ) -> Result<()> {
+        let covered: bool = self.db().query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_alert
+                           WHERE recording_id = ?1 AND severity = 'error')",
+            params![rec_id],
+            |r| r.get(0),
         )?;
+        if covered {
+            return Ok(());
+        }
+        let (monitor_id, channel): (i64, String) = self.db().query_row(
+            "SELECT r.monitor_id, COALESCE(c.name, '')
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE r.id = ?1",
+            params![rec_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let last_line = log_excerpt
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match exit_code {
+                Some(c) => format!("capture process exited with code {c} (no log output)"),
+                None => "capture process died without log output".to_string(),
+            });
+        self.upsert_capture_alert(&crate::store::NewCaptureAlert {
+            kind: "capture_failed".to_string(),
+            severity: "error".to_string(),
+            source: "capture".to_string(),
+            take_key: format!("capture_failed:rec{rec_id}"),
+            monitor_id: Some(monitor_id),
+            recording_id: Some(rec_id),
+            video_id: None,
+            channel,
+            count: 1,
+            lost_segments: 0,
+            last_line,
+        })?;
         Ok(())
     }
 
@@ -1981,6 +2048,76 @@ impl Store {
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    /// Every failed take must reach the 🚨 Warnings window: finish_recording
+    /// files a `capture_failed` error alert — unless an error alert (🎫 PO
+    /// token, tool error) already covers the take, and never for
+    /// non-"failed" outcomes.
+    #[test]
+    fn finish_recording_files_capture_failed_alert_once() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // A failed take with a log tail -> one capture_failed error alert
+        // whose last_line is the tail's last non-empty line.
+        let r1 = store
+            .insert_recording(mid, 1_000, "C:/rec/a.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        store
+            .finish_recording(r1, 1_100, 0, Some(1), "failed", "C:/rec/a.mkv", "line one\nreal reason\n\n")
+            .unwrap();
+        let alerts = store.list_capture_alerts(10).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "capture_failed");
+        assert_eq!(alerts[0].severity, "error");
+        assert_eq!(alerts[0].last_line, "real reason");
+        assert_eq!(alerts[0].channel, "Streamer");
+        assert_eq!(alerts[0].recording_id, Some(r1));
+
+        // Already covered by an error alert (e.g. the 🎫 PO row) -> no second row.
+        let r2 = store
+            .insert_recording(mid, 2_000, "C:/rec/b.mkv", Some(2_000), false, Some("s2"), None, "", "")
+            .unwrap();
+        store
+            .upsert_capture_alert(&crate::store::NewCaptureAlert {
+                kind: "po_token_rejected".into(),
+                severity: "error".into(),
+                source: "capture".into(),
+                take_key: format!("po_token:rec{r2}"),
+                monitor_id: Some(mid),
+                recording_id: Some(r2),
+                video_id: None,
+                channel: "Streamer".into(),
+                count: 1,
+                lost_segments: 0,
+                last_line: "rejected".into(),
+            })
+            .unwrap();
+        store.finish_recording(r2, 2_100, 0, Some(1), "failed", "C:/rec/b.mkv", "x").unwrap();
+        assert_eq!(
+            store.list_capture_alerts(10).unwrap().iter().filter(|a| a.recording_id == Some(r2)).count(),
+            1,
+            "the PO row already covers the take"
+        );
+
+        // Completed takes file nothing; a failed take with NO log falls back
+        // to the exit code.
+        let r3 = store
+            .insert_recording(mid, 3_000, "C:/rec/c.mkv", Some(3_000), false, Some("s3"), None, "", "")
+            .unwrap();
+        store.finish_recording(r3, 3_100, 9, Some(0), "completed", "C:/rec/c.mkv", "").unwrap();
+        assert!(store.list_capture_alerts(10).unwrap().iter().all(|a| a.recording_id != Some(r3)));
+        let r4 = store
+            .insert_recording(mid, 4_000, "C:/rec/d.mkv", Some(4_000), false, Some("s4"), None, "", "")
+            .unwrap();
+        store.finish_recording(r4, 4_100, 0, Some(3221225477), "failed", "C:/rec/d.mkv", "").unwrap();
+        let a4 = store.list_capture_alerts(10).unwrap();
+        let a4 = a4.iter().find(|a| a.recording_id == Some(r4)).unwrap();
+        assert!(a4.last_line.contains("3221225477"), "{}", a4.last_line);
+    }
 
     #[test]
     fn monitor_meta_filter_texts_groups_dedupes_and_lowercases() {

@@ -43,6 +43,7 @@ fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
         "sequence_gap" => ("⛔", "Lost segments"),
         "fetch_failed" => ("⛔", "Failed segment fetches"),
         "tool_error" => ("❌", "Tool errors"),
+        "capture_failed" => ("⛔", "Capture failed"),
         _ => ("⚠", "Tool warnings"),
     }
 }
@@ -1050,6 +1051,11 @@ impl StreamArchiverApp {
                                         );
                                         ui.horizontal_wrapped(|ui| {
                                             ui.spacing_mut().item_spacing.x = 6.0;
+                                            // Timestamp leads, exactly like the
+                                            // 🔔 feed's rows, so the two windows
+                                            // align when read side by side.
+                                            ui.label(egui::RichText::new(&span).weak())
+                                                .on_hover_text("First and most recent occurrence.");
                                             let base = (!r.acked).then_some(accent);
                                             notif_title(ui, &title, &r.channel, name_color, base);
                                             if r.count > 1 {
@@ -1062,8 +1068,6 @@ impl StreamArchiverApp {
                                                 )
                                                 .on_hover_text("Occurrences folded into this row.");
                                             }
-                                            ui.label(egui::RichText::new(format!("·  {span}")).weak())
-                                                .on_hover_text("First and most recent occurrence.");
                                             if !r.source.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(format!("·  {}", r.source))
@@ -1094,18 +1098,27 @@ impl StreamArchiverApp {
                                         // selectable text (tooltips made it
                                         // uncopyable), right-click to copy.
                                         if !r.last_line.is_empty() {
+                                            // Rows persisted before the
+                                            // strip-on-ingest fix can still
+                                            // carry ANSI colour codes.
+                                            let line: std::borrow::Cow<'_, str> =
+                                                if r.last_line.contains('\x1b') {
+                                                    crate::logfmt::strip_ansi(&r.last_line).into()
+                                                } else {
+                                                    r.last_line.as_str().into()
+                                                };
                                             let resp = ui
                                                 .add(
                                                     egui::Label::new(
-                                                        egui::RichText::new(&r.last_line).weak(),
+                                                        egui::RichText::new(line.as_ref()).weak(),
                                                     )
                                                     .truncate()
                                                     .sense(egui::Sense::click()),
                                                 )
-                                                .on_hover_text(&r.last_line);
+                                                .on_hover_text(line.as_ref());
                                             resp.context_menu(|ui| {
                                                 if ui.button("📋 Copy log line").clicked() {
-                                                    ui.ctx().copy_text(r.last_line.clone());
+                                                    ui.ctx().copy_text(line.to_string());
                                                     ui.close();
                                                 }
                                                 if ui.button("📋 Copy alert details").clicked() {
@@ -1119,7 +1132,7 @@ impl StreamArchiverApp {
                                                         alert_damage_summary(r)
                                                             .map(|d| format!("{d}\n"))
                                                             .unwrap_or_default(),
-                                                        r.last_line
+                                                        line
                                                     ));
                                                     ui.close();
                                                 }

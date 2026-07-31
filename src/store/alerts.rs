@@ -184,13 +184,21 @@ impl Store {
     /// occurrences must re-light the badge. Returns `(id, was_new)`.
     pub fn upsert_capture_alert(&self, a: &NewCaptureAlert) -> Result<(i64, bool)> {
         let now = now_unix();
+        // Tool logs (and, before 2026-07-31, the app's own composed alert
+        // text) can carry ANSI colour codes — strip on ingest so the
+        // Warnings window never renders the escapes as literal text.
+        let last_line = if a.last_line.contains('\x1b') {
+            std::borrow::Cow::Owned(crate::logfmt::strip_ansi(&a.last_line))
+        } else {
+            std::borrow::Cow::Borrowed(a.last_line.as_str())
+        };
         let conn = self.db();
         let updated = conn.execute(
             "UPDATE capture_alert SET
                 last_at = ?3, count = count + ?4, lost_segments = lost_segments + ?5,
                 last_line = ?6, acked = 0
              WHERE take_key = ?1 AND kind = ?2",
-            params![a.take_key, a.kind, now, a.count, a.lost_segments, a.last_line],
+            params![a.take_key, a.kind, now, a.count, a.lost_segments, last_line],
         )?;
         if updated == 0 {
             conn.execute(
@@ -209,7 +217,7 @@ impl Store {
                     a.channel,
                     a.count.max(1),
                     a.lost_segments,
-                    a.last_line
+                    last_line
                 ],
             )?;
             return Ok((conn.last_insert_rowid(), true));
@@ -723,6 +731,24 @@ mod tests {
             lost_segments: 29,
             last_line: "Sequence gap of 21 segments at position 3159.".into(),
         }
+    }
+
+    /// ANSI colour codes (from tool logs, or the app's own pre-2026-07-31
+    /// composed text) are stripped on ingest — the Warnings window must never
+    /// render escape bytes as literal text.
+    #[test]
+    fn alert_upsert_strips_ansi_from_last_line() {
+        let store = Store::open_in_memory().unwrap();
+        let mut a = gap_alert(r"A:\ansi.ts.log");
+        a.last_line = "\x1b[38;2;255;68;68m[YouTube]\x1b[0m rejected this capture's token".into();
+        store.upsert_capture_alert(&a).unwrap();
+        let row = &store.list_capture_alerts(10).unwrap()[0];
+        assert_eq!(row.last_line, "[YouTube] rejected this capture's token");
+        // The update path strips too (same row, new dirty line).
+        a.last_line = "again \x1b[0m clean".into();
+        store.upsert_capture_alert(&a).unwrap();
+        let row = &store.list_capture_alerts(10).unwrap()[0];
+        assert_eq!(row.last_line, "again  clean");
     }
 
     #[test]

@@ -127,6 +127,34 @@ impl<W: io::Write> io::Write for StripAnsi<W> {
     }
 }
 
+/// Remove ANSI CSI escape sequences (`ESC [ ... <final>`, the shell colour
+/// codes) from a string — the string-level sibling of the [`StripAnsi`]
+/// writer. For UI display of text that may carry the app log's coloured
+/// platform tags: alert rows persisted before 2026-07-31 embedded
+/// `platform().tag()` verbatim, and the escape bytes rendered as literal
+/// `[38;2;...m` garbage in the Warnings window.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // Consume parameter/intermediate bytes up to and including
+                // the final byte (0x40..=0x7e), same rule as the writer.
+                for c2 in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            continue; // a bare ESC (or ESC + non-'[') is dropped either way
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +173,15 @@ mod tests {
     fn strips_csi_sequences_and_keeps_text() {
         let colored = b"a \x1b[38;2;145;70;255m[Twitch]\x1b[0m b";
         assert_eq!(strip(colored), b"a [Twitch] b");
+    }
+
+    #[test]
+    fn strip_ansi_string_removes_colour_codes() {
+        assert_eq!(
+            strip_ansi("\x1b[38;2;255;68;68m[YouTube]\x1b[0m rejected this capture's token"),
+            "[YouTube] rejected this capture's token"
+        );
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
     }
 
     #[test]

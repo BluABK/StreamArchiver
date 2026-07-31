@@ -660,10 +660,11 @@ overnight wave rejected *every* token of two concurrent captures for over
 three hours. The ordinary failure ladder (30 s, 60 s, 90 s…) just burns takes
 against that wall, so a capture that dies this way gets an **escalating
 cooldown — 5, 10, then 15 minutes per consecutive rejection (capped at 15)**
-before the next automatic attempt, and files a **🎫 PO token rejected** entry
-in the 🚨 Warnings window (one per take) explaining what happened, rather
-than leaving a bare "failed" take whose only trace is a traceback in a
-per-capture log. The cap stays at 15 minutes on purpose: live-edge captures
+before the next automatic attempt, and files a **🎫 PO token rejected**
+entry — a red **error** row, since the killed take genuinely loses the
+footage until the next attempt — in the 🚨 Warnings window (one per take)
+explaining what happened, rather than leaving a bare "failed" take whose
+only trace is a traceback in a per-capture log. The cap stays at 15 minutes on purpose: live-edge captures
 lose the held-off minutes for good once the wave lifts, so waiting longer
 would trade take clutter for real footage.
 
@@ -1389,6 +1390,14 @@ matching lines into persistent alerts:
   - streamlink `Failed to fetch segment N` — retries exhausted, segment
     skipped.
   - yt-dlp `Skipping fragment N` and `ERROR:` lines.
+  - **⛔ Capture failed** — every take that finalizes as *failed* gets an
+    error row here, even when nothing in its log matched a known pattern (a
+    killed process, an unrecognised failure wording): the row carries the
+    log's last line (or the exit code when there's no log) and its category
+    chip derives from that line, so a network drop or disk-full death still
+    sorts into the right ✔ Ack group. Skipped when an error alert (🎫 PO
+    token, tool error) already covers the take — one failure, one row — and
+    never filed for user-initiated stops.
 - **Warnings (yellow rows)** — non-fatal tool complaints (yt-dlp `WARNING:`,
   other streamlink `[error]` lines), minus known-benign chatter: retry/ad
   notices, the SABR deep-rewind "experimental" banner and format-negotiation

@@ -3106,6 +3106,14 @@ progress_info: None,
         let shutting_down = self.shutdown.load(Ordering::SeqCst);
         let sabr_stall =
             self.note_sabr_stall(sabr_key, monitor_id, ok, manually_stopped, shutting_down, &outcome);
+        // File the 🎫 alert BEFORE finalize: `finish_recording` files a
+        // generic `capture_failed` error for any failed take that has no
+        // error alert yet, so the more specific PO row must already exist or
+        // the take ends up with both.
+        let po_rejected = !manually_stopped && !ok && po_token_rejected(&outcome.log);
+        if po_rejected {
+            self.file_po_token_alert(&row, monitor_id, rec_id);
+        }
         self.finalize_recording(
             &row,
             monitor_id,
@@ -3127,10 +3135,6 @@ progress_info: None,
         // otherwise reset the wait to 30s, and a captured one would clear it entirely,
         // either way re-triggering the moment the next LIVE signal arrives.
         if !manually_stopped {
-            let po_rejected = !ok && po_token_rejected(&outcome.log);
-            if po_rejected {
-                self.file_po_token_alert(&row, monitor_id, rec_id);
-            }
             self.note_result(monitor_id, duration, ok, po_rejected);
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
