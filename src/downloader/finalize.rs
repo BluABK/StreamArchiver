@@ -35,7 +35,7 @@ pub async fn reorganize_recording_files(
         if cfg.enabled && !reverse {
             if let Some(s) = current.file_stem().and_then(|s| s.to_str()) {
                 let from_dir = current.parent().map(PathBuf::from).unwrap_or_else(|| base_dir.clone());
-                move_companions_to_subdirs(&from_dir, &base_dir, s, cfg).await;
+                move_companions_to_subdirs(&from_dir, &base_dir, s, cfg, store).await;
             }
         }
         return Ok(None);
@@ -63,7 +63,7 @@ pub async fn reorganize_recording_files(
         // files that were left behind by a previous run (e.g. because the extension
         // wasn't handled at the time).
         if cfg.enabled && !reverse {
-            move_companions_to_subdirs(&base_dir, &base_dir, &stem, cfg).await;
+            move_companions_to_subdirs(&base_dir, &base_dir, &stem, cfg, store).await;
         }
         return Ok(None);
     }
@@ -81,20 +81,43 @@ pub async fn reorganize_recording_files(
     // Move companion files (subs, thumbnail, chat) to their own dirs.
     if cfg.enabled && !reverse {
         let from_dir = current.parent().unwrap_or(&base_dir);
-        move_companions_to_subdirs(from_dir, &base_dir, &stem, cfg).await;
+        move_companions_to_subdirs(from_dir, &base_dir, &stem, cfg, store).await;
     } else if reverse {
         // Collapse all companions from sub-dirs back to base_dir.
         let dirs = [&cfg.videos, &cfg.subs, &cfg.chat, &cfg.thumbs, &cfg.logs];
         for sub in &dirs {
             let sub_dir = base_dir.join(sub);
-            move_companions(&sub_dir, &base_dir, &stem).await;
+            for (from, to) in move_companions(&sub_dir, &base_dir, &stem).await {
+                let is_chat = to
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .is_some_and(|n| is_chat_suffix(&n));
+                if is_chat {
+                    let _ = store.update_chat_path_by_path(
+                        &from.to_string_lossy(),
+                        &to.to_string_lossy(),
+                    );
+                }
+            }
             // Try to remove the empty sub-dir (best effort; only our dirs).
             let _ = crate::iomon::fs::remove_dir(Cat::Promote, &sub_dir).await;
         }
     } else {
         // Normal companion move: keep everything together with the video.
         if let Some(from_dir) = current.parent() {
-            move_companions(from_dir, &target_dir, &stem).await;
+            let moved = move_companions(from_dir, &target_dir, &stem).await;
+            for (from, to) in moved {
+                let is_chat = to
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .is_some_and(|n| is_chat_suffix(&n));
+                if is_chat {
+                    let _ = store.update_chat_path_by_path(
+                        &from.to_string_lossy(),
+                        &to.to_string_lossy(),
+                    );
+                }
+            }
         }
     }
 
@@ -104,8 +127,16 @@ pub async fn reorganize_recording_files(
 }
 
 /// Move companion files (subs, thumbnail, chat log) to the appropriate sub-dirs
-/// based on `cfg`. Best-effort — skips files that can't be moved.
-pub(super) async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path, stem: &str, cfg: &crate::models::SubdirConfig) {
+/// based on `cfg`. Best-effort — skips files that can't be moved. Chat moves
+/// re-point `recording.chat_path` (keyed by old path; a no-op for takes that
+/// never had it set) so the pointer survives the reorganize.
+pub(super) async fn move_companions_to_subdirs(
+    from_dir: &Path,
+    base_dir: &Path,
+    stem: &str,
+    cfg: &crate::models::SubdirConfig,
+    store: &Store,
+) {
     let prefix = format!("{stem}.");
     let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, from_dir).await {
         Ok(rd) => rd,
@@ -117,7 +148,7 @@ pub(super) async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path,
             continue;
         }
         let rest = &name[prefix.len()..];
-        let target_sub = if rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") || rest.ends_with("chat.log") {
+        let target_sub = if is_chat_suffix(rest) {
             Some(&cfg.chat)
         } else if rest.ends_with("thumbnail.jpg") || rest.ends_with("thumbnail.webp") {
             Some(&cfg.thumbs)
@@ -136,7 +167,14 @@ pub(super) async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path,
             let target_dir = base_dir.join(sub);
             let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &target_dir).await;
             let dst = target_dir.join(&name);
-            let _ = crate::iomon::fs::rename(Cat::Promote, entry.path(), dst).await;
+            if crate::iomon::fs::rename(Cat::Promote, entry.path(), &dst).await.is_ok()
+                && is_chat_suffix(rest)
+            {
+                let _ = store.update_chat_path_by_path(
+                    &entry.path().to_string_lossy(),
+                    &dst.to_string_lossy(),
+                );
+            }
         }
     }
 }
@@ -146,7 +184,7 @@ pub(super) async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path,
 /// This catches files that aren't linked to any recording in the database
 /// (e.g. chat logs from recordings that ended with no output_path).
 /// Video/part files are ignored — only known companion extensions are moved.
-pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::SubdirConfig) {
+pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::SubdirConfig, store: &Store) {
     if !cfg.enabled {
         return;
     }
@@ -160,10 +198,10 @@ pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::Subdi
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         let lower = name.to_ascii_lowercase();
-        let target_sub = if lower.ends_with(".chat.log")
+        let is_chat = lower.ends_with(".chat.log")
             || lower.ends_with(".chat.jsonl")
-            || lower.ends_with(".live_chat.json")
-        {
+            || lower.ends_with(".live_chat.json");
+        let target_sub = if is_chat {
             Some(&cfg.chat)
         } else if lower.ends_with(".thumbnail.jpg") || lower.ends_with(".thumbnail.webp") {
             Some(&cfg.thumbs)
@@ -181,7 +219,14 @@ pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::Subdi
             let target_dir = dir.join(sub);
             let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &target_dir).await;
             let dst = target_dir.join(&name);
-            let _ = crate::iomon::fs::rename(Cat::Promote, entry.path(), dst).await;
+            if crate::iomon::fs::rename(Cat::Promote, entry.path(), &dst).await.is_ok() && is_chat {
+                // A swept chat file may be a chat-only take's sidecar — keep
+                // its `chat_path` pointer valid (no-op when nothing points here).
+                let _ = store.update_chat_path_by_path(
+                    &entry.path().to_string_lossy(),
+                    &dst.to_string_lossy(),
+                );
+            }
         }
     }
 }
@@ -224,29 +269,9 @@ pub async fn rename_recording_files(
     let new_file = dir.join(format!("{new_stem_clean}.{ext}"));
     crate::iomon::fs::rename(Cat::Promote, &current, &new_file).await?;
 
-    // Rename companion files.
-    let prefix_old = format!("{old_stem}.");
-    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, &dir).await {
-        Ok(rd) => rd,
-        Err(_) => {
-            let new_path = new_file.to_string_lossy().into_owned();
-            store.update_recording_output_path(rec_id, &new_path)?;
-            return Ok(Some(new_path));
-        }
-    };
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == new_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() {
-            continue;
-        }
-        if let Some(rest) = name.strip_prefix(&prefix_old) {
-            if is_companion_suffix(rest) {
-                let new_name = format!("{new_stem_clean}.{rest}");
-                let dst = dir.join(&new_name);
-                let _ = crate::iomon::fs::rename(Cat::Promote, entry.path(), dst).await;
-            }
-        }
-    }
+    // Rename companion files — the shared follow logic (retry/shorten, the
+    // dedicated-chat-root mirror pass, and `chat_path` maintenance).
+    rename_companion_sidecars(&dir, &old_stem, &new_stem_clean, store).await;
 
     let new_path = new_file.to_string_lossy().into_owned();
     store.update_recording_output_path(rec_id, &new_path)?;
@@ -254,7 +279,9 @@ pub async fn rename_recording_files(
 }
 /// Rename a finished capture to `new_stem` (keeping its extension), avoiding
 /// collisions. Returns the resulting path (unchanged on no-op or failure).
-pub(super) async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
+/// `store` is only used to keep `recording.chat_path` matched when a chat
+/// sidecar follows the rename (see [`rename_companion_sidecars`]).
+pub(super) async fn rename_for_media(final_path: PathBuf, new_stem: &str, store: &Store) -> PathBuf {
     let Some(dir) = final_path.parent().map(Path::to_path_buf) else {
         return final_path;
     };
@@ -285,7 +312,7 @@ pub(super) async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> Pat
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| unique.clone());
-                rename_companion_sidecars(&dir, &old, &actual_stem).await;
+                rename_companion_sidecars(&dir, &old, &actual_stem, store).await;
             }
             actual
         }
@@ -347,7 +374,7 @@ pub(super) async fn patch_stuck_title_games_placeholder(
         return final_path; // still unknown — leave the placeholder for a later pass
     }
     let new_stem = sanitize_filename(&new_stem);
-    let new_path = rename_for_media(final_path, &new_stem).await;
+    let new_path = rename_for_media(final_path, &new_stem, store).await;
     let _ = store.update_recording_output_path(rec_id, &new_path.to_string_lossy());
     new_path
 }
@@ -755,12 +782,20 @@ pub(super) async fn promote_capture(
 
 /// Move every recognized companion (`{stem}.*` matched by [`is_companion_suffix`] —
 /// subtitles, thumbnail, in-process chat) from `from_dir` up to `to_dir`.
-/// Best-effort; never clobbers an existing target.
-pub(super) async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
+/// Best-effort; never clobbers an existing target. Returns the `(from, to)`
+/// pairs actually moved so callers that can touch the DB re-point
+/// `recording.chat_path` for chat files (see `reorganize_recording_files`'s
+/// reverse branch — the promote-path callers never move chat and ignore it).
+pub(super) async fn move_companions(
+    from_dir: &Path,
+    to_dir: &Path,
+    stem: &str,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     let prefix = format!("{stem}.");
     let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, from_dir).await {
         Ok(rd) => rd,
-        Err(_) => return,
+        Err(_) => return moved,
     };
     while let Ok(Some(entry)) = rd.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -775,15 +810,17 @@ pub(super) async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) 
             continue;
         }
         match crate::iomon::fs::rename(Cat::Promote, entry.path(), &to).await {
-            Ok(()) => {}
+            Ok(()) => moved.push((entry.path(), to)),
             Err(e) if is_name_too_long(&e) => {
-                if let Err(e) = rename_or_shorten(&entry.path(), to_dir, stem, rest).await {
-                    warn!("companion promote failed for {name}: {e:#}");
+                match rename_or_shorten(&entry.path(), to_dir, stem, rest).await {
+                    Ok(p) => moved.push((entry.path(), p)),
+                    Err(e) => warn!("companion promote failed for {name}: {e:#}"),
                 }
             }
             Err(e) => warn!("companion promote failed for {name}: {e:#}"),
         }
     }
+    moved
 }
 
 /// After promotion, delete the recording's remaining working files (`{stem}.*`) from
@@ -802,70 +839,121 @@ pub(super) async fn purge_cache(cache: &Path, stem: &str) {
     let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, cache).await; // only if empty
 }
 
+/// Move one chat sidecar into the dedicated chat root: copy → verify the byte
+/// count → delete the source (cross-drive, so never a rename). Returns
+/// `Ok(false)` when the target already exists (never clobbers); a partial
+/// copy is removed before reporting failure, so a retry starts clean.
+pub(super) async fn migrate_chat_file(src: &Path, dst: &Path) -> anyhow::Result<bool> {
+    if crate::iomon::fs::exists_sync(Cat::ChatSidecar, dst) {
+        return Ok(false);
+    }
+    if let Some(dir) = dst.parent() {
+        crate::iomon::fs::create_dir_all(Cat::DirSetup, dir).await?;
+    }
+    let src_len = crate::iomon::fs::metadata(Cat::ChatSidecar, src).await?.len();
+    let copied = crate::iomon::fs::copy(Cat::ChatSidecar, src, dst).await?;
+    if copied != src_len {
+        let _ = crate::iomon::fs::remove_file(Cat::ChatSidecar, dst).await;
+        anyhow::bail!("size mismatch after copy ({copied} of {src_len} bytes)");
+    }
+    crate::iomon::fs::remove_file(Cat::ChatSidecar, src).await?;
+    Ok(true)
+}
+
+/// True when a companion filename suffix (the part after `{stem}.`) is a chat
+/// log — the file class the dedicated chat root and `recording.chat_path`
+/// maintenance care about.
+pub(super) fn is_chat_suffix(rest: &str) -> bool {
+    rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") || rest.ends_with("chat.log")
+}
+
 /// When the main recording file is renamed, move its companion sidecars
 /// (`{old_stem}.<lang>.vtt` subtitles, `{old_stem}.chat.jsonl` /
 /// `{old_stem}.live_chat.json` chat logs) to follow `new_stem`, so they don't
-/// become orphaned next to a renamed video. Best-effort: per-file failures are
-/// logged, not fatal; existing targets are never clobbered.
-pub(super) async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
+/// become orphaned next to a renamed video. With a dedicated chat root
+/// configured, a second pass renames the chat sidecar in the root's MIRROR of
+/// `dir` too (same drive as the sidecar — always a plain rename, never
+/// cross-device). Every chat rename also re-points `recording.chat_path`
+/// (keyed by old path, so no rec id is needed). Best-effort: per-file
+/// failures are logged, not fatal; existing targets are never clobbered.
+pub(super) async fn rename_companion_sidecars(
+    dir: &Path,
+    old_stem: &str,
+    new_stem: &str,
+    store: &Store,
+) {
     if old_stem == new_stem || old_stem.is_empty() {
         return;
     }
+    // (dir to scan, chat-files-only) — the mirror dir only ever holds chat.
+    let mirror = crate::chat::chat_dir_for(dir);
+    let mut scans: Vec<(PathBuf, bool)> = vec![(dir.to_path_buf(), false)];
+    if mirror != dir {
+        scans.push((mirror, true));
+    }
     let prefix = format!("{old_stem}.");
-    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, dir).await {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(&prefix) else {
-            continue;
+    for (scan_dir, chat_only) in scans {
+        let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, &scan_dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
         };
-        if !is_companion_suffix(rest) {
-            continue;
-        }
-        let to = dir.join(format!("{new_stem}.{rest}"));
-        if crate::iomon::fs::exists_sync(Cat::Promote, &to) {
-            continue; // don't clobber an unrelated existing file
-        }
-        // Retry with exponential backoff: on Windows the chat downloader
-        // (yt-dlp) may still have live_chat.json open when finalization runs,
-        // producing os error 32 (ERROR_SHARING_VIOLATION). Give the process
-        // time to flush and release the handle before giving up.
-        let src = entry.path();
-        let mut delay_ms = 500u64;
-        let mut last_err: Option<std::io::Error> = None;
-        let mut renamed = false;
-        for attempt in 0u32..5 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                delay_ms *= 2; // 500 → 1000 → 2000 → 4000 ms
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !is_companion_suffix(rest) || (chat_only && !is_chat_suffix(rest)) {
+                continue;
             }
-            match crate::iomon::fs::rename(Cat::Promote, &src, &to).await {
-                Ok(()) => { last_err = None; renamed = true; break; }
-                Err(e) if e.raw_os_error() == Some(32)  // Windows: SHARING_VIOLATION
-                       || e.raw_os_error() == Some(16)  // Unix: EBUSY
-                => { last_err = Some(e); }
-                Err(e) => { last_err = Some(e); break; } // non-retryable error
+            let to = scan_dir.join(format!("{new_stem}.{rest}"));
+            if crate::iomon::fs::exists_sync(Cat::Promote, &to) {
+                continue; // don't clobber an unrelated existing file
             }
-        }
-        if renamed {
-            continue;
-        }
-        // The name itself may be the problem (most commonly NTFS's
-        // 255-UTF-16-unit-per-component limit — see `MAX_STEM_UTF16_LEN`).
-        // Following the video's rename matters more than a fully-descriptive
-        // sidecar name, so shorten `new_stem` (never touching `rest`, which
-        // identifies the sidecar's role) and retry, rather than leaving this
-        // companion permanently orphaned under its old name.
-        if last_err.as_ref().is_some_and(is_name_too_long) {
-            match rename_or_shorten(&src, dir, new_stem, rest).await {
-                Ok(_) => continue,
-                Err(e) => last_err = Some(e),
+            // Retry with exponential backoff: on Windows the chat downloader
+            // (yt-dlp) may still have live_chat.json open when finalization runs,
+            // producing os error 32 (ERROR_SHARING_VIOLATION). Give the process
+            // time to flush and release the handle before giving up.
+            let src = entry.path();
+            let mut delay_ms = 500u64;
+            let mut last_err: Option<std::io::Error> = None;
+            let mut actual: Option<PathBuf> = None;
+            for attempt in 0u32..5 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2; // 500 → 1000 → 2000 → 4000 ms
+                }
+                match crate::iomon::fs::rename(Cat::Promote, &src, &to).await {
+                    Ok(()) => { last_err = None; actual = Some(to.clone()); break; }
+                    Err(e) if e.raw_os_error() == Some(32)  // Windows: SHARING_VIOLATION
+                           || e.raw_os_error() == Some(16)  // Unix: EBUSY
+                    => { last_err = Some(e); }
+                    Err(e) => { last_err = Some(e); break; } // non-retryable error
+                }
             }
-        }
-        if let Some(e) = last_err {
-            warn!("companion sidecar rename failed for {}: {e:#}", name);
+            // The name itself may be the problem (most commonly NTFS's
+            // 255-UTF-16-unit-per-component limit — see `MAX_STEM_UTF16_LEN`).
+            // Following the video's rename matters more than a fully-descriptive
+            // sidecar name, so shorten `new_stem` (never touching `rest`, which
+            // identifies the sidecar's role) and retry, rather than leaving this
+            // companion permanently orphaned under its old name.
+            if actual.is_none() && last_err.as_ref().is_some_and(is_name_too_long) {
+                match rename_or_shorten(&src, &scan_dir, new_stem, rest).await {
+                    Ok(p) => { last_err = None; actual = Some(p); }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if let Some(e) = last_err {
+                warn!("companion sidecar rename failed for {}: {e:#}", name);
+            }
+            // Keep `recording.chat_path` pointing at the moved file (no-op for
+            // takes that never had it set).
+            if let Some(p) = actual
+                && is_chat_suffix(rest)
+                && let Err(e) = store
+                    .update_chat_path_by_path(&src.to_string_lossy(), &p.to_string_lossy())
+            {
+                warn!("chat_path update after sidecar rename: {e:#}");
+            }
         }
     }
 }
@@ -1622,7 +1710,19 @@ mod tests {
         // A same-stem non-companion file must be left alone.
         tokio::fs::write(dir.join(format!("{old}.notes.txt")), b"x").await.unwrap();
 
-        rename_companion_sidecars(&dir, old, new).await;
+        // A take whose persisted chat_path points at the sidecar: the rename
+        // must re-point it (path-keyed, no rec id at the rename site).
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mid = store.insert_monitor(&crate::store::test_util::sample_monitor(cid)).unwrap();
+        let rec = store
+            .insert_recording(mid, 1_000, "", None, false, None, None, "", "")
+            .unwrap();
+        store
+            .set_recording_chat_path(rec, &dir.join(format!("{old}.chat.jsonl")).to_string_lossy())
+            .unwrap();
+
+        rename_companion_sidecars(&dir, old, new, &store).await;
 
         assert!(dir.join(format!("{new}.en.vtt")).exists());
         assert!(dir.join(format!("{new}.chat.jsonl")).exists());
@@ -1631,6 +1731,11 @@ mod tests {
         assert!(!dir.join(format!("{old}.chat.jsonl")).exists());
         assert!(dir.join(format!("{old}.notes.txt")).exists());
         assert!(!dir.join(format!("{new}.notes.txt")).exists());
+        assert_eq!(
+            store.get_recording(rec).unwrap().unwrap().chat_path,
+            dir.join(format!("{new}.chat.jsonl")).to_string_lossy(),
+            "chat_path must follow the sidecar rename"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -1651,7 +1756,8 @@ mod tests {
         let new_stem = "x".repeat(250);
         tokio::fs::write(dir.join(format!("{old_stem}.chat.jsonl")), b"chat-data").await.unwrap();
 
-        rename_companion_sidecars(&dir, old_stem, &new_stem).await;
+        let store = crate::store::Store::open_in_memory().unwrap();
+        rename_companion_sidecars(&dir, old_stem, &new_stem, &store).await;
 
         assert!(
             !dir.join(format!("{old_stem}.chat.jsonl")).exists(),

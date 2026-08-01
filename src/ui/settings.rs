@@ -1121,7 +1121,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_defaults_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Recording, "Defaults", &["default", "output", "folder", "media player", "concurrent", "filename", "date", "timestamp"]) {
+            if self.section_shown(SettingsTab::Recording, "Defaults", &["default", "output", "folder", "media player", "concurrent", "filename", "date", "timestamp", "chat", "logs", "sidecar"]) {
             ui.add_space(12.0);
             ui.heading("Defaults");
             egui::Grid::new("defaults_grid")
@@ -1164,6 +1164,34 @@ impl StreamArchiverApp {
                             self.pending_browse = Some(spawn_browse_folder(
                                 &self.settings.default_video_output_dir,
                                 |app, p| app.settings.default_video_output_dir = p,
+                            ));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Chat logs folder (dedicated)").on_hover_text(
+                        "Write chat sidecars to a dedicated folder — ideally on another, \
+                         quieter drive — instead of next to the recordings, taking the \
+                         constant small chat appends off the busy capture drives. The \
+                         recordings' folder structure is mirrored under it with the drive \
+                         letter as the top folder, so it can be re-merged by hand later: \
+                         A:\\VODs\\GEEGA -> {root}\\A\\VODs\\GEEGA, and \
+                         `robocopy {root}\\A\\ A:\\ /E` (one per drive folder) puts every \
+                         chat log back beside its recording. Applies to all chat shapes — \
+                         Twitch takes, YouTube live-chat sidecars, and chat-without-\
+                         recording sessions. Renames (title in the filename), View chat, \
+                         and Files-view relocation all follow it. Empty = chat logs stay \
+                         next to the recordings (the default). Existing files don't move \
+                         on their own — use \"Migrate chat logs\" under Maintenance.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.chat_log_root)
+                                .hint_text(r"D:\ChatLogs"),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            self.pending_browse = Some(spawn_browse_folder(
+                                &self.settings.chat_log_root,
+                                |app, p| app.settings.chat_log_root = p,
                             ));
                         }
                     });
@@ -3825,6 +3853,7 @@ impl StreamArchiverApp {
             let fetch_thumb_running   = self.background_tasks.iter().any(|t| t.kind == BTK::FetchMissingThumbnails);
             let reorganize_running    = self.background_tasks.iter().any(|t| t.kind == BTK::ReorganizeAll);
             let join_cleanup_running  = self.background_tasks.iter().any(|t| t.kind == BTK::RerunJoinCleanup);
+            let chat_migrate_running  = self.background_tasks.iter().any(|t| t.kind == BTK::MigrateChatLogs);
             egui::Grid::new("maintenance_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -3854,6 +3883,27 @@ impl StreamArchiverApp {
                         self.core.manual(ManualCommand::ReorganizeAll);
                     }
                     ui.label("Move files into/out of subdirectories based on current File Management settings.");
+                    ui.end_row();
+
+                    let chat_root_set = !self.settings.chat_log_root.trim().is_empty();
+                    if ui
+                        .add_enabled(chat_root_set && !chat_migrate_running, egui::Button::new("Migrate chat logs"))
+                        .on_hover_text(
+                            "One-shot sweep: move every EXISTING chat sidecar into the \
+                             dedicated Chat logs folder (Recording → Defaults), mirroring \
+                             each recording folder's structure there. Cross-drive, so each \
+                             file is copied, size-verified, then deleted from the source — \
+                             a failed verify leaves the original untouched. Sidecars of \
+                             still-running sessions are skipped (run it again later), and \
+                             every moved take keeps working in View chat. New takes \
+                             already write to the chat folder directly; this is only the \
+                             catch-up pass for files from before it was configured.",
+                        )
+                        .clicked()
+                    {
+                        self.core.manual(ManualCommand::MigrateChatLogs);
+                    }
+                    ui.label("Move existing chat sidecars into the dedicated chat logs folder.");
                     ui.end_row();
 
                     if ui

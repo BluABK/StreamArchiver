@@ -52,9 +52,118 @@ async fn wait_stopped(done: &AtomicBool, shutdown: &AtomicBool) {
 /// Flush the sidecar buffer at least this often while messages are pending.
 /// Keeps the on-disk file near-live for the chat replay popup's 3s tail poll
 /// while turning per-message write syscalls into a couple of appends per
-/// second — the sidecar lives next to the capture on the recordings drive,
-/// where per-message writes from several busy chats are pure seek churn.
+/// second — by default the sidecar lives next to the capture on the
+/// recordings drive, where per-message writes from several busy chats are
+/// pure seek churn. (With a dedicated chat root configured the sidecar is on
+/// its own drive, but the buffering stays — cheap, and the default layout
+/// still needs it.)
 const FLUSH_EVERY: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
+// Dedicated chat-log root ("chat logs on another drive").
+// ---------------------------------------------------------------------------
+
+/// Settings key for the dedicated chat-log root folder (empty = chat sidecars
+/// are written next to the recording, the pre-setting behavior).
+pub const K_CHAT_ROOT: &str = "chat_log_root";
+
+/// The configured chat-log root. `None` = sidecars live next to recordings.
+/// Same static-root pattern as `downloader::cache::CACHE_ROOTS`.
+static CHAT_ROOT: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
+
+/// Apply the chat-root setting (startup + live on settings save).
+pub fn set_chat_root(raw: &str) {
+    let trimmed = raw.trim().trim_end_matches(['\\', '/']);
+    let root = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+    if let Some(r) = &root {
+        tracing::info!("chat log root: {}", r.display());
+    }
+    *CHAT_ROOT.write() = root;
+}
+
+/// The configured chat-log root, if any.
+pub fn chat_root() -> Option<PathBuf> {
+    CHAT_ROOT.read().clone()
+}
+
+/// Where a take's chat sidecar directory lives: `dir` itself when no chat
+/// root is configured (sidecar next to the recording), else the recording
+/// dir MIRRORED under the root with the drive letter as the top folder —
+/// `A:\VODs\Twitch\GEEGA` → `{root}\A\VODs\Twitch\GEEGA`. The full path (not
+/// just the leaf, unlike the capture cache) so the tree can be re-merged onto
+/// the recordings drives by hand later (`robocopy {root}\A\ A:\ /E` per drive
+/// folder), and so leaf-name collisions across parents/drives can't mix chats.
+///
+/// Non-drive prefixes (UNC) collapse into one sanitized top folder instead of
+/// a drive letter; `..`/`.` components are dropped (an output dir containing
+/// them is already anomalous — never let one climb out of the root). A `dir`
+/// already under the root is returned unchanged (no recursive nesting).
+pub fn chat_dir_for(dir: &Path) -> PathBuf {
+    let Some(root) = chat_root() else {
+        return dir.to_path_buf();
+    };
+    if dir.starts_with(&root) {
+        return dir.to_path_buf();
+    }
+    let mut out = root;
+    for c in dir.components() {
+        match c {
+            std::path::Component::Prefix(p) => {
+                if let Some(d) = crate::downloader::drive_of(Path::new(c.as_os_str())) {
+                    out.push(d.to_string());
+                } else {
+                    // UNC or other exotic prefix: one sanitized component.
+                    out.push(crate::downloader::sanitize_filename(
+                        &p.as_os_str().to_string_lossy(),
+                    ));
+                }
+            }
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::RootDir
+            | std::path::Component::CurDir
+            | std::path::Component::ParentDir => {}
+        }
+    }
+    out
+}
+
+/// Re-root a sidecar path that was computed NEXT TO its recording (the
+/// pre-chat-root convention) into the configured chat root: same filename,
+/// [`chat_dir_for`]-mirrored directory. Identity when no root is configured —
+/// producers call this unconditionally.
+pub fn chat_sidecar_path(next_to_recording: &Path) -> PathBuf {
+    match (next_to_recording.parent(), next_to_recording.file_name()) {
+        (Some(dir), Some(name)) => chat_dir_for(dir).join(name),
+        _ => next_to_recording.to_path_buf(),
+    }
+}
+
+/// Candidate paths for a recording's chat sidecar, in priority order. An
+/// explicit `chat_path` (persisted at spawn for every producer since the
+/// chat-root feature) is the SOLE candidate. Otherwise (legacy takes) the
+/// path is derived from the video's `output_path`: the four historical
+/// next-to-the-recording shapes, plus — when a chat root is configured —
+/// their chat-root mirrors, so a legacy row whose sidecar was migrated (or a
+/// row whose `chat_path` was lost) still resolves.
+pub fn chat_file_candidates(chat_path: &str, output_path: &str) -> Vec<PathBuf> {
+    if !chat_path.is_empty() {
+        return vec![PathBuf::from(chat_path)];
+    }
+    let base = Path::new(output_path);
+    let appended = PathBuf::from(format!("{output_path}.live_chat.json"));
+    let swapped = base.with_extension("chat.jsonl");
+    let mut v = vec![
+        appended.clone(),
+        swapped.clone(),
+        base.with_extension("live_chat.json"),
+        base.with_extension("ts.live_chat.json"),
+    ];
+    if chat_root().is_some() {
+        v.push(chat_sidecar_path(&swapped));
+        v.push(chat_sidecar_path(&appended));
+    }
+    v
+}
 
 /// Flush early once this much is buffered (GDQ-scale chat bursts).
 const FLUSH_BYTES: usize = 32 * 1024;
@@ -966,6 +1075,52 @@ impl EventTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ALL `set_chat_root` calls in the test suite live in this ONE function:
+    /// `CHAT_ROOT` is process-global and tests run in parallel, so a second
+    /// mutating test would race this one.
+    #[test]
+    fn chat_dir_for_mirrors_the_recording_dir_under_the_root() {
+        // Unset (default): identity — sidecar next to the recording.
+        set_chat_root("");
+        assert_eq!(chat_dir_for(Path::new(r"A:\VODs\GEEGA")), PathBuf::from(r"A:\VODs\GEEGA"));
+
+        // Trailing slash is normalized away; drive letter becomes the top
+        // folder; the rest of the path mirrors verbatim.
+        set_chat_root("D:\\ChatLogs\\");
+        assert_eq!(
+            chat_dir_for(Path::new(r"A:\VODs\Twitch\GEEGA")),
+            PathBuf::from(r"D:\ChatLogs\A\VODs\Twitch\GEEGA")
+        );
+        // Another drive gets its own top folder.
+        assert_eq!(
+            chat_dir_for(Path::new(r"G:\Streams\YUY")),
+            PathBuf::from(r"D:\ChatLogs\G\Streams\YUY")
+        );
+        // A dir already under the root is returned unchanged (no nesting).
+        assert_eq!(
+            chat_dir_for(Path::new(r"D:\ChatLogs\A\X")),
+            PathBuf::from(r"D:\ChatLogs\A\X")
+        );
+        // Dot components are dropped — nothing climbs out of the root.
+        assert_eq!(
+            chat_dir_for(Path::new(r"A:\a\..\b\.\c")),
+            PathBuf::from(r"D:\ChatLogs\A\a\b\c")
+        );
+
+        // Sidecar re-rooting keeps the filename, mirrors the directory.
+        assert_eq!(
+            chat_sidecar_path(Path::new(r"A:\VODs\GEEGA\take.chat.jsonl")),
+            PathBuf::from(r"D:\ChatLogs\A\VODs\GEEGA\take.chat.jsonl")
+        );
+
+        set_chat_root(" ");
+        assert!(chat_root().is_none(), "whitespace-only clears the root");
+        assert_eq!(
+            chat_sidecar_path(Path::new(r"A:\V\t.chat.jsonl")),
+            PathBuf::from(r"A:\V\t.chat.jsonl")
+        );
+    }
 
     #[test]
     fn parses_tagged_privmsg() {

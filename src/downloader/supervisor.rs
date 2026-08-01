@@ -236,6 +236,7 @@ impl Supervisor {
                 self.cmd_reorganize_channel(channel_id)
             }
             ManualCommand::RerunJoinCleanup => self.cmd_rerun_join_cleanup(),
+            ManualCommand::MigrateChatLogs => self.cmd_migrate_chat_logs(),
             ManualCommand::RenameRecording { rec_id, new_stem } => {
                 self.cmd_rename_recording(rec_id, new_stem)
             }
@@ -761,13 +762,158 @@ progress_info: None,
             if cfg.enabled {
                 if let Ok(dirs) = store.list_monitor_output_dirs() {
                     for dir in dirs {
-                        sweep_companion_files(std::path::Path::new(&dir), &cfg).await;
+                        sweep_companion_files(std::path::Path::new(&dir), &cfg, &store).await;
                     }
                 }
             }
             let _ = tx.send(AppEvent::BackgroundTaskFinished {
                 id: task_id,
                 outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::MigrateChatLogs`]: one-shot sweep moving every existing
+    /// chat sidecar into the dedicated chat root — the catch-up pass for files
+    /// written before the root was configured (new takes write there directly).
+    /// Cross-drive, so each file is copy → size-verify → delete, never a
+    /// rename; `recording.chat_path` is re-pointed per moved file. Skips takes
+    /// whose chat may still be written (open sessions), files already under
+    /// the root, and anything whose copy can't be verified. Deliberately
+    /// sequential — this is the I/O-relief feature; it shouldn't hammer the
+    /// recording drives to prove it.
+    fn cmd_migrate_chat_logs(&self) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::MigrateChatLogs,
+                label: "Migrate chat logs".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let Some(root) = crate::chat::chat_root() else {
+                let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                    id: task_id,
+                    outcome: crate::events::TaskOutcome::CompletedWithNote(
+                        "no chat folder configured".into(),
+                    ),
+                });
+                return;
+            };
+            let (mut moved, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+            // Sidecars of still-open sessions: never move a file a logger may
+            // hold open; also excluded from the unlinked pass 2 below.
+            let mut active_files: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
+
+            // Pass 1 — sidecars reachable from a recording row.
+            let recs = store.list_recordings_for_chat_migration().unwrap_or_default();
+            let total = recs.len();
+            for (i, (rec_id, output_path, chat_path, open)) in recs.iter().enumerate() {
+                if i % 50 == 0 {
+                    let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                        id: task_id,
+                        progress: Some(i as f32 / total.max(1) as f32),
+                        info: format!("{}/{total}", i + 1),
+                    });
+                }
+                let src = crate::chat::chat_file_candidates(chat_path, output_path)
+                    .into_iter()
+                    .find(|p| crate::iomon::fs::exists_sync(crate::iomon::Cat::ChatSidecar, p));
+                let Some(src) = src else { continue };
+                if *open {
+                    active_files.insert(src);
+                    skipped += 1;
+                    continue;
+                }
+                if src.starts_with(&root) {
+                    continue; // already under the chat root
+                }
+                let dst = crate::chat::chat_sidecar_path(&src);
+                if dst == src {
+                    continue;
+                }
+                match migrate_chat_file(&src, &dst).await {
+                    Ok(true) => {
+                        moved += 1;
+                        let _ = store.set_recording_chat_path(*rec_id, &dst.to_string_lossy());
+                    }
+                    Ok(false) => skipped += 1, // target already exists
+                    Err(e) => {
+                        failed += 1;
+                        warn!("chat migration: {} -> {}: {e:#}", src.display(), dst.display());
+                    }
+                }
+            }
+
+            // Pass 2 — unlinked chat-suffix files sitting in monitor output
+            // dirs (and their configured chat/ subdirs): logs from takes that
+            // never got an output_path, or pre-chat_path history.
+            let cfg = store.subdir_config();
+            for dir in store.list_monitor_output_dirs().unwrap_or_default() {
+                let base = PathBuf::from(&dir);
+                if base.starts_with(&root) {
+                    continue;
+                }
+                for scan in [base.clone(), base.join(&cfg.chat)] {
+                    let Ok(mut rd) =
+                        crate::iomon::fs::read_dir(crate::iomon::Cat::ChatSidecar, &scan).await
+                    else {
+                        continue;
+                    };
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if !is_chat_suffix(&name) {
+                            continue;
+                        }
+                        let src = entry.path();
+                        if active_files.contains(&src) {
+                            continue; // still being written
+                        }
+                        let dst = crate::chat::chat_dir_for(&scan).join(&name);
+                        if dst == src {
+                            continue;
+                        }
+                        match migrate_chat_file(&src, &dst).await {
+                            Ok(true) => {
+                                moved += 1;
+                                // No-op unless some take points at this file.
+                                let _ = store.update_chat_path_by_path(
+                                    &src.to_string_lossy(),
+                                    &dst.to_string_lossy(),
+                                );
+                            }
+                            Ok(false) => skipped += 1,
+                            Err(e) => {
+                                failed += 1;
+                                warn!(
+                                    "chat migration: {} -> {}: {e:#}",
+                                    src.display(),
+                                    dst.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!("chat migration done: {moved} moved, {skipped} skipped, {failed} failed");
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: if failed == 0 {
+                    crate::events::TaskOutcome::CompletedWithNote(format!(
+                        "{moved} moved, {skipped} skipped"
+                    ))
+                } else {
+                    crate::events::TaskOutcome::Failed(format!(
+                        "{moved} moved, {skipped} skipped, {failed} FAILED — see log"
+                    ))
+                },
             });
         });
     }
@@ -2547,7 +2693,7 @@ progress_info: None,
                         &video, started_at, &title, &channel, &video_id, &quality, Some(&mi),
                         video.tool.label(), Platform::detect(&video.url).as_str(),
                     );
-                    final_path = rename_for_media(final_path, &stem).await;
+                    final_path = rename_for_media(final_path, &stem, &self.store).await;
                 }
             }
             if let Some(cache) = cache.as_deref() {
@@ -3023,6 +3169,7 @@ progress_info: None,
             &ytdlp_global_args,
             &ytdlp_bins,
             monitor_id,
+            rec_id,
             stream_id.as_deref().unwrap_or(""),
         );
 
@@ -3672,16 +3819,28 @@ progress_info: None,
         ytdlp_global_args: &[String],
         ytdlp_bins: &YtDlpBins,
         monitor_id: i64,
+        rec_id: i64,
         stream_id: &str,
     ) -> (Arc<AtomicBool>, Option<tokio::task::JoinHandle<()>>) {
         // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
-        // a `.chat.jsonl` sidecar in the OUTPUT dir (next to the final file, not in
-        // .cache\) so it isn't promoted/purged from under a still-writing logger; it
-        // follows the file's stem on the post-rename. Twitch only.
+        // a `.chat.jsonl` sidecar in the OUTPUT dir (next to the final file, not
+        // in .cache\) so it isn't promoted/purged from under a still-writing
+        // logger — or, with a dedicated chat root configured, in that root's
+        // mirror of the output dir (chat I/O off the recording drive; see
+        // `chat::chat_dir_for`). It follows the file's stem on the post-rename
+        // either way. `recording.chat_path` is persisted up front so readers
+        // and renames never have to guess which layout a take used. Twitch only.
         let chat_done = Arc::new(AtomicBool::new(false));
         let chat_task = (row.monitor.chat_log && row.monitor.platform() == Platform::Twitch)
             .then(|| {
-                let chat_path = plan.final_path.with_extension("chat.jsonl");
+                let chat_path =
+                    crate::chat::chat_sidecar_path(&plan.final_path.with_extension("chat.jsonl"));
+                if let Err(e) = self
+                    .store
+                    .set_recording_chat_path(rec_id, &chat_path.to_string_lossy())
+                {
+                    warn!("set_recording_chat_path (twitch take): {e}");
+                }
                 // Register the in-process logger in `active_chats` (pid 0, the
                 // chat-only convention) so a recording Twitch row gets the same
                 // 💬 badge, "Stop chat download" action, and shutdown accounting
@@ -3706,6 +3865,13 @@ progress_info: None,
                     monitor_id,
                     flag: chat_done.clone(),
                 };
+                // Under a dedicated chat root the mirror dir may not exist yet
+                // (the capture pipeline only creates the OUTPUT dir); ChatSink
+                // opens lazily but never mkdirs.
+                let mkdir = crate::chat::chat_root()
+                    .is_some()
+                    .then(|| chat_path.parent().map(std::path::Path::to_path_buf))
+                    .flatten();
                 let fut = crate::chat::log_twitch_chat(
                     row.monitor.url.clone(),
                     chat_path,
@@ -3720,6 +3886,12 @@ progress_info: None,
                 );
                 tokio::spawn(async move {
                     let _guard = guard;
+                    if let Some(d) = mkdir
+                        && let Err(e) =
+                            crate::iomon::fs::create_dir_all(crate::iomon::Cat::DirSetup, &d).await
+                    {
+                        warn!("chat root: create {}: {e}", d.display());
+                    }
                     fut.await;
                 })
             });
@@ -3734,12 +3906,36 @@ progress_info: None,
         {
             // Base the YouTube chat sidecar on the final (output-dir) path, not the
             // .cache\ capture: this process outlives the video, so its
-            // `.live_chat.json` must not be promoted/purged mid-write.
-            let chat_plan = build_chat_plan(row, &plan.final_path, auth, ytdlp_global_args, &ytdlp_bins.system_program());
+            // `.live_chat.json` must not be promoted/purged mid-write. With a
+            // dedicated chat root, the base is that root's mirror of the final
+            // path instead — yt-dlp appends `.live_chat.json` to whatever `-o`
+            // it's given, so the sidecar lands in the chat dir.
+            let chat_base = crate::chat::chat_sidecar_path(&plan.final_path);
+            // Persist the predicted sidecar name (same prediction chat_only.rs
+            // makes): `{-o value}.live_chat.json`.
+            if let Err(e) = self.store.set_recording_chat_path(
+                rec_id,
+                &format!("{}.live_chat.json", chat_base.to_string_lossy()),
+            ) {
+                warn!("set_recording_chat_path (yt chat take): {e}");
+            }
+            let mkdir = crate::chat::chat_root()
+                .is_some()
+                .then(|| chat_base.parent().map(std::path::Path::to_path_buf))
+                .flatten();
+            let chat_plan = build_chat_plan(row, &chat_base, auth, ytdlp_global_args, &ytdlp_bins.system_program());
             let this = self.clone();
             let mid = monitor_id;
             let chat_platform = row.monitor.platform();
-            tokio::spawn(async move { this.run_chat_download(mid, chat_platform, chat_plan).await });
+            tokio::spawn(async move {
+                if let Some(d) = mkdir
+                    && let Err(e) =
+                        crate::iomon::fs::create_dir_all(crate::iomon::Cat::DirSetup, &d).await
+                {
+                    warn!("chat root: create {}: {e}", d.display());
+                }
+                this.run_chat_download(mid, chat_platform, chat_plan).await;
+            });
         }
         (chat_done, chat_task)
     }
@@ -3890,7 +4086,7 @@ progress_info: None,
                 // Stop the YouTube chat sidecar before renaming so its open
                 // live_chat.json handle is released before companion rename.
                 self.stop_and_wait_for_chat(monitor_id, Duration::from_secs(6)).await;
-                final_path = rename_for_media(final_path, &stem).await;
+                final_path = rename_for_media(final_path, &stem, &self.store).await;
             }
             // Drop this recording's working leftovers (SABR parts/state, etc.).
             if let Some(cache) = cache.as_deref() {

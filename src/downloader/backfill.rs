@@ -1218,8 +1218,11 @@ impl Supervisor {
         }
         // The live capture is the take's main file: re-point the row at the
         // full BEFORE removing it, so there is no window where `output_path`
-        // names a deleted file. Sidecars (chat/thumbnail) share the stem with
-        // the full and stay matched.
+        // names a deleted file. Sidecar files themselves stay put (nothing to
+        // rename — the full shares the live capture's directory); the chat
+        // replay finds the sidecar via the persisted `recording.chat_path`,
+        // NOT by deriving from the now-`.full.mkv` output_path (that
+        // derivation would yield `{stem}.full.chat.jsonl`, which never exists).
         let full_s = full.to_string_lossy().into_owned();
         let live_note = match self.store.update_recording_output_path(rec_id, &full_s) {
             Ok(()) => {

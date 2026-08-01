@@ -74,11 +74,11 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Point a take at the chat sidecar a **chat-only session** is writing
-    /// (see [`crate::models::Recording::chat_path`]). Only ever called for
-    /// `not_recorded` sessions, which have no `output_path` for the usual
-    /// extension-swap lookup to work from; an ordinary take's sidecar is
-    /// still derived from its video path and this column stays empty.
+    /// Point a take at the chat sidecar being written for it (see
+    /// [`crate::models::Recording::chat_path`]). Persisted at spawn for EVERY
+    /// chat producer (recorded takes and chat-only sessions alike) since the
+    /// dedicated chat-root option landed — the sidecar may live on another
+    /// drive, so the reader's `output_path`-derived fallbacks can't find it.
     pub fn set_recording_chat_path(&self, rec_id: i64, chat_path: &str) -> Result<()> {
         let conn = self.db();
         conn.execute(
@@ -86,6 +86,36 @@ impl Store {
             params![rec_id, chat_path],
         )?;
         Ok(())
+    }
+
+    /// Work list for the one-shot chat-log migration sweep: every recording's
+    /// `(id, output_path, chat_path, still_open)`. `still_open` (no `ended_at`)
+    /// flags takes whose chat may still be written — the sweep must not move
+    /// a file out from under a live logger.
+    pub fn list_recordings_for_chat_migration(&self) -> Result<Vec<(i64, String, String, bool)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, COALESCE(output_path, ''), chat_path, ended_at IS NULL FROM recording
+             WHERE chat_path != '' OR COALESCE(output_path, '') != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Re-point `chat_path` after a chat sidecar was physically renamed or
+    /// moved, keyed by the OLD path — every move/rename site calls this with
+    /// the (from, to) pair it just executed, so no caller needs to know which
+    /// recording owns the file. A no-op (0 rows) when no take points there
+    /// (e.g. legacy takes recorded before `chat_path` was persisted at spawn).
+    pub fn update_chat_path_by_path(&self, old_path: &str, new_path: &str) -> Result<usize> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET chat_path = ?2 WHERE chat_path = ?1",
+            params![old_path, new_path],
+        )
+        .map_err(Into::into)
     }
 
     /// Close any open not-recorded session for this monitor (see
@@ -874,12 +904,13 @@ impl Store {
         let m = |col: &str| format!("substr(COALESCE({col}, ''), 1, length(?1)) = ?1");
         let recs: i64 = conn.query_row(
             &format!(
-                "SELECT COUNT(*) FROM recording WHERE {} OR {} OR {} OR {} OR {}",
+                "SELECT COUNT(*) FROM recording WHERE {} OR {} OR {} OR {} OR {} OR {}",
                 m("output_path"),
                 m("backfill_path"),
                 m("full_path"),
                 m("recovered_path"),
                 m("vod_dl_path"),
+                m("chat_path"),
             ),
             params![from],
             |r| r.get(0),
@@ -898,8 +929,8 @@ impl Store {
     }
 
     /// Rewrite the leading `from` prefix to `to` in every stored path column
-    /// (recordings: output/backfill/full/recovered/vod-download paths; videos:
-    /// output path + dir; optionally monitor output dirs). This is a
+    /// (recordings: output/backfill/full/recovered/vod-download/chat paths;
+    /// videos: output path + dir; optionally monitor output dirs). This is a
     /// DB-side remap for files the user physically moved (e.g. a drive
     /// migration A:\ → D:\) — no files are touched. Returns
     /// `(recording cols updated, video cols updated, monitors updated)`.
@@ -911,7 +942,14 @@ impl Store {
     ) -> Result<(usize, usize, usize)> {
         let conn = self.db();
         let mut recs = 0usize;
-        for col in ["output_path", "backfill_path", "full_path", "recovered_path", "vod_dl_path"] {
+        for col in [
+            "output_path",
+            "backfill_path",
+            "full_path",
+            "recovered_path",
+            "vod_dl_path",
+            "chat_path",
+        ] {
             recs += conn.execute(
                 &format!(
                     "UPDATE recording SET {col} = ?2 || substr({col}, length(?1) + 1)
@@ -2555,11 +2593,24 @@ mod tests {
             .finish_recording(stays, 4_000, 5, Some(0), "completed", r"G:\other\Chan\b.mkv", "")
             .unwrap();
 
+        // A chat-only take living entirely on the relocated prefix: chat_path
+        // is its ONLY pointer, so the relocation must rewrite it too.
+        let chat_only = store
+            .insert_recording(mid, 5_000, "", None, false, None, None, "", "")
+            .unwrap();
+        store
+            .set_recording_chat_path(chat_only, r"A:\streams\Chan\c.chat.jsonl")
+            .unwrap();
+
         let (r, v, mons) = store.count_path_prefix_matches(r"A:\streams").unwrap();
-        assert_eq!((r, v, mons), (1, 0, 1));
+        assert_eq!((r, v, mons), (2, 0, 1));
 
         let (r, v, mons) = store.replace_path_prefix(r"A:\streams", r"D:\streams", true).unwrap();
-        assert_eq!((r, v, mons), (1, 0, 1));
+        assert_eq!((r, v, mons), (2, 0, 1));
+        assert_eq!(
+            store.get_recording(chat_only).unwrap().unwrap().chat_path,
+            r"D:\streams\Chan\c.chat.jsonl"
+        );
         assert_eq!(
             store.get_recording(moved).unwrap().unwrap().output_path,
             r"D:\streams\Chan\a.mkv"

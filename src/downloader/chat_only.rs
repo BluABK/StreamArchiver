@@ -202,12 +202,14 @@ impl Supervisor {
             warn!(monitor_id, "chat-only: monitor has no output directory; skipping");
             return;
         }
-        let dir = PathBuf::from(&row.monitor.output_dir);
         // No `.cache\` staging like a capture gets: a chat sidecar is written
-        // straight to the output dir (same as a recorded take's — the promote
-        // step must never move a file a logger still has open).
+        // straight to its final dir (same as a recorded take's — the promote
+        // step must never move a file a logger still has open). That dir is
+        // the monitor's output dir, or its mirror under the dedicated chat
+        // root when one is configured (`chat::chat_dir_for`).
+        let dir = crate::chat::chat_dir_for(Path::new(&row.monitor.output_dir));
         if let Err(e) = crate::iomon::fs::create_dir_all(Cat::DirSetup, &dir).await {
-            warn!(monitor_id, "chat-only: output dir {}: {e:#}", dir.display());
+            warn!(monitor_id, "chat-only: chat dir {}: {e:#}", dir.display());
             return;
         }
         let twitch = row.monitor.platform() == Platform::Twitch;

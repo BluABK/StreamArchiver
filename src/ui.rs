@@ -905,6 +905,11 @@ pub(crate) struct SettingsForm {
     /// Recover VOD) — seeds `DownloadDefaults`' per-platform output dirs,
     /// separate from `default_output_dir` (live stream recordings).
     default_video_output_dir: String,
+    /// Dedicated chat-log root folder ([`crate::chat::K_CHAT_ROOT`]): chat
+    /// sidecars are written under `{root}\{drive}\{output-dir path}\` instead
+    /// of next to the recordings, moving chat I/O off the capture drives.
+    /// Empty = sidecars next to recordings (the default).
+    chat_log_root: String,
     max_concurrent_downloads: String,
     /// VOD/video download rate limit (yt-dlp `--limit-rate` syntax, e.g. `4M`);
     /// empty = unlimited (the default). Never applied to live captures.

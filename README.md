@@ -2968,6 +2968,44 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
 
+#### Dedicated chat logs folder (on another drive)
+
+Chat appends are small but constant, and on a drive that's simultaneously
+recording several streams they're pure seek churn. **Settings → Recording →
+Defaults → Chat logs folder (dedicated)** moves ALL chat writes to their own
+folder — ideally on another, quieter drive. Empty (the default) keeps sidecars
+next to the recordings.
+
+- **Mirrored layout, drive letter on top** — the recording's folder structure
+  is reproduced under the root so the trees can be re-merged by hand later:
+
+  ```
+  A:\VODs\Twitch\GEEGA\take.mkv          (recording, unchanged)
+  D:\ChatLogs\A\VODs\Twitch\GEEGA\take.chat.jsonl
+  D:\ChatLogs\G\Streams\YUY\take.mkv.live_chat.json
+
+  remerge:  robocopy D:\ChatLogs\A\ A:\ /E     (one per drive folder)
+  ```
+
+- Applies to **every chat shape**: a Twitch take's built-in logger, a YouTube
+  take's yt-dlp `live_chat` sidecar, and chat-without-recording sessions.
+  Each take's sidecar location is persisted on the recording row
+  (`chat_path`), so **💬 View chat**, post-capture **renames** (the chat file
+  follows the title rename inside the chat folder — always a same-drive
+  rename), head-backfill joins, and gap splices all keep resolving it.
+- **Existing files don't move on their own.** **Settings → Maintenance →
+  Migrate chat logs** is the one-shot catch-up: each old sidecar is copied,
+  size-verified, then deleted from the source; still-running sessions are
+  skipped (run it again later). It also sweeps unlinked chat files out of the
+  output dirs (and their `chat/` subdirs).
+- Interplay with other file features: the *File management* subdirectory
+  split doesn't apply inside the chat folder (the dedicated root IS the
+  segregation); the Files view's **Relocate prefix** now rewrites `chat_path`
+  too, so relocating the chat root itself is a normal prefix relocation; and
+  **Redirect drive** on the recordings changes where FUTURE takes' chat
+  mirrors land automatically. Chat-drive I/O shows up in the I/O monitor as a
+  recordings surface, on its own drive row.
+
 While a chat capture is running, its row shows the **💬 badge** (bubbled up
 to the instance and collapsed channel rows) and the context menu offers
 **💬 Stop chat download** — for *all three* shapes: a YouTube recording's
@@ -2991,7 +3029,8 @@ captured on its own. This is on by default and switched off under
   chat** off for an instance turns this off for it too.
 - The sidecar is exactly the file a recorded take would have produced —
   `<name>.chat.jsonl` / `<name>.mkv.live_chat.json` in the instance's output
-  folder, named from its usual filename template — so the chat replay, the
+  folder (or its mirror under the *dedicated chat logs folder*, when one is
+  configured), named from its usual filename template — so the chat replay, the
   subdirectory split (*File management*), and the 💬 badge all work
   unchanged. `{title}` and `{games}` are filled from what detection knows at
   the time rather than the usual `title-tba` placeholders, since there's no

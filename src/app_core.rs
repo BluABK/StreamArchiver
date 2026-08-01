@@ -209,6 +209,16 @@ impl AppCore {
                 .flatten()
                 .unwrap_or_default(),
         );
+        // Dedicated chat-log root (empty = sidecars next to the recordings) —
+        // applied before any capture/chat-only session derives a sidecar path.
+        crate::chat::set_chat_root(
+            &self
+                .store
+                .get_setting(crate::chat::K_CHAT_ROOT)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         // I/O monitor: register the recordings roots for region classification,
         // apply the persisted sample-log toggle, and start the 1 s process/disk
         // sampler (here rather than the GUI path so headless runs sample too).
@@ -238,6 +248,11 @@ impl AppCore {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(crate::app_paths::default_video_output_dir),
             );
+            // The dedicated chat-log root (when configured) is a recordings
+            // surface too — without this, chat-drive I/O classifies as Other.
+            if let Some(chat_root) = crate::chat::chat_root() {
+                roots.push(chat_root);
+            }
             // …plus every dir PAST recordings live in: an instance retargeted
             // from A:\ to D:\ leaves its old takes on A:, and that drive must
             // stay classified/sampled as a recordings drive too.

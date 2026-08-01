@@ -34,6 +34,12 @@ pub(super) fn refresh_iomon_roots(
             roots.push(std::path::PathBuf::from(d));
         }
     }
+    // The dedicated chat-log root (when configured) counts as a recordings
+    // surface too — read from the live static so callers don't need to
+    // thread it through (set_chat_root always runs before this on save).
+    if let Some(chat_root) = crate::chat::chat_root() {
+        roots.push(chat_root);
+    }
     roots.extend(crate::downloader::historical_recording_dirs(store));
     crate::iomon::set_recordings_roots(roots);
 }

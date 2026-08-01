@@ -782,7 +782,23 @@ impl Supervisor {
             // `.chat.jsonl` sidecar. (YouTube chat is a yt-dlp process and
             // re-attaches via its own registry row.)
             if m.monitor.chat_log && m.monitor.platform() == Platform::Twitch {
-                let chat_path = PathBuf::from(&row.final_path).with_extension("chat.jsonl");
+                // Prefer the persisted chat_path (append continues the SAME
+                // file the pre-restart logger wrote, even if the chat-root
+                // setting changed between sessions); derive only for legacy
+                // rows recorded before chat_path was persisted at spawn.
+                let chat_path = self
+                    .store
+                    .get_recording(row.ref_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.chat_path)
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        crate::chat::chat_sidecar_path(
+                            &PathBuf::from(&row.final_path).with_extension("chat.jsonl"),
+                        )
+                    });
                 watchers.push(tokio::spawn(crate::chat::log_twitch_chat(
                     m.monitor.url.clone(),
                     chat_path,
@@ -1164,7 +1180,7 @@ impl Supervisor {
                 if let Some(mid) = row.monitor_id {
                     self.stop_and_wait_for_chat(mid, Duration::from_secs(6)).await;
                 }
-                final_path = rename_for_media(final_path, &stem).await;
+                final_path = rename_for_media(final_path, &stem, &self.store).await;
             }
         }
 
@@ -1627,7 +1643,7 @@ impl Supervisor {
                     row.monitor.platform().as_str(),
                     rec.went_live_at.unwrap_or(0),
                 );
-                final_path = rename_for_media(final_path, &stem).await;
+                final_path = rename_for_media(final_path, &stem, &self.store).await;
             }
             if let Some(cache) = cache.as_deref() {
                 purge_cache(cache, &capstem).await;

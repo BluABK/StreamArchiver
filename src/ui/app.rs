@@ -140,6 +140,7 @@ impl StreamArchiverApp {
             kick_client_secret: setting_or_empty(&core, K_KICK_SECRET),
             default_output_dir: default_out,
             default_video_output_dir: default_video_out,
+            chat_log_root: setting_or_empty(&core, crate::chat::K_CHAT_ROOT),
             max_concurrent_downloads: core
                 .store
                 .get_setting(K_MAX_CONCURRENT)
@@ -1759,6 +1760,7 @@ impl StreamArchiverApp {
             (K_KICK_SECRET, s.kick_client_secret.trim()),
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_VIDEO_DEFAULT_OUT, s.default_video_output_dir.trim()),
+            (crate::chat::K_CHAT_ROOT, s.chat_log_root.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (crate::io_gate::K_DOWNLOAD_RATE_LIMIT, s.download_rate_limit.trim()),
             (crate::downloader::K_CACHE_ROOT, s.capture_cache_root.trim()),
@@ -1965,6 +1967,7 @@ impl StreamArchiverApp {
         }
         crate::io_gate::set_disk_limits(disk_cfg);
         crate::downloader::set_cache_root(&self.settings.capture_cache_root);
+        crate::chat::set_chat_root(&self.settings.chat_log_root);
         crate::io_gate::set_ytdlp_ppa(&self.settings.ytdlp_ppa);
         // PO token server: re-read path/autostart/base-url and wake the
         // watchdog so a corrected config takes effect without a restart.

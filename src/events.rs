@@ -41,6 +41,9 @@ pub enum BackgroundTaskKind {
     /// Re-applying the effective post-join cleanup to takes that were joined
     /// while the setting was still "Keep" (see `ManualCommand::RerunJoinCleanup`).
     RerunJoinCleanup,
+    /// One-shot sweep moving existing chat sidecars into the dedicated
+    /// chat-log root (see `ManualCommand::MigrateChatLogs`).
+    MigrateChatLogs,
     /// A single Twitch VOD recovery (CDN probe + segment salvage + mux).
     /// Carries the recording id when recovering into an existing take
     /// (`None` for a standalone recovery not tied to a recording).
@@ -90,6 +93,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ReorganizeMonitor(_) => "Re-organize monitor",
             BackgroundTaskKind::ReorganizeChannel(_) => "Re-organize channel",
             BackgroundTaskKind::RerunJoinCleanup => "Re-run join cleanup",
+            BackgroundTaskKind::MigrateChatLogs => "Migrate chat logs",
             BackgroundTaskKind::RecoverVod(_) => "VOD recovery",
             BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
             BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
@@ -126,6 +130,7 @@ impl BackgroundTaskKind {
             | BackgroundTaskKind::ReorganizeMonitor(_)
             | BackgroundTaskKind::ReorganizeChannel(_)
             | BackgroundTaskKind::RerunJoinCleanup
+            | BackgroundTaskKind::MigrateChatLogs
             | BackgroundTaskKind::RecoverVodScan
             | BackgroundTaskKind::RefreshCdnHosts
             | BackgroundTaskKind::ReembedChaptersAll
@@ -518,6 +523,12 @@ pub enum ManualCommand {
     /// double forever. This is the catch-up pass, and it re-verifies the join's
     /// duration gate per take before disposing anything.
     RerunJoinCleanup,
+    /// One-shot sweep: move every existing chat sidecar (linked via
+    /// `recording.chat_path` or derivable from `output_path`, plus unlinked
+    /// chat-suffix files in monitor output dirs) into the dedicated chat-log
+    /// root, updating `chat_path` per moved file. Cross-drive copy + verify +
+    /// delete; skips takes whose chat is still being written.
+    MigrateChatLogs,
     /// Rename a recording's output file using the given new filename stem.
     RenameRecording { rec_id: i64, new_stem: String },
     /// Recover a Twitch VOD from surviving CDN segments and file the muxed MKV per

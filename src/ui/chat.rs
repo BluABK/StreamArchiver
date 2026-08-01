@@ -493,25 +493,12 @@ pub(super) fn chat_file_for_recording(rec: &Recording) -> Option<std::path::Path
 /// The candidate sidecar paths [`chat_file_for_recording`] probes, in order.
 ///
 /// An explicit [`Recording::chat_path`] always comes first and, when set, is
-/// the only candidate that can match anything: it exists precisely for takes
-/// whose sidecar ISN'T derivable from `output_path` — a chat-only session
-/// (`downloader::chat_only`) has no video file, so every derived form below
-/// would be built from an empty stem.
+/// the only candidate — persisted at spawn for every producer since the
+/// dedicated chat-root feature. The derived fallbacks (legacy takes, plus
+/// chat-root mirrors) live in [`crate::chat::chat_file_candidates`], shared
+/// with the migration sweep.
 pub(super) fn chat_file_candidates(rec: &Recording) -> Vec<std::path::PathBuf> {
-    if !rec.chat_path.is_empty() {
-        return vec![std::path::PathBuf::from(&rec.chat_path)];
-    }
-    let base = Path::new(&rec.output_path);
-    vec![
-        // YouTube (yt-dlp append form): `<output_path>.live_chat.json`.
-        std::path::PathBuf::from(format!("{}.live_chat.json", rec.output_path)),
-        // Twitch native logger (extension replace): `<stem>.chat.jsonl`.
-        base.with_extension("chat.jsonl"),
-        // Extension-replace live_chat form, just in case.
-        base.with_extension("live_chat.json"),
-        // Legacy pre-`.cache` YouTube name: `<stem>.ts.live_chat.json`.
-        base.with_extension("ts.live_chat.json"),
-    ]
+    crate::chat::chat_file_candidates(&rec.chat_path, &rec.output_path)
 }
 
 /// [`chat_file_for_recording`] for render paths: existence via the non-blocking
