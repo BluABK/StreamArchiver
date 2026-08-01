@@ -757,7 +757,12 @@ A few features delete finished recordings on their own: the post-join parts
 cleanup above, superseded old heads, and a live capture displaced by *Replace
 with VOD*. **Settings → Downloads → Automatic deletion** controls what such a
 delete actually does — with the usual global < channel < instance override
-chain (channel Properties / edit instance):
+chain (channel Properties / edit instance). A take started by a
+[trigger word](#trigger-words-force-record-on-titlegame-match-) can go one
+step further: its rule's own **Deletion** override, or the trigger words
+section's all-triggers default, beats channel/instance for that take's
+disposals — the one case where "which channel/instance this is" isn't the
+most specific thing known about a recording.
 
 - **Recycle Bin** (default): the normal Windows bin — restorable, needs no
   setup. Note that drives without a bin (some removable media) delete
@@ -2062,7 +2067,23 @@ polled regardless).
   changes during a recording, so small End delay values effectively round up
   to the next check. Survives an app restart (a re-attached recording keeps
   enforcing it).
+- **Deletion** — force the [deletion method](#automatic-deletion) for every
+  automatic disposal of a recording *this rule* started. Trigger words usually
+  flag content that's easy to lose (unarchived streams, deletion-flagged
+  titles), so it can warrant stricter handling than the channel/instance is
+  set to — and it beats the channel/instance method (and the all-triggers
+  default below it) whenever it applies, precisely so it can't be
+  quietly defeated by a laxer setting elsewhere. *Inherit* = no special
+  treatment. Frozen into the take at the moment it starts, so a later edit to
+  the rule never changes how an already-started take's files get disposed of.
 - An **enabled** checkbox per rule, so seasonal rules can be kept but parked.
+
+There's also one **all-triggers default** (Settings → Downloads → Trigger
+words, below the rule list): applies to any trigger-started take whose own
+rule doesn't set a Deletion override, still beating the channel/instance
+method. *Inherit* there means trigger-started takes get no special treatment
+at all — the individual rules are the only source of "be extra careful with
+this one".
 
 **Three-level control.** Rules resolve through the same inheritance chain as the
 VOD options — **global < per-channel < per-instance** — but as a *list*, each
@@ -2076,7 +2097,8 @@ instance overrides in their **Properties** windows ("Trigger words" section).
 toast (which rule matched, the matching title/game text, and what it did); the
 recording and its takes carry a **⚡ badge** (hover shows the match, e.g.
 `title ~ "karaoke" · capture-from-start forced on`, or
-`title ~ "boss rush" · lead 30s · stops when unmatched (+15s)`); and the
+`title ~ "boss rush" · lead 30s · stops when unmatched (+15s)`, or
+`title ~ "unarchived" · deletion forced to Trash folder`); and the
 take's Properties window gets a **Trigger** row. While the recording is
 running, the ⚡ badge also bubbles up to the instance row and the (collapsed)
 channel row — same for the 💬 chat-download badge — so a trigger-started

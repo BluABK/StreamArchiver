@@ -22,7 +22,8 @@
 //! explicit user ▶ Start records. They reuse the same rule/scope structures
 //! and three-level resolution under their own settings keys; the per-rule
 //! action overrides (`capture_from_start`, `stop_on_unmatch`, `lead_secs`,
-//! `end_delay_secs`) are meaningless for a veto and ignored.
+//! `end_delay_secs`, `disposal_override`) are meaningless for a veto and
+//! ignored.
 
 use std::collections::HashMap;
 
@@ -121,6 +122,25 @@ pub struct TriggerRule {
     /// `stop_on_unmatch` is false.
     #[serde(default)]
     pub end_delay_secs: i64,
+    /// Force the deletion method for every automatic disposal of a recording
+    /// THIS rule started (post-join cleanup, gap-splice cleanup, superseded
+    /// old head — see [`crate::disposal`]) — the whole point of a trigger
+    /// word is usually "this content is easy to lose" (unarchived streams,
+    /// deletion-flagged titles), so it can warrant stricter handling than
+    /// whatever the channel/instance happens to be set to. `None` falls
+    /// through to [`crate::disposal::K_TRIGGER_DISPOSAL_DEFAULT`] (the
+    /// all-triggers default), then the normal monitor/channel/global chain.
+    /// Takes precedence over BOTH — a trigger match is the most specific
+    /// context available for the recording it caused, and the deliberate
+    /// point of setting this is that it shouldn't be casually overridden by
+    /// a channel's laxer setting. Frozen into `Recording.trigger_rule_json`
+    /// at start time along with the rest of the rule, so a later edit to the
+    /// rule (or its removal) never changes how an already-started take's
+    /// files get disposed of. Meaningless for a blacklist rule (a veto never
+    /// starts a recording) and ignored there, same as the other action
+    /// overrides above.
+    #[serde(default)]
+    pub disposal_override: Option<crate::disposal::DisposalMethod>,
 }
 
 impl Default for TriggerRule {
@@ -136,6 +156,7 @@ impl Default for TriggerRule {
             stop_on_unmatch: false,
             lead_secs: 0,
             end_delay_secs: 0,
+            disposal_override: None,
         }
     }
 }
@@ -378,6 +399,9 @@ impl TriggerHit {
                 s.push_str(" · stops when unmatched");
             }
         }
+        if let Some(m) = self.rule.disposal_override {
+            s.push_str(&format!(" · deletion forced to {}", m.label()));
+        }
         s
     }
 }
@@ -518,6 +542,14 @@ mod tests {
     }
 
     #[test]
+    fn describe_notes_disposal_override() {
+        let mut r = rule(TriggerField::Title, false, "unarchived");
+        r.disposal_override = Some(crate::disposal::DisposalMethod::Trash);
+        let hit = first_match(&[r], Some("unarchived karaoke"), None).unwrap();
+        assert_eq!(hit.describe(), "title ~ \"unarchived\" · deletion forced to Trash folder");
+    }
+
+    #[test]
     fn three_level_resolution_modes() {
         let global = vec![rule(TriggerField::Any, false, "unarchived")];
         let extra = rule(TriggerField::Title, false, "karaoke");
@@ -581,6 +613,7 @@ mod tests {
                 stop_on_unmatch: true,
                 lead_secs: 30,
                 end_delay_secs: 15,
+                disposal_override: Some(crate::disposal::DisposalMethod::Trash),
             }],
         };
         let json = serde_json::to_string(&scope).unwrap();
@@ -599,6 +632,7 @@ mod tests {
         assert!(!r.stop_on_unmatch);
         assert_eq!(r.lead_secs, 0);
         assert_eq!(r.end_delay_secs, 0);
+        assert_eq!(r.disposal_override, None);
         assert!(TriggerScope::default().is_inherit());
         // Old JSON missing these fields entirely (pre-this-feature) still
         // deserializes fine with them defaulted off.
@@ -608,6 +642,7 @@ mod tests {
         .unwrap();
         assert!(!old.stop_on_unmatch);
         assert_eq!(old.lead_secs, 0);
+        assert_eq!(old.disposal_override, None);
         assert!(old.label.is_empty() && old.note.is_empty());
     }
 

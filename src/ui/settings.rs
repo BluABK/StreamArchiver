@@ -256,6 +256,19 @@ pub(super) fn trigger_rules_editor(
                      is confirmed.",
                 );
             }
+            ui.label("Deletion:");
+            ui.push_id((salt, "disposal", i), |ui| {
+                disposal_method_combo(ui, "trigger_disposal", &mut r.disposal_override)
+            })
+            .inner
+            .on_hover_text(
+                "Force the deletion method for every automatic disposal (post-join \
+                 cleanup, gap-splice cleanup, superseded old head) of a recording THIS \
+                 rule started — trigger words usually flag content that's easy to \
+                 lose, so it can warrant stricter handling than the channel/instance \
+                 is set to. Beats the channel/instance AND the all-triggers default \
+                 below. Inherit = no special treatment for this rule's recordings.",
+            );
         });
     }
     if let Some(i) = remove {
@@ -2976,7 +2989,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_trigger_words_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Trigger words", &["trigger", "word", "karaoke", "unarchived", "force", "auto", "title", "game", "regex"]) {
+            if self.section_shown(SettingsTab::Downloads, "Trigger words", &["trigger", "word", "karaoke", "unarchived", "force", "auto", "title", "game", "regex", "delete", "deletion", "disposal"]) {
             ui.add_space(12.0);
             ui.heading("Trigger words ⚡");
             ui.label(
@@ -2989,6 +3002,23 @@ impl StreamArchiverApp {
             );
             ui.add_space(6.0);
             trigger_rules_editor(ui, &mut self.settings.trigger_rules, "settings_triggers", true);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Deletion for trigger-started takes:");
+                disposal_method_combo(
+                    ui,
+                    "settings_trigger_disposal_default",
+                    &mut self.settings.trigger_disposal_default,
+                )
+                .on_hover_text(
+                    "Applies to every automatic disposal of a recording that a trigger word \
+                     started (post-join cleanup, gap-splice cleanup, superseded old head), \
+                     UNLESS the specific rule that started it sets its own override above — \
+                     that always wins. Beats the channel/instance deletion method whenever it \
+                     applies. Inherit = trigger-started recordings get no special treatment, \
+                     same as any other take.",
+                );
+            });
             ui.label(
                 egui::RichText::new(
                     "Note: EventSub-pushed go-lives fetch the title via a follow-up check; \

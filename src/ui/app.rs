@@ -352,6 +352,7 @@ impl StreamArchiverApp {
             disposal_trash_default_root: setting_or_empty(&core, crate::disposal::K_TRASH_DEFAULT_ROOT),
             trigger_rules: crate::triggers::load_global_rules(&core.store),
             trigger_block_rules: crate::triggers::load_global_block_rules(&core.store),
+            trigger_disposal_default: crate::disposal::global_trigger_disposal_default(&core.store),
             custom_tools: crate::downloader::load_custom_tools(&core.store),
             // Installed by main() before the UI starts, so this reflects the
             // persisted per-disk config (or the legacy-seeded defaults).
@@ -1936,6 +1937,13 @@ impl StreamArchiverApp {
             &self.settings.trigger_block_rules,
         ) {
             self.status = format!("Error saving blacklist triggers: {e}");
+            return;
+        }
+        if let Err(e) = crate::disposal::save_global_trigger_disposal_default(
+            &self.core.store,
+            self.settings.trigger_disposal_default,
+        ) {
+            self.status = format!("Error saving trigger deletion default: {e}");
             return;
         }
         // Custom tools serialize to JSON too.

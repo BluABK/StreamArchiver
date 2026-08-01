@@ -1173,6 +1173,14 @@ pub(crate) struct SettingsForm {
     /// Global blacklist trigger rules (PREVENT automatic recording on title/game
     /// match; manual Start still records). Same scope inheritance as above.
     trigger_block_rules: Vec<crate::triggers::TriggerRule>,
+    /// Deletion method applied to every trigger-started take that doesn't set
+    /// its own per-rule override (edited on the rule itself, in
+    /// `trigger_rules` — meaningless for a blacklist rule, which never starts
+    /// a recording). `None` means trigger-started takes get no special
+    /// treatment — the normal monitor/channel/global chain applies. Beats the
+    /// monitor/channel overrides whenever it does apply; the per-rule
+    /// override beats this in turn.
+    trigger_disposal_default: Option<crate::disposal::DisposalMethod>,
     /// User-defined alternate yt-dlp-compatible binaries (alias + path),
     /// selectable alongside the system yt-dlp / SABR build in the Videos-tab
     /// download form.

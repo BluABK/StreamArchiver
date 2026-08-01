@@ -41,6 +41,14 @@ pub const K_GAP_SPLICE_CLEANUP: &str = "gap_splice_cleanup";
 pub const K_CHANNEL_DISPOSAL_SCOPE: &str = "channel_disposal_scope";
 /// Per-monitor scope-config map (`{monitor_id -> DisposalScope}`).
 pub const K_MONITOR_DISPOSAL_SCOPE: &str = "monitor_disposal_scope";
+/// Deletion method applied to every trigger-started take that doesn't set
+/// its own [`crate::triggers::TriggerRule::disposal_override`] — `""` (the
+/// default) means trigger-started takes get no special treatment and just
+/// use the normal monitor/channel/global chain like anything else. Unlike
+/// the settings above this is itself an override, not a base default: it
+/// only ever applies to a take that was trigger-started at all, and a
+/// per-rule override still wins over it. See `effective_method_for_take`.
+pub const K_TRIGGER_DISPOSAL_DEFAULT: &str = "trigger_disposal_default";
 
 // ---------- the two settings ----------
 
@@ -283,6 +291,25 @@ pub fn global_gap_splice_cleanup(store: &Store) -> GapSpliceCleanup {
         .unwrap_or_default()
 }
 
+/// The all-triggers deletion-method default — `None` when unset (trigger-
+/// started takes get no special treatment). See [`K_TRIGGER_DISPOSAL_DEFAULT`].
+pub fn global_trigger_disposal_default(store: &Store) -> Option<DisposalMethod> {
+    store
+        .get_setting(K_TRIGGER_DISPOSAL_DEFAULT)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| DisposalMethod::parse(&s))
+}
+
+pub fn save_global_trigger_disposal_default(
+    store: &Store,
+    method: Option<DisposalMethod>,
+) -> anyhow::Result<()> {
+    store.set_setting(K_TRIGGER_DISPOSAL_DEFAULT, method.map(DisposalMethod::as_str).unwrap_or(""))?;
+    Ok(())
+}
+
 /// Monitor override over channel override over the global default.
 pub fn effective_method_from(
     global: DisposalMethod,
@@ -306,11 +333,53 @@ pub fn effective_join_cleanup_from(
         .unwrap_or(global)
 }
 
-/// Store-hitting resolver for one channel+monitor pair.
-pub fn effective_method(store: &Store, channel_id: i64, monitor_id: i64) -> DisposalMethod {
+/// A trigger-started take gets first say over its own deletion method: the
+/// rule's own [`crate::triggers::TriggerRule::disposal_override`] if it set
+/// one, else the all-triggers default, before falling through to the normal
+/// monitor/channel/global chain. `trigger_rule` is `None` for a take that
+/// wasn't trigger-started, in which case this is identical to
+/// `effective_method_from`.
+pub fn effective_method_for_take(
+    global: DisposalMethod,
+    channel_scope: Option<&DisposalScope>,
+    monitor_scope: Option<&DisposalScope>,
+    trigger_rule: Option<&crate::triggers::TriggerRule>,
+    trigger_all_default: Option<DisposalMethod>,
+) -> DisposalMethod {
+    if let Some(rule) = trigger_rule
+        && let Some(m) = rule.disposal_override.or(trigger_all_default)
+    {
+        return m;
+    }
+    effective_method_from(global, channel_scope, monitor_scope)
+}
+
+/// Store-hitting resolver for one channel+monitor+recording triple — the
+/// trigger-aware sibling of `effective_method`, used wherever a specific
+/// take's file is being disposed of (`execute_disposal`). Looks up the
+/// take's frozen `trigger_rule_json` (empty/unparseable = not trigger-started,
+/// same as "no override").
+pub fn effective_method_for_recording(
+    store: &Store,
+    channel_id: i64,
+    monitor_id: i64,
+    rec_id: i64,
+) -> DisposalMethod {
     let ch = load_channel_disposal_scope(store, channel_id);
     let mon = load_monitor_disposal_scope(store, monitor_id);
-    effective_method_from(global_method(store), Some(&ch), Some(&mon))
+    let trigger_rule = store
+        .get_recording(rec_id)
+        .ok()
+        .flatten()
+        .filter(|r| !r.trigger_rule_json.trim().is_empty())
+        .and_then(|r| serde_json::from_str::<crate::triggers::TriggerRule>(&r.trigger_rule_json).ok());
+    effective_method_for_take(
+        global_method(store),
+        Some(&ch),
+        Some(&mon),
+        trigger_rule.as_ref(),
+        global_trigger_disposal_default(store),
+    )
 }
 
 /// Store-hitting resolver for one channel+monitor pair.
@@ -633,8 +702,9 @@ pub fn trash_root_missing(method: DisposalMethod, trash_dirs: &str, default_root
         && default_root.trim().is_empty()
 }
 
-/// Dispose of a finished-media file per the effective (instance > channel >
-/// global) method. On failure the file is left in place and an error returned —
+/// Dispose of a finished-media file per the effective (trigger > instance >
+/// channel > global) method — see `effective_method_for_recording`. On
+/// failure the file is left in place and an error returned —
 /// disposal never escalates (a failed trash move or recycle NEVER falls
 /// through to a permanent delete; trash does fall back to the Recycle Bin when
 /// no same-drive trash root is configured, which is *less* destructive).
@@ -653,7 +723,7 @@ pub async fn dispose_media(
     // Best-effort: a stat failure (already gone, permissions, a drive that
     // dropped mid-race) must not block the disposal itself.
     let bytes = crate::iomon::fs::metadata(Cat::CacheSweep, path).await.ok().map(|m| m.len() as i64);
-    let result = execute_disposal(store, channel_id, monitor_id, path).await;
+    let result = execute_disposal(store, channel_id, monitor_id, rec_id, path).await;
     if let Ok(disposed) = &result {
         log_disposal(store, rec_id, reason, path, disposed, bytes);
     }
@@ -673,9 +743,10 @@ async fn execute_disposal(
     store: &Store,
     channel_id: i64,
     monitor_id: i64,
+    rec_id: i64,
     path: &Path,
 ) -> std::io::Result<Disposed> {
-    let method = effective_method(store, channel_id, monitor_id);
+    let method = effective_method_for_recording(store, channel_id, monitor_id, rec_id);
     match method {
         DisposalMethod::Trash => {
             let dirs = store.get_setting(K_TRASH_DIRS).ok().flatten().unwrap_or_default();
@@ -853,6 +924,75 @@ mod tests {
     }
 
     #[test]
+    fn trigger_override_beats_monitor_and_channel_but_only_for_a_trigger_started_take() {
+        let ch = DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None, gap_splice_cleanup: None };
+        let mon = DisposalScope { method: Some(DisposalMethod::Recycle), join_cleanup: None, gap_splice_cleanup: None };
+        let mut rule = crate::triggers::TriggerRule { pattern: "karaoke".into(), ..Default::default() };
+
+        // No trigger context at all: falls through to the normal chain exactly
+        // like `effective_method_from`.
+        assert_eq!(
+            effective_method_for_take(DisposalMethod::Recycle, Some(&ch), Some(&mon), None, None),
+            DisposalMethod::Recycle
+        );
+        // Trigger-started, but the rule and the all-triggers default are both
+        // unset: still the normal chain — a trigger match alone isn't special.
+        assert_eq!(
+            effective_method_for_take(DisposalMethod::Recycle, Some(&ch), Some(&mon), Some(&rule), None),
+            DisposalMethod::Recycle
+        );
+        // The all-triggers default applies once trigger-started, beating BOTH
+        // the monitor and channel overrides.
+        assert_eq!(
+            effective_method_for_take(
+                DisposalMethod::Recycle, Some(&ch), Some(&mon), Some(&rule), Some(DisposalMethod::Trash)
+            ),
+            DisposalMethod::Trash
+        );
+        // A per-rule override beats the all-triggers default too.
+        rule.disposal_override = Some(DisposalMethod::Delete);
+        assert_eq!(
+            effective_method_for_take(
+                DisposalMethod::Recycle, Some(&ch), Some(&mon), Some(&rule), Some(DisposalMethod::Trash)
+            ),
+            DisposalMethod::Delete
+        );
+    }
+
+    #[test]
+    fn effective_method_for_recording_reads_the_takes_frozen_trigger_rule() {
+        use crate::store::test_util::sample_monitor;
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        store.set_setting(K_DISPOSAL_METHOD, "recycle").unwrap();
+        save_monitor_disposal_scope(
+            &store,
+            mid,
+            &DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None, gap_splice_cleanup: None },
+        )
+        .unwrap();
+        // A normal (non-trigger-started) take just uses the monitor override.
+        let plain = store.insert_recording(mid, 0, "", None, false, None, None, "", "").unwrap();
+        assert_eq!(effective_method_for_recording(&store, cid, mid, plain), DisposalMethod::Delete);
+
+        // A trigger-started take whose frozen rule forces Trash wins over the
+        // monitor's Delete override.
+        let rule = crate::triggers::TriggerRule {
+            pattern: "unarchived".into(),
+            disposal_override: Some(DisposalMethod::Trash),
+            ..Default::default()
+        };
+        let started = store
+            .insert_recording(mid, 0, "", None, false, None, None, "", &serde_json::to_string(&rule).unwrap())
+            .unwrap();
+        assert_eq!(effective_method_for_recording(&store, cid, mid, started), DisposalMethod::Trash);
+
+        // A recording id that doesn't exist behaves like "not trigger-started".
+        assert_eq!(effective_method_for_recording(&store, cid, mid, 999_999), DisposalMethod::Delete);
+    }
+
+    #[test]
     fn defaults_are_safe_when_unset() {
         let store = Store::open_in_memory().unwrap();
         // Opt-in cleanup: default keeps parts; deletes default to the Recycle Bin.
@@ -868,7 +1008,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(effective_join_cleanup(&store, 1, 1), JoinCleanup::Keep);
-        assert_eq!(effective_method(&store, 1, 1), DisposalMethod::Recycle);
+        assert_eq!(effective_method_for_recording(&store, 1, 1, 1), DisposalMethod::Recycle);
     }
 
     #[test]
