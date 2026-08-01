@@ -353,6 +353,7 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>, Send
     // remain valid for event matching (the tray owns the Menu itself).
     std::mem::forget(open_item);
     std::mem::forget(quit_item);
+    std::mem::forget(quit_stop_item);
 
     Ok((tray, rx, tx_out))
 }

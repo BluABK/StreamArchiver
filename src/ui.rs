@@ -2344,7 +2344,37 @@ impl eframe::App for StreamArchiverApp {
             .resizable(false)
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("StreamArchiver");
+                    // The brand label doubles as an app menu with the two
+                    // quit actions, so quitting never REQUIRES the tray icon
+                    // (hard to reach mid notification storm).
+                    ui.menu_button(egui::RichText::new("StreamArchiver").heading(), |ui| {
+                        if ui
+                            .button("⏻ Quit (keep recording)")
+                            .on_hover_text(
+                                "Close the app while active recordings, downloads and chat \
+                                 sidecars keep running detached — the next launch re-attaches \
+                                 to them. Same as the tray icon's Quit.",
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                            self.request_quit_detach(ui.ctx());
+                        }
+                        if ui
+                            .button("⏹ Quit & stop recordings")
+                            .on_hover_text(
+                                "Stop all active recordings (files are finalized), then close \
+                                 the app. Asks for confirmation first. Same as the tray \
+                                 icon's Quit & stop recordings.",
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                            self.confirm_quit_stop = true;
+                        }
+                    })
+                    .response
+                    .on_hover_text("Quit options — the same two actions as the tray icon menu.");
                     ui.separator();
 
                     // ── All view tabs, collapsing into » before they can ever

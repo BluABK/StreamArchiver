@@ -41,8 +41,13 @@ cargo build --release
 ./target/release/streamarchiver --hidden   # start straight to the tray (used by autostart)
 ```
 
-Right-click the tray icon → **Open** / **Quit**. Quitting gracefully stops any active
-recordings (finalizing the MKV) before exiting.
+Right-click the tray icon → **Open** / **Quit (keep recording)** / **Quit &
+stop recordings** — or click the **StreamArchiver** label in the window's top
+bar for the same two quit actions (handy when a notification storm makes the
+tray icon hard to reach). The default Quit detaches active downloads and chat
+sidecars (they keep running and re-attach on the next launch); **Quit & stop
+recordings** asks for confirmation, then stops all active recordings
+(finalizing the MKV) before exiting.
 
 Only one instance runs at a time (a loopback-port guard, held for the process's
 lifetime). Launching the app again while it's already running — including
@@ -55,6 +60,11 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 ## Using it
 
 ### The top bar
+
+The **StreamArchiver** label on the far left is a menu: **⏻ Quit (keep
+recording)** (detach downloads/chat and exit — the tray's default Quit) and
+**⏹ Quit & stop recordings** (confirmation dialog, then stop-and-finalize) —
+so both quit paths work without touching the tray icon.
 
 Every view is an always-visible tab, shown as an icon only at 2x the normal
 button size — big enough to hit without hunting — (hover any tab for its

@@ -1157,6 +1157,22 @@ impl StreamArchiverApp {
         }
     }
 
+    /// The default Quit: close the app while DETACHING active downloads and
+    /// chat sidecars (they keep running and re-attach on the next launch).
+    /// One path for every entry point — the tray's "Quit (keep recording)"
+    /// and the window's StreamArchiver ▾ menu.
+    pub(super) fn request_quit_detach(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        // The exit path (detach/stop + a bounded async-runtime
+        // shutdown) deliberately blocks after the last frame —
+        // stand the freeze watchdog down so quitting doesn't pop
+        // a "Frozen for 10s" diagnostics dialog mid-shutdown
+        // (observed 2026-07-31: tray Quit with chat sidecars and
+        // detached captures live).
+        self.heartbeat.set_active(false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     /// Handle tray commands and bus events; returns true if a repaint is needed.
     pub(super) fn pump_messages(&mut self, ctx: &egui::Context) {
         // One-shot startup notice (e.g. detached downloads recovered on launch).
@@ -1179,17 +1195,7 @@ impl StreamArchiverApp {
                         .mark_notifications_read_before(crate::models::now_unix());
                     self.notif_unread = 0;
                 }
-                UiCommand::Quit => {
-                    self.quitting = true;
-                    // The exit path (detach/stop + a bounded async-runtime
-                    // shutdown) deliberately blocks after the last frame —
-                    // stand the freeze watchdog down so quitting doesn't pop
-                    // a "Frozen for 10s" diagnostics dialog mid-shutdown
-                    // (observed 2026-07-31: tray Quit with chat sidecars and
-                    // detached captures live).
-                    self.heartbeat.set_active(false);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                UiCommand::Quit => self.request_quit_detach(ctx),
                 UiCommand::QuitAndStop => {
                     // Show confirmation before stopping active recordings.
                     self.confirm_quit_stop = true;
