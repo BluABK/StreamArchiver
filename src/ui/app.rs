@@ -241,6 +241,7 @@ impl StreamArchiverApp {
             schedule_title_fill: setting_or_empty(&core, K_SCHEDULE_TITLE_FILL) == "1",
             youtube_community_max_posts: setting_or_empty(&core, K_YT_COMMUNITY_MAX_POSTS),
             dialog_icon: setting_or_empty(&core, K_DIALOG_ICON),
+            app_icon: setting_or_empty(&core, K_APP_ICON),
             remux_embed_thumbnail: core.store.get_setting(K_REMUX_EMBED_THUMBNAIL)
                 .ok().flatten().map_or(true, |v| v != "0"),
             remux_embed_title: setting_or_empty(&core, K_REMUX_EMBED_TITLE) == "1",
@@ -515,7 +516,7 @@ impl StreamArchiverApp {
 
         let mut app = StreamArchiverApp {
             core,
-            _tray: tray,
+            tray,
             ui_rx,
             events_rx,
             autostart,
@@ -1741,9 +1742,18 @@ impl StreamArchiverApp {
         }
     }
 
-    pub(super) fn save_settings(&mut self) {
+    pub(super) fn save_settings(&mut self, ctx: &egui::Context) {
         // Settings (e.g. the date format) feed the cached Streams-view model.
         self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+        // Old value BEFORE the write, so a changed custom app icon can be
+        // applied live below without re-applying on every unrelated save.
+        let old_app_icon = self
+            .core
+            .store
+            .get_setting(K_APP_ICON)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let s = &self.settings;
         let postproc_readrate = format!("{}", s.postproc_readrate.clamp(0.0, 1000.0));
         // Discord import counts as on only when a token backs the toggle.
@@ -1828,6 +1838,7 @@ impl StreamArchiverApp {
                 s.youtube_community_max_posts.trim(),
             ),
             (K_DIALOG_ICON, s.dialog_icon.trim()),
+            (K_APP_ICON, s.app_icon.trim()),
             (K_REMUX_EMBED_THUMBNAIL, if s.remux_embed_thumbnail { "1" } else { "0" }),
             (K_REMUX_EMBED_TITLE,     if s.remux_embed_title     { "1" } else { "0" }),
             (K_REMUX_TITLE_TEMPLATE, s.remux_title_template.trim()),
@@ -1982,6 +1993,33 @@ impl StreamArchiverApp {
         );
         self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
+        // Apply a changed custom app icon live — all three surfaces have
+        // runtime update paths, so no restart: window/taskbar via a viewport
+        // command, tray via set_icon, toast attribution via the AUMID's
+        // IconUri. A bad path decodes to None inside set_app_icon (warn +
+        // built-in fallback), so this can't strip the app of an icon. Last so
+        // a load failure's status line isn't clobbered by "Settings saved.".
+        if old_app_icon != self.settings.app_icon.trim() {
+            if !crate::platform::set_app_icon(Some(self.settings.app_icon.trim())) {
+                self.status =
+                    "Settings saved — app icon couldn't be loaded, using the built-in icon \
+                     (see log)"
+                        .to_string();
+            }
+            let (rgba, width, height) = crate::platform::app_icon_rgba();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+                egui::IconData { rgba, width, height },
+            ))));
+            match crate::platform::tray_icon_image() {
+                Ok(icon) => {
+                    if let Err(e) = self.tray.set_icon(Some(icon)) {
+                        tracing::warn!("tray icon update failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("tray icon rebuild failed: {e:#}"),
+            }
+            crate::toast_activation::refresh_icon();
+        }
     }
     /// Single entry point for changing the active view — every switching path
     /// (top-bar tabs, the Views/Help menus, the » overflow menu, keyboard

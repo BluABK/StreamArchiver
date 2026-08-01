@@ -1839,6 +1839,15 @@ independent detectors feeding the same table:
 
   ![Notifications window with a mixed feed of events](doc/screenshots/notifications-window.png)
   ![Desktop toast for a channel going live](doc/screenshots/live-toast-notification.png)
+- **Custom app icon** (Settings → Interface → Display) — point "App icon" at
+  any image (PNG/JPEG/WebP/GIF/ICO; square, ≥64px recommended) and it
+  replaces the built-in purple record-dot icon everywhere it appears at
+  runtime: window title bar, taskbar, tray, and the attribution icon on
+  desktop toasts. Applies on Save with no restart. Empty = built-in icon; a
+  missing/undecodable file falls back to the built-in icon with a logged
+  warning. Two things it deliberately does *not* touch: the exe's icon in
+  Explorer (there is no embedded resource icon), and the crash/freeze dialog
+  icon, which stays its own setting (Settings → System → Diagnostics).
 - **Do Not Disturb** (Settings → Notifications) — suppresses desktop toasts
   without touching anything else: the 🔔 feed, Background view, and recording
   itself all keep working exactly as normal. Two independent switches: a

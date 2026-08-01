@@ -20,7 +20,7 @@ use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DailyRecordingStat, DetectionMethod, DownloadDefaults,
     GlobalStats,
-    K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
+    K_APP_ICON, K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
     K_OCR_COMMAND, K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL,
     K_OCR_OFFSET, K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
     K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, K_YT_API_QUOTA_CUTOFF, K_YT_SEARCH_QUOTA_CUTOFF,
@@ -991,6 +991,9 @@ pub(crate) struct SettingsForm {
     /// File path to a PNG used as the main icon in crash and freeze dialogs.
     /// Empty = standard Windows error/warning icon. Requires a restart to take effect.
     dialog_icon: String,
+    /// File path to an image replacing the built-in app icon (window/taskbar,
+    /// tray, toast attribution). Empty = built-in icon. Applies on save.
+    app_icon: String,
     /// Global "go to the next schedule source when an event has no title" toggle:
     /// after a winner is found, keep querying lower-priority sources to fill in
     /// blank titles (e.g. a Twitch schedule with times but no titles).
@@ -1234,7 +1237,9 @@ type PostImageCache = HashMap<String, Option<(egui::TextureHandle, (u32, u32))>>
 
 pub struct StreamArchiverApp {
     core: Arc<AppCore>,
-    _tray: TrayIcon,
+    /// Kept alive for the app's lifetime (dropping it removes the tray icon);
+    /// also re-iconed live when the custom app icon setting changes.
+    tray: TrayIcon,
     ui_rx: Receiver<UiCommand>,
     events_rx: crate::events::EventRx,
     autostart: AutoStart,
@@ -2200,12 +2205,34 @@ fn spawn_browse_file(
     current: &str,
     apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
 ) -> PendingBrowse {
+    spawn_browse_file_impl(current, None, apply)
+}
+
+/// [`spawn_browse_file`] with an extension filter, e.g.
+/// `("Images", &["png", "jpg"])`. The picker still offers an "All files"
+/// escape hatch (rfd adds one on Windows).
+fn spawn_browse_file_filtered(
+    current: &str,
+    filter: (&'static str, &'static [&'static str]),
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+) -> PendingBrowse {
+    spawn_browse_file_impl(current, Some(filter), apply)
+}
+
+fn spawn_browse_file_impl(
+    current: &str,
+    filter: Option<(&'static str, &'static [&'static str])>,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+) -> PendingBrowse {
     let (tx, rx) = std::sync::mpsc::channel();
     let current = current.to_string();
     std::thread::Builder::new()
         .name("browse-file".into())
         .spawn(move || {
             let mut dialog = rfd::FileDialog::new();
+            if let Some((name, exts)) = filter {
+                dialog = dialog.add_filter(name, exts);
+            }
             if let Some(parent) = std::path::Path::new(&current).parent() {
                 if crate::iomon::fs::is_dir_sync(crate::iomon::Cat::FsProbe, parent) {
                     dialog = dialog.set_directory(parent);
@@ -3019,7 +3046,7 @@ impl eframe::App for StreamArchiverApp {
             self.processes_refreshed = None;
         }
         if ctx_save_settings {
-            self.save_settings();
+            self.save_settings(ui.ctx());
         }
 
         self.form_window(ui.ctx());

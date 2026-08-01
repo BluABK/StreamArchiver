@@ -494,7 +494,7 @@ impl StreamArchiverApp {
                     .inspect("Settings: Save button", &[])
                     .clicked()
                 {
-                    self.save_settings();
+                    self.save_settings(ui.ctx());
                 }
             });
         });
@@ -1395,7 +1395,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_display_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Interface, "Display", &["display", "actions", "emotes", "animate", "columns", "theme"]) {
+            if self.section_shown(SettingsTab::Interface, "Display", &["display", "actions", "emotes", "animate", "columns", "theme", "icon", "app icon", "tray", "branding"]) {
             ui.add_space(12.0);
             ui.heading("Display");
             if ui
@@ -1484,6 +1484,33 @@ impl StreamArchiverApp {
                  metadata is richer (e.g. Twitch's game/category). Can be overridden per \
                  channel in Properties, or per instance with a pin (highest priority).",
             );
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("App icon").on_hover_text(
+                    "Path to an image (PNG/JPEG/WebP/GIF/ICO) replacing the built-in app \
+                     icon everywhere it appears at runtime: the window title bar, the \
+                     taskbar, the tray, and the attribution icon on desktop toasts. Square \
+                     images of 64px or larger look best (downscaled to fit 256px; the tray \
+                     gets a crisp 32px render). Empty = the built-in purple record-dot \
+                     icon. Applies on Save — no restart needed. Does NOT change the exe's \
+                     icon in Explorer, nor the crash/freeze dialog icon (that one is \
+                     Settings → System → Diagnostics). If the file can't be read or \
+                     decoded, the built-in icon is used and a warning is logged.",
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.app_icon)
+                        .hint_text(r"C:\path\to\icon.png")
+                        .desired_width(360.0),
+                );
+                if ui.button("Browse…").clicked() {
+                    self.pending_browse = Some(spawn_browse_file_filtered(
+                        &self.settings.app_icon,
+                        ("Images", &["png", "jpg", "jpeg", "webp", "gif", "ico"]),
+                        |app, p| app.settings.app_icon = p,
+                    ));
+                }
+            });
 
             }
     }
@@ -4089,13 +4116,14 @@ impl StreamArchiverApp {
                              icon if the file is missing or not a valid PNG.",
                         );
                         if ui.button("Browse…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("PNG images", &["png"])
-                                .pick_file()
-                            {
-                                self.settings.dialog_icon =
-                                    path.to_string_lossy().into_owned();
-                            }
+                            // Async like every other Browse in the app — a
+                            // picker run ON the UI thread blocks painting and
+                            // the watchdog heartbeat.
+                            self.pending_browse = Some(spawn_browse_file_filtered(
+                                &self.settings.dialog_icon,
+                                ("PNG images", &["png"]),
+                                |app, p| app.settings.dialog_icon = p,
+                            ));
                         }
                     });
                     ui.end_row();

@@ -177,6 +177,30 @@ mod win {
         spawn_activator_thread();
     }
 
+    /// Re-materialize the toast icon PNG from the CURRENT app icon and point
+    /// the AUMID's `IconUri` at it. Called after the custom app icon setting
+    /// is loaded (startup, right after the store opens) or changed (settings
+    /// save) — [`init`] necessarily ran before the store was available, so
+    /// its registration wrote the built-in icon. Cheap when nothing changed
+    /// (the PNG write is content-compared). A no-op under the PowerShell
+    /// fallback identity, which has no branding to refresh.
+    pub fn refresh_icon() {
+        if !AUMID_READY.load(Ordering::Acquire) {
+            return;
+        }
+        let refresh = || -> anyhow::Result<()> {
+            let icon = write_icon_png().context("materializing toast icon")?;
+            let k = windows_registry::CURRENT_USER
+                .create(format!(r"Software\Classes\AppUserModelId\{APP_AUMID}"))
+                .context("opening AppUserModelId key")?;
+            k.set_string("IconUri", icon.to_string_lossy().as_ref())?;
+            Ok(())
+        };
+        if let Err(e) = refresh() {
+            warn!("toast icon refresh failed: {e:#}");
+        }
+    }
+
     /// Write (refresh) the HKCU registration: the AUMID's branding values and
     /// the activator CLSID's `LocalServer32` command line.
     fn register_registry() -> anyhow::Result<()> {
@@ -315,10 +339,15 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{effective_aumid, init};
+pub use win::{effective_aumid, init, refresh_icon};
 
 #[cfg(not(windows))]
 pub fn init() {}
+
+/// Non-Windows: toast branding is per-notification (`notify_rust`), not a
+/// registered identity — nothing to refresh.
+#[cfg(not(windows))]
+pub fn refresh_icon() {}
 
 #[cfg(test)]
 mod tests {

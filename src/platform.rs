@@ -57,8 +57,57 @@ pub fn notify_running_instance() {
     let _ = TcpStream::connect(("127.0.0.1", SINGLE_INSTANCE_PORT));
 }
 
-/// Build the tray/window icon: a purple tile with a red "record" dot.
+/// User-supplied replacement for the built-in app icon (Settings → Interface
+/// → Display → "App icon"), decoded to straight-alpha RGBA. `None` = use the
+/// procedural tile. An `RwLock` rather than a `OnceLock` because a settings
+/// save re-applies it live (window, tray and toast registration all have
+/// runtime update paths).
+static APP_ICON: parking_lot::RwLock<Option<(Vec<u8>, u32, u32)>> =
+    parking_lot::RwLock::new(None);
+
+/// Load (or clear) the custom app icon from an image file path. Empty/`None`
+/// clears it back to the built-in icon. Decode failures also clear it — the
+/// same silent-fallback contract as the crash-dialog icon: a bad path must
+/// never cost the app its icon, just the customization. Returns `false` when
+/// a non-empty path failed to load (so the settings save can say so in its
+/// status line); clearing counts as success.
+pub fn set_app_icon(path: Option<&str>) -> bool {
+    let path = path.map(str::trim).filter(|p| !p.is_empty());
+    let mut ok = true;
+    let decoded = path.and_then(|p| match load_icon_rgba(p) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            tracing::warn!("custom app icon {p}: {e:#} — using the built-in icon");
+            ok = false;
+            None
+        }
+    });
+    *APP_ICON.write() = decoded;
+    ok
+}
+
+/// Decode an image file to RGBA for the app icon, downscaled to fit within
+/// 256×256 (aspect kept) so a wallpaper-sized file can't bloat the window
+/// icon, the tray bitmap and the toast PNG.
+fn load_icon_rgba(path: &str) -> Result<(Vec<u8>, u32, u32)> {
+    let bytes = crate::iomon::fs::read_sync(crate::iomon::Cat::Startup, path)?;
+    let img = image::load_from_memory(&bytes)?;
+    let img = if img.width() > 256 || img.height() > 256 {
+        img.resize(256, 256, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let rgba = img.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok((rgba.into_raw(), w, h))
+}
+
+/// Build the tray/window icon: the user's custom icon when one is set
+/// ([`set_app_icon`]), otherwise a purple tile with a red "record" dot.
 pub fn app_icon_rgba() -> (Vec<u8>, u32, u32) {
+    if let Some(icon) = APP_ICON.read().clone() {
+        return icon;
+    }
     let size: u32 = 32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let (cx, cy, r) = (15.5f32, 15.5f32, 9.0f32);
@@ -82,9 +131,25 @@ pub fn app_icon_rgba() -> (Vec<u8>, u32, u32) {
     (rgba, size, size)
 }
 
-/// Build a [`tray_icon::Icon`] from the embedded image.
+/// Build a [`tray_icon::Icon`] from the app icon. A custom icon larger than
+/// 32px is downscaled here so the tray gets a crisp pre-sized bitmap instead
+/// of leaving the shrink to the shell (the procedural tile is already 32).
 pub fn tray_icon_image() -> Result<tray_icon::Icon> {
     let (rgba, w, h) = app_icon_rgba();
+    let (rgba, w, h) = if w > 32 || h > 32 {
+        let img = image::RgbaImage::from_raw(w, h, rgba)
+            .ok_or_else(|| anyhow::anyhow!("icon buffer size mismatch"))?;
+        let img = image::DynamicImage::ImageRgba8(img).resize(
+            32,
+            32,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let img = img.into_rgba8();
+        let (w, h) = img.dimensions();
+        (img.into_raw(), w, h)
+    } else {
+        (rgba, w, h)
+    };
     Ok(tray_icon::Icon::from_rgba(rgba, w, h)?)
 }
 
@@ -1327,6 +1392,47 @@ impl Default for AutoStart {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    /// The ONLY test allowed to call `set_app_icon` — the backing static is
+    /// process-global and tests run in parallel (same rule as chat.rs's
+    /// CHAT_ROOT), so every scenario lives in this one fn, in order.
+    #[test]
+    fn custom_app_icon_replaces_and_clearing_restores_the_builtin() {
+        // Unset: the 32×32 procedural tile.
+        let (_, w, h) = app_icon_rgba();
+        assert_eq!((w, h), (32, 32));
+
+        // A tiny green PNG becomes the icon verbatim (≤256 → no resize).
+        let path = std::env::temp_dir().join(format!("sa-appicon-{}.png", std::process::id()));
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+        img.save(&path).unwrap();
+        set_app_icon(Some(path.to_string_lossy().as_ref()));
+        let (rgba, w, h) = app_icon_rgba();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&rgba[..4], &[0, 255, 0, 255]);
+        // Tray build path accepts it too.
+        assert!(tray_icon_image().is_ok());
+
+        // Oversized images are downscaled to fit 256 (aspect kept).
+        let big = image::RgbaImage::from_pixel(512, 256, image::Rgba([255, 0, 0, 255]));
+        big.save(&path).unwrap();
+        set_app_icon(Some(path.to_string_lossy().as_ref()));
+        let (_, w, h) = app_icon_rgba();
+        assert_eq!((w, h), (256, 128));
+
+        // A bad path falls back to the built-in icon instead of erroring.
+        set_app_icon(Some(r"Z:\no\such\icon.png"));
+        let (_, w, h) = app_icon_rgba();
+        assert_eq!((w, h), (32, 32));
+
+        // Explicit clear restores the built-in icon as well.
+        big.save(&path).unwrap();
+        set_app_icon(Some(path.to_string_lossy().as_ref()));
+        set_app_icon(None);
+        let (_, w, h) = app_icon_rgba();
+        assert_eq!((w, h), (32, 32));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn self_io_counters_nonzero_and_monotonic() {

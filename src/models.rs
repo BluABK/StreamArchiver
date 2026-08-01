@@ -2211,6 +2211,14 @@ pub const K_MONITOR_SCOPE_CFG: &str = "monitor_schedule_scope";
 /// in crash and freeze dialogs. Empty = standard Windows error/warning icon.
 pub const K_DIALOG_ICON: &str = "dialog_icon";
 
+/// `app_settings` key for an absolute path to an image (PNG/JPEG/WebP/GIF/ICO)
+/// replacing the built-in app icon everywhere it appears at runtime: window
+/// title bar, taskbar, tray, and the toast attribution icon. Empty = the
+/// built-in purple record-dot tile. Applied live on settings save (see
+/// [`crate::platform::set_app_icon`]); does NOT change the exe's Explorer
+/// icon (no embedded resource) or the crash-dialog icon ([`K_DIALOG_ICON`]).
+pub const K_APP_ICON: &str = "app_icon";
+
 // ---------- Remux embedding options ----------
 
 /// `app_settings` key — embed the thumbnail sidecar as MKV cover art on remux.

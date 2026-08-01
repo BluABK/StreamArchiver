@@ -144,6 +144,13 @@ fn main() -> Result<()> {
         .map(std::path::PathBuf::from);
     watchdog::set_dialog_icon(dialog_icon_path);
 
+    // Load the optional custom app icon (Settings → Interface → Display)
+    // BEFORE the window and tray are built so both start with it, then point
+    // the toast AUMID registration at it — `toast_activation::init()` above
+    // ran before the store was open and registered the built-in icon.
+    platform::set_app_icon(store.get_setting(models::K_APP_ICON).ok().flatten().as_deref());
+    toast_activation::refresh_icon();
+
     // Per-disk I/O limits (gate permits, ffmpeg -readrate, yt-dlp
     // --limit-rate) from the persisted config; updated live on settings save.
     // The legacy global keys seed the defaults when the per-disk config has
