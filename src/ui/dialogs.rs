@@ -305,6 +305,223 @@ impl StreamArchiverApp {
         }
     }
 
+    /// "Move instance to another channel" dialog: pick a destination channel
+    /// container for one capture instance. Everything monitor-keyed
+    /// (recordings, schedule, stats, chat) moves implicitly; posts/about
+    /// history is re-keyed by the store call. See
+    /// [`crate::store::Store::move_monitor_to_channel`].
+    #[allow(deprecated)]
+    pub(super) fn move_instance_window(&mut self, ctx: &egui::Context) {
+        let Some((mid, mut dest)) = self.move_instance_dialog else {
+            return;
+        };
+        let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid) else {
+            self.move_instance_dialog = None; // instance deleted meanwhile
+            return;
+        };
+        let src_cid = row.channel.id;
+        let src_name = row.channel.name.clone();
+        let inst = instance_label(&row.monitor.url);
+        // (id, name) of every possible destination — cloned up front so the
+        // viewport closure doesn't borrow `self`.
+        let dests: Vec<(i64, String)> = self
+            .channels
+            .iter()
+            .filter(|c| c.id != src_cid)
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+
+        let mut open = true;
+        let mut do_move = false;
+        let mut do_cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("move_instance_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Move instance")
+                .with_inner_size([440.0, 190.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!("Move “{src_name}”'s {inst} instance into:"));
+                    ui.add_space(4.0);
+                    let sel_name = dest
+                        .and_then(|d| dests.iter().find(|(id, _)| *id == d))
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "Select a channel…".into());
+                    egui::ComboBox::from_id_salt("move_instance_dest")
+                        .width(260.0)
+                        .selected_text(sel_name)
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &dests {
+                                ui.selectable_value(&mut dest, Some(*id), name);
+                            }
+                        });
+                    if dests.is_empty() {
+                        ui.weak("There is no other channel to move it into.");
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        "Its recordings, schedule, stats, posts, and about history move \
+                         with it; the destination channel's own settings (Auto/Enabled, \
+                         color, triggers) apply to it from then on.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(dest.is_some(), egui::Button::new("Move"))
+                            .clicked()
+                        {
+                            do_move = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_move && let Some(d) = dest {
+            let dest_name = dests
+                .iter()
+                .find(|(id, _)| *id == d)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default();
+            match self.core.store.move_monitor_to_channel(mid, d) {
+                Ok(()) => self.status = format!("Moved the {inst} instance to “{dest_name}”."),
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+            // Both containers' avatar/colour picks may change with the roster.
+            for cid in [src_cid, d] {
+                self.channel_icons.remove(&cid);
+                self.channel_twitch_colors.remove(&cid);
+            }
+            self.move_instance_dialog = None;
+            self.reload_rows();
+        } else if do_cancel || !open {
+            self.move_instance_dialog = None;
+        } else {
+            self.move_instance_dialog = Some((mid, dest)); // keep the selection
+        }
+    }
+
+    /// "Merge channel into another" dialog: move ALL of the source channel's
+    /// instances to a destination channel, then delete the (now empty) source.
+    /// See [`crate::store::Store::merge_channel_into`].
+    #[allow(deprecated)]
+    pub(super) fn merge_channel_window(&mut self, ctx: &egui::Context) {
+        let Some((src, mut dest)) = self.merge_channel_dialog else {
+            return;
+        };
+        let Some(src_name) = self
+            .channels
+            .iter()
+            .find(|c| c.id == src)
+            .map(|c| c.name.clone())
+        else {
+            self.merge_channel_dialog = None; // channel deleted meanwhile
+            return;
+        };
+        let ninst = self.rows.iter().filter(|r| r.channel.id == src).count();
+        let dests: Vec<(i64, String)> = self
+            .channels
+            .iter()
+            .filter(|c| c.id != src)
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+
+        let mut open = true;
+        let mut do_merge = false;
+        let mut do_cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("merge_channel_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Merge channel")
+                .with_inner_size([460.0, 210.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!(
+                        "Merge “{src_name}” ({ninst} instance{}) into:",
+                        if ninst == 1 { "" } else { "s" }
+                    ));
+                    ui.add_space(4.0);
+                    let sel_name = dest
+                        .and_then(|d| dests.iter().find(|(id, _)| *id == d))
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "Select a channel…".into());
+                    egui::ComboBox::from_id_salt("merge_channel_dest")
+                        .width(260.0)
+                        .selected_text(sel_name)
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &dests {
+                                ui.selectable_value(&mut dest, Some(*id), name);
+                            }
+                        });
+                    if dests.is_empty() {
+                        ui.weak("There is no other channel to merge into.");
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        "Every instance moves over with its recordings, schedule, \
+                         stats, posts, and about history; group memberships are \
+                         carried too. The emptied source channel is then deleted. \
+                         Its channel-level settings (color, triggers, scopes) are \
+                         NOT carried over — the destination's apply.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(dest.is_some(), egui::Button::new("Merge"))
+                            .clicked()
+                        {
+                            do_merge = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_merge && let Some(d) = dest {
+            let dest_name = dests
+                .iter()
+                .find(|(id, _)| *id == d)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default();
+            match self.core.store.merge_channel_into(src, d) {
+                Ok((moved, deleted)) => {
+                    self.status = format!(
+                        "Merged “{src_name}” into “{dest_name}”: {moved} instance{} moved{}.",
+                        if moved == 1 { "" } else { "s" },
+                        if deleted { "" } else { " (source kept — not empty)" },
+                    );
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+            for cid in [src, d] {
+                self.channel_icons.remove(&cid);
+                self.channel_twitch_colors.remove(&cid);
+            }
+            self.merge_channel_dialog = None;
+            self.reload_rows();
+        } else if do_cancel || !open {
+            self.merge_channel_dialog = None;
+        } else {
+            self.merge_channel_dialog = Some((src, dest)); // keep the selection
+        }
+    }
+
     /// Modal confirmation for tombstoning a schedule segment (it won't reappear
     /// on the next refresh).
     #[allow(deprecated)]

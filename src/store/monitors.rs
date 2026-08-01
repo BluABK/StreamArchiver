@@ -51,6 +51,100 @@ impl Store {
         Ok(())
     }
 
+    /// Move a capture instance to another channel container. Everything keyed
+    /// by monitor id (recordings, schedule segments, stats history, chat, …)
+    /// follows automatically; the two tables that ALSO denormalize a channel
+    /// id are re-keyed here so archival history moves with the instance:
+    /// `community_post` (per monitor) and `about_snapshot` (keyed by
+    /// (channel, platform, account) with no monitor id — re-keyed for this
+    /// instance's account only). Channel-LEVEL configuration (color, groups,
+    /// trigger/scope settings, schedule hides) stays with each channel — the
+    /// destination's own settings apply to the instance from now on. Cached
+    /// asset files on disk are not moved: the fetcher self-heals under the
+    /// destination channel's name dir on the next fetch, and post/schedule
+    /// media paths are DB-persisted and deliberately never move.
+    /// No-op when the monitor doesn't exist or is already in the destination.
+    pub fn move_monitor_to_channel(&self, monitor_id: i64, dest_channel_id: i64) -> Result<()> {
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let Some((src_channel_id, url)) = tx
+            .query_row(
+                "SELECT channel_id, url FROM monitor WHERE id = ?1",
+                params![monitor_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        if src_channel_id == dest_channel_id {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE monitor SET channel_id = ?2 WHERE id = ?1",
+            params![monitor_id, dest_channel_id],
+        )?;
+        tx.execute(
+            "UPDATE community_post SET channel_id = ?2 WHERE monitor_id = ?1",
+            params![monitor_id, dest_channel_id],
+        )?;
+        let platform = crate::models::Platform::detect(&url);
+        let account = crate::assets::account_slug(&url, platform);
+        tx.execute(
+            "UPDATE about_snapshot SET channel_id = ?2
+             WHERE channel_id = ?1 AND platform = ?3 AND account = ?4",
+            params![src_channel_id, dest_channel_id, platform.as_str(), account],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Merge one channel container into another: every instance of `src`
+    /// moves to `dest` (with its channel-keyed archival history — posts,
+    /// about snapshots — like [`Self::move_monitor_to_channel`]), `src`'s
+    /// group memberships are carried over (skipping ones `dest` already
+    /// has), and `src` is then deleted — but ONLY if it is actually empty.
+    /// Channel-level settings of `src` (color, scopes, schedule hides) are
+    /// NOT carried over; `dest`'s own settings win. Returns
+    /// `(instances moved, source deleted)`.
+    pub fn merge_channel_into(&self, src: i64, dest: i64) -> Result<(usize, bool)> {
+        if src == dest {
+            return Ok((0, false));
+        }
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let moved = tx.execute(
+            "UPDATE monitor SET channel_id = ?2 WHERE channel_id = ?1",
+            params![src, dest],
+        )?;
+        tx.execute(
+            "UPDATE community_post SET channel_id = ?2 WHERE channel_id = ?1",
+            params![src, dest],
+        )?;
+        tx.execute(
+            "UPDATE about_snapshot SET channel_id = ?2 WHERE channel_id = ?1",
+            params![src, dest],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO channel_group_member(channel_id, group_id)
+             SELECT ?2, group_id FROM channel_group_member WHERE channel_id = ?1",
+            params![src, dest],
+        )?;
+        // Delete the emptied source — guarded by an actual count rather than
+        // assumed, so a concurrently-added instance keeps its channel.
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM monitor WHERE channel_id = ?1",
+            params![src],
+            |r| r.get(0),
+        )?;
+        let deleted = remaining == 0;
+        if deleted {
+            tx.execute("DELETE FROM channel WHERE id = ?1", params![src])?;
+        }
+        tx.commit()?;
+        Ok((moved, deleted))
+    }
+
     /// All channel containers (including ones with no instances yet), ordered to
     /// match the monitor list (name, then id).
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
@@ -522,6 +616,106 @@ impl Store {
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    /// One i64 straight from SQL — tiny helper for the move/merge assertions.
+    fn q1(store: &Store, sql: &str, p: impl rusqlite::Params) -> i64 {
+        store.db().query_row(sql, p, |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn move_monitor_rekeys_posts_and_its_own_about_history() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.create_container("Alice").unwrap();
+        let b = store.create_container("Bob").unwrap();
+        let mid = store.insert_monitor(&sample_monitor(a)).unwrap(); // twitch.tv/sample
+        store
+            .db()
+            .execute(
+                "INSERT INTO community_post(monitor_id, channel_id, post_id, first_seen, last_seen)
+                 VALUES(?1, ?2, 'p1', 1, 1)",
+                params![mid, a],
+            )
+            .unwrap();
+        // Two about histories under Alice: the moving instance's account and
+        // an unrelated one that must stay behind.
+        for account in ["sample", "other_account"] {
+            store
+                .db()
+                .execute(
+                    "INSERT INTO about_snapshot(channel_id, platform, account, fetched_at,
+                         last_checked_at, content_hash)
+                     VALUES(?1, 'twitch', ?2, 1, 1, 'h')",
+                    params![a, account],
+                )
+                .unwrap();
+        }
+
+        store.move_monitor_to_channel(mid, b).unwrap();
+        assert_eq!(q1(&store, "SELECT channel_id FROM monitor WHERE id = ?1", params![mid]), b);
+        assert_eq!(
+            q1(&store, "SELECT channel_id FROM community_post WHERE post_id = 'p1'", params![]),
+            b
+        );
+        assert_eq!(
+            q1(&store, "SELECT channel_id FROM about_snapshot WHERE account = 'sample'", params![]),
+            b
+        );
+        assert_eq!(
+            q1(&store, "SELECT channel_id FROM about_snapshot WHERE account = 'other_account'", params![]),
+            a,
+            "an unrelated account's about history must not move"
+        );
+
+        // No-ops: already in the destination / nonexistent monitor.
+        store.move_monitor_to_channel(mid, b).unwrap();
+        store.move_monitor_to_channel(999_999, b).unwrap();
+        assert_eq!(q1(&store, "SELECT channel_id FROM monitor WHERE id = ?1", params![mid]), b);
+    }
+
+    #[test]
+    fn merge_channel_moves_everything_and_deletes_the_empty_source() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.create_container("Alice").unwrap();
+        let b = store.create_container("Bob").unwrap();
+        let m1 = store.insert_monitor(&sample_monitor(a)).unwrap();
+        let mut m = sample_monitor(a);
+        m.url = "https://youtube.com/@alice".into();
+        let m2 = store.insert_monitor(&m).unwrap();
+        store.insert_monitor(&sample_monitor(b)).unwrap();
+        // A group both channels belong to (the INSERT OR IGNORE dedup case)
+        // plus one only the source has (must carry over).
+        let g_shared = store.create_channel_group("Shared").unwrap();
+        let g_src = store.create_channel_group("SrcOnly").unwrap();
+        for (cid, gid) in [(a, g_shared), (b, g_shared), (a, g_src)] {
+            store.set_channel_group_member(cid, gid, true).unwrap();
+        }
+        store
+            .db()
+            .execute(
+                "INSERT INTO about_snapshot(channel_id, platform, account, fetched_at,
+                     last_checked_at, content_hash)
+                 VALUES(?1, 'twitch', 'sample', 1, 1, 'h')",
+                params![a],
+            )
+            .unwrap();
+
+        // Merging a channel into itself is a guarded no-op.
+        assert_eq!(store.merge_channel_into(a, a).unwrap(), (0, false));
+
+        let (moved, deleted) = store.merge_channel_into(a, b).unwrap();
+        assert_eq!(moved, 2);
+        assert!(deleted, "the emptied source must be deleted");
+        assert!(store.list_channels().unwrap().iter().all(|c| c.id != a));
+        for mid in [m1, m2] {
+            assert_eq!(q1(&store, "SELECT channel_id FROM monitor WHERE id = ?1", params![mid]), b);
+        }
+        assert_eq!(
+            q1(&store, "SELECT channel_id FROM about_snapshot WHERE account = 'sample'", params![]),
+            b
+        );
+        let b_groups = store.channel_groups_for_channel(b).unwrap();
+        assert!(b_groups.contains(&g_shared) && b_groups.contains(&g_src));
+    }
 
     #[test]
     fn migrate_and_crud_roundtrip() {

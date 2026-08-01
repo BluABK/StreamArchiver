@@ -605,6 +605,8 @@ impl StreamArchiverApp {
             selected_monitor: None,
             confirm_delete: None,
             confirm_delete_channel: None,
+            move_instance_dialog: None,
+            merge_channel_dialog: None,
             confirm_delete_segment: None,
             channel_form: None,
             show_group_manager: false,
@@ -2032,6 +2034,8 @@ impl StreamArchiverApp {
             || self.confirm_delete.is_some()
             || self.confirm_delete_channel.is_some()
             || self.confirm_delete_segment.is_some()
+            || self.move_instance_dialog.is_some()
+            || self.merge_channel_dialog.is_some()
         {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.form = None;
@@ -2039,6 +2043,8 @@ impl StreamArchiverApp {
                 self.confirm_delete = None;
                 self.confirm_delete_channel = None;
                 self.confirm_delete_segment = None;
+                self.move_instance_dialog = None;
+                self.merge_channel_dialog = None;
             }
             return;
         }

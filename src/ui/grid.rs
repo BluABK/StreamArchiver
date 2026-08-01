@@ -2179,6 +2179,8 @@ pub(super) struct RowActions {
     pub(super) view_chat: Option<i64>,             // monitor id
     pub(super) edit: Option<i64>,                  // monitor id
     pub(super) add_instance: Option<i64>,          // channel id
+    /// Monitor id to open the "Move to another channel" dialog for.
+    pub(super) move_instance: Option<i64>,
     pub(super) delete: Option<(i64, String)>,      // (monitor id, channel name)
     pub(super) toggle_enabled: Option<(i64, bool)>,
     pub(super) toggle_automation: Option<(i64, bool)>,
@@ -2574,6 +2576,19 @@ pub(super) fn render_instance_row(
         }
         if ui.button("➕  Add instance to channel").clicked() {
             a.add_instance = Some(row.channel.id);
+            ui.close();
+        }
+        if ui
+            .button("⮫  Move to another channel…")
+            .on_hover_text(
+                "Move this instance into a different channel container — its \
+                 recordings, schedule, stats, posts, and about history all move \
+                 with it. The destination channel's own settings (Auto/Enabled, \
+                 color, triggers) apply to it from then on.",
+            )
+            .clicked()
+        {
+            a.move_instance = Some(m.id);
             ui.close();
         }
         let master_label = if m.automation_enabled { "⏸  Disable (go dormant)" } else { "✔  Enable" };

@@ -1458,6 +1458,13 @@ pub struct StreamArchiverApp {
     confirm_delete: Option<(i64, String)>,
     /// Pending channel-delete confirmation: (channel id, name).
     confirm_delete_channel: Option<(i64, String)>,
+    /// "Move instance to another channel" dialog: `(monitor id, chosen
+    /// destination channel id)`. The destination lives here (not a per-frame
+    /// local) so the ComboBox selection persists across frames.
+    move_instance_dialog: Option<(i64, Option<i64>)>,
+    /// "Merge channel into another" dialog: `(source channel id, chosen
+    /// destination channel id)`.
+    merge_channel_dialog: Option<(i64, Option<i64>)>,
     /// Pending schedule-segment-delete confirmation: segment id.
     confirm_delete_segment: Option<i64>,
     /// Backing state for the create/rename-channel dialog.
@@ -3016,6 +3023,8 @@ impl eframe::App for StreamArchiverApp {
         self.add_to_recording_group_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
+        self.move_instance_window(ui.ctx());
+        self.merge_channel_window(ui.ctx());
         self.confirm_delete_segment_window(ui.ctx());
         self.merge_preview_window(ui.ctx());
         self.confirm_delete_segments_window(ui.ctx());

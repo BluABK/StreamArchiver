@@ -141,6 +141,23 @@ two tools on one URL.
 2. **➕** on a channel row (or **Add instance to channel** in the menu) adds
    another instance — including one on a **different platform** (paste a YouTube
    URL on a Twitch channel, etc.).
+
+   Containers can also be **reshaped after the fact**:
+   - **⮫ Move to another channel…** (instance right-click) moves one instance
+     into a different channel container. Everything that belongs to the
+     instance moves with it — recordings, schedule, stats/chat history, posts,
+     and about-page archive. Channel-*level* configuration does **not**
+     follow: the destination's own Auto/Enabled, color, triggers, and scope
+     overrides apply to the instance from then on. (Cached asset files on
+     disk stay where they are and re-fetch under the new channel's folder;
+     nothing breaks meanwhile.)
+   - **⇋ Merge into another channel…** (channel right-click) moves **all** of
+     a channel's instances into another channel (same rules as above, and
+     group memberships carry over too), then deletes the emptied source
+     channel — only if it is actually empty. Handy for collapsing an
+     accidental duplicate ("GEEGA" + "geega") into one container. The source
+     channel's own settings (color, trigger scopes, schedule hides) are not
+     merged; the destination's win.
 3. **Two independent switches**, each at both the channel and instance level
    (the channel checkbox gates *all* its instances at once; each instance has
    its own — pause just YouTube for the day, keep Twitch). Both also appear on

@@ -181,6 +181,8 @@ struct StreamsOut {
     toggle_channel_enabled: Option<(i64, bool)>, // set all instances
     toggle_channel_automation: Option<(i64, bool)>, // master switch
     rename_channel: Option<i64>,
+    /// Channel id to open the "Merge into another channel" dialog for.
+    merge_channel: Option<i64>,
     delete_channel: Option<(i64, String)>,
     clear_channel_err: Option<i64>,
     open_channel_props: Option<i64>,
@@ -1931,6 +1933,7 @@ impl StreamArchiverApp {
             toggle_channel_enabled,
             toggle_channel_automation,
             rename_channel,
+            merge_channel,
             delete_channel,
             clear_channel_err,
             open_channel_props,
@@ -2154,6 +2157,9 @@ impl StreamArchiverApp {
                 ));
             }
         }
+        if let Some(mid) = acts.move_instance {
+            self.move_instance_dialog = Some((mid, None));
+        }
         if let Some(id) = acts.select {
             self.selected_monitor = Some(id);
         }
@@ -2245,6 +2251,9 @@ impl StreamArchiverApp {
         }
         if let Some((cid, name)) = delete_channel {
             self.confirm_delete_channel = Some((cid, name));
+        }
+        if let Some(cid) = merge_channel {
+            self.merge_channel_dialog = Some((cid, None));
         }
         if let Some(cid) = clear_channel_err {
             if let Err(e) = self.core.store.clear_channel_errors(cid) {
@@ -3279,6 +3288,19 @@ impl StreamArchiverApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui
+                    .button("⇋  Merge into another channel…")
+                    .on_hover_text(
+                        "Move ALL of this channel's instances into another channel \
+                         (recordings, schedules, stats, posts, and about history move \
+                         with them), then delete this emptied channel. The \
+                         destination's own channel-level settings apply afterwards.",
+                    )
+                    .clicked()
+                {
+                    out.merge_channel = Some(cid);
+                    ui.close();
+                }
                 if ui.button("🗑  Delete channel").clicked() {
                     out.delete_channel = Some((cid, ch.name.clone()));
                     ui.close();
