@@ -236,21 +236,37 @@ pub(super) fn merge_source_priority(source: &str) -> u8 {
     }
 }
 
+/// Whether a scheduled stream matches the calendar's event-filter text:
+/// case-insensitive substring match against the channel name, title,
+/// category, and collaborator names. `needle` must already be lowercased
+/// (and trimmed); an empty needle matches everything.
+pub(super) fn schedule_filter_hit(s: &UpcomingStream, needle: &str) -> bool {
+    needle.is_empty()
+        || s.channel_name.to_lowercase().contains(needle)
+        || s.title.to_lowercase().contains(needle)
+        || s.category.to_lowercase().contains(needle)
+        || s.collab.to_lowercase().contains(needle)
+}
+
 /// Indices into `all` whose visible (channel not in `hidden`, instance not in
-/// `hidden_monitors`) time window overlaps another visible stream's — i.e. two
-/// streams scheduled at the same time. A stream with no/invalid end time is
-/// treated as [`COLLISION_DEFAULT_SECS`] long.
+/// `hidden_monitors`, matching the `filter` needle — see
+/// [`schedule_filter_hit`]) time window overlaps another visible stream's —
+/// i.e. two streams scheduled at the same time. A stream with no/invalid end
+/// time is treated as [`COLLISION_DEFAULT_SECS`] long.
 pub(super) fn schedule_collisions(
     all: &[UpcomingStream],
     hidden: &HashSet<i64>,
     hidden_monitors: &HashSet<i64>,
+    filter: &str,
 ) -> HashSet<usize> {
     // (original index, start, effective end) for visible streams, sorted by start.
     let mut spans: Vec<(usize, i64, i64)> = all
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            !hidden.contains(&s.channel_id) && !hidden_monitors.contains(&s.monitor_id)
+            !hidden.contains(&s.channel_id)
+                && !hidden_monitors.contains(&s.monitor_id)
+                && schedule_filter_hit(s, filter)
         })
         .map(|(i, s)| (i, s.start_time, effective_end(s)))
         .collect();
@@ -1421,6 +1437,38 @@ mod tests {
             TriggerPreview::WouldFire(hit) => assert_eq!(hit.field, "game"),
             _ => panic!("expected WouldFire on the game field, got a different preview"),
         }
+    }
+
+    #[test]
+    fn schedule_filter_hit_matches_all_four_fields_case_insensitively() {
+        let s = crate::models::UpcomingStream {
+            channel_name: "LucksShi".into(),
+            title: "Friday Karaoke Night".into(),
+            category: "Just Chatting".into(),
+            collab: "girl_dm_, YUY".into(),
+            ..stream(1, 0, None)
+        };
+        // Empty needle matches everything (the filter bar's cleared state).
+        assert!(schedule_filter_hit(&s, ""));
+        // One hit per field, lowercase needle vs. mixed-case data.
+        assert!(schedule_filter_hit(&s, "lucksshi"));
+        assert!(schedule_filter_hit(&s, "karaoke"));
+        assert!(schedule_filter_hit(&s, "just chat"));
+        assert!(schedule_filter_hit(&s, "girl_dm"));
+        assert!(!schedule_filter_hit(&s, "minecraft"));
+    }
+
+    #[test]
+    fn schedule_collisions_ignores_events_filtered_out_by_the_needle() {
+        // Two overlapping streams: unfiltered they collide; once the needle
+        // excludes one, the survivor has nothing to collide with — the ⚠
+        // badge/count must agree with what's actually drawn.
+        let a = crate::models::UpcomingStream { title: "Karaoke".into(), ..stream(1, 0, Some(100)) };
+        let b = crate::models::UpcomingStream { title: "Minecraft".into(), ..stream(2, 50, Some(150)) };
+        let all = vec![a, b];
+        let none = HashSet::new();
+        assert_eq!(schedule_collisions(&all, &none, &none, "").len(), 2);
+        assert!(schedule_collisions(&all, &none, &none, "karaoke").is_empty());
     }
 
     #[test]

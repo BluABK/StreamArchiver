@@ -681,6 +681,7 @@ impl StreamArchiverApp {
             schedule_hidden_monitors,
             schedule_sidebar_open: HashSet::new(),
             schedule_channel_filter: String::new(),
+            schedule_event_filter: String::new(),
             schedule_hidden_segments: HashSet::new(),
             schedule_show_hidden: false,
             schedule_collisions: true,

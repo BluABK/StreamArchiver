@@ -1668,6 +1668,11 @@ pub struct StreamArchiverApp {
     /// Live substring filter over the sidebar's channel list (case-insensitive,
     /// name match) — session-only, not persisted.
     schedule_channel_filter: String,
+    /// The calendar's event filter bar (under the toolbar): case-insensitive
+    /// substring over channel name / title / category / collaborators,
+    /// narrowing every view (Month/Week/Day/Agenda). Session-only, like the
+    /// sidebar filter above.
+    schedule_event_filter: String,
     /// Individual segment IDs the user has soft-hidden (not tombstoned). Reset
     /// on app restart; use Delete for permanent suppression.
     schedule_hidden_segments: HashSet<i64>,

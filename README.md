@@ -2664,6 +2664,17 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
 - **Right-click** any stream (chip, day list, or popup) to **copy** its URL,
   platform, title, channel, or full details, or **open it in the browser**. The
   day popup also has **Copy all**. Hover a stream for its full details.
+- **🔍 Filter bar** (under the toolbar) — type to narrow **every view**
+  (Month, Week, Day, Agenda) to events whose **channel name, title,
+  category, or collaborators** contain the text (case-insensitive
+  substring). While active, a live **"N matching streams"** count sits next
+  to the box, and the collision `⚠` badge/count only considers matching
+  events, so what's flagged always agrees with what's drawn. `Esc` (or the
+  ✕ button) clears it; the filter is session-only and independent of the
+  sidebar's channel filter — that one narrows the *sidebar list*, this one
+  narrows the *calendar*. The day pop-up window intentionally still shows
+  everything (it's the "show me all of this day" detail view, hidden
+  entries included).
 - **Left sidebar** filters which channels are shown: a **Filter…** box narrows
   the list to matching channel names (case-insensitive substring), an **All
   channels** toggle plus a per-channel checkbox (with each channel's avatar,

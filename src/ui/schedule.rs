@@ -683,6 +683,9 @@ impl StreamArchiverApp {
         // Precompute (immutable reads of `self`) what the closures need: collisions
         // and the per-day buckets of visible streams (indices into `schedule_all`).
         let (collide, by_day, all_day_events) = self.schedule_visible_buckets();
+        // Total visible events (each event lands in exactly one `by_day` bucket) —
+        // the filter bar's live "N matching" readout.
+        let visible_n: usize = by_day.values().map(Vec::len).sum();
 
         // Auto-record tint + recording-now/trigger-preview badges for every
         // visible event — see `build_event_signals`.
@@ -739,6 +742,7 @@ impl StreamArchiverApp {
                 &mut set_collisions,
             );
 
+            self.schedule_filter_bar(ui, visible_n);
             self.schedule_selection_bar(ui);
 
             // Zoom the calendar body only: scale every relative text size
@@ -936,11 +940,16 @@ impl StreamArchiverApp {
         HashMap<chrono::NaiveDate, Vec<usize>>,
         Vec<usize>,
     ) {
+        // The toolbar filter bar's needle — one lowercase compute shared by the
+        // collision scan and the bucket loop below. Applies to every view
+        // (Month/Week/Day/Agenda) since they all render from these buckets.
+        let needle = self.schedule_event_filter.trim().to_lowercase();
         let collide: HashSet<usize> = if self.schedule_collisions {
             schedule_collisions(
                 &self.schedule_all,
                 &self.schedule_hidden,
                 &self.schedule_hidden_monitors,
+                &needle,
             )
         } else {
             HashSet::new()
@@ -962,6 +971,8 @@ impl StreamArchiverApp {
             {
                 continue;
             }
+            // Skip events not matching the filter bar (channel/title/category/collab).
+            if !schedule_filter_hit(s, &needle) { continue; }
             // Skip segments that are secondaries of a merge (auto or manual) —
             // their primary renders the merged event block.
             if s.merged_into.is_some() { continue; }
@@ -1479,6 +1490,44 @@ impl StreamArchiverApp {
                         .on_hover_text("Overlapping streams in view");
                 }
             });
+        });
+        ui.separator();
+    }
+
+    /// ── Filter bar: live text search over the calendar's events. ──
+    ///
+    /// One box narrows every view (Month/Week/Day/Agenda) to events whose
+    /// channel name, title, category, or collaborators contain the text —
+    /// the actual narrowing happens in [`Self::schedule_visible_buckets`]
+    /// (and the collision scan), so all four views and the ⚠ count stay
+    /// consistent for free. Session-only, like the sidebar's channel filter.
+    fn schedule_filter_bar(&mut self, ui: &mut egui::Ui, visible_n: usize) {
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.schedule_event_filter)
+                        .hint_text("Filter events…")
+                        .desired_width(240.0),
+                )
+                .on_hover_text(
+                    "Filter the calendar — every view (Month, Week, Day, Agenda) narrows \
+                     to events whose channel name, title, category, or collaborators \
+                     contain this text (case-insensitive). Esc clears. The day pop-up \
+                     window still shows everything.",
+                );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.schedule_event_filter.clear();
+            }
+            if !self.schedule_event_filter.trim().is_empty() {
+                if ui.button("✕").on_hover_text("Clear the event filter").clicked() {
+                    self.schedule_event_filter.clear();
+                }
+                ui.weak(format!(
+                    "{visible_n} matching stream{}",
+                    if visible_n == 1 { "" } else { "s" }
+                ));
+            }
         });
         ui.separator();
     }
