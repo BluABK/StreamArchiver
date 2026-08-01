@@ -203,6 +203,10 @@ fn import_candidate(
         disposed_at: proxy_at,
         updated_at: proxy_at,
         confidence,
+        // Unknowable in principle: this scan only ever imports a candidate
+        // whose file is already confirmed gone from disk (see the `exists_sync`
+        // guard above), so there's nothing left to stat.
+        bytes: None,
     };
     if store.insert_disposal_record(&row).is_ok() {
         match confidence {

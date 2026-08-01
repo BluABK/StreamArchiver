@@ -449,6 +449,14 @@ pub struct DisposalRecordRow {
     pub disposed_at: i64,
     pub updated_at: i64,
     pub confidence: DisposalConfidence,
+    /// The file's size at the moment it was disposed of — `None` when it
+    /// couldn't be stat'd in time (a race with something else removing it)
+    /// or, for every `disposal_backfill`-imported row, unknowable in
+    /// principle: that scan only imports a candidate whose file is already
+    /// confirmed gone from disk. Captured once, before the disposal acts —
+    /// afterward the file may be moved, recycled, or gone for good, so
+    /// there's no later point size could still be read back from.
+    pub bytes: Option<i64>,
 }
 
 /// Record a completed disposal for the Trash view. Best-effort: a logging
@@ -456,7 +464,14 @@ pub struct DisposalRecordRow {
 /// warn on error. Always `DisposalConfidence::Live` — this runs at the exact
 /// moment `dispose_media` acted; see `disposal_backfill` for the historical-
 /// import path that produces the other two confidence levels.
-pub fn log_disposal(store: &Store, rec_id: i64, reason: &str, original_path: &Path, disposed: &Disposed) {
+pub fn log_disposal(
+    store: &Store,
+    rec_id: i64,
+    reason: &str,
+    original_path: &Path,
+    disposed: &Disposed,
+    bytes: Option<i64>,
+) {
     let now = crate::models::now_unix();
     let (method, trash_path, state) = match disposed {
         Disposed::Trashed(p) => {
@@ -476,6 +491,7 @@ pub fn log_disposal(store: &Store, rec_id: i64, reason: &str, original_path: &Pa
         disposed_at: now,
         updated_at: now,
         confidence: DisposalConfidence::Live,
+        bytes,
     };
     if let Err(e) = store.insert_disposal_record(&row) {
         warn!("disposal: failed to log history row for {}: {e:#}", original_path.display());
@@ -632,9 +648,14 @@ pub async fn dispose_media(
     rec_id: i64,
     reason: &str,
 ) -> std::io::Result<Disposed> {
+    // Stat BEFORE disposing — afterward the file has been moved, recycled, or
+    // is simply gone, so this is the only point its size can still be read.
+    // Best-effort: a stat failure (already gone, permissions, a drive that
+    // dropped mid-race) must not block the disposal itself.
+    let bytes = crate::iomon::fs::metadata(Cat::CacheSweep, path).await.ok().map(|m| m.len() as i64);
     let result = execute_disposal(store, channel_id, monitor_id, path).await;
     if let Ok(disposed) = &result {
-        log_disposal(store, rec_id, reason, path, disposed);
+        log_disposal(store, rec_id, reason, path, disposed, bytes);
     }
     result
 }

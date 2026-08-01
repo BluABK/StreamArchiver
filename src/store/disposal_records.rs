@@ -18,6 +18,12 @@ pub struct DisposalRecordDisplay {
     pub channel_id: Option<i64>,
     pub channel_name: String,
     pub take_started_at: Option<i64>,
+    /// The take's current (latest-logged) title, empty if unknown — lets the
+    /// Trash view tell apart several disposals from the same channel (e.g.
+    /// repeated post-join head/live cleanups across many broadcasts), which
+    /// otherwise render as identical rows differing only by timestamp and
+    /// an opaque path. See [`crate::models::Recording::title`].
+    pub take_title: String,
 }
 
 impl Store {
@@ -30,8 +36,8 @@ impl Store {
         conn.execute(
             "INSERT INTO disposal_record(
                  rec_id, reason, method, original_path, trash_path, state,
-                 disposed_at, updated_at, confidence)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 disposed_at, updated_at, confidence, bytes)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 row.rec_id,
                 row.reason,
@@ -42,6 +48,7 @@ impl Store {
                 row.disposed_at,
                 row.updated_at,
                 row.confidence.as_str(),
+                row.bytes,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -62,6 +69,7 @@ impl Store {
             disposed_at: r.get(7)?,
             updated_at: r.get(8)?,
             confidence: DisposalConfidence::parse(&confidence).unwrap_or(DisposalConfidence::Live),
+            bytes: r.get(10)?,
         })
     }
 
@@ -69,7 +77,7 @@ impl Store {
         let conn = self.db();
         conn.query_row(
             "SELECT id, rec_id, method, reason, original_path, state, trash_path,
-                    disposed_at, updated_at, confidence
+                    disposed_at, updated_at, confidence, bytes
              FROM disposal_record WHERE id=?1",
             params![id],
             Self::row_from,
@@ -140,8 +148,11 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT d.id, d.rec_id, d.method, d.reason, d.original_path, d.state,
-                    d.trash_path, d.disposed_at, d.updated_at, d.confidence,
-                    c.id, c.name, r.started_at
+                    d.trash_path, d.disposed_at, d.updated_at, d.confidence, d.bytes,
+                    c.id, c.name, r.started_at,
+                    (SELECT new_value FROM stream_meta_change smc
+                     WHERE smc.recording_id = r.id AND smc.kind = 'title'
+                     ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1)
              FROM disposal_record d
              LEFT JOIN recording r ON r.id = d.rec_id
              LEFT JOIN monitor m ON m.id = r.monitor_id
@@ -152,9 +163,10 @@ impl Store {
             .query_map([], |r| {
                 Ok(DisposalRecordDisplay {
                     row: Self::row_from(r)?,
-                    channel_id: r.get(10)?,
-                    channel_name: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                    take_started_at: r.get(12)?,
+                    channel_id: r.get(11)?,
+                    channel_name: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    take_started_at: r.get(13)?,
+                    take_title: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -178,6 +190,7 @@ mod tests {
             disposed_at: 1_000,
             updated_at: 1_000,
             confidence: DisposalConfidence::Live,
+            bytes: Some(123_456),
         }
     }
 
@@ -237,6 +250,25 @@ mod tests {
 
         let live_id = store.insert_disposal_record(&sample(6, DisposalRecordState::Permanent)).unwrap();
         assert_eq!(store.get_disposal_record(live_id).unwrap().unwrap().confidence, DisposalConfidence::Live);
+    }
+
+    #[test]
+    fn bytes_round_trips_and_none_survives_a_missing_stat() {
+        let store = Store::open_in_memory().unwrap();
+        let known = sample(1, DisposalRecordState::Permanent); // bytes: Some(123_456)
+        let known_id = store.insert_disposal_record(&known).unwrap();
+        assert_eq!(store.get_disposal_record(known_id).unwrap().unwrap().bytes, Some(123_456));
+
+        let mut unknown = sample(2, DisposalRecordState::Permanent);
+        unknown.bytes = None; // a historical-import row, or a stat that raced a deletion
+        let unknown_id = store.insert_disposal_record(&unknown).unwrap();
+        assert_eq!(store.get_disposal_record(unknown_id).unwrap().unwrap().bytes, None);
+
+        // list_disposal_records reads through the same row_from — the join
+        // columns tacked on after `bytes` must not have shifted its index.
+        let list = store.list_disposal_records().unwrap();
+        assert_eq!(list.iter().find(|d| d.row.id == known_id).unwrap().row.bytes, Some(123_456));
+        assert_eq!(list.iter().find(|d| d.row.id == unknown_id).unwrap().row.bytes, None);
     }
 
     /// The 🗑 badge counts only what's still IN a trash folder — a recycled or

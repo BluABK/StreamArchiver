@@ -1617,7 +1617,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 81)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 81);
+        if version < 82 {
+            // The disposed file's size, captured at the moment of disposal
+            // (there's no later point it could be read back from — a Trash
+            // move relocates it, Recycle/Delete makes it gone). Backs the
+            // Trash view's per-row size column and per-channel size total.
+            // NULL (no DEFAULT) for every pre-existing row: their files were
+            // already gone by the time this column exists, so their size is
+            // unknowable — same reasoning as `disposal_backfill`-imported
+            // rows, which insert NULL going forward too.
+            conn.execute_batch("ALTER TABLE disposal_record ADD COLUMN bytes INTEGER;")?;
+            conn.pragma_update(None, "user_version", 82)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 82);
         Ok(())
     }
 }

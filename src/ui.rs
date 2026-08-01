@@ -1620,6 +1620,13 @@ pub struct StreamArchiverApp {
     trash_loaded: bool,
     /// Case-insensitive channel-name filter for the Trash view.
     trash_filter: String,
+    /// Which disposal states to show in the Trash view — a checkbox bank
+    /// (not a dropdown) so more than one state can be visible at once, e.g.
+    /// "In trash" + "Restored" with "Permanently deleted" hidden. All on by
+    /// default. Session-only, like `trash_filter`.
+    trash_show_soft_deleted: bool,
+    trash_show_permanent: bool,
+    trash_show_restored: bool,
     /// Set while a Restore/Permanently-delete action is running for that
     /// record id, so its row can disable its buttons and show a spinner
     /// instead of racing a second click against the same file.
@@ -1632,9 +1639,17 @@ pub struct StreamArchiverApp {
     /// can't touch `self` directly), drained on the UI thread at the top of
     /// `trash::trash_view` each frame.
     trash_action_done: Arc<Mutex<Vec<TrashActionOutcome>>>,
-    /// Record id + trash path pending the "Permanently delete" confirmation
-    /// dialog (an irreversible action, unlike Restore).
-    confirm_permadelete_trash: Option<(i64, String)>,
+    /// `(record id, path)` pairs pending the "Permanently delete" confirmation
+    /// dialog (an irreversible action, unlike Restore) — one row's worth for
+    /// the per-row 🗑 button, or every checked row's worth for the toolbar's
+    /// "Delete selected".
+    confirm_permadelete_trash: Option<Vec<(i64, String)>>,
+    /// Checked disposal-record ids in the Trash view (session-only) — backs
+    /// the per-row checkbox + toolbar "Delete selected". Only ever holds ids
+    /// of `SoftDeleted` rows (the only state with a delete action); pruned on
+    /// every `reload_trash` so a since-restored/deleted row can't linger
+    /// checked.
+    trash_selected: HashSet<i64>,
     /// True while the "Import history" (`disposal_backfill`) scan is
     /// running, so the button disables and shows a spinner instead of
     /// allowing an overlapping second scan.

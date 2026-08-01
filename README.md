@@ -803,32 +803,48 @@ Turn it off to keep every working-dir capture forever.
 
 **🗑 Trash view.** Every automatic disposal is logged here — reason (post-join
 cleanup, gap-splice cleanup, superseded old head, VOD replace, superseded
-working-dir capture), method, when,
+working-dir capture), when, the take's **title** (so several disposals from
+the same channel don't all render as identical rows), method, state, size,
 and its current path — grouped by channel like the Streams grid, with a
-channel-name filter. A **Trash folder** disposal is "soft-deleted": the file
-still exists in its trash folder, so its row gets **↩ Restore** (moves it back
-to where it lived) and **🗑 Permanently delete** (asks for confirmation, then
-removes it for good). Because a trash folder is only ever emptied by hand, the
-top bar's **🗑** tab carries a **count in amber** whenever soft-deleted files
-are still sitting in one — otherwise those files silently keep occupying the
-recordings drive with nothing to say so. The badge clears itself as rows are
-restored or permanently deleted. Recycle Bin and permanent-delete rows are history only —
-Windows owns Recycle Bin recovery, and a permanent delete has nothing left to
-act on. Every row also has **▶ Open file** / **📂 Open folder**, enabled only
-while the shown path still exists on disk. A **Source** column marks each row
-**Live** (logged the instant it happened — exact method/path/time), or, from
-the **⤵ Import history** button, one of two backfilled tiers for disposals
-that predate this view: **Historical (exact path)** (gap-splice patches, VOD
--replace backups — read from a DB column that still held the real path) or
-**Historical (inferred path)** (post-join head/live cleanup — guessed from the
-`{stem}.head.mkv` naming convention, since the DB pointer was cleared).
-Historical rows only import once their file is confirmed gone from a
-currently-reachable drive, are always read-only (no Restore/Permanently
-delete — the method and exact time are unknown), and re-running the import is
-safe — it never duplicates an already-logged row. "Superseded old head"
-disposals are deliberately never backfilled: nothing distinguishes a
-recording whose head was superseded from one that never had a head at all,
-so guessing would flood the view with false positives.
+channel-name filter and a **Show:** checkbox bank (In trash / Permanently
+deleted / Restored, all on by default — check any combination, not just one
+at a time). Each channel's header shows the row count plus the total size of
+whatever's known, e.g. "girl_dm_ (12, 69.4 GB)". Columns are laid out
+**Select/Actions first, Path last** so a long path can never crowd the action
+buttons off-screen, every column is individually resizable (drag its border;
+the width is remembered), and **Path** stretches to fill whatever room is
+left. A **Trash folder** disposal is "soft-deleted": the file still exists in
+its trash folder, so its row gets a **selection checkbox**, **↩ Restore**
+(moves it back to where it lived), and **🗑 Permanently delete** (asks for
+confirmation, then removes it for good). Check several rows — a channel's
+header checkbox selects/deselects every soft-deleted row in that channel at
+once — and the toolbar's **🗑 Delete selected (N)** permanently deletes all of
+them in one confirmation. Because a trash folder is only ever emptied by
+hand, the top bar's **🗑** tab carries a **count in amber** whenever
+soft-deleted files are still sitting in one — otherwise those files silently
+keep occupying the recordings drive with nothing to say so. The badge clears
+itself as rows are restored or permanently deleted. Recycle Bin and
+permanent-delete rows are history only — Windows owns Recycle Bin recovery,
+and a permanent delete has nothing left to act on. Every row also has
+**▶ Open file** / **📂 Open folder**, enabled only while the shown path still
+exists on disk. The **Size** column shows the file's size at the moment it
+was disposed of (captured right before the disposal acts — there's no later
+point it could be read back from); it shows **—** for any row whose size
+wasn't captured, which is always the case for backfilled rows below. A
+**Source** column marks each row **Live** (logged the instant it happened —
+exact method/path/time), or, from the **⤵ Import history** button, one of two
+backfilled tiers for disposals that predate this view: **Historical (exact
+path)** (gap-splice patches, VOD-replace backups — read from a DB column that
+still held the real path) or **Historical (inferred path)** (post-join
+head/live cleanup — guessed from the `{stem}.head.mkv` naming convention,
+since the DB pointer was cleared). Historical rows only import once their
+file is confirmed gone from a currently-reachable drive, are always read-only
+(no Restore/Permanently delete, no size — the method, exact time, and size
+are all unknown), and re-running the import is safe — it never duplicates an
+already-logged row. "Superseded old head" disposals are deliberately never
+backfilled: nothing distinguishes a recording whose head was superseded from
+one that never had a head at all, so guessing would flood the view with false
+positives.
 
 **Manual "🧩 Backfill head."** Right-click an **instance** (targets its latest
 recording) or a specific **take** for a manual, on-demand head backfill —
