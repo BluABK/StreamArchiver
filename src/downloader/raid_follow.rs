@@ -87,6 +87,26 @@ impl Supervisor {
     /// its own explicit "Exclude from auto-play" override, since opening a
     /// player touches nothing about the target's recording/disk config.
     async fn try_follow_raid_play(&self, sig: &RaidOutSignal, target_row: Option<&MonitorWithChannel>) {
+        // "Only when watching" (default on): follow the raid in a player only
+        // if a player for the RAIDING instance is open right now — or closed
+        // within the grace window, since mpv often hits end-of-stream and
+        // exits moments before the raid event arrives. Without this gate,
+        // every auto-play-enabled instance pops an unexplained player window
+        // whenever it raids out, watched or not.
+        if crate::raid_follow::raid_follow_play_only_watched(&self.store)
+            && !crate::ui::player::monitor_watched_recently(
+                sig.from_monitor_id,
+                crate::raid_follow::RAID_PLAY_WATCHED_GRACE_SECS,
+            )
+        {
+            tracing::debug!(
+                monitor_id = sig.from_monitor_id,
+                to = sig.to_display_name.as_str(),
+                "follow-raid: auto-play skipped — the raiding instance wasn't open in a \
+                 player (\"Only when watching\" is on)"
+            );
+            return;
+        }
         if let Some(row) = target_row
             && crate::raid_follow::is_excluded_from_auto_play(&self.store, row.channel.id, row.monitor.id)
         {

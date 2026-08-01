@@ -2346,7 +2346,7 @@ impl StreamArchiverApp {
             if !player.is_empty() {
                 for t in targets {
                     if let Some(msg) =
-                        spawn_logged(build_player_command(&player, &t), "stream in player")
+                        spawn_logged(build_player_command(&player, &t), "stream in player", None)
                     {
                         self.status = msg;
                     }

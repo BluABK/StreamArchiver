@@ -1147,6 +1147,11 @@ pub(crate) struct SettingsForm {
     /// `raid_follow_record` — the automatic equivalent of the manual "▷🏃
     /// Follow raid" button. Default OFF, single-hop only, same as above.
     raid_follow_play: bool,
+    /// Gate auto-play on the raiding instance having been open in a player
+    /// this app launched (still open, or closed within the last ~10 min).
+    /// Default ON — the guard against unexplained player windows popping up
+    /// for raids of streams nobody was watching.
+    raid_follow_play_only_watched: bool,
     /// Output directory for an UNTRACKED raid target's ad-hoc capture
     /// (supports the `{name}` token).
     raid_follow_output_dir: String,

@@ -2422,6 +2422,17 @@ fully independent behaviors — either, both, or neither can be on at once:
   doesn't touch the target's recording/disk configuration) — the only way
   to opt a channel/instance out is its own **"Exclude from auto-play"**
   override (Always/Never/Inherit; default allowed).
+  - **"Only when watching the raider" (default on)**: the auto-play only
+    fires if the RAIDING instance was open in a player this app launched —
+    still open when the raid lands, or closed within the last ~10 minutes
+    (players usually exit at end-of-stream moments before the raid event
+    arrives, and "I was literally just watching" still counts). Without
+    this gate, every auto-play-enabled instance pops an unexplained player
+    window whenever it raids out, watched or not. Players opened outside
+    the app don't count (the app can't see them); what does count are the
+    live tune-ins — ▷ play-stream-live-edge on any tool (streamlink,
+    yt-dlp pipe/preview, ffmpeg source) and the collab live-edge angle
+    spawns. Playing a finished file doesn't register as watching.
 - **Single-hop only**: a followed recording runs until the raid target's own
   stream ends — Twitch has no formal "raid end" event, so this is the
   natural stop signal. A followed player window has no such lifecycle at

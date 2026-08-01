@@ -302,6 +302,9 @@ impl StreamArchiverApp {
             chapters_enabled: crate::chapters::global_chapters_enabled(&core.store),
             raid_follow_record: crate::raid_follow::global_raid_follow_record(&core.store),
             raid_follow_play: crate::raid_follow::global_raid_follow_play(&core.store),
+            raid_follow_play_only_watched: crate::raid_follow::raid_follow_play_only_watched(
+                &core.store,
+            ),
             raid_follow_output_dir: crate::raid_follow::raid_follow_output_dir(&core.store),
             raid_skip_disabled_targets: crate::raid_follow::raid_skip_disabled_targets_enabled(&core.store),
             chapters_title: core.store.get_setting(crate::chapters::K_CHAPTERS_TITLE).ok().flatten().is_none_or(|v| v != "0"),
@@ -1853,6 +1856,10 @@ impl StreamArchiverApp {
             (crate::chapters::K_CHAPTERS_COALESCE_SECS, s.chapters_coalesce_secs.trim()),
             (crate::raid_follow::K_RAID_FOLLOW_RECORD, if s.raid_follow_record { "1" } else { "0" }),
             (crate::raid_follow::K_RAID_FOLLOW_PLAY, if s.raid_follow_play { "1" } else { "0" }),
+            (
+                crate::raid_follow::K_RAID_FOLLOW_PLAY_ONLY_WATCHED,
+                if s.raid_follow_play_only_watched { "1" } else { "0" },
+            ),
             (crate::raid_follow::K_RAID_FOLLOW_OUTPUT_DIR, s.raid_follow_output_dir.trim()),
             (crate::raid_follow::K_RAID_SKIP_DISABLED_TARGETS, if s.raid_skip_disabled_targets { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),

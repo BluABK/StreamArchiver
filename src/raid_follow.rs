@@ -50,6 +50,18 @@ pub const K_MONITOR_RAID_FOLLOW_SCOPE: &str = "monitor_raid_follow_scope";
 pub const K_RAID_FOLLOW_PLAY: &str = "raid_follow_play";
 pub const K_CHANNEL_RAID_FOLLOW_PLAY_SCOPE: &str = "channel_raid_follow_play_scope";
 pub const K_MONITOR_RAID_FOLLOW_PLAY_SCOPE: &str = "monitor_raid_follow_play_scope";
+/// Global: gate follow-PLAY on the raiding instance actually being *watched*
+/// — a player this app opened for it is still open, or closed within
+/// [`RAID_PLAY_WATCHED_GRACE_SECS`]. Default ON: without it, any instance
+/// with auto-play enabled pops a player for a raid the user never saw coming
+/// (a stream ends while nobody's looking → an unexplained mpv window). "0"
+/// disables the gate (auto-play fires whether or not you were watching).
+pub const K_RAID_FOLLOW_PLAY_ONLY_WATCHED: &str = "raid_follow_play_only_watched";
+/// How recently a player for the raiding instance must have been open to
+/// still count as "watching". Raids fire as the source broadcast winds down,
+/// and mpv often hits end-of-stream and closes moments before the EventSub
+/// raid event arrives — "I was literally just watching" must still count.
+pub const RAID_PLAY_WATCHED_GRACE_SECS: i64 = 600;
 /// Global: output directory for an untracked (not one of our channels) raid
 /// target's ad-hoc capture. Supports the `{name}` token.
 pub const K_RAID_FOLLOW_OUTPUT_DIR: &str = "raid_follow_output_dir";
@@ -151,6 +163,17 @@ pub fn effective_raid_follow_play(store: &Store, channel_id: i64, monitor_id: i6
     let ch = load_bool_scope(store, K_CHANNEL_RAID_FOLLOW_PLAY_SCOPE, channel_id);
     let mon = load_bool_scope(store, K_MONITOR_RAID_FOLLOW_PLAY_SCOPE, monitor_id);
     effective_raid_follow_record_from(global_raid_follow_play(store), ch, mon)
+}
+
+/// Whether follow-play additionally requires the raiding instance to have
+/// been open in a player (see [`K_RAID_FOLLOW_PLAY_ONLY_WATCHED`]).
+pub fn raid_follow_play_only_watched(store: &Store) -> bool {
+    store
+        .get_setting(K_RAID_FOLLOW_PLAY_ONLY_WATCHED)
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 // ---------- destination side: "record me when I'm a raid target" ----------

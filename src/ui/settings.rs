@@ -3424,6 +3424,25 @@ impl StreamArchiverApp {
                     ui.label("Master on/off (default OFF). Never gated by the target's disabled state.");
                     ui.end_row();
 
+                    ui.add_enabled_ui(self.settings.raid_follow_play, |ui| {
+                        ui.checkbox(
+                            &mut self.settings.raid_follow_play_only_watched,
+                            "Only when watching the raider",
+                        )
+                        .on_hover_text(
+                            "Auto-play the raid only if the RAIDING instance was open in a \
+                             player this app launched (▷ live edge, ⏵ from start, collab \
+                             angles…) — still open when the raid fires, or closed within the \
+                             last 10 minutes (players often exit at end-of-stream moments \
+                             before the raid event arrives). On by default: without it, every \
+                             auto-play-enabled instance pops an unexplained player window \
+                             whenever it raids out, watched or not. Players opened outside \
+                             this app don't count — the app can't see them.",
+                        );
+                    });
+                    ui.label("Skip the auto-play when you weren't watching the raiding stream.");
+                    ui.end_row();
+
                     ui.label("Ad-hoc capture folder");
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.settings.raid_follow_output_dir);

@@ -524,9 +524,59 @@ fn player_log(channel: &str, tool: &str) -> std::process::Stdio {
     }
 }
 
+// ----- Open-player presence (which instances are on screen right now) -----
+
+/// monitor_id -> (players currently open, unix time the last one closed).
+/// Fed by every live tune-in path that spawns a player for a TRACKED row
+/// (streamlink, yt-dlp pipe, ffmpeg-source, the live-edge preview); read by
+/// Follow-raid auto-play's "only when watching" gate via
+/// [`monitor_watched_recently`]. In-memory only — a restart forgets, which
+/// errs toward NOT popping players, the safe direction.
+static OPEN_PLAYERS: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, (u32, i64)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn note_player_opened(monitor_id: i64) {
+    if monitor_id <= 0 {
+        return; // synthetic rows (follow-raid/collab partners) have no instance
+    }
+    OPEN_PLAYERS.lock().unwrap().entry(monitor_id).or_insert((0, 0)).0 += 1;
+}
+
+fn note_player_closed(monitor_id: i64) {
+    if monitor_id <= 0 {
+        return;
+    }
+    if let Some(e) = OPEN_PLAYERS.lock().unwrap().get_mut(&monitor_id) {
+        e.0 = e.0.saturating_sub(1);
+        e.1 = crate::models::now_unix();
+    }
+}
+
+/// Whether a player for this instance is open right now, or closed within
+/// `within_secs`. The grace window matters because a raid fires as the
+/// source broadcast winds down — mpv often hits end-of-stream and closes
+/// moments before the EventSub raid event arrives, and "I was literally
+/// just watching" must still count as watching.
+pub(crate) fn monitor_watched_recently(monitor_id: i64, within_secs: i64) -> bool {
+    OPEN_PLAYERS
+        .lock()
+        .unwrap()
+        .get(&monitor_id)
+        .is_some_and(|&(open, closed_at)| {
+            open > 0 || crate::models::now_unix() - closed_at <= within_secs
+        })
+}
+
 /// Log and spawn a player/downloader command built for "play new instance",
-/// returning a status-bar error message on spawn failure.
-pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option<String> {
+/// returning a status-bar error message on spawn failure. `watch_monitor`
+/// registers the spawned process in [`OPEN_PLAYERS`] as an open player for
+/// that instance (a reaper thread notes the close) — pass it for live
+/// tune-ins of a tracked row, `None` for everything else.
+pub(super) fn spawn_logged(
+    mut cmd: std::process::Command,
+    what: &str,
+    watch_monitor: Option<i64>,
+) -> Option<String> {
     let line = format!(
         "{} {}",
         cmd.get_program().to_string_lossy(),
@@ -534,7 +584,19 @@ pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option
     );
     tracing::info!(%line, "play-new-instance: spawning {what}");
     match cmd.spawn() {
-        Ok(_) => None,
+        Ok(mut child) => {
+            if let Some(mid) = watch_monitor.filter(|&m| m > 0) {
+                note_player_opened(mid);
+                // The streamlink path's child is streamlink itself, which
+                // exits when the player it owns closes — waiting on either
+                // process shape means "the window is gone".
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    note_player_closed(mid);
+                });
+            }
+            None
+        }
         Err(e) => {
             warn!(%line, "play-new-instance: failed to spawn {what}: {e}");
             Some(format!("Failed to launch {what}: {e}"))
@@ -1321,6 +1383,12 @@ pub(super) fn spawn_live_preview(
                     }
                 }
             })();
+        // This thread owns the player Child, so open/close presence for the
+        // watched-instance registry is tracked inline (see OPEN_PLAYERS).
+        let watch_mid = title_row.monitor.id;
+        if launched.is_some() {
+            note_player_opened(watch_mid);
+        }
         match launched {
             Some((mut p, Some(mut hp))) => {
                 // Keep the playlists fresh while the player runs. When the
@@ -1340,10 +1408,12 @@ pub(super) fn spawn_live_preview(
                     }
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
+                note_player_closed(watch_mid);
                 tracing::info!(%channel, "live-preview: player closed, stopping preview download");
             }
             Some((mut p, None)) => {
                 let _ = p.wait();
+                note_player_closed(watch_mid);
                 tracing::info!(%channel, "live-preview: player closed, stopping preview download");
             }
             None => {}
@@ -1479,7 +1549,7 @@ pub(super) fn spawn_play_new_instance(
             // Streamlink spawns mpv itself here, so its stderr is the only
             // window into BOTH processes for the Twitch path.
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
-            let status = spawn_logged(cmd, "streamlink");
+            let status = spawn_logged(cmd, "streamlink", Some(m.id));
             // Both updaters start only if Streamlink actually started —
             // otherwise one would sit on a pipe that can never appear and log
             // a spurious warning a minute later.
@@ -1557,7 +1627,7 @@ pub(super) fn spawn_play_new_instance(
                     if mute && player_is_mpv(player) {
                         cmd.arg("--mute");
                     }
-                    spawn_logged(cmd, "media player")
+                    spawn_logged(cmd, "media player", Some(m.id))
                 }
                 Err(e) => {
                     warn!(%line, "play-new-instance: failed to spawn yt-dlp: {e}");
@@ -1577,7 +1647,7 @@ pub(super) fn spawn_play_new_instance(
                 cmd.arg("--mute");
             }
             cmd.arg(&m.url);
-            spawn_logged(cmd, "media player")
+            spawn_logged(cmd, "media player", Some(m.id))
         }
     }
 }
@@ -1973,6 +2043,31 @@ mod tests {
     fn static_live_title_fixes_pos_at_zero() {
         let v = static_live_title("{channel} [{pos}]", "Layna", "Hello !gg", "Just Chatting");
         assert_eq!(v, "Layna [00:00:00]");
+    }
+
+    #[test]
+    fn open_players_presence_open_then_grace_then_stale() {
+        // Distinct ids so this test can't collide with any other user of the
+        // process-wide registry.
+        let (a, b) = (9_000_001, 9_000_002);
+        assert!(!monitor_watched_recently(a, 600), "never opened");
+        note_player_opened(a);
+        assert!(monitor_watched_recently(a, 0), "open now counts at any grace");
+        note_player_closed(a);
+        assert!(monitor_watched_recently(a, 600), "just closed, inside grace");
+        // Aged-out close: rewrite the entry as if it closed an hour ago.
+        OPEN_PLAYERS.lock().unwrap().insert(a, (0, crate::models::now_unix() - 3600));
+        assert!(!monitor_watched_recently(a, 600), "closed too long ago");
+        // Synthetic rows (id 0) are never tracked.
+        note_player_opened(0);
+        assert!(!monitor_watched_recently(0, 600));
+        // Two players open, one closes — still watching (count bookkeeping,
+        // not the grace window: the close stamp is aged out below).
+        note_player_opened(b);
+        note_player_opened(b);
+        note_player_closed(b);
+        OPEN_PLAYERS.lock().unwrap().get_mut(&b).unwrap().1 = crate::models::now_unix() - 3600;
+        assert!(monitor_watched_recently(b, 0), "one of two players still open");
     }
 
     #[test]
