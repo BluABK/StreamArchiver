@@ -46,8 +46,15 @@ stop recordings** — or click the **StreamArchiver** label in the window's top
 bar for the same two quit actions (handy when a notification storm makes the
 tray icon hard to reach). The default Quit detaches active downloads and chat
 sidecars (they keep running and re-attach on the next launch); **Quit & stop
-recordings** asks for confirmation, then stops all active recordings
-(finalizing the MKV) before exiting.
+recordings** asks for confirmation (an always-on-top dialog, so it can't get
+lost behind the main window), then stops all active recordings (finalizing
+the MKV) before exiting.
+
+A Windows shutdown / restart / logoff is never held up: the app answers the
+session-end signal immediately with a detach-quit — any pending confirmation
+dialog is dismissed and the hide-to-tray close cancel is bypassed. Whatever
+the OS then terminates is picked up by the next launch's crash-recovery
+reconcile, same as any other interrupted session.
 
 Only one instance runs at a time (a loopback-port guard, held for the process's
 lifetime). Launching the app again while it's already running — including

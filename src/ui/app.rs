@@ -789,6 +789,7 @@ impl StreamArchiverApp {
             job_toggles,
             format_designer: None,
             confirm_quit_stop: false,
+            confirm_quit_stop_raised: false,
             debug_monitor_idx: 0,
             debug_test_title: "Test Stream Title".into(),
             debug_test_game: "Just Chatting".into(),
@@ -1201,6 +1202,15 @@ impl StreamArchiverApp {
                     self.confirm_quit_stop = true;
                     // Bring the window to the foreground so the dialog is visible.
                     raise_window(ctx);
+                }
+                UiCommand::SessionEnding => {
+                    // OS shutdown/logoff: drop any pending confirmation and
+                    // take the fast detach-quit path — never hold up the
+                    // shutdown. Captures are detached processes; whatever the
+                    // OS then kills is finalized by the next launch's
+                    // reconcile, exactly like a crash.
+                    self.confirm_quit_stop = false;
+                    self.request_quit_detach(ctx);
                 }
             }
         }

@@ -268,6 +268,18 @@ fn main() -> Result<()> {
             fonts::install_unicode_fonts(&cc.egui_ctx);
             let (tray, ui_rx, ui_tx) = build_tray(cc.egui_ctx.clone())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            // OS shutdown/logoff: a hidden listener window flips the app into
+            // an immediate detach-quit (skipping the quit confirmation and the
+            // hide-to-tray close cancel) so it can never read as
+            // "StreamArchiver is preventing shutdown".
+            {
+                let tx = ui_tx.clone();
+                let ctx = cc.egui_ctx.clone();
+                platform::spawn_session_end_listener(move || {
+                    let _ = tx.send(UiCommand::SessionEnding);
+                    ctx.request_repaint();
+                });
+            }
             // Toast clicks feed the same command channel as the tray menu.
             toast_activation::set_ui_sink(ui_tx, cc.egui_ctx.clone());
             Ok(Box::new(ui::StreamArchiverApp::new(

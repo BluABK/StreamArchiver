@@ -1986,8 +1986,11 @@ pub struct StreamArchiverApp {
     debug_test_game: String,
     /// Format Designer: an interactive template preview/editor window.
     format_designer: Option<FormatDesignerState>,
-    /// Pending "Stop recordings & quit" confirmation (triggered by the tray item).
+    /// Pending "Stop recordings & quit" confirmation (triggered by the tray
+    /// item or the top-bar StreamArchiver ▾ menu).
     confirm_quit_stop: bool,
+    /// One-shot: the confirmation viewport got its focus raise this showing.
+    confirm_quit_stop_raised: bool,
     /// Cached (ocr_stats, global_stats, poll_stats) for the Stats view; None = not yet loaded.
     stats_snapshot: Option<(OcrStats, GlobalStats, PollStats)>,
     /// App Stats "Capture health": lifetime totals + per-day trend, loaded
@@ -2327,10 +2330,16 @@ impl eframe::App for StreamArchiverApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
-        // Close button hides to tray unless we're really quitting.
+        // Close button hides to tray unless we're really quitting — or the OS
+        // session is ending, where cancelling the close would hold up the
+        // shutdown: let it through as a detach-quit instead.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if crate::platform::session_ending() {
+                self.request_quit_detach(ctx);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
     }
 

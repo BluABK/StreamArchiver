@@ -577,17 +577,23 @@ impl StreamArchiverApp {
     #[allow(deprecated)]
     pub(super) fn confirm_quit_stop_window(&mut self, ctx: &egui::Context) {
         if !self.confirm_quit_stop {
+            self.confirm_quit_stop_raised = false;
             return;
         }
         let mut open = true;
         let mut confirmed = false;
 
+        let vp_id = egui::ViewportId::from_hash_of("confirm_quit_stop_vp");
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("confirm_quit_stop_vp"),
+            vp_id,
             egui::ViewportBuilder::default()
                 .with_title("Stop recordings and quit?")
                 .with_inner_size([380.0, 130.0])
-                .with_resizable(false),
+                .with_resizable(false)
+                // A quit confirmation must not open BEHIND the main window
+                // (observed: it did, and quitting looked wedged). Keep it on
+                // top; it's a tiny short-lived dialog.
+                .with_always_on_top(),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
@@ -610,6 +616,13 @@ impl StreamArchiverApp {
                 });
             },
         );
+
+        // One-shot focus raise the frame after the viewport is created —
+        // always-on-top keeps it visible, this also gives it the keyboard.
+        if !self.confirm_quit_stop_raised {
+            self.confirm_quit_stop_raised = true;
+            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::Focus);
+        }
 
         if confirmed {
             self.core

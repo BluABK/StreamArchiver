@@ -153,6 +153,121 @@ pub fn tray_icon_image() -> Result<tray_icon::Icon> {
     Ok(tray_icon::Icon::from_rgba(rgba, w, h)?)
 }
 
+// ===== OS session end (shutdown / logoff / restart): never block it =====
+
+/// True once the OS has told us the session is ending. Read by the UI's
+/// close handler so a shutdown-time close is never cancelled into
+/// hide-to-tray (which reads as "StreamArchiver is preventing shutdown"),
+/// and never gated behind the quit confirmation dialog.
+static SESSION_ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn session_ending() -> bool {
+    SESSION_ENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Callback installed by [`spawn_session_end_listener`], invoked from the
+/// listener window's wndproc when the session starts ending.
+#[cfg(windows)]
+static SESSION_END_NOTIFY: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>> =
+    parking_lot::Mutex::new(None);
+
+/// Listen for Windows session end (`WM_QUERYENDSESSION`/`WM_ENDSESSION`) on a
+/// hidden top-level window and call `notify` when it happens (plus set
+/// [`session_ending`]). A dedicated window because the main window's wndproc
+/// belongs to winit, which doesn't surface these; top-level (not
+/// message-only) because `HWND_MESSAGE` windows don't receive the broadcast.
+/// `WM_QUERYENDSESSION` is always answered TRUE — this app must never hold
+/// up a shutdown; whatever the exit path can't finish in time is exactly the
+/// crash-recovery case the next launch's reconcile already handles.
+#[cfg(windows)]
+pub fn spawn_session_end_listener(notify: impl Fn() + Send + 'static) {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, TranslateMessage,
+        WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPED,
+    };
+    use windows::core::w;
+    *SESSION_END_NOTIFY.lock() = Some(Box::new(notify));
+    std::thread::Builder::new()
+        .name("session-end".into())
+        .spawn(|| unsafe {
+            let hinstance = match GetModuleHandleW(None) {
+                Ok(h) => h,
+                Err(e) => return tracing::warn!("session-end listener: GetModuleHandleW: {e}"),
+            };
+            let class = w!("StreamArchiverSessionEnd");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(session_end_wndproc),
+                hInstance: hinstance.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            if RegisterClassW(&wc) == 0 {
+                return tracing::warn!("session-end listener: RegisterClassW failed");
+            }
+            if let Err(e) = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class,
+                w!(""),
+                WS_OVERLAPPED, // hidden: never shown, exists only to get broadcasts
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            ) {
+                return tracing::warn!("session-end listener: CreateWindowExW: {e}");
+            }
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        })
+        .ok();
+}
+
+#[cfg(not(windows))]
+pub fn spawn_session_end_listener(_notify: impl Fn() + Send + 'static) {}
+
+#[cfg(windows)]
+extern "system" fn session_end_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION,
+    };
+    let fire = || {
+        SESSION_ENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(f) = &*SESSION_END_NOTIFY.lock() {
+            f();
+        }
+    };
+    match msg {
+        WM_QUERYENDSESSION => {
+            fire();
+            LRESULT(1) // TRUE: never block shutdown
+        }
+        // wparam FALSE = another app vetoed the shutdown; it isn't happening.
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                fire();
+            } else {
+                SESSION_ENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
 // ===== Detached downloads: jobs that OUTLIVE the app, re-attachable on relaunch =====
 
 #[cfg(windows)]

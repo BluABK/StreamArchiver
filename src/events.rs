@@ -453,6 +453,10 @@ pub enum UiCommand {
     Quit,
     /// Begin shutdown and stop all active downloads (don't detach them).
     QuitAndStop,
+    /// The OS session is ending (shutdown/logoff/restart): quit-detach
+    /// immediately, skipping any confirmation dialog — the app must never
+    /// hold up a shutdown (see `platform::spawn_session_end_listener`).
+    SessionEnding,
 }
 
 /// On-demand recording commands from the UI to the download supervisor.
