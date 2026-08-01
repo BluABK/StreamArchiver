@@ -796,6 +796,69 @@ pub(crate) fn sanitize_emote_name(name: &str) -> String {
         .collect()
 }
 
+/// Resolve a manifest entry's on-disk image path: try the current
+/// `{id}_{sanitized_name}.{ext}` filename fetchers write, falling back to the
+/// pre-rename `{id}.{ext}` form for files downloaded before that change.
+/// Shared by every reader of an emote manifest (chat render-time lookup, the
+/// Emote Properties viewer) so a future filename-scheme change only needs
+/// updating here — this used to be duplicated per-caller, and the chat
+/// renderer's copy fell out of sync with the fetchers' `{id}_{name}` rename,
+/// silently breaking rendering for every emote downloaded since (2026-08-02).
+pub(crate) fn resolve_emote_path(base: &Path, entry: &EmoteManifestEntry) -> PathBuf {
+    let new_path = base.join(format!(
+        "{}_{}.{}",
+        entry.id,
+        sanitize_emote_name(&entry.name),
+        entry.ext
+    ));
+    if crate::iomon::fs::exists_sync(Cat::AssetCache, &new_path) {
+        new_path
+    } else {
+        base.join(format!("{}.{}", entry.id, entry.ext))
+    }
+}
+
+/// Every cached channel's Twitch first-party emote directory
+/// (`channel_assets/{name}/twitch/{account}/emotes/twitch/`, plus the legacy
+/// pre-account `channel_assets/{name}/twitch/emotes/twitch/`), across EVERY
+/// channel this app has ever fetched assets for — not just one. Twitch lets
+/// any subscriber use their sub emotes in any channel's chat, so a chat log
+/// routinely references emotes that were never fetched for the channel whose
+/// chat is open, only for whichever OTHER channel(s) the poster is
+/// subscribed to. If that other channel also happens to be archived here,
+/// the emote is already sitting on disk — this is the fallback search list
+/// the chat renderer walks when an emote id isn't in the open channel's own
+/// directory, so it still resolves instead of silently falling back to text.
+pub(crate) fn all_twitch_emote_dirs() -> Vec<PathBuf> {
+    all_twitch_emote_dirs_under(&crate::app_paths::asset_cache_dir().join("channel_assets"))
+}
+
+/// Testable core of [`all_twitch_emote_dirs`] (takes the `channel_assets`
+/// root directly instead of the real app data dir).
+pub(crate) fn all_twitch_emote_dirs_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(channels) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, root) else { return out };
+    for chan in channels.flatten() {
+        let twitch_dir = chan.path().join("twitch");
+        if !crate::iomon::fs::is_dir_sync(Cat::AssetCache, &twitch_dir) {
+            continue;
+        }
+        // Legacy pre-account layout: emotes directly under the platform dir.
+        let legacy_emotes = twitch_dir.join("emotes").join("twitch");
+        if crate::iomon::fs::is_dir_sync(Cat::AssetCache, &legacy_emotes) {
+            out.push(legacy_emotes);
+        }
+        let Ok(accounts) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, &twitch_dir) else { continue };
+        for acc in accounts.flatten() {
+            let emote_dir = acc.path().join("emotes").join("twitch");
+            if crate::iomon::fs::is_dir_sync(Cat::AssetCache, &emote_dir) {
+                out.push(emote_dir);
+            }
+        }
+    }
+    out
+}
+
 // ---------- Asset change history ----------
 
 /// One recorded change to a channel's assets, appended as a JSON line to the
@@ -2573,6 +2636,62 @@ mod tests {
         );
         migrate_assets_root(&root, &urls2);
         assert!(orphan.join("icon.png").is_file(), "stamped run must not touch anything");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_emote_path_prefers_new_scheme_falls_back_to_old() {
+        let dir = unique_test_dir("sa-emote-resolve");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Neither file exists yet: falls back to the (nonexistent) old form —
+        // callers gate on `exists_sync` themselves, this just picks a candidate.
+        let entry = EmoteManifestEntry { name: "Kappa".into(), id: "425618".into(), ext: "png".into(), shared: false };
+        assert_eq!(resolve_emote_path(&dir, &entry), dir.join("425618.png"));
+
+        // Only the OLD file present: still resolves to it.
+        std::fs::write(dir.join("425618.png"), b"x").unwrap();
+        assert_eq!(resolve_emote_path(&dir, &entry), dir.join("425618.png"));
+
+        // Once the NEW-scheme file is also present, it wins even though the
+        // old one still exists too — this is the exact regression that broke
+        // chat rendering for every emote fetched after the filename rename
+        // (the chat renderer's own copy of this logic hadn't been updated).
+        std::fs::write(dir.join("425618_Kappa.png"), b"y").unwrap();
+        assert_eq!(resolve_emote_path(&dir, &entry), dir.join("425618_Kappa.png"));
+
+        // A name needing sanitization resolves consistently with the fetcher's
+        // own `sanitize_emote_name` call.
+        let weird = EmoteManifestEntry { name: "some emote!".into(), id: "999".into(), ext: "webp".into(), shared: false };
+        std::fs::write(dir.join("999_some_emote_.webp"), b"z").unwrap();
+        assert_eq!(resolve_emote_path(&dir, &weird), dir.join("999_some_emote_.webp"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_twitch_emote_dirs_under_walks_account_and_legacy_layouts() {
+        let root = unique_test_dir("sa-twitch-emote-dirs");
+        // Account-layout channel: channel_assets/Nihmune/twitch/nihmune/emotes/twitch/
+        let nihmune = root.join("Nihmune").join("twitch").join("nihmune").join("emotes").join("twitch");
+        std::fs::create_dir_all(&nihmune).unwrap();
+        std::fs::write(nihmune.join("111_nihmunHeart.png"), b"x").unwrap();
+        // Legacy pre-account layout: channel_assets/OldChan/twitch/emotes/twitch/
+        let old_chan = root.join("OldChan").join("twitch").join("emotes").join("twitch");
+        std::fs::create_dir_all(&old_chan).unwrap();
+        // A channel with a twitch dir but no emotes fetched yet — must be
+        // skipped, not produce a dir that doesn't exist.
+        std::fs::create_dir_all(root.join("NoEmotesYet").join("twitch")).unwrap();
+        // A YouTube-only channel — must never contribute (first-party emotes
+        // are a Twitch-only concept).
+        std::fs::create_dir_all(root.join("YtOnly").join("youtube")).unwrap();
+
+        let mut dirs = all_twitch_emote_dirs_under(&root);
+        dirs.sort();
+        let mut want = vec![nihmune, old_chan];
+        want.sort();
+        assert_eq!(dirs, want);
 
         let _ = std::fs::remove_dir_all(&root);
     }

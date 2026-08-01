@@ -3224,6 +3224,10 @@ generic palette).
   **emotes**, plus third-party **BTTV / FFZ / 7TV** emotes (the channel's sets,
   fetched from its Twitch broadcaster id), and the broadcaster's chosen chat
   **name colour** (tints the channel's name in the Streams list and chat replay).
+  First-party emotes are fetched per-channel, but any subscriber can use their
+  sub emotes in ANY channel's chat — so the **chat replay** also falls back to
+  every OTHER archived channel's already-cached emote set before giving up, on
+  the (common) chance the poster's home channel is also monitored here.
 - **YouTube** (needs a **YouTube Data API key**, Settings → Detection): profile
   icon + channel banner via the Data API. Without a key the background refresh
   **skips** YouTube (the manual Refetch button still explains why); when the API

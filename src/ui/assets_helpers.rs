@@ -846,21 +846,15 @@ pub(super) fn emote_provider_counts(
 /// `exists = false` (the viewer lists those under "Deprecated"). Twitch is
 /// directory-listed by opaque id (no codes, so never deprecated). Sorted by code.
 pub(super) fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider) -> Vec<ViewerEmote> {
-    use crate::assets::{EmoteManifestEntry, sanitize_emote_name};
+    use crate::assets::{EmoteManifestEntry, resolve_emote_path};
     let emotes_dir = twitch_emotes_dir(name, account);
     let plat = crate::app_paths::platform_assets_dir();
 
-    // Resolve an emote's on-disk path: try the new `{id}_{name}.{ext}` pattern
-    // first (written by updated fetchers), fall back to old `{id}.{ext}` for
-    // files downloaded before this change.
+    // Resolve an emote's on-disk path — shared with `build_emote_map`'s chat
+    // render-time lookup so both readers can never drift on the filename
+    // scheme a manifest points into.
     let resolve_path = |base: std::path::PathBuf, e: &EmoteManifestEntry| -> std::path::PathBuf {
-        let new_name = format!("{}_{}.{}", e.id, sanitize_emote_name(&e.name), e.ext);
-        let new_path = base.join(&new_name);
-        if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &new_path) {
-            new_path
-        } else {
-            base.join(format!("{}.{}", e.id, e.ext))
-        }
+        resolve_emote_path(&base, e)
     };
 
     // For Twitch: use the manifest when available (written after a refetch under
