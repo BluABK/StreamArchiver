@@ -148,7 +148,8 @@ pub fn send_test_toast(
     let account = crate::assets::account_slug(channel_url, platform);
     let mut lines = Vec::new();
     if !title.is_empty() {
-        lines.push(title.to_string());
+        // Matches the real toasts below: titles show command-plug-trimmed.
+        lines.push(crate::downloader::trim_title_commands(title));
     }
     if !game.is_empty() {
         lines.push(game.to_string());
@@ -536,7 +537,9 @@ fn content_for_url(
     let account = crate::assets::account_slug(&row.monitor.url, platform);
     let mut lines = Vec::new();
     if !row.last_recording_title.is_empty() {
-        lines.push(row.last_recording_title.clone());
+        // Same cleanup as the `{title_trimmed}` filename token: a toast is a
+        // glance surface, and `!gg !tts !discord` plugs are noise there.
+        lines.push(crate::downloader::trim_title_commands(&row.last_recording_title));
     }
     if !row.last_recording_category.is_empty() {
         lines.push(row.last_recording_category.clone());

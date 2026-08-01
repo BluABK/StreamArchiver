@@ -1821,7 +1821,10 @@ independent detectors feeding the same table:
     browser; the Posts feed narrows to it and offers **✕ Show all** to go back.
 
   The same events also raise a **desktop toast** (with a "Watch on Web"/"Watch
-  VOD" action where relevant). On Windows the toasts are attributed to **StreamArchiver**
+  VOD" action where relevant). The stream-title line shows the
+  command-plug-trimmed title (same cleanup as the `{title_trimmed}` filename
+  token — `!gg !discord` plugs and `#ad` tags stripped), both on the toast and
+  in the 🔔 feed row. On Windows the toasts are attributed to **StreamArchiver**
   (own name + icon, registered at startup — no installer needed), and
   clicking a toast's body calls back into the app: it focuses the window (or
   relaunches the app to the tray and raises it if it wasn't running), and
