@@ -1437,7 +1437,10 @@ impl StreamArchiverApp {
             // group each monitor's takes into streams.
             // A channel always shows its instances when expanded; an instance shows
             // its stream history when *it* is expanded — so we only need recordings
-            // for expanded instances inside expanded channels.
+            // for expanded instances inside expanded channels. `expanded_monitors`
+            // itself stays scoped to true expansion (other lazy caches below —
+            // ad-breaks, meta-change logs — are deliberately bounded by what's
+            // actually visible).
             let mut expanded_monitors: Vec<i64> = Vec::new();
             for e in &chan_entries {
                 if !self.expanded_channels.contains(&e.channel.id) {
@@ -1450,7 +1453,25 @@ impl StreamArchiverApp {
                     }
                 }
             }
-            for &mid in &expanded_monitors {
+            // `groups` doubles as the data "Only stored" / the Recording-group
+            // filter scan to decide which channels/instances even qualify to be
+            // shown (`build_vis_rows`'s `qualifying_monitors`) — a collapsed
+            // monitor whose takes were never loaded here would look like it has
+            // nothing stored and get hidden outright, the filter deciding "no
+            // match" from data it never fetched rather than an actual absence of
+            // stored recordings. So while either filter is active, `groups` (and
+            // the `rec_cache` it reads from) covers every monitor, not just the
+            // expanded ones — the cache-rebuild `stamp` gate above still means
+            // this only reruns on an actual change (reload/expansion/F5/settings
+            // save), not every frame.
+            let filter_active =
+                self.streams_only_recorded || self.streams_recording_group_filter.is_some();
+            let monitors_to_group: Vec<i64> = if filter_active {
+                self.rows.iter().map(|r| r.monitor.id).collect()
+            } else {
+                expanded_monitors.clone()
+            };
+            for &mid in &monitors_to_group {
                 if !self.rec_cache.contains_key(&mid) {
                     let recs = self
                         .core
@@ -1460,7 +1481,7 @@ impl StreamArchiverApp {
                     self.rec_cache.insert(mid, recs);
                 }
             }
-            let groups: HashMap<i64, Vec<StreamGroup>> = expanded_monitors
+            let groups: HashMap<i64, Vec<StreamGroup>> = monitors_to_group
                 .iter()
                 .map(|&mid| {
                     let recs = self.rec_cache.get(&mid).map(Vec::as_slice).unwrap_or(&[]);

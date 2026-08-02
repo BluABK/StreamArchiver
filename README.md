@@ -325,7 +325,11 @@ combines with an active recording-group filter rather than overriding it):
 hide any channel/instance/stream with no take that actually has a file on
 disk — detected-but-never-recorded streams (Auto off at the time) and
 failed/missed attempts disappear, and the ones that remain force-expand down
-to their stored takes just like a recording-group filter does.
+to their stored takes just like a recording-group filter does. Either filter
+loads every monitor's recording history to decide this (not just the
+already-expanded ones) — a collapsed channel/instance you'd never manually
+opened still shows correctly if it has stored takes, instead of looking
+empty just because nothing had been fetched for it yet.
 
 #### Saved views: sort, grouping, and filter presets
 
