@@ -3227,7 +3227,15 @@ generic palette).
   First-party emotes are fetched per-channel, but any subscriber can use their
   sub emotes in ANY channel's chat — so the **chat replay** also falls back to
   every OTHER archived channel's already-cached emote set before giving up, on
-  the (common) chance the poster's home channel is also monitored here.
+  the (common) chance the poster's home channel is also monitored here. If it
+  still isn't found anywhere, **Settings → Interface → Display → "Fetch
+  unknown emotes from Twitch"** (on by default) fetches that specific emote
+  straight from Twitch's public CDN by numeric id — no login needed, and no
+  need to add the poster's channel here at all — into a shared cache, so chat
+  renders 1:1 regardless of which channels you actually track. Only the
+  static image (not the animated version) is fetched this way, since there's
+  no way to know ahead of time whether an unknown id is animated without a
+  Helix call this app can't make for a channel it doesn't track.
 - **YouTube** (needs a **YouTube Data API key**, Settings → Detection): profile
   icon + channel banner via the Data API. Without a key the background refresh
   **skips** YouTube (the manual Refetch button still explains why); when the API

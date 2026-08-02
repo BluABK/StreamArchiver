@@ -431,6 +431,15 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        // Fetching unknown-channel emotes from Twitch's CDN defaults on; only
+        // an explicit "0" disables.
+        let fetch_unknown_emotes = core
+            .store
+            .get_setting(K_FETCH_UNKNOWN_EMOTES)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true);
         // Streams grid channel-group clustering defaults on (it always has
         // been); only an explicit "0" flattens it.
         let streams_group_visually = core
@@ -780,6 +789,7 @@ impl StreamArchiverApp {
             shorten_timestamps,
             render_emotes,
             animate_emotes,
+            fetch_unknown_emotes,
             reset_streams_columns: false,
             streams_grid,
             videos_grid,

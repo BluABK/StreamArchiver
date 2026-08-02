@@ -1408,7 +1408,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_display_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Interface, "Display", &["display", "actions", "emotes", "animate", "columns", "theme", "icon", "app icon", "tray", "branding"]) {
+            if self.section_shown(SettingsTab::Interface, "Display", &["display", "actions", "emotes", "animate", "columns", "theme", "icon", "app icon", "tray", "branding", "unknown emotes", "cdn", "cross-channel"]) {
             ui.add_space(12.0);
             ui.heading("Display");
             if ui
@@ -1430,14 +1430,36 @@ impl StreamArchiverApp {
                 .on_hover_text(
                     "Show Twitch / BTTV / FFZ / 7TV emotes (and color emoji) as inline \
                      images in the chat replay. Off shows the emote code as plain text. \
-                     Requires \"Fetch chat assets\" so the images are on disk. Applies \
-                     immediately.",
+                     Local/cross-channel-cached images need each channel's own \"Fetch chat \
+                     assets\"; \"Fetch unknown emotes from Twitch\" below fetches anything \
+                     still missing directly from Twitch's CDN. Applies immediately.",
                 )
                 .changed()
             {
                 let _ = self.core.store.set_setting(
                     K_RENDER_EMOTES,
                     if self.render_emotes { "1" } else { "0" },
+                );
+            }
+            if ui
+                .add_enabled(
+                    self.render_emotes,
+                    egui::Checkbox::new(&mut self.fetch_unknown_emotes, "Fetch unknown emotes from Twitch"),
+                )
+                .on_hover_text(
+                    "A chat message can use ANY Twitch subscriber emote, not just the ones \
+                     belonging to a channel this app monitors — Twitch lets any subscriber \
+                     use their sub emotes in any chat. When an emote id isn't cached under \
+                     any monitored channel, fetch it directly from Twitch's public CDN by id \
+                     (no login needed) into a shared cache, so it still renders 1:1 instead of \
+                     showing as plain text. Off = only locally-cached emotes render. Applies \
+                     immediately.",
+                )
+                .changed()
+            {
+                let _ = self.core.store.set_setting(
+                    K_FETCH_UNKNOWN_EMOTES,
+                    if self.fetch_unknown_emotes { "1" } else { "0" },
                 );
             }
             if ui

@@ -830,7 +830,13 @@ pub(crate) fn resolve_emote_path(base: &Path, entry: &EmoteManifestEntry) -> Pat
 /// the chat renderer walks when an emote id isn't in the open channel's own
 /// directory, so it still resolves instead of silently falling back to text.
 pub(crate) fn all_twitch_emote_dirs() -> Vec<PathBuf> {
-    all_twitch_emote_dirs_under(&crate::app_paths::asset_cache_dir().join("channel_assets"))
+    let mut dirs =
+        all_twitch_emote_dirs_under(&crate::app_paths::asset_cache_dir().join("channel_assets"));
+    // Also fall back to emotes fetched on demand for a channel that isn't
+    // monitored/archived here at all (see `twitch_emote_cdn_fetch`) — same
+    // fallback mechanism, one more directory, no lookup-code changes needed.
+    dirs.push(global_twitch_emote_dir());
+    dirs
 }
 
 /// Testable core of [`all_twitch_emote_dirs`] (takes the `channel_assets`
@@ -887,6 +893,38 @@ pub(crate) fn index_emote_stems(dirs: &[PathBuf]) -> std::collections::HashMap<S
         }
     }
     map
+}
+
+/// Shared cache for first-party Twitch emotes fetched on demand for a
+/// channel this app doesn't monitor/archive at all — see
+/// `twitch_emote_cdn_fetch`. Platform-wide (not per-channel), same shape as
+/// the 7TV/FFZ global emote caches.
+pub(crate) fn global_twitch_emote_dir() -> PathBuf {
+    crate::app_paths::platform_assets_dir().join("twitch").join("global_emotes")
+}
+
+/// `(dest, url)` for fetching a first-party Twitch emote directly by numeric
+/// id, with no broadcaster/channel context at all — Twitch's emote CDN
+/// serves images keyed purely by id. This is how an emote whose home channel
+/// isn't monitored here (e.g. a poster's own sub emote, used in some OTHER
+/// channel's chat — Twitch lets any subscriber use their emotes anywhere) can
+/// still render 1:1 without adding that channel.
+///
+/// Always the `static/dark/3.0` CDN variant: without a Helix "Get Channel
+/// Emotes" call (which needs a broadcaster id we don't have for an unknown
+/// channel) there's no way to know ahead of time whether an id is animated
+/// or static, and `EmojiFetch` writes one fixed destination per queued fetch
+/// — guessing wrong would write mismatched bytes under the wrong extension.
+/// A purely-animated-only unknown emote 404s on this URL and stays text;
+/// that's a smaller regression than today's "never renders cross-channel at
+/// all". `dest` is deterministic in `(id, name)` so repeat occurrences of the
+/// same code in one log collapse to a single fetch (see
+/// `parse_chat_chunk`'s `fetches.dedup()`), and every occurrence's
+/// independently-set `pending` promotes together once that one file lands.
+pub(crate) fn twitch_emote_cdn_fetch(id: &str, name: &str) -> (PathBuf, String) {
+    let dest = global_twitch_emote_dir().join(format!("{id}_{}.png", sanitize_emote_name(name)));
+    let url = format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/3.0");
+    (dest, url)
 }
 
 // ---------- Asset change history ----------
@@ -2756,5 +2794,29 @@ mod tests {
         assert!(empty.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_twitch_emote_dir_lives_under_platform_assets_twitch() {
+        let dir = global_twitch_emote_dir();
+        assert!(dir.ends_with(std::path::Path::new("twitch").join("global_emotes")), "{dir:?}");
+        assert!(dir.starts_with(crate::app_paths::platform_assets_dir()), "{dir:?}");
+    }
+
+    #[test]
+    fn twitch_emote_cdn_fetch_is_deterministic_and_sanitizes_the_name() {
+        let (dest1, url1) = twitch_emote_cdn_fetch("425618", "thonkListen");
+        let (dest2, url2) = twitch_emote_cdn_fetch("425618", "thonkListen");
+        // Same input twice -> identical dest/url, so repeat chat occurrences
+        // of the same emote collapse to one fetch via `fetches.dedup()`.
+        assert_eq!(dest1, dest2);
+        assert_eq!(url1, url2);
+        assert_eq!(dest1, global_twitch_emote_dir().join("425618_thonkListen.png"));
+        assert_eq!(url1, "https://static-cdn.jtvnw.net/emoticons/v2/425618/static/dark/3.0");
+
+        // A name needing sanitization matches `sanitize_emote_name` exactly,
+        // consistent with every other reader/writer of this filename scheme.
+        let (dest3, _) = twitch_emote_cdn_fetch("999", "some emote!");
+        assert_eq!(dest3, global_twitch_emote_dir().join("999_some_emote_.png"));
     }
 }

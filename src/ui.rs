@@ -113,6 +113,14 @@ const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
 /// Whether animated emotes play (off ⇒ a static first frame). Default on; only an
 /// explicit `"0"` disables. Off is the perf/RAM escape hatch for heavy channels.
 const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
+/// Whether a first-party Twitch emote id missing from every locally-cached
+/// channel (this app's own monitored channels) gets fetched straight from
+/// Twitch's public CDN by id, for a poster whose home channel isn't
+/// monitored/archived here at all. Default on; only an explicit `"0"`
+/// disables. Separate from [`K_RENDER_EMOTES`] on purpose: the latter covers
+/// purely-local rendering, this one gates a NEW network fetch for channels
+/// the user hasn't added. See `assets::twitch_emote_cdn_fetch`.
+const K_FETCH_UNKNOWN_EMOTES: &str = "fetch_unknown_twitch_emotes";
 /// Path to the media player binary used by "Play local recording (start)" on
 /// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
 /// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`
@@ -1975,6 +1983,11 @@ pub struct StreamArchiverApp {
     /// Play animated emotes (off ⇒ static first frame). Default on. Persisted under
     /// [`K_ANIMATE_EMOTES`].
     animate_emotes: bool,
+    /// Fetch a first-party Twitch emote id that's missing from every
+    /// locally-cached channel straight from Twitch's CDN by id, for a poster
+    /// whose home channel isn't monitored here. Default on. Persisted under
+    /// [`K_FETCH_UNKNOWN_EMOTES`]; separate from `render_emotes` (see its doc).
+    fetch_unknown_emotes: bool,
     /// Set to true by the "⇔ Fit columns" button; consumed in `channels_view`
     /// to call `TableBuilder::reset()` so columns revert to content-fit widths.
     reset_streams_columns: bool,

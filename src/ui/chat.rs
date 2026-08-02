@@ -207,6 +207,15 @@ pub(super) struct ChatPopup {
     /// chat log take over a minute to load. Built ONCE on popup-open; empty
     /// for YouTube. `Arc` for the same reason as `emote_map`.
     pub(super) twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
+    /// Snapshot of the "Fetch unknown emotes from Twitch" setting at
+    /// popup-open — when true, a first-party id missing from BOTH
+    /// `twitch_emote_dir` and `twitch_fallback_index` gets fetched straight
+    /// from Twitch's CDN by id (see `assets::twitch_emote_cdn_fetch`),
+    /// independent of channel monitoring. A separate toggle from
+    /// `render_emotes` by design — the latter covers purely-local rendering,
+    /// this one gates a NEW network fetch for channels not otherwise
+    /// archived here.
+    pub(super) fetch_unknown_emotes: bool,
     /// True while a background emoji-download pass is running, so the 3s tail-reload
     /// doesn't pile up overlapping download passes for the same chat.
     pub(super) loading: Arc<AtomicBool>,
@@ -333,6 +342,8 @@ pub(super) fn build_twitch_segments(
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
     twitch_fallback_index: &HashMap<String, std::path::PathBuf>,
+    fetch_unknown_emotes: bool,
+    fetches: &mut Vec<EmojiFetch>,
 ) -> Vec<ChatSegment> {
     let spans = parse_first_party_spans(text, emotes_tag);
     if spans.is_empty() {
@@ -360,7 +371,30 @@ pub(super) fn build_twitch_segments(
         let file = twitch_dir
             .and_then(|d| find_emote_file(d, &id, &name))
             .or_else(|| find_emote_fallback(twitch_fallback_index, &id, &name));
-        out.push(ChatSegment::Emote { name, file, fallback_text: None, pending: None });
+        // Still nothing local — the poster's home channel may not be
+        // monitored/archived here at all. When enabled, queue an on-demand
+        // fetch straight from Twitch's CDN by id (see `twitch_emote_cdn_fetch`)
+        // and mark it pending; `upgrade_pending_emotes` promotes it to `file`
+        // once the background download lands, same as a Unicode emoji glyph.
+        let (file, pending) = if file.is_some() {
+            (file, None)
+        } else if fetch_unknown_emotes {
+            let (dest, url) = crate::assets::twitch_emote_cdn_fetch(&id, &name);
+            if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &dest) {
+                (Some(dest), None)
+            } else if !crate::iomon::fs::exists_sync(
+                crate::iomon::Cat::AssetCache,
+                dest.with_extension("404"),
+            ) {
+                fetches.push(EmojiFetch { dest: dest.clone(), urls: vec![url] });
+                (None, Some(dest))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        out.push(ChatSegment::Emote { name, file, fallback_text: None, pending });
         cursor = b1;
     }
     if cursor < text.len() {
@@ -1304,6 +1338,7 @@ pub(super) const CHAT_TAIL_BYTES: u64 = 512 * 1024;
 /// pass via `parsed_to`, so incremental tail reads never split a message. Both
 /// formats (Twitch `.chat.jsonl`, YouTube `.live_chat.json`) are line-delimited
 /// JSON, so byte-offset resumption is exact.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn parse_chat_chunk(
     path: &Path,
     from: u64,
@@ -1312,6 +1347,7 @@ pub(super) fn parse_chat_chunk(
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
     twitch_fallback_index: &HashMap<String, std::path::PathBuf>,
+    fetch_unknown_emotes: bool,
 ) -> anyhow::Result<ChatChunk> {
     use std::io::{Read, Seek, SeekFrom};
     // Read window: bounds peak memory on huge logs — the previous whole-range
@@ -1391,6 +1427,7 @@ pub(super) fn parse_chat_chunk(
                     emote_map,
                     twitch_dir,
                     twitch_fallback_index,
+                    fetch_unknown_emotes,
                     &mut fetches,
                 ) {
                     messages.push(m);
@@ -1435,6 +1472,7 @@ pub(super) fn chat_tail_start(path: &Path) -> anyhow::Result<u64> {
 
 /// Parse a chunk of a chat file off the UI thread, mapping both join and parse
 /// errors to a string for [`ChatLoadState::Error`].
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn parse_chunk_blocking(
     path: std::path::PathBuf,
     from: u64,
@@ -1443,6 +1481,7 @@ pub(super) async fn parse_chunk_blocking(
     emote_map: Arc<HashMap<String, std::path::PathBuf>>,
     twitch_dir: Option<std::path::PathBuf>,
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
+    fetch_unknown_emotes: bool,
 ) -> Result<ChatChunk, String> {
     tokio::task::spawn_blocking(move || {
         parse_chat_chunk(
@@ -1453,6 +1492,7 @@ pub(super) async fn parse_chunk_blocking(
             &emote_map,
             twitch_dir.as_deref(),
             &twitch_fallback_index,
+            fetch_unknown_emotes,
         )
     })
     .await
@@ -1565,6 +1605,7 @@ pub(super) async fn load_chat(
     emote_map: Arc<HashMap<String, std::path::PathBuf>>,
     twitch_dir: Option<std::path::PathBuf>,
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
+    fetch_unknown_emotes: bool,
     fetch_emoji: bool,
     ctx: egui::Context,
 ) {
@@ -1599,6 +1640,7 @@ pub(super) async fn load_chat(
         emote_map.clone(),
         twitch_dir.clone(),
         twitch_fallback_index.clone(),
+        fetch_unknown_emotes,
     )
     .await
     {
@@ -1632,6 +1674,7 @@ pub(super) async fn load_chat(
             emote_map.clone(),
             twitch_dir.clone(),
             twitch_fallback_index.clone(),
+            fetch_unknown_emotes,
         )
         .await
         {
@@ -1687,6 +1730,7 @@ pub(super) async fn tail_chat(
     emote_map: Arc<HashMap<String, std::path::PathBuf>>,
     twitch_dir: Option<std::path::PathBuf>,
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
+    fetch_unknown_emotes: bool,
     fetch_emoji: bool,
     ctx: egui::Context,
 ) {
@@ -1710,6 +1754,7 @@ pub(super) async fn tail_chat(
             emote_map,
             twitch_dir,
             twitch_fallback_index,
+            fetch_unknown_emotes,
             fetch_emoji,
             ctx,
         )
@@ -1724,6 +1769,7 @@ pub(super) async fn tail_chat(
         emote_map,
         twitch_dir,
         twitch_fallback_index,
+        fetch_unknown_emotes,
     )
     .await
     else {
@@ -1960,12 +2006,14 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
 
 /// Parse one line of a Twitch `.chat.jsonl` file. `start_ms` is the stream
 /// start in unix milliseconds (timestamps become offsets from it).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn parse_twitch_chat_line(
     line: &str,
     start_ms: f64,
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
     twitch_fallback_index: &HashMap<String, std::path::PathBuf>,
+    fetch_unknown_emotes: bool,
     fetches: &mut Vec<EmojiFetch>,
 ) -> Option<ChatMessage> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -1988,8 +2036,15 @@ pub(super) fn parse_twitch_chat_line(
     // `emotes` tag is absent on pre-feature logs → empty → first-party emotes
     // simply don't render (third-party word-matching still applies).
     let emotes_tag = v["emotes"].as_str().unwrap_or("");
-    let segments =
-        build_twitch_segments(&text, emotes_tag, emote_map, twitch_dir, twitch_fallback_index);
+    let segments = build_twitch_segments(
+        &text,
+        emotes_tag,
+        emote_map,
+        twitch_dir,
+        twitch_fallback_index,
+        fetch_unknown_emotes,
+        fetches,
+    );
     // Split literal unicode emoji out of the text segments into colour images.
     let segments = expand_emoji(segments, fetches);
     Some(ChatMessage {
@@ -2060,6 +2115,7 @@ impl StreamArchiverApp {
                 emote_map.clone(),
                 twitch_emote_dir.clone(),
                 twitch_fallback_index.clone(),
+                self.fetch_unknown_emotes,
                 self.render_emotes,
                 ctx.clone(),
             ));
@@ -2078,6 +2134,7 @@ impl StreamArchiverApp {
             emote_map,
             twitch_emote_dir,
             twitch_fallback_index,
+            fetch_unknown_emotes: self.fetch_unknown_emotes,
             loading,
             error_retries: 0,
             filter_cache: None,
@@ -2147,6 +2204,7 @@ impl StreamArchiverApp {
             Arc<HashMap<String, std::path::PathBuf>>,
             Option<std::path::PathBuf>,
             Arc<HashMap<String, std::path::PathBuf>>,
+            bool,
             Arc<AtomicBool>,
         );
         let reload_info: Option<ReloadInfo> =
@@ -2164,6 +2222,7 @@ impl StreamArchiverApp {
                             popup.emote_map.clone(),
                             popup.twitch_emote_dir.clone(),
                             popup.twitch_fallback_index.clone(),
+                            popup.fetch_unknown_emotes,
                             popup.loading.clone(),
                         )
                     })
@@ -2229,6 +2288,7 @@ impl StreamArchiverApp {
                                             let emap = popup.emote_map.clone();
                                             let tdir = popup.twitch_emote_dir.clone();
                                             let tfallback = popup.twitch_fallback_index.clone();
+                                            let funknown = popup.fetch_unknown_emotes;
                                             popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
@@ -2244,6 +2304,7 @@ impl StreamArchiverApp {
                                                 emap,
                                                 tdir,
                                                 tfallback,
+                                                funknown,
                                                 render_emotes,
                                                 ctx.clone(),
                                             ));
@@ -2435,7 +2496,7 @@ impl StreamArchiverApp {
         // Tail-reload: while the recording is live, parse only the bytes
         // appended since the last pass and push them onto the shown log —
         // the whole file is never re-read.
-        if let Some((path, start_ts, state, emap, tdir, tfallback, loading)) = reload_info {
+        if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading)) = reload_info {
             self.chat_popups[idx].last_reload = std::time::Instant::now();
             if errored {
                 self.chat_popups[idx].error_retries =
@@ -2449,6 +2510,7 @@ impl StreamArchiverApp {
                 emap,
                 tdir,
                 tfallback,
+                funknown,
                 render_emotes,
                 ctx.clone(),
             ));
@@ -2592,8 +2654,10 @@ mod tests {
         // exactly as before, just without deletion matching.
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi"}"#;
         let mut fetches = Vec::new();
-        let m = parse_twitch_chat_line(line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), &mut fetches)
-            .expect("old line parses");
+        let m = parse_twitch_chat_line(
+            line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
+        )
+        .expect("old line parses");
         assert_eq!(m.msg_id, "");
         assert_eq!(m.login, "bob");
         assert!(!m.system && m.deleted.is_none());
@@ -2717,7 +2781,9 @@ mod tests {
         // must land on "Kappa", not on the control-char-prefixed wrapper.
         let stripped = strip_ctcp_action("\u{1}ACTION Kappa\u{1}");
         let map = HashMap::new();
-        let segs = build_twitch_segments(stripped, "25:0-4", &map, None, &HashMap::new());
+        let mut fetches = Vec::new();
+        let segs =
+            build_twitch_segments(stripped, "25:0-4", &map, None, &HashMap::new(), false, &mut fetches);
         assert!(matches!(&segs[0], ChatSegment::Emote { name, .. } if name == "Kappa"));
     }
 
@@ -2765,7 +2831,10 @@ mod tests {
 
         let map = HashMap::new();
         let fallback_index = crate::assets::index_emote_stems(&[other_a.clone(), other_b.clone()]);
-        let segs = build_twitch_segments("nihmunHeart", "555:0-10", &map, Some(&primary), &fallback_index);
+        let mut fetches = Vec::new();
+        let segs = build_twitch_segments(
+            "nihmunHeart", "555:0-10", &map, Some(&primary), &fallback_index, false, &mut fetches,
+        );
         let ChatSegment::Emote { name, file, .. } = &segs[0] else {
             panic!("expected an Emote segment");
         };
@@ -2773,12 +2842,57 @@ mod tests {
         assert_eq!(file.as_deref(), Some(other_a.join("555_nihmunHeart.png").as_path()));
 
         // An id present under NEITHER the primary nor any fallback dir still
-        // renders as text (file: None) instead of panicking or matching wrong.
-        let segs_missing =
-            build_twitch_segments("totallyUnknown", "999:0-13", &map, Some(&primary), &fallback_index);
-        assert!(matches!(&segs_missing[0], ChatSegment::Emote { file: None, .. }));
+        // renders as text (file: None) instead of panicking or matching wrong
+        // — `fetch_unknown_emotes: false` here, so nothing gets enqueued either.
+        let segs_missing = build_twitch_segments(
+            "totallyUnknown", "999:0-13", &map, Some(&primary), &fallback_index, false, &mut fetches,
+        );
+        assert!(matches!(&segs_missing[0], ChatSegment::Emote { file: None, pending: None, .. }));
+        assert!(fetches.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression guard: an id missing from BOTH the primary dir and the
+    /// fallback index — the poster's home channel isn't monitored/archived
+    /// here at all — queues a CDN fetch by id (see
+    /// `assets::twitch_emote_cdn_fetch`) instead of giving up permanently,
+    /// when "Fetch unknown emotes from Twitch" is on.
+    #[test]
+    fn build_twitch_segments_queues_a_cdn_fetch_for_a_totally_unknown_id_when_enabled() {
+        let map = HashMap::new();
+        let mut fetches = Vec::new();
+        let segs = build_twitch_segments(
+            "brandNewEmoteCode", "8675309:0-16", &map, None, &HashMap::new(), true, &mut fetches,
+        );
+        let ChatSegment::Emote { name, file, pending, .. } = &segs[0] else {
+            panic!("expected an Emote segment");
+        };
+        assert_eq!(name, "brandNewEmoteCode");
+        assert!(file.is_none(), "not on disk yet");
+        let (expected_dest, expected_url) =
+            crate::assets::twitch_emote_cdn_fetch("8675309", "brandNewEmoteCode");
+        assert_eq!(pending.as_deref(), Some(expected_dest.as_path()));
+        assert_eq!(fetches.len(), 1);
+        assert_eq!(fetches[0].dest, expected_dest);
+        assert_eq!(fetches[0].urls, vec![expected_url]);
+    }
+
+    /// The same total miss, with the toggle off: no fetch queued, no `pending`
+    /// — today's plain-text-forever behavior is preserved when the user
+    /// hasn't opted into fetching from channels not otherwise archived here.
+    #[test]
+    fn build_twitch_segments_skips_cdn_fetch_when_toggle_is_off() {
+        let map = HashMap::new();
+        let mut fetches = Vec::new();
+        let segs = build_twitch_segments(
+            "brandNewEmoteCode", "8675309:0-16", &map, None, &HashMap::new(), false, &mut fetches,
+        );
+        let ChatSegment::Emote { file, pending, .. } = &segs[0] else {
+            panic!("expected an Emote segment");
+        };
+        assert!(file.is_none() && pending.is_none());
+        assert!(fetches.is_empty());
     }
 
     // ----- username colour readability -----
@@ -2851,7 +2965,10 @@ mod tests {
         let pog = PathBuf::from("/x/poggers.webp");
         map.insert("POGGERS".to_string(), pog.clone());
         // "Kappa POGGERS": Kappa at cp 0-4; POGGERS is the gap word.
-        let segs = build_twitch_segments("Kappa POGGERS", "25:0-4", &map, None, &HashMap::new());
+        let mut fetches = Vec::new();
+        let segs = build_twitch_segments(
+            "Kappa POGGERS", "25:0-4", &map, None, &HashMap::new(), false, &mut fetches,
+        );
         // Expect: Emote(Kappa, None) then Text(" ") then Emote(POGGERS, Some).
         assert!(matches!(&segs[0], ChatSegment::Emote { name, file, .. } if name == "Kappa" && file.is_none()));
         assert!(segs.iter().any(|s| matches!(s, ChatSegment::Emote { name, file, .. } if name == "POGGERS" && file.as_ref() == Some(&pog))));
