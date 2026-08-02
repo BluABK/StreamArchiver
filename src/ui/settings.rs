@@ -3998,7 +3998,13 @@ impl StreamArchiverApp {
                              (YouTube chat has no first-party emote CDN to backfill from). \
                              Clicking this always fetches, regardless of the \"Fetch unknown \
                              emotes from Twitch\" display setting — that one only gates the \
-                             passive per-chat-popup fetch; this button is its own explicit ask.",
+                             passive per-chat-popup fetch; this button is its own explicit ask. \
+                             A big archive can turn up hundreds of distinct missing ids in one \
+                             run, so downloads are paced (150ms apart) and every miss across \
+                             every log is deduplicated before any request goes out — one \
+                             spammed emote across thousands of messages still costs exactly one \
+                             fetch. Can take a while for months of logs; watch progress in the \
+                             Background view.",
                         )
                         .clicked()
                     {

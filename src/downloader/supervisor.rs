@@ -1016,8 +1016,17 @@ progress_info: None,
                 progress: Some(0.95),
                 info: format!("fetching {queued} emote(s)…"),
             });
+            // Paced (unlike the interactive per-popup path — nobody's waiting
+            // on this one, and a sweep across months of logs can turn up
+            // hundreds of distinct ids): 150ms after each successful
+            // download, matching every other bulk emote fetcher in
+            // `assets.rs` (BTTV/FFZ/7TV/Twitch channel emotes).
             for batch in all_fetches.chunks(250) {
-                crate::ui::chat::download_emoji_images(batch).await;
+                crate::ui::chat::download_emoji_images(
+                    batch,
+                    Some(std::time::Duration::from_millis(150)),
+                )
+                .await;
             }
             let fetched = all_fetches
                 .iter()

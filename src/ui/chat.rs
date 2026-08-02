@@ -1555,7 +1555,17 @@ pub(super) async fn upgrade_pending_emotes(state: &Arc<Mutex<ChatLoadState>>) {
 /// Download missing emoji/emoji-emote images (sequential, best-effort; 404s for a
 /// liberally-detected non-emoji just leave the glyph). Capped so a pathological
 /// message can't trigger thousands of requests.
-pub(crate) async fn download_emoji_images(fetches: &[EmojiFetch]) {
+///
+/// `pace`: delay after each successful download, `None` for the interactive
+/// per-popup path (`load_chat`/`tail_chat` — a user is waiting, and a normal
+/// chat log only ever queues a handful of emoji). The "Fetch missing chat
+/// emotes" maintenance sweep (`downloader::supervisor::cmd_fetch_missing_chat_emotes`)
+/// passes `Some(150ms)` — matching every other bulk emote fetcher in
+/// `assets.rs` (BTTV/FFZ/7TV/Twitch channel emotes all pace themselves the
+/// same way) — since a sweep across months of chat logs can turn up
+/// hundreds of distinct missing ids in one run, all hitting Twitch's CDN
+/// back to back with no delay otherwise.
+pub(crate) async fn download_emoji_images(fetches: &[EmojiFetch], pace: Option<std::time::Duration>) {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1586,6 +1596,9 @@ pub(crate) async fn download_emoji_images(fetches: &[EmojiFetch]) {
                 // Any other HTTP status or a transport error is transient-ish.
                 Ok(_) | Err(_) => network_error = true,
             }
+        }
+        if got && let Some(d) = pace {
+            tokio::time::sleep(d).await;
         }
         // Negative-cache ONLY a definitive miss (every candidate 404'd, no network
         // error), so a transient offline failure can't permanently block a real
@@ -1720,7 +1733,7 @@ pub(super) async fn load_chat(
     fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
     fetches.dedup();
     if fetch_emoji && !fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
-        download_emoji_images(&fetches).await;
+        download_emoji_images(&fetches, None).await;
         loading.store(false, Ordering::SeqCst);
         upgrade_pending_emotes(&state).await;
         ctx.request_repaint();
@@ -1807,7 +1820,7 @@ pub(super) async fn tail_chat(
         ctx.request_repaint();
     }
     if fetch_emoji && !chunk.fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
-        download_emoji_images(&chunk.fetches).await;
+        download_emoji_images(&chunk.fetches, None).await;
         loading.store(false, Ordering::SeqCst);
         upgrade_pending_emotes(&state).await;
         ctx.request_repaint();

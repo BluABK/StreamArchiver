@@ -3241,7 +3241,12 @@ generic palette).
   pass: a one-shot sweep over every archived Twitch chat log (Twitch only;
   skips still-recording takes) that backfills the same way, so logs recorded
   before this existed — or simply never reopened — render correctly too,
-  without waiting for each one to be viewed.
+  without waiting for each one to be viewed. Every miss across every log is
+  deduplicated before any request goes out (one spammed emote across
+  thousands of messages still costs exactly one fetch), and downloads are
+  paced 150ms apart — same as every other bulk emote fetch in this app —
+  since a large archive can turn up hundreds of distinct missing ids in one
+  run.
 - **YouTube** (needs a **YouTube Data API key**, Settings → Detection): profile
   icon + channel banner via the Data API. Without a key the background refresh
   **skips** YouTube (the manual Refetch button still explains why); when the API
