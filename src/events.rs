@@ -76,6 +76,13 @@ pub enum BackgroundTaskKind {
     /// user's own channels) raid target — the only UI surface it gets, since
     /// it has no `Channel`/`Monitor`/`Recording` row (see `raid_follow.rs`).
     RaidFollow,
+    /// One-shot sweep scanning every archived Twitch chat log for first-party
+    /// emote ids not cached anywhere, fetching each straight from Twitch's
+    /// CDN by id (see `assets::twitch_emote_cdn_fetch`) — the retroactive
+    /// counterpart to the on-demand per-popup fetch, for logs recorded before
+    /// that feature existed or never opened since (see
+    /// `ManualCommand::FetchMissingChatEmotes`).
+    FetchMissingChatEmotes,
 }
 
 impl BackgroundTaskKind {
@@ -103,6 +110,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::Chapters(_) => "Chapters",
             BackgroundTaskKind::ReembedChaptersAll => "Re-embed chapters (all)",
             BackgroundTaskKind::RaidFollow => "Follow raid",
+            BackgroundTaskKind::FetchMissingChatEmotes => "Fetch missing chat emotes",
         }
     }
 
@@ -134,7 +142,8 @@ impl BackgroundTaskKind {
             | BackgroundTaskKind::RecoverVodScan
             | BackgroundTaskKind::RefreshCdnHosts
             | BackgroundTaskKind::ReembedChaptersAll
-            | BackgroundTaskKind::RaidFollow => None,
+            | BackgroundTaskKind::RaidFollow
+            | BackgroundTaskKind::FetchMissingChatEmotes => None,
         }
     }
 }
@@ -594,4 +603,12 @@ pub enum ManualCommand {
     /// Downloads → Chapters → "Re-embed chapters"), regardless of each
     /// take's current `chapters_state` — mirrors `ReRemuxAll`.
     ReembedChaptersAll,
+    /// One-shot sweep: scan every archived Twitch chat log (`.chat.jsonl`)
+    /// for first-party emote ids that resolve nowhere — not the log's own
+    /// channel, not any other monitored channel, not the global on-demand
+    /// cache — and fetch each straight from Twitch's CDN by id, same as the
+    /// per-popup on-demand fetch (`ui::chat::build_twitch_segments`) would
+    /// eventually do, but for every log at once instead of waiting for each
+    /// to be opened. Settings → Maintenance → "Fetch missing chat emotes".
+    FetchMissingChatEmotes,
 }

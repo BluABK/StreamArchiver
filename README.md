@@ -3235,7 +3235,13 @@ generic palette).
   renders 1:1 regardless of which channels you actually track. Only the
   static image (not the animated version) is fetched this way, since there's
   no way to know ahead of time whether an unknown id is animated without a
-  Helix call this app can't make for a channel it doesn't track.
+  Helix call this app can't make for a channel it doesn't track. This fetch
+  is normally on-demand — it only runs for a log you actually open — so
+  **Settings → Maintenance → "Fetch missing chat emotes"** is the catch-up
+  pass: a one-shot sweep over every archived Twitch chat log (Twitch only;
+  skips still-recording takes) that backfills the same way, so logs recorded
+  before this existed — or simply never reopened — render correctly too,
+  without waiting for each one to be viewed.
 - **YouTube** (needs a **YouTube Data API key**, Settings → Detection): profile
   icon + channel banner via the Data API. Without a key the background refresh
   **skips** YouTube (the manual Refetch button still explains why); when the API

@@ -1242,19 +1242,26 @@ pub(super) fn find_emote_fallback(
 /// An emoji image not yet on disk that the renderer would otherwise show as a
 /// glyph. Collected during parse; the popup tries each `url` in order (Twemoji's
 /// FE0F naming is irregular) and writes the first that succeeds to `dest`.
+/// `pub(crate)`: also built/consumed by the "Fetch missing chat emotes"
+/// maintenance sweep (`downloader::supervisor::cmd_fetch_missing_chat_emotes`),
+/// which reuses this same struct + `download_emoji_images` rather than a
+/// parallel download mechanism.
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct EmojiFetch {
-    pub(super) dest: std::path::PathBuf,
-    pub(super) urls: Vec<String>,
+pub(crate) struct EmojiFetch {
+    pub(crate) dest: std::path::PathBuf,
+    pub(crate) urls: Vec<String>,
 }
 
 /// One parsed slice of a chat file: the messages, the emoji images to fetch,
 /// and the byte offset just past the last complete line — the resume point for
-/// the next incremental pass.
-pub(super) struct ChatChunk {
+/// the next incremental pass. `pub(crate)` for the same reason as `EmojiFetch`.
+pub(crate) struct ChatChunk {
+    // `ChatMessage`/`MarkerAt` stay UI-internal (`pub(super)`) — the
+    // maintenance sweep this struct is also shared with only ever reads
+    // `fetches`/`parsed_to`, never these.
     pub(super) messages: Vec<ChatMessage>,
-    pub(super) fetches: Vec<EmojiFetch>,
-    pub(super) parsed_to: u64,
+    pub(crate) fetches: Vec<EmojiFetch>,
+    pub(crate) parsed_to: u64,
     /// Moderation markers found in this byte range (Twitch sidecars only).
     pub(super) markers: Vec<MarkerAt>,
 }
@@ -1471,9 +1478,11 @@ pub(super) fn chat_tail_start(path: &Path) -> anyhow::Result<u64> {
 }
 
 /// Parse a chunk of a chat file off the UI thread, mapping both join and parse
-/// errors to a string for [`ChatLoadState::Error`].
+/// errors to a string for [`ChatLoadState::Error`]. `pub(crate)`: also used
+/// by `downloader::supervisor::cmd_fetch_missing_chat_emotes` to parse a
+/// whole log (`from: 0, to: None`) during the maintenance sweep.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn parse_chunk_blocking(
+pub(crate) async fn parse_chunk_blocking(
     path: std::path::PathBuf,
     from: u64,
     to: Option<u64>,
@@ -1546,7 +1555,7 @@ pub(super) async fn upgrade_pending_emotes(state: &Arc<Mutex<ChatLoadState>>) {
 /// Download missing emoji/emoji-emote images (sequential, best-effort; 404s for a
 /// liberally-detected non-emoji just leave the glyph). Capped so a pathological
 /// message can't trigger thousands of requests.
-pub(super) async fn download_emoji_images(fetches: &[EmojiFetch]) {
+pub(crate) async fn download_emoji_images(fetches: &[EmojiFetch]) {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()

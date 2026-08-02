@@ -242,6 +242,7 @@ impl Supervisor {
             }
             ManualCommand::RetriggerChapters(rec_id) => self.cmd_retrigger_chapters(rec_id),
             ManualCommand::ReembedChaptersAll => self.cmd_reembed_chapters_all(),
+            ManualCommand::FetchMissingChatEmotes => self.cmd_fetch_missing_chat_emotes(),
         }
     }
 
@@ -914,6 +915,123 @@ progress_info: None,
                         "{moved} moved, {skipped} skipped, {failed} FAILED — see log"
                     ))
                 },
+            });
+        });
+    }
+
+    /// [`ManualCommand::FetchMissingChatEmotes`]: one-shot sweep over every
+    /// archived Twitch chat log (`.chat.jsonl`), fetching any first-party
+    /// emote id that resolves nowhere — not the log's own channel, not any
+    /// other monitored channel, not the global on-demand cache — straight
+    /// from Twitch's CDN by id (`assets::twitch_emote_cdn_fetch`). The
+    /// retroactive counterpart to `ui::chat::build_twitch_segments`'s
+    /// per-popup on-demand fetch, for logs recorded before that existed or
+    /// never opened since. Skips YouTube sidecars (`.live_chat.json` — no
+    /// Twitch CDN concept to backfill) and takes still being written (never
+    /// read a file a live logger may still hold open).
+    ///
+    /// One global stem index (every archived channel's own emotes + the
+    /// on-demand cache) is built ONCE up front rather than resolving each
+    /// log's own channel/account — a log's own channel is just one of the
+    /// many directories that index already walks, so there's nothing extra
+    /// a per-channel lookup would find. Scan pass is sequential (same I/O-
+    /// relief reasoning as `cmd_migrate_chat_logs`); every miss across every
+    /// log is collected and deduped BEFORE any network request, so a
+    /// spammed emote across thousands of messages in many logs still costs
+    /// exactly one fetch.
+    fn cmd_fetch_missing_chat_emotes(&self) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::FetchMissingChatEmotes,
+                label: "Fetch missing chat emotes".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+
+            let fallback_index = std::sync::Arc::new(
+                tokio::task::spawn_blocking(|| {
+                    crate::assets::index_emote_stems(&crate::assets::all_twitch_emote_dirs())
+                })
+                .await
+                .unwrap_or_default(),
+            );
+            let empty_map = std::sync::Arc::new(std::collections::HashMap::new());
+
+            let recs = store.list_recordings_for_chat_migration().unwrap_or_default();
+            let candidates: Vec<PathBuf> = recs
+                .iter()
+                .filter(|(_, _, _, open)| !open)
+                .filter_map(|(_, output_path, chat_path, _)| {
+                    crate::chat::chat_file_candidates(chat_path, output_path)
+                        .into_iter()
+                        .find(|p| {
+                            // Twitch only: `.chat.jsonl` carries the first-party
+                            // `emotes` IRC tag this sweep backfills against.
+                            // YouTube's `.live_chat.json` has no Twitch CDN
+                            // concept.
+                            p.extension().is_some_and(|e| e == "jsonl")
+                                && crate::iomon::fs::exists_sync(crate::iomon::Cat::ChatSidecar, p)
+                        })
+                })
+                .collect();
+            let total = candidates.len();
+
+            let mut all_fetches: Vec<crate::ui::chat::EmojiFetch> = Vec::new();
+            for (i, path) in candidates.iter().enumerate() {
+                if i % 20 == 0 {
+                    let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                        id: task_id,
+                        progress: Some(0.9 * i as f32 / total.max(1) as f32),
+                        info: format!("scanning {}/{total}", i + 1),
+                    });
+                }
+                if let Ok(chunk) = crate::ui::chat::parse_chunk_blocking(
+                    path.clone(),
+                    0,
+                    None,
+                    0,
+                    empty_map.clone(),
+                    None,
+                    fallback_index.clone(),
+                    true,
+                )
+                .await
+                {
+                    all_fetches.extend(chunk.fetches);
+                }
+            }
+
+            all_fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
+            all_fetches.dedup();
+            let queued = all_fetches.len();
+
+            let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                id: task_id,
+                progress: Some(0.95),
+                info: format!("fetching {queued} emote(s)…"),
+            });
+            for batch in all_fetches.chunks(250) {
+                crate::ui::chat::download_emoji_images(batch).await;
+            }
+            let fetched = all_fetches
+                .iter()
+                .filter(|f| crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &f.dest))
+                .count();
+
+            info!(
+                "chat emote backfill done: {total} log(s) scanned, {queued} missing, {fetched} fetched"
+            );
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
+                    "{total} chat log(s) scanned, {fetched}/{queued} emote(s) fetched"
+                )),
             });
         });
     }

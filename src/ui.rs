@@ -471,7 +471,11 @@ mod assets_helpers;
 mod background;
 mod calendar;
 mod channel_stats;
-mod chat;
+// `pub(crate)`, unlike its neighbors: `downloader::supervisor`'s
+// "Fetch missing chat emotes" maintenance sweep reuses this module's
+// `parse_chat_chunk`/`EmojiFetch`/`download_emoji_images` directly rather
+// than duplicating chat-log parsing.
+pub(crate) mod chat;
 mod debug;
 mod dialogs;
 mod files;

@@ -3917,7 +3917,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_maintenance_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Maintenance, "Maintenance", &["maintenance", "re-remux", "remux all", "thumbnails", "reorganize", "batch", "preset"]) {
+            if self.section_shown(SettingsTab::Maintenance, "Maintenance", &["maintenance", "re-remux", "remux all", "thumbnails", "reorganize", "batch", "preset", "emote", "chat"]) {
             ui.add_space(12.0);
             ui.heading("Maintenance 🔧");
             ui.label("One-time batch jobs — each runs in the background and reports progress in the Background tab.");
@@ -3933,6 +3933,7 @@ impl StreamArchiverApp {
             let reorganize_running    = self.background_tasks.iter().any(|t| t.kind == BTK::ReorganizeAll);
             let join_cleanup_running  = self.background_tasks.iter().any(|t| t.kind == BTK::RerunJoinCleanup);
             let chat_migrate_running  = self.background_tasks.iter().any(|t| t.kind == BTK::MigrateChatLogs);
+            let fetch_emotes_running  = self.background_tasks.iter().any(|t| t.kind == BTK::FetchMissingChatEmotes);
             egui::Grid::new("maintenance_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -3983,6 +3984,27 @@ impl StreamArchiverApp {
                         self.core.manual(ManualCommand::MigrateChatLogs);
                     }
                     ui.label("Move existing chat sidecars into the dedicated chat logs folder.");
+                    ui.end_row();
+
+                    if ui
+                        .add_enabled(!fetch_emotes_running, egui::Button::new("Fetch missing chat emotes"))
+                        .on_hover_text(
+                            "One-shot sweep: scan every archived Twitch chat log for first-party \
+                             emote ids that don't render anywhere yet — not cached for that \
+                             channel, not for any other monitored channel — and fetch each \
+                             straight from Twitch's CDN by id, same as opening the chat would \
+                             eventually do on its own. Useful for logs recorded before that \
+                             on-demand fetch existed, or never opened since. Twitch only \
+                             (YouTube chat has no first-party emote CDN to backfill from). \
+                             Clicking this always fetches, regardless of the \"Fetch unknown \
+                             emotes from Twitch\" display setting — that one only gates the \
+                             passive per-chat-popup fetch; this button is its own explicit ask.",
+                        )
+                        .clicked()
+                    {
+                        self.core.manual(ManualCommand::FetchMissingChatEmotes);
+                    }
+                    ui.label("Scan existing chat logs and fetch any first-party emotes still missing.");
                     ui.end_row();
 
                     if ui
