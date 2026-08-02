@@ -987,7 +987,15 @@ gains two playback actions, as inline buttons and context-menu entries:
   like opening the stream in a browser, without touching the recording (and
   without needing one to be running). The player's window title can be
   customized (and, for mpv on non-Twitch tune-ins, kept live-updating) — see
-  [Live-edge player title](#live-edge-player-title) below.
+  [Live-edge player title](#live-edge-player-title) below. Disabled once the
+  channel doesn't look live (there's no live edge to tune into on a past
+  broadcast) — it becomes a small submenu with an enabled **Try anyway**
+  entry instead, in case live detection is stale or wrong and you want to
+  force it. For a *past* broadcast, use **▷ Play VOD** /
+  **🌐 Open VOD webpage** instead (see
+  [Missed-stream backfill](#missed-stream-backfill)) — those play/open the
+  platform's VOD rather than a live edge, and work whether or not the take
+  was ever recorded.
 
 [mpv](https://mpv.io) is strongly recommended — the app hands it live-viewing
 flags (`appending://` growing-file URLs, `--keep-open`, a generated live HLS
@@ -2317,6 +2325,16 @@ filename. This feature layers automation on top of that fix:
 > is "published VOD or nothing" — YouTube in particular rarely prunes stream
 > VODs, so discovery there mostly just catches app-downtime gaps rather than
 > a race against deletion.
+
+**Just want to watch it, not archive it?** A past take/stream row (recorded
+or not) also gets **▷ Play VOD** and **🌐 Open VOD webpage** — both resolve
+the VOD URL the same way (published VOD, or a Twitch CDN-reconstructed one),
+then either open it in the configured media player or your browser. Neither
+downloads or archives anything; they're the "just watch it" counterpart to
+**⏬ Backfill missed VOD**. Both no-op quietly if nothing resolves (e.g. the
+VOD genuinely isn't recoverable). Disabled while the take is still actively
+recording — there's a live edge to watch instead at that point (▷ Play
+stream (live edge), above).
 
 ### Audio & subtitle tracks
 

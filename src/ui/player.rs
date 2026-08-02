@@ -1450,6 +1450,14 @@ pub(super) fn spawn_live_preview(
 /// once, and a separate template for a synthetic (untracked-partner) row
 /// that has no real title/game to fill the normal template's tokens with.
 /// Both are no-ops (`false`/`None`) for a normal single-instance play.
+///
+/// `is_vod`, set by [`spawn_play_vod`], skips everything here that only
+/// makes sense for a LIVE tune-in: marking a currently-recording broadcast
+/// as "started" (a VOD play isn't watching whatever's live right now),
+/// YouTube's SABR live-preview workaround (VODs aren't SABR-restricted, so
+/// the plain yt-dlp pipe branch handles them fine), and the live-title
+/// auto-update IPC dance (there's nothing "live" left to track — the title
+/// is set once at launch and never touched again).
 pub(super) fn spawn_play_new_instance(
     row: &crate::models::MonitorWithChannel,
     player: &str,
@@ -1458,6 +1466,7 @@ pub(super) fn spawn_play_new_instance(
     mute: bool,
     title_template_override: Option<&str>,
     meta: Option<&LiveMetaCtx>,
+    is_vod: bool,
 ) -> Option<String> {
     use crate::downloader::{
         push_track_args, resolve_auth, resolved_quality, split_args, AuthSource,
@@ -1469,8 +1478,10 @@ pub(super) fn spawn_play_new_instance(
     // is currently recording for this monitor, if any — mirrors the
     // finished-file playback hook in `ui/streams.rs`. A live-only tune-in
     // with nothing actively recording has no broadcast identity yet, so
-    // there's nothing to mark (correctly a no-op).
-    if let Ok(Some(rec)) = store.current_recording_for_monitor(m.id) {
+    // there's nothing to mark (correctly a no-op). Skipped for a VOD play:
+    // an old broadcast being watched has no bearing on whatever's currently
+    // recording for this monitor, if anything.
+    if !is_vod && let Ok(Some(rec)) = store.current_recording_for_monitor(m.id) {
         let key = crate::models::stream_key(&rec);
         let cur = store.stream_watch_state(&key).ok().flatten().map(|(s, _)| s);
         if history::should_advance_to_started(cur.as_deref()) {
@@ -1483,6 +1494,10 @@ pub(super) fn spawn_play_new_instance(
     let cookies = compose_browser_profile(&settings.cookies_browser, &settings.cookies_profile);
     let auth = resolve_auth(row, &settings.download_auth_method, &cookies);
     let extra: Vec<String> = split_args(&m.extra_args);
+    // The global auto-update setting would otherwise poll this monitor's
+    // CURRENT (possibly still-live) title/game into a VOD player's title —
+    // wrong for something that isn't live anymore.
+    let auto_update = settings.live_title_auto_update && !is_vod;
 
     match m.tool {
         Tool::Streamlink => {
@@ -1518,14 +1533,13 @@ pub(super) fn spawn_play_new_instance(
             // A synthetic row (id 0: follow-raid/collab partner) has no monitor
             // to poll, so it takes the deferred-fetch updater instead: same
             // socket, metadata from Helix rather than from the DB.
-            let untracked = settings
-                .live_title_auto_update
+            let untracked = auto_update
                 .then(|| plan_untracked_title(meta, row, player, title_template))
                 .flatten();
             let ipc_pipe = match &untracked {
                 Some(plan) => Some(plan.pipe_path.clone()),
                 None => (!title_template.is_empty()
-                    && settings.live_title_auto_update
+                    && auto_update
                     && player_is_mpv(player)
                     && m.id != 0)
                     .then(new_mpv_ipc_pipe_path),
@@ -1568,7 +1582,7 @@ pub(super) fn spawn_play_new_instance(
             }
             status
         }
-        Tool::YtDlp if m.platform() == Platform::YouTube => {
+        Tool::YtDlp if !is_vod && m.platform() == Platform::YouTube => {
             spawn_live_preview(row, player, settings, store, mute, title_template_override, meta)
         }
         Tool::YtDlp => {
@@ -1622,7 +1636,7 @@ pub(super) fn spawn_play_new_instance(
                     apply_live_title_and_spawn_updater(
                         &mut cmd, player, row,
                         title_template_override.unwrap_or(settings.live_title_template.trim()),
-                        settings.live_title_auto_update, store, meta,
+                        auto_update, store, meta,
                     );
                     if mute && player_is_mpv(player) {
                         cmd.arg("--mute");
@@ -1641,7 +1655,7 @@ pub(super) fn spawn_play_new_instance(
             apply_live_title_and_spawn_updater(
                 &mut cmd, player, row,
                 title_template_override.unwrap_or(settings.live_title_template.trim()),
-                settings.live_title_auto_update, store, meta,
+                auto_update, store, meta,
             );
             if mute && player_is_mpv(player) {
                 cmd.arg("--mute");
@@ -1650,6 +1664,34 @@ pub(super) fn spawn_play_new_instance(
             spawn_logged(cmd, "media player", Some(m.id))
         }
     }
+}
+
+/// Play a resolved VOD URL in the configured media player — reuses
+/// [`spawn_play_new_instance`]'s per-platform/per-tool dispatch (same auth,
+/// cookies, quality, and tool preference the channel's own live plays use)
+/// via a row clone with `monitor.url` swapped to the VOD URL, the same
+/// substitute-URL pattern [`spawn_follow_raid`]/`spawn_play_collab_partner`
+/// use. `is_vod = true` is passed through so nothing live-only (SABR
+/// live-preview, live-title auto-update, watch-state marking) kicks in.
+/// `pub(crate)` so `downloader::supervisor`'s manual-command handling — the
+/// only caller, since resolving `vod_url` needs an async Helix/CDN lookup
+/// this UI-thread function can't do itself — can reach it directly.
+pub(crate) fn spawn_play_vod(
+    source_row: &crate::models::MonitorWithChannel,
+    vod_url: &str,
+    vod_title: &str,
+    player: &str,
+    settings: &SettingsForm,
+    store: &Arc<crate::store::Store>,
+) -> Option<String> {
+    let mut row = source_row.clone();
+    row.monitor.url = vod_url.to_string();
+    row.last_title = vod_title.to_string();
+    row.last_game.clear();
+    spawn_play_new_instance(
+        &row, player, settings, store, false,
+        Some("🎬  VOD: {channel} - {title_trimmed}"), None, true,
+    )
 }
 
 /// "Follow raid": tune into a raid target at the live edge, no recording —
@@ -1687,7 +1729,7 @@ pub(crate) fn spawn_follow_raid(
     row.channel.name = to_display_name.to_string();
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store, false, None, meta)
+    spawn_play_new_instance(&row, player, settings, store, false, None, meta, false)
 }
 
 /// Tune into a verified-but-untracked collab partner at the live edge, no
@@ -1716,7 +1758,7 @@ pub(super) fn spawn_play_collab_partner(
     // after launch rather than before it (`run_untracked_title_updater`).
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store, mute, title_template_override, meta)
+    spawn_play_new_instance(&row, player, settings, store, mute, title_template_override, meta, false)
 }
 
 #[cfg(test)]

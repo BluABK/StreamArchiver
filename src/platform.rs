@@ -1458,6 +1458,19 @@ pub fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
+/// Open a URL in the OS default browser. Same launchers as [`open_path`] —
+/// `explorer`/`open`/`xdg-open` all happily take a URL in place of a path —
+/// kept as a separate `&str`-typed function rather than overloading
+/// `open_path` since a URL isn't a filesystem path.
+pub fn open_url(url: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
 /// Manages launch-on-login via the OS autostart mechanism (HKCU Run key on
 /// Windows), keyed to the current executable path.
 pub struct AutoStart {

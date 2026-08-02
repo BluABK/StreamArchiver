@@ -578,6 +578,18 @@ pub enum ManualCommand {
     /// single monitor now, by monitor id — the on-demand counterpart to the
     /// periodic `K_AUTO_BACKFILL_MISSED` sweep.
     ScanForMissedStreams(i64),
+    /// Resolve this take's VOD URL (same lookup `BackfillMissedVodNow` uses)
+    /// and open it in the configured media player, by recording id. Works on
+    /// a past broadcast regardless of whether it was ever captured — the
+    /// "▷ Play VOD" action on a take/stream row.
+    PlayVodNow(i64),
+    /// Resolve this take's VOD URL and open it in the OS default browser, by
+    /// recording id — the "🌐 Open VOD webpage" action. Unlike
+    /// `Recording::vod_url()` (Twitch-only, requires an already-known
+    /// `vod_id`), this re-resolves live via `vod::resolve_vod_url` so it
+    /// also works for YouTube/Kick and for a take whose VOD was never
+    /// archived/downloaded.
+    OpenVodWebpage(i64),
     /// Manually (re)trigger a head backfill for a recording now, by recording id
     /// (Twitch capture-from-start only). User-initiated: forced regardless of the
     /// "fetch new head backfill on new take" setting — unlike the automatic path,

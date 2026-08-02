@@ -204,6 +204,8 @@ impl Supervisor {
                 );
             }
             ManualCommand::ScanForMissedStreams(monitor_id) => self.cmd_scan_for_missed_streams(monitor_id),
+            ManualCommand::PlayVodNow(rec_id) => self.cmd_play_vod_now(rec_id),
+            ManualCommand::OpenVodWebpage(rec_id) => self.cmd_open_vod_webpage(rec_id),
             ManualCommand::BackfillHeadNow(rec_id) => {
                 let this = self.clone();
                 tokio::spawn(async move {
@@ -492,6 +494,52 @@ progress_info: None,
                 None => {
                     let _ = store.set_recording_vod_dl(rec_id, "failed", None);
                 }
+            }
+        });
+    }
+
+    /// [`ManualCommand::PlayVodNow`]: resolve this take's VOD URL the same
+    /// way `cmd_archive_vod_now`/`attempt_missed_stream_backfill` do, then
+    /// open it in the configured media player. Works on a past broadcast
+    /// regardless of whether it was ever captured, since nothing here reads
+    /// `output_path`.
+    fn cmd_play_vod_now(&self, rec_id: i64) {
+        let store = self.store.clone();
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            let Ok(Some(rec)) = store.get_recording(rec_id) else { return };
+            let Ok(Some(row)) = store.get_monitor_with_channel(rec.monitor_id) else { return };
+            let player = store.get_setting(crate::ui::K_MEDIA_PLAYER).ok().flatten().unwrap_or_default();
+            let player = player.trim();
+            if player.is_empty() {
+                tracing::warn!(rec_id, "play-vod: no media player configured");
+                return;
+            }
+            let Some((url, _platform)) = resolve_vod_url(&ctx, &store, rec_id).await else {
+                tracing::info!(rec_id, "play-vod: no VOD URL resolvable for this take");
+                return;
+            };
+            let settings = crate::ui::SettingsForm::for_auto_play(&store);
+            if let Some(msg) =
+                crate::ui::player::spawn_play_vod(&row, &url, &rec.title, player, &settings, &store)
+            {
+                tracing::info!(rec_id, "play-vod: {msg}");
+            }
+        });
+    }
+
+    /// [`ManualCommand::OpenVodWebpage`]: resolve this take's VOD URL and
+    /// open it in the OS default browser — unlike `Recording::vod_url()`
+    /// (Twitch-only, needs an already-known `vod_id`), this re-resolves live
+    /// so it also covers YouTube/Kick and a take whose VOD was never
+    /// archived/downloaded.
+    fn cmd_open_vod_webpage(&self, rec_id: i64) {
+        let store = self.store.clone();
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            match resolve_vod_url(&ctx, &store, rec_id).await {
+                Some((url, _platform)) => crate::platform::open_url(&url),
+                None => tracing::info!(rec_id, "open-vod-webpage: no VOD URL resolvable for this take"),
             }
         });
     }

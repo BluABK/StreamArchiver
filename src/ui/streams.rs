@@ -178,6 +178,11 @@ struct StreamsOut {
     backfill_missed_vod_now: Option<i64>,
     /// "🔎 Scan for missed streams" — by monitor id.
     scan_for_missed_streams: Option<i64>,
+    /// "▷ Play VOD" on a past take/stream row — by recording id. Works
+    /// regardless of whether the take was ever captured.
+    play_vod_now: Option<i64>,
+    /// "🌐 Open VOD webpage" on a past take/stream row — by recording id.
+    open_vod_webpage: Option<i64>,
     backfill_head_now: Option<i64>,
     abort_backfill: Option<i64>,
     /// "📑 Embed chapters"/"🔁 Re-embed chapters" on a take/stream row.
@@ -1966,6 +1971,8 @@ impl StreamArchiverApp {
             archive_vod_now,
             backfill_missed_vod_now,
             scan_for_missed_streams,
+            play_vod_now,
+            open_vod_webpage,
             backfill_head_now,
             abort_backfill,
             retrigger_chapters,
@@ -2036,6 +2043,14 @@ impl StreamArchiverApp {
         if let Some(monitor_id) = scan_for_missed_streams {
             self.core.manual(ManualCommand::ScanForMissedStreams(monitor_id));
             self.status = "Scanning for missed streams…".into();
+        }
+        if let Some(rec_id) = play_vod_now {
+            self.core.manual(ManualCommand::PlayVodNow(rec_id));
+            self.status = "Resolving VOD to play…".into();
+        }
+        if let Some(rec_id) = open_vod_webpage {
+            self.core.manual(ManualCommand::OpenVodWebpage(rec_id));
+            self.status = "Resolving VOD webpage…".into();
         }
         if let Some(rec_id) = backfill_head_now.or_else(|| acts.backfill_head.take()) {
             self.core.manual(ManualCommand::BackfillHeadNow(rec_id));
@@ -2393,7 +2408,7 @@ impl StreamArchiverApp {
                 && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
                 && let Some(msg) =
                     spawn_play_new_instance(
-                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
+                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(), false,
                     )
             {
                 self.status = msg;
@@ -2424,7 +2439,7 @@ impl StreamArchiverApp {
                 if let Some(row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
                     && let Some(msg) =
                         spawn_play_new_instance(
-                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
+                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(), false,
                     )
                 {
                     self.status = msg;
@@ -2439,6 +2454,7 @@ impl StreamArchiverApp {
                             mute_partners,
                             None,
                             meta.as_ref(),
+                            false,
                         )
                     {
                         self.status = msg;
@@ -3682,6 +3698,69 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Renders "▷ Play stream (live edge)" — a normal enabled button when
+    /// the owning monitor looks live, or a submenu offering an enabled "Try
+    /// anyway" when it doesn't. Live-edge playback is meaningless once a
+    /// broadcast is over (there's no live edge to tune into), but if live
+    /// detection is stale or simply wrong, the user can still force it.
+    /// Shared by the icon-button action bar and the context menu, on both
+    /// the stream row and the take row.
+    ///
+    /// `small`: renders the compact icon-only variant used in the table
+    /// row's action bar instead of the full labeled button/menu.
+    /// `close_menu_on_click`: whether a direct click (the `is_live` branch)
+    /// should also close an enclosing context menu — `true` for the
+    /// context-menu call sites, `false` for the always-visible action bar
+    /// (there's no enclosing menu to close there). "Try anyway" always
+    /// closes its own submenu regardless, since that popup only exists here.
+    fn play_live_edge_control(
+        ui: &mut egui::Ui,
+        mid: i64,
+        is_live: bool,
+        media_player_empty: bool,
+        small: bool,
+        close_menu_on_click: bool,
+        target: &mut Option<i64>,
+    ) {
+        let full_label = "▷  Play stream (live edge)";
+        if is_live {
+            let button = if small {
+                egui::Button::new("▷").small()
+            } else {
+                egui::Button::new(full_label)
+            };
+            if ui
+                .add_enabled(!media_player_empty, button)
+                .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
+                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
+                .clicked()
+            {
+                *target = Some(mid);
+                if close_menu_on_click {
+                    ui.close();
+                }
+            }
+            return;
+        }
+        let label = if small { "▷" } else { full_label };
+        ui.menu_button(label, |ui| {
+            if ui
+                .add_enabled(!media_player_empty, egui::Button::new("Try anyway"))
+                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
+                .clicked()
+            {
+                *target = Some(mid);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text(
+            "This channel doesn't currently look live, so there's no live edge to \
+             tune into. If live detection is stale or wrong, use \"Try anyway\" to \
+             force it.",
+        );
+    }
+
     /// Render one stream-group row (a broadcast's takes, aggregated) plus its
     /// context menu. Self-mutating picks land in `out`.
     #[allow(clippy::too_many_arguments)]
@@ -3745,6 +3824,13 @@ impl StreamArchiverApp {
         let recording = g.status() == "recording"
             && active_ids.contains(&mid)
             && !finalizing_ids.contains(&mid);
+        // Owning monitor's live status — gates "Play stream (live edge)"
+        // (pointless once the broadcast is over) and, further down,
+        // "Backfill head" (needs the still-growing live CDN playlist).
+        let owning_monitor = rows.iter().find(|r| r.monitor.id == mid).map(|r| &r.monitor);
+        let is_live = owning_monitor
+            .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
+            .unwrap_or(false);
         let has_takes = stream_has_children(g);
         let expanded = exp_streams.contains(&g.key);
         let when = fmt_went_live(g.went_live_at, g.went_live_approx);
@@ -3857,17 +3943,10 @@ impl StreamArchiverApp {
                             out.open_in_player = grp_stream_target.clone();
                             out.mark_started_stream = Some((g.key.clone(), mid));
                         }
-                        if ui
-                            .add_enabled(
-                                !media_player.is_empty(),
-                                egui::Button::new("▷").small(),
-                            )
-                            .on_hover_text("Play stream (live edge) in the media player (does not record)")
-                            .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                            .clicked()
-                        {
-                            out.play_new_instance_mid = Some(mid);
-                        }
+                        Self::play_live_edge_control(
+                            ui, mid, is_live, media_player.is_empty(), true, false,
+                            &mut out.play_new_instance_mid,
+                        );
                     }
                     "name" => {
                         ctrl_or_shift = ui.input(|i| i.modifiers.ctrl || i.modifiers.shift);
@@ -4186,18 +4265,10 @@ impl StreamArchiverApp {
                     out.mark_started_stream = Some((g.key.clone(), mid));
                     ui.close();
                 }
-                if ui
-                    .add_enabled(
-                        !media_player.is_empty(),
-                        egui::Button::new("▷  Play stream (live edge)"),
-                    )
-                    .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
-                    .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                    .clicked()
-                {
-                    out.play_new_instance_mid = Some(mid);
-                    ui.close();
-                }
+                Self::play_live_edge_control(
+                    ui, mid, is_live, media_player.is_empty(), false, true,
+                    &mut out.play_new_instance_mid,
+                );
                 {
                     // Latest take with a chat sidecar drives the
                     // stream's chat view. Probe-cache lookups: an
@@ -4232,6 +4303,39 @@ impl StreamArchiverApp {
                 if let Some(t) = g.takes.iter().max_by_key(|t| t.started_at)
                     && t.stream_id.is_some()
                 {
+                    // "Play VOD"/"Open VOD webpage" work regardless of
+                    // whether this stream's latest take was ever captured —
+                    // see the take row's copy of this comment.
+                    if !recording {
+                        if ui
+                            .button("▷  Play VOD")
+                            .on_hover_text(
+                                "Play this stream's (latest take's) VOD in the media \
+                                 player — the platform's published VOD if available, \
+                                 else (Twitch) reconstructed from CDN segments. Works \
+                                 regardless of whether it was ever recorded. No-ops \
+                                 quietly if nothing resolves.",
+                            )
+                            .clicked()
+                        {
+                            out.play_vod_now = Some(t.id);
+                            ui.close();
+                        }
+                        if ui
+                            .button("🌐  Open VOD webpage")
+                            .on_hover_text(
+                                "Open this stream's (latest take's) VOD webpage in \
+                                 your browser — resolved the same way as \"Play \
+                                 VOD\", so it works even before any \
+                                 download/recovery has run. No-ops quietly if \
+                                 nothing resolves.",
+                            )
+                            .clicked()
+                        {
+                            out.open_vod_webpage = Some(t.id);
+                            ui.close();
+                        }
+                    }
                     if ui
                         .button("🛟  Recover VOD…")
                         .on_hover_text("Reconstruct this stream's (latest take's) VOD from segments still on the Twitch CDN (deleted or DMCA-muted). Works on a \u{1F441} \"seen live, Auto was off\" row too.")
@@ -4264,15 +4368,8 @@ impl StreamArchiverApp {
                         out.backfill_missed_vod_now = Some(t.id);
                         ui.close();
                     }
-                    let owning_monitor = rows
-                        .iter()
-                        .find(|r| r.monitor.id == mid)
-                        .map(|r| &r.monitor);
                     let is_twitch = owning_monitor
                         .map(|m| m.platform() == Platform::Twitch)
-                        .unwrap_or(false);
-                    let is_live = owning_monitor
-                        .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
                         .unwrap_or(false);
                     if is_twitch
                         && ui
@@ -4457,6 +4554,12 @@ impl StreamArchiverApp {
         let recording = t.is_active()
             && active_ids.contains(&mid)
             && !finalizing_ids.contains(&mid);
+        // Owning monitor's live status — see `stream_row`'s copy of this
+        // comment.
+        let owning_monitor = rows.iter().find(|r| r.monitor.id == mid).map(|r| &r.monitor);
+        let is_live = owning_monitor
+            .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
+            .unwrap_or(false);
         let take_variant = dual_take_variant(g, t);
         let dir = std::path::Path::new(&t.output_path)
             .parent()
@@ -4514,17 +4617,10 @@ impl StreamArchiverApp {
                                 out.open_in_player = stream_target;
                                 out.mark_started_stream = Some((g.key.clone(), mid));
                             }
-                            if ui
-                                .add_enabled(
-                                    !media_player.is_empty(),
-                                    egui::Button::new("▷").small(),
-                                )
-                                .on_hover_text("Play stream (live edge) in the media player (does not record)")
-                                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                                .clicked()
-                            {
-                                out.play_new_instance_mid = Some(t.monitor_id);
-                            }
+                            Self::play_live_edge_control(
+                                ui, t.monitor_id, is_live, media_player.is_empty(), true, false,
+                                &mut out.play_new_instance_mid,
+                            );
                             let dir_ok =
                                 dir.as_ref().is_some_and(|d| fs_probes.is_dir(d));
                             if ui
@@ -4854,18 +4950,10 @@ impl StreamArchiverApp {
                         out.mark_started_stream = Some((g.key.clone(), mid));
                         ui.close();
                     }
-                    if ui
-                        .add_enabled(
-                            !media_player.is_empty(),
-                            egui::Button::new("▷  Play stream (live edge)"),
-                        )
-                        .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
-                        .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                        .clicked()
-                    {
-                        out.play_new_instance_mid = Some(t.monitor_id);
-                        ui.close();
-                    }
+                    Self::play_live_edge_control(
+                        ui, t.monitor_id, is_live, media_player.is_empty(), false, true,
+                        &mut out.play_new_instance_mid,
+                    );
                 }
                 let dir_ok =
                     dir.as_ref().is_some_and(|d| fs_probes.is_dir(d));
@@ -4891,9 +4979,38 @@ impl StreamArchiverApp {
                     out.view_chat_rec = Some((t.monitor_id, t.id));
                     ui.close();
                 }
-                if let Some(vod_url) = t.vod_url() {
-                    if ui.button("🌐  Open VOD").clicked() {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(vod_url));
+                // "Play VOD"/"Open VOD webpage" work on a past broadcast
+                // regardless of whether it was ever captured (unlike the
+                // buttons below, which need `output_path`/`vod_id` already
+                // set) — both re-resolve the VOD URL live via
+                // `vod::resolve_vod_url`, the same lookup
+                // `attempt_missed_stream_backfill` uses.
+                if t.stream_id.is_some() && !t.is_active() {
+                    if ui
+                        .button("▷  Play VOD")
+                        .on_hover_text(
+                            "Play this take's VOD in the media player — the \
+                             platform's published VOD if available, else \
+                             (Twitch) reconstructed from CDN segments. Works \
+                             regardless of whether this take was ever \
+                             recorded. No-ops quietly if nothing resolves.",
+                        )
+                        .clicked()
+                    {
+                        out.play_vod_now = Some(t.id);
+                        ui.close();
+                    }
+                    if ui
+                        .button("🌐  Open VOD webpage")
+                        .on_hover_text(
+                            "Open this take's VOD webpage in your browser — \
+                             resolved the same way as \"Play VOD\", so it \
+                             works even before any download/recovery has \
+                             run. No-ops quietly if nothing resolves.",
+                        )
+                        .clicked()
+                    {
+                        out.open_vod_webpage = Some(t.id);
                         ui.close();
                     }
                 }
@@ -4949,13 +5066,8 @@ impl StreamArchiverApp {
                 // depends on stops being pre-mute-safe once the stream
                 // ends). Forced regardless of the "fetch new head
                 // backfill on new take" setting (user-initiated).
-                let owning_monitor =
-                    rows.iter().find(|r| r.monitor.id == mid).map(|r| &r.monitor);
                 let is_twitch = owning_monitor
                     .map(|m| m.platform() == Platform::Twitch)
-                    .unwrap_or(false);
-                let is_live = owning_monitor
-                    .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
                     .unwrap_or(false);
                 if t.stream_id.is_some()
                     && is_twitch

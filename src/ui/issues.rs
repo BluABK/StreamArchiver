@@ -717,6 +717,7 @@ impl StreamArchiverApp {
                             false,
                             None,
                             crate::ui::player::LiveMetaCtx::from_core(&self.core).as_ref(),
+                            false,
                         ) {
                             self.status = msg;
                         }
