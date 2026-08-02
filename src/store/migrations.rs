@@ -1629,7 +1629,15 @@ impl Store {
             conn.execute_batch("ALTER TABLE disposal_record ADD COLUMN bytes INTEGER;")?;
             conn.pragma_update(None, "user_version", 82)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 82);
+        if version < 83 {
+            // Per-channel "hide from the 📣 Posts feed" flag. The channel is
+            // still fetched/archived exactly as before — this only affects
+            // whether `render_posts_feed` shows its posts, so muting a noisy
+            // channel there never loses history.
+            conn.execute_batch("ALTER TABLE channel ADD COLUMN posts_hidden INTEGER NOT NULL DEFAULT 0;")?;
+            conn.pragma_update(None, "user_version", 83)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 83);
         Ok(())
     }
 }

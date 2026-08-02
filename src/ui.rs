@@ -1372,6 +1372,10 @@ pub struct StreamArchiverApp {
     pot_log_refreshed: Option<std::time::Instant>,
     notif_refreshed: Option<std::time::Instant>,
     notif_unread: i64,
+    /// Unread `youtube_post`-kind notifications — the 📣 Posts tab badge.
+    /// Refreshed on the same throttle as `notif_unread` (both come off the
+    /// 🔔 feed's `notification` table); see `notifications_window`.
+    posts_unread: i64,
     notif_search: String,
     notif_kind_filter: Option<crate::models::NotificationKind>,
     /// The 🚨 Warnings window (capture alerts scraped from tool logs): open
@@ -1407,6 +1411,10 @@ pub struct StreamArchiverApp {
     /// render fn): loaded rows, load throttle, session-only channel + text
     /// filters, and a lazy visible-only texture cache keyed by content hash.
     show_posts_window: bool,
+    /// "🚫 Excluded channels…" management window: which channels' posts are
+    /// hidden from the feed (`Channel::posts_hidden`, session filter text).
+    show_posts_excluded: bool,
+    posts_excluded_search: String,
     posts: Vec<crate::store::CommunityPostRow>,
     posts_refreshed: Option<std::time::Instant>,
     posts_search: String,
@@ -1574,6 +1582,14 @@ pub struct StreamArchiverApp {
     /// batched Settings form — same shape as Schedule's `schedule_compact`).
     /// Also the `group_visually` field a saved view snapshots/restores.
     streams_group_visually: bool,
+    /// Streams grid "Only stored" checkbox: hide any channel/instance/stream
+    /// with no take that actually has a file on disk (`Recording.output_path`
+    /// non-empty) — detected-but-never-recorded and failed/missed streams
+    /// disappear, same force-expand-to-matches behavior as the Recording
+    /// group filter (`build_vis_rows`'s `recording_group_filter` param, which
+    /// this reuses/intersects with rather than a parallel filter dimension).
+    /// Persisted immediately on toggle, same shape as `streams_group_visually`.
+    streams_only_recorded: bool,
     /// Streams grid's saved views (`crate::saved_views`): the currently-
     /// applied view's name (session-only — re-applying one is a single
     /// click, so this isn't persisted across restarts) and the last-loaded
@@ -2522,9 +2538,27 @@ impl eframe::App for StreamArchiverApp {
                     // drive quietly fills up. Computed once and used for BOTH
                     // the width budget and the paint, so a badge appearing
                     // can't desync the overflow calculation.
+                    // Streams "<recording>/<live>" badge, Posts unread-post
+                    // badge, and Videos active-download badge — all cheap
+                    // in-memory counts (no DB call, unlike the Trash/bell
+                    // badges above which need a synchronous SQLite read),
+                    // computed once here and used for both the width budget
+                    // and the paint below, same reasoning as Trash's.
+                    let active_ids: HashSet<i64> =
+                        self.core.active.lock().unwrap().keys().copied().collect();
+                    let finalizing_ids: HashSet<i64> =
+                        self.core.finalizing.lock().unwrap().keys().copied().collect();
+                    let rec_now = active_ids.iter().filter(|id| !finalizing_ids.contains(id)).count();
+                    let rows_ref: Vec<&MonitorWithChannel> = self.rows.iter().collect();
+                    let live_now = channel_live_count(&rows_ref, &active_ids);
+                    let videos_active =
+                        self.videos.iter().filter(|v| v.status == "downloading").count();
                     let tab_label = |v: &View, icon: &str| -> String {
-                        match (v, self.trash_badge) {
-                            (View::Trash, n) if n > 0 => format!("{icon} {n}"),
+                        match v {
+                            View::Trash if self.trash_badge > 0 => format!("{icon} {}", self.trash_badge),
+                            View::Posts if self.posts_unread > 0 => format!("{icon} {}", self.posts_unread),
+                            View::Streams if live_now > 0 => format!("{icon} {rec_now}/{live_now}"),
+                            View::Videos if videos_active > 0 => format!("{icon} {videos_active}"),
                             _ => icon.to_string(),
                         }
                     };
@@ -2563,6 +2597,21 @@ impl eframe::App for StreamArchiverApp {
                                  delete them here.",
                                 self.trash_badge
                             ));
+                        }
+                        if *v == View::Posts && self.posts_unread > 0 {
+                            hover_text.push_str(&format!(
+                                "\n\n{} unread post(s) — cleared the same way as the 🔔 feed's \
+                                 \"Mark all read\" (opening this tab alone doesn't clear it).",
+                                self.posts_unread
+                            ));
+                        }
+                        if *v == View::Streams && live_now > 0 {
+                            hover_text.push_str(&format!(
+                                "\n\n{rec_now} recording out of {live_now} currently live."
+                            ));
+                        }
+                        if *v == View::Videos && videos_active > 0 {
+                            hover_text.push_str(&format!("\n\n{videos_active} download(s) in progress."));
                         }
                         let text = egui::RichText::new(label).font(big_font.clone());
                         // Amber while the trash holds something, so it reads as
@@ -2968,6 +3017,23 @@ impl eframe::App for StreamArchiverApp {
                                 );
                                 self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
                             }
+                            if ui
+                                .checkbox(&mut self.streams_only_recorded, "Only stored")
+                                .on_hover_text(
+                                    "Hide any channel/instance/stream with no take that \
+                                     actually has a file on disk — detected-but-never-\
+                                     recorded (Auto off) and failed/missed streams disappear. \
+                                     The ones that remain force-expand down to their stored \
+                                     takes, same as a Recording group filter.",
+                                )
+                                .changed()
+                            {
+                                let _ = self.core.store.set_setting(
+                                    K_STREAMS_ONLY_RECORDED,
+                                    if self.streams_only_recorded { "1" } else { "0" },
+                                );
+                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                            }
                             {
                                 let selected_label =
                                     self.streams_active_view.as_deref().unwrap_or("Views");
@@ -3168,6 +3234,7 @@ impl eframe::App for StreamArchiverApp {
         self.warnings_window(ui.ctx());
         self.pot_server_log_window(ui.ctx());
         self.posts_window(ui.ctx());
+        self.posts_excluded_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
         self.import_window(ui.ctx());

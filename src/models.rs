@@ -827,6 +827,10 @@ pub struct Channel {
     /// can belong to any number of groups but has at most one primary; see
     /// `Store::set_channel_primary_group`.
     pub primary_group_id: Option<i64>,
+    /// Excluded from the 📣 Posts feed (`render_posts_feed`) — still fetched
+    /// and archived normally; this is display-only. See
+    /// `Store::set_channel_posts_hidden`.
+    pub posts_hidden: bool,
 }
 
 /// A named collection of channels (`channel_group` table) — a channel can be

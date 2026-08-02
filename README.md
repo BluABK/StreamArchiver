@@ -78,8 +78,17 @@ button size — big enough to hit without hunting — (hover any tab for its
 name, plus a description for the less-obvious ones): **📺 Streams, 🎬
 Videos, 🗓 Schedule, 📣 Posts, 🎛 Background, 📁 Files, 📈 Channel Stats, 📊
 App Stats, 🖴 I/O** (same HDD glyph as the Background tab's disk gate), and
-**🐞 Debug** when enabled. The rest of the left-hand side — **»**, **⋯**,
-**📖**, and **⚙** — renders at that same doubled size:
+**🐞 Debug** when enabled. Four tabs carry a live count badge next to their
+icon, computed in-memory every frame (no extra DB load) so it's always
+current even if you never open the tab: **🗑 Trash** — soft-deleted files
+still sitting in a trash folder (amber, since these quietly eat disk space
+until you deal with them); **📣 Posts** — unread posts (shares the 🔔 feed's
+read state — its own "Mark all read" clears this too, opening the tab alone
+does not); **📺 Streams** — `<recording>/<live>`, e.g. `3/10` for 3 of 10
+currently-live channels being recorded (hidden entirely while nothing is
+live); **🎬 Videos** — downloads currently in progress. The rest of the
+left-hand side — **»**, **⋯**, **📖**, and **⚙** — renders at that same
+doubled size:
 
 - **⋯** — the two display toggles (*Status bgcolor*, *Short timestamps* —
   the menu stays open while toggling).
@@ -310,6 +319,13 @@ regardless of which day or how many takes each one has.
 - Deleting a channel or a take cascades its recording-group memberships
   automatically; deleting a recording group only drops the tag, never
   touches any recording/file.
+
+The toolbar's **Only stored** checkbox is a filter of the same shape (and
+combines with an active recording-group filter rather than overriding it):
+hide any channel/instance/stream with no take that actually has a file on
+disk — detected-but-never-recorded streams (Auto off at the time) and
+failed/missed attempts disappear, and the ones that remain force-expand down
+to their stored takes just like a recording-group filter does.
 
 #### Saved views: sort, grouping, and filter presets
 
@@ -3161,6 +3177,12 @@ opens the archived file, and **right-click** offers *Copy Image* (to the
 clipboard), *Open File*, *Open Folder*, and *Copy URL* (the original source
 URL).
 
+- **Excluded channels.** The **🚫** button next to the channel filter opens
+  a management window listing every channel with a checkbox — checking one
+  hides its posts from this feed (and from the channel filter dropdown)
+  immediately. This is display-only: an excluded channel's posts are still
+  fetched and archived exactly as before, so un-hiding it later shows the
+  full history, nothing was lost while it was hidden.
 - **Post kinds.** A channel's community tab mixes the channel's **own posts**,
   **viewer posts** (fans posting in the channel's Community space), and
   **reshares** (the channel quoting another post). StreamArchiver tells them

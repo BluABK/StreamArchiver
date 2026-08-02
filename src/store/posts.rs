@@ -172,6 +172,20 @@ impl Store {
         Ok(n)
     }
 
+    /// Number of unread notifications of one `NotificationKind::id()` — the
+    /// 📣 Posts tab badge counts `"youtube_post"`. Shares `notification.read`
+    /// with the 🔔 bell badge; "Mark all read" there clears both together
+    /// (there's no separate "mark posts read" action).
+    pub fn unread_notification_count_by_kind(&self, kind: &str) -> Result<i64> {
+        let conn = self.db();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM notification WHERE read = 0 AND kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Mark every notification created at or before `created_at` as read (the
     /// "mark all read on window open" action — items arriving after open stay
     /// unread). Returns the number of rows updated.

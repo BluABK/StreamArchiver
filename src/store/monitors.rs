@@ -20,7 +20,7 @@ impl Store {
         let ch = conn
             .query_row(
                 "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
-                 automation_enabled, primary_group_id FROM channel WHERE url = ?1",
+                 automation_enabled, primary_group_id, posts_hidden FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
             )
@@ -151,7 +151,7 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
-             automation_enabled, primary_group_id FROM channel
+             automation_enabled, primary_group_id, posts_hidden FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt
@@ -243,6 +243,17 @@ impl Store {
         conn.execute(
             "UPDATE channel SET automation_enabled = ?2 WHERE id = ?1",
             params![channel_id, on as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Show/hide a channel's posts in the 📣 Posts feed. Display-only — its
+    /// posts keep being fetched and archived normally either way.
+    pub fn set_channel_posts_hidden(&self, channel_id: i64, hidden: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE channel SET posts_hidden = ?2 WHERE id = ?1",
+            params![channel_id, hidden as i64],
         )?;
         Ok(())
     }

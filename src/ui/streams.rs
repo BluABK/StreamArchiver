@@ -8,6 +8,11 @@ use super::*;
 /// batched Settings form — same shape as `K_SCHEDULE_COMPACT`.
 pub(super) const K_STREAMS_GROUP_VISUALLY: &str = "streams_group_visually";
 
+/// `app_settings` key for the Streams grid's "Only stored" checkbox —
+/// `"1"`/`"0"`, defaults to off. Saved immediately on toggle, same shape as
+/// [`K_STREAMS_GROUP_VISUALLY`].
+pub(super) const K_STREAMS_ONLY_RECORDED: &str = "streams_only_recorded";
+
 /// Backing state for the "Add to group…" dialog (bulk-adds `selected_streams`
 /// to a recording group — new or existing). `pick` wins over `new_name` when
 /// both are set (picking an existing group after having typed a name that's
@@ -1600,6 +1605,35 @@ impl StreamArchiverApp {
         let recording_group_filter_members: Option<HashSet<i64>> = self
             .streams_recording_group_filter
             .map(|gid| self.core.store.recording_ids_in_group(gid).unwrap_or_default());
+        // "Only stored" toolbar checkbox: reuses the SAME filter mechanism as
+        // the Recording group dropdown (`build_vis_rows`'s single
+        // `recording_group_filter` param) rather than a parallel one — a
+        // take id set restricted to ones with a file on disk, intersected
+        // with any active Recording group so the two combine sensibly
+        // instead of one silently overriding the other. In-memory only
+        // (`cache.groups`, no DB call): cheap next to the rest of this
+        // function's per-frame work.
+        let recording_group_filter_members: Option<HashSet<i64>> = if self.streams_only_recorded {
+            let stored_ids: HashSet<i64> = self
+                .streams_cache
+                .as_ref()
+                .map(|c| {
+                    c.groups
+                        .values()
+                        .flat_map(|grps| grps.iter())
+                        .flat_map(|g| g.takes.iter())
+                        .filter(|t| !t.output_path.is_empty())
+                        .map(|t| t.id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(match recording_group_filter_members {
+                Some(named_group) => named_group.intersection(&stored_ids).copied().collect(),
+                None => stored_ids,
+            })
+        } else {
+            recording_group_filter_members
+        };
         let current_recording_group: Option<(i64, String)> = self.streams_recording_group_filter.and_then(|gid| {
             self.recording_groups.iter().find(|g| g.id == gid).map(|g| (gid, g.name.clone()))
         });

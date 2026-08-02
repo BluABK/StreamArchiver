@@ -449,6 +449,15 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        // "Only stored" defaults off — showing everything (including
+        // detected-but-never-recorded streams) has always been the default.
+        let streams_only_recorded = core
+            .store
+            .get_setting(K_STREAMS_ONLY_RECORDED)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(false);
         let streams_views = crate::saved_views::list_views(&core.store, GridTableId::Streams);
 
         let mut download_defaults = core
@@ -568,6 +577,7 @@ impl StreamArchiverApp {
             pot_log_refreshed: None,
             notif_refreshed: None,
             notif_unread: 0,
+            posts_unread: 0,
             notif_search: String::new(),
             notif_kind_filter: None,
             show_warnings: false,
@@ -582,6 +592,8 @@ impl StreamArchiverApp {
             warn_bgcolor,
             notif_bgcolor,
             show_posts_window: false,
+            show_posts_excluded: false,
+            posts_excluded_search: String::new(),
             posts: Vec::new(),
             posts_refreshed: None,
             posts_search: String::new(),
@@ -649,6 +661,7 @@ impl StreamArchiverApp {
             streams_group_filter: None,
             streams_recording_group_filter: None,
             streams_group_visually,
+            streams_only_recorded,
             streams_active_view: None,
             streams_views,
             views_manager_new_name: String::new(),

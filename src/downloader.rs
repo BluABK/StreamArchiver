@@ -602,6 +602,7 @@ pub(crate) mod test_util {
                 enabled: true,
                 automation_enabled: true,
                 primary_group_id: None,
+                posts_hidden: false,
             },
             monitor: Monitor {
                 id: 7,

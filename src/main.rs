@@ -501,6 +501,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             enabled: true,
             automation_enabled: true,
             primary_group_id: None,
+            posts_hidden: false,
         },
         monitor: models::Monitor {
             id: 0,

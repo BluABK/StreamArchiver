@@ -384,6 +384,13 @@ impl StreamArchiverApp {
             .unwrap_or(true);
         if stale {
             self.notif_unread = self.core.store.unread_notification_count().unwrap_or(0);
+            // The 📣 Posts tab badge rides the same throttle — it's the same
+            // `notification` table, just one kind of it.
+            self.posts_unread = self
+                .core
+                .store
+                .unread_notification_count_by_kind(crate::models::NotificationKind::YoutubePost.id())
+                .unwrap_or(0);
             if self.show_notifications {
                 self.notifications = self.core.store.list_notifications(500).unwrap_or_default();
             }

@@ -85,6 +85,66 @@ impl StreamArchiverApp {
         }
     }
 
+    /// "🚫 Excluded channels…" management window (launched from the Posts
+    /// feed toolbar): every channel with a checkbox for `Channel::posts_hidden`.
+    /// Checking one hides it from the feed immediately — still fetched and
+    /// archived normally either way.
+    pub(super) fn posts_excluded_window(&mut self, ctx: &egui::Context) {
+        if !self.show_posts_excluded {
+            return;
+        }
+        let mut open = true;
+        let mut channels = self.channels.clone();
+        channels.sort_by_key(|c| c.name.to_lowercase());
+        let mut search = std::mem::take(&mut self.posts_excluded_search);
+        let mut toggled: Option<(i64, bool)> = None;
+        egui::Window::new("🚫 Excluded channels")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(320.0)
+            .default_height(420.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Checked channels' posts are hidden from the 📣 Posts feed — \
+                         still fetched and archived normally, just not shown there.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut search)
+                        .hint_text("Filter…")
+                        .desired_width(200.0),
+                );
+                ui.separator();
+                let q = search.trim().to_lowercase();
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    for c in channels.iter().filter(|c| q.is_empty() || c.name.to_lowercase().contains(&q))
+                    {
+                        let mut hidden = c.posts_hidden;
+                        if ui.checkbox(&mut hidden, &c.name).changed() {
+                            toggled = Some((c.id, hidden));
+                        }
+                    }
+                    if channels.is_empty() {
+                        ui.weak("No channels yet.");
+                    }
+                });
+            });
+        self.posts_excluded_search = search;
+        if !open {
+            self.show_posts_excluded = false;
+        }
+        if let Some((cid, hidden)) = toggled {
+            let _ = self.core.store.set_channel_posts_hidden(cid, hidden);
+            if let Some(c) = self.channels.iter_mut().find(|c| c.id == cid) {
+                c.posts_hidden = hidden;
+            }
+        }
+    }
+
     /// Render the YouTube community-posts feed (shared by the tab + the window):
     /// a throttle-loaded list of post cards (author, timestamp, body with links,
     /// all images 1:1), with a channel filter + text search. Post rows are moved
@@ -107,6 +167,13 @@ impl StreamArchiverApp {
             self.posts_refreshed = Some(Instant::now());
         }
         let posts = std::mem::take(&mut self.posts);
+        // Channels excluded via "🚫 Excluded channels…" — still fetched and
+        // archived normally (see `Channel::posts_hidden`), just not shown
+        // here (feed rows or the channel-filter dropdown below) by default.
+        // A focused post (from the 🔔 feed's "View post") bypasses this like
+        // every other filter, further below.
+        let hidden_channels: std::collections::HashSet<i64> =
+            self.channels.iter().filter(|c| c.posts_hidden).map(|c| c.id).collect();
 
         // ── Toolbar: channel filter + search + refresh ──
         ui.horizontal(|ui| {
@@ -126,6 +193,7 @@ impl StreamArchiverApp {
                         let mut seen = std::collections::HashSet::new();
                         posts
                             .iter()
+                            .filter(|p| !hidden_channels.contains(&p.channel_id))
                             .filter(|p| seen.insert(p.channel_id))
                             .map(|p| (p.channel_id, p.channel.clone()))
                             .collect()
@@ -135,6 +203,16 @@ impl StreamArchiverApp {
                         ui.selectable_value(&mut self.posts_channel_filter, Some(cid), name);
                     }
                 });
+            if ui
+                .button("🚫")
+                .on_hover_text(
+                    "Excluded channels — hide specific channels' posts from this feed \
+                     (they're still fetched/archived normally, just not shown here).",
+                )
+                .clicked()
+            {
+                self.show_posts_excluded = true;
+            }
             ui.add(
                 egui::TextEdit::singleline(&mut self.posts_search)
                     .hint_text("Search…")
@@ -201,7 +279,8 @@ impl StreamArchiverApp {
                 // A focused post bypasses every other filter (that's the point).
                 Some(pid) => &p.post_id == pid,
                 None => {
-                    (show_viewer || p.author_kind != "viewer")
+                    !hidden_channels.contains(&p.channel_id)
+                        && (show_viewer || p.author_kind != "viewer")
                         && cf.map(|c| p.channel_id == c).unwrap_or(true)
                         && (q.is_empty()
                             || p.author.to_lowercase().contains(&q)
