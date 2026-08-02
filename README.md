@@ -2453,9 +2453,14 @@ live, and archived:
   "unconfirmed" — a handle already confirmed via Shared Chat or the
   collaboration group is never added a second time as a title mention.
 - **Live display** — the channel/instance name gains a
-  `nihmune × Shylily`-style suffix while a shared-chat session is live
-  (confirmed partners only), and a **🤝 Collab** column lists everyone
-  (shared-chat partners first, then `@mentions`). Hover for the host,
+  `nihmune × Shylily`-style suffix while a shared-chat session is live.
+  Title-mention partners join the same suffix as `× @zentreya` (`@`-prefixed
+  to stay visually distinct from confirmed ones) via **Title-mention collabs
+  in Name column** (*Settings → Accounts → Detection credentials*, default
+  on) — turn it off to keep the Name-cell suffix confirmed-partners-only and
+  see `@mentions` only in the 🤝 Collab column below. Either way, a **🤝
+  Collab** column lists everyone (shared-chat partners first, then
+  `@mentions`). Hover for the host,
   session start, and source; right-click the channel/instance row →
   **🤝 Collab history**. Stream/take rows show which collab a **past
   broadcast** was. A confirmed partner whose OWN broadcast Twitch currently

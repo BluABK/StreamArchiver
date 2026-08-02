@@ -666,6 +666,23 @@ impl StreamArchiverApp {
                     if collab_titles { "1" } else { "0" },
                 );
             }
+            let mut collab_titles_in_name = self.collab_title_in_name;
+            if ui
+                .checkbox(&mut collab_titles_in_name, "@ Title-mention collabs in Name column")
+                .on_hover_text(
+                    "Also show title-mention collab partners in the Name cell's \" × Partner\" \
+                     suffix (as \" × @Name\", `@`-prefixed to stay visually distinct from \
+                     confirmed Shared Chat/group partners), not just in the 🤝 Collab column. \
+                     Purely a display toggle — has no effect on detection. Default on.",
+                )
+                .changed()
+            {
+                self.collab_title_in_name = collab_titles_in_name;
+                let _ = self.core.store.set_setting(
+                    "collab_title_mentions_in_name",
+                    if collab_titles_in_name { "1" } else { "0" },
+                );
+            }
 
             }
     }

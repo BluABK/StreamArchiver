@@ -67,6 +67,14 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Showing title-mention partners in the Name-cell suffix defaults on too.
+        let collab_title_in_name = core
+            .store
+            .get_setting("collab_title_mentions_in_name")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
         // Channel Stats auto refresh defaults on likewise.
         let chstats_auto = core
             .store
@@ -546,6 +554,7 @@ impl StreamArchiverApp {
             collab_eventsub,
             raid_eventsub,
             collab_title_mentions,
+            collab_title_in_name,
             dnd_enabled,
             dnd_schedule_enabled,
             dnd_start,

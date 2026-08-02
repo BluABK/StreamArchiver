@@ -1292,6 +1292,12 @@ pub struct StreamArchiverApp {
     /// `collab_title_mentions`; default on. See
     /// [`crate::detectors::DetectContext::refresh_twitch_collab`].
     collab_title_mentions: bool,
+    /// Show title-`@mention` collab partners in the Name-cell " × Partner"
+    /// suffix too (as " × @Name", `@`-prefixed to stay visually distinct
+    /// from confirmed Shared Chat/group partners) instead of only in the 🤝
+    /// Collab column. Persisted as `collab_title_mentions_in_name`; default
+    /// on. Purely a display toggle — doesn't affect detection.
+    collab_title_in_name: bool,
     /// Do Not Disturb: manually suppress toasts right now. Persisted as
     /// `dnd_enabled`; default off. See [`crate::notifications::dnd_active`].
     dnd_enabled: bool,

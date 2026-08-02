@@ -2290,6 +2290,11 @@ pub(super) fn render_instance_row(
     // Active header filters, for the matched-substring highlight in the
     // game/title cells.
     fhits: Option<&FilterHits>,
+    // Whether title-`@mention` collab partners also get a " × @Name" Name-cell
+    // suffix, same as confirmed Shared Chat/group partners (just `@`-prefixed
+    // per `CollabPartner::display`'s `at_mention` styling). Persisted as
+    // `collab_title_mentions_in_name`; default on.
+    collab_title_in_name: bool,
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -2767,13 +2772,20 @@ pub(super) fn render_instance_row(
                 // this instance's shared-chat session is live — each name
                 // coloured/linked when it resolves to a tracked channel (see
                 // `collab_plays`'s per-partner monitor-id resolution).
+                // Title-`@mention` partners (lower confidence, no shared-chat
+                // confirmation) join the same suffix as " × @Name" when the
+                // setting is on — `display(true)` adds the `@` so they stay
+                // visually distinct from confirmed partners in the run.
                 if let Some(c) = &row.live_collab {
-                    let shared: Vec<_> = collab_plays.iter().filter(|(p, _, _)| !p.from_title).collect();
-                    if !shared.is_empty() {
+                    let shown: Vec<_> = collab_plays
+                        .iter()
+                        .filter(|(p, _, _)| !p.from_title || collab_title_in_name)
+                        .collect();
+                    if !shown.is_empty() {
                         let resp = ui
                             .horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                for (p, _, pmid) in &shared {
+                                for (p, _, pmid) in &shown {
                                     ui.weak(" × ");
                                     let pcid = pmid.and_then(|mid| {
                                         rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id)
@@ -2789,7 +2801,9 @@ pub(super) fn render_instance_row(
                                             base
                                         }
                                     });
-                                    if let Some(cid) = tracked_name_label(ui, &p.display(false), pcid, color) {
+                                    if let Some(cid) =
+                                        tracked_name_label(ui, &p.display(p.from_title), pcid, color)
+                                    {
                                         a.open_channel_props = Some(cid);
                                     }
                                 }

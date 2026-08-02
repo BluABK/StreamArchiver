@@ -1873,6 +1873,7 @@ impl StreamArchiverApp {
                                     status_bgcolor, &col_order, &self.spark_data,
                                     hit_instances.contains(&self.rows[ri].monitor.id),
                                     fhits.as_ref(),
+                                    self.collab_title_in_name,
                                     &mut out,
                                 );
                             }
@@ -3467,6 +3468,9 @@ impl StreamArchiverApp {
         // text highlight inside cells.
         filter_hit: bool,
         fhits: Option<&FilterHits>,
+        // Whether title-`@mention` collab partners also get a Name-cell suffix
+        // (see `render_instance_row`'s doc comment) — `self.collab_title_in_name`.
+        collab_title_in_name: bool,
         out: &mut StreamsOut,
     ) {
         let mid = row.monitor.id;
@@ -3585,7 +3589,9 @@ impl StreamArchiverApp {
             rows,
             channel_name_colors,
             latest_raid_out.get(&mid),
-            col_order, fhits, &mut out.acts,
+            col_order, fhits,
+            collab_title_in_name,
+            &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
         }
