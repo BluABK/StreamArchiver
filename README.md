@@ -2467,7 +2467,11 @@ fully independent behaviors — either, both, or neither can be on at once:
   **"Raids via EventSub"** on (*Settings → Accounts → Detection
   credentials*). Chat only ever sees a raid coming **in**, never going out,
   so without both of those this whole feature is inert — no other detection
-  path exists.
+  path exists. When both the raider and the target are monitored channels,
+  Twitch delivers the same raid as two separate notifications (one per
+  matching subscription direction); these are deduplicated internally so
+  auto-play/auto-record and their player/capture launches only fire once
+  per raid, not twice.
 - **Manual play** — a live instance's right-click menu gains **"▷🏃 Follow
   raid"**, enabled once a recent raid-out is known: opens the target at the
   live edge in your media player, same as ▷ Play stream (live edge), without

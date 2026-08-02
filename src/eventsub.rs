@@ -245,6 +245,10 @@ async fn run_session(
     // Event loop. Twitch sends `session_keepalive` every `keepalive` seconds; if
     // none (plus slack) arrives, treat the connection as dead.
     let read_timeout = Duration::from_secs(keepalive + 15);
+    // (from_broadcaster_id, to_broadcaster_id, seen_at_unix) — dedup window
+    // for the "both sides monitored -> two subscriptions match" case in the
+    // channel.raid handler below.
+    let mut seen_raids: Vec<(String, String, i64)> = Vec::new();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(true);
@@ -259,7 +263,15 @@ async fn run_session(
         use tokio_tungstenite::tungstenite::Message;
         match msg {
             Message::Text(text) => {
-                if handle_message(&text, &uid_to_monitors, live_tx, offline_tx, raid_out_tx, store) {
+                if handle_message(
+                    &text,
+                    &uid_to_monitors,
+                    live_tx,
+                    offline_tx,
+                    raid_out_tx,
+                    store,
+                    &mut seen_raids,
+                ) {
                     // session_reconnect — drop out and reconnect fresh.
                     return Ok(true);
                 }
@@ -274,6 +286,7 @@ async fn run_session(
 }
 
 /// Handle one EventSub text frame. Returns true if the caller should reconnect.
+#[allow(clippy::too_many_arguments)]
 fn handle_message(
     text: &str,
     uid_to_monitors: &HashMap<String, Vec<i64>>,
@@ -281,6 +294,7 @@ fn handle_message(
     offline_tx: &UnboundedSender<OfflineSignal>,
     raid_out_tx: &UnboundedSender<RaidOutSignal>,
     store: &Store,
+    seen_raids: &mut Vec<(String, String, i64)>,
 ) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
@@ -341,8 +355,31 @@ fn handle_message(
                     // Twitch usually sends it, but it's not guaranteed.
                     let to_login = event["to_broadcaster_user_login"].as_str().unwrap_or("");
                     let to_id = event["to_broadcaster_user_id"].as_str().unwrap_or("");
+                    let from_id = event["from_broadcaster_user_id"].as_str().unwrap_or("");
                     let viewers = event["viewers"].as_i64().unwrap_or(0);
                     let at = crate::models::now_unix();
+                    // A single raid between two channels that are BOTH
+                    // monitored matches two independent subscriptions below
+                    // (one filtered on to_broadcaster_user_id, one on
+                    // from_broadcaster_user_id) — Twitch delivers a separate
+                    // notification per matching subscription, so the exact
+                    // same raid arrives as two distinct messages a few tens
+                    // of ms apart, each carrying the full from/to payload.
+                    // Without this, everything downstream double-fires:
+                    // duplicate stream_event rows AND a second Follow raid
+                    // auto-play launching a second player/streamlink instance.
+                    if !seen_raids.is_empty() {
+                        seen_raids.retain(|&(_, _, seen_at)| at - seen_at < 5);
+                    }
+                    if seen_raids.iter().any(|(f, t, _)| f == from_id && t == to_id) {
+                        debug!(
+                            "eventsub {}: {from} raided {to} — duplicate notification \
+                             (matched both raid subscriptions), skipping",
+                            crate::models::Platform::Twitch.tag()
+                        );
+                        return false;
+                    }
+                    seen_raids.push((from_id.to_string(), to_id.to_string(), at));
                     if let Some(mons) = uid_to_monitors.get(to_id) {
                         for &mid in mons {
                             info!(
@@ -354,7 +391,7 @@ fn handle_message(
                             );
                         }
                     }
-                    if let Some(from_id) = event["from_broadcaster_user_id"].as_str()
+                    if !from_id.is_empty()
                         && let Some(mons) = uid_to_monitors.get(from_id)
                     {
                         for &mid in mons {
@@ -781,4 +818,122 @@ fn twitch_login(url: &str) -> Option<String> {
     let rest = &trimmed[pos + "twitch.tv/".len()..];
     let login = rest.split(['/', '?', '#']).next()?.trim();
     (!login.is_empty()).then(|| login.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::store::test_util::sample_monitor;
+    use tokio::sync::mpsc;
+
+    fn raid_notification(from_id: &str, to_id: &str) -> String {
+        format!(
+            r#"{{
+                "metadata": {{ "message_type": "notification" }},
+                "payload": {{
+                    "subscription": {{ "type": "channel.raid" }},
+                    "event": {{
+                        "from_broadcaster_user_id": "{from_id}",
+                        "from_broadcaster_user_login": "nyanners",
+                        "from_broadcaster_user_name": "nyanners",
+                        "to_broadcaster_user_id": "{to_id}",
+                        "to_broadcaster_user_login": "ironmouse",
+                        "to_broadcaster_user_name": "ironmouse",
+                        "viewers": 1728
+                    }}
+                }}
+            }}"#
+        )
+    }
+
+    /// A raid between two monitored channels matches both the
+    /// `to_broadcaster_user_id`- and `from_broadcaster_user_id`-filtered
+    /// subscriptions, so Twitch delivers it as two separate notifications.
+    /// Regression test for the resulting double Follow-raid auto-play spawn
+    /// (two `mpv`/`streamlink` instances for one raid).
+    #[test]
+    fn channel_raid_duplicate_notification_fires_raid_out_once() {
+        let store = Store::open_in_memory().unwrap();
+        let cid_from = store.create_container("nyanners").unwrap();
+        let mid_from = store.insert_monitor(&sample_monitor(cid_from)).unwrap();
+        let cid_to = store.create_container("ironmouse").unwrap();
+        let mid_to = store.insert_monitor(&sample_monitor(cid_to)).unwrap();
+
+        let mut uid_to_monitors: HashMap<String, Vec<i64>> = HashMap::new();
+        uid_to_monitors.insert("111".to_string(), vec![mid_from]);
+        uid_to_monitors.insert("222".to_string(), vec![mid_to]);
+
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (offline_tx, _offline_rx) = mpsc::unbounded_channel();
+        let (raid_out_tx, mut raid_out_rx) = mpsc::unbounded_channel();
+        let mut seen_raids = Vec::new();
+
+        let text = raid_notification("111", "222");
+        // Two independently-arriving notifications for the SAME raid, as
+        // Twitch actually sends when both sides are monitored.
+        for _ in 0..2 {
+            handle_message(
+                &text,
+                &uid_to_monitors,
+                &live_tx,
+                &offline_tx,
+                &raid_out_tx,
+                &store,
+                &mut seen_raids,
+            );
+        }
+
+        drop(raid_out_tx);
+        let mut signals = Vec::new();
+        while let Ok(sig) = raid_out_rx.try_recv() {
+            signals.push(sig);
+        }
+        assert_eq!(signals.len(), 1, "duplicate raid notification should only fire one RaidOutSignal");
+        assert_eq!(signals[0].from_monitor_id, mid_from);
+    }
+
+    /// Two genuinely distinct raids (different target) must both go through
+    /// — the dedup key is (from, to), not just "any raid from this source
+    /// recently".
+    #[test]
+    fn channel_raid_distinct_raids_both_fire() {
+        let store = Store::open_in_memory().unwrap();
+        let cid_from = store.create_container("nyanners").unwrap();
+        let mid_from = store.insert_monitor(&sample_monitor(cid_from)).unwrap();
+
+        let mut uid_to_monitors: HashMap<String, Vec<i64>> = HashMap::new();
+        uid_to_monitors.insert("111".to_string(), vec![mid_from]);
+
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (offline_tx, _offline_rx) = mpsc::unbounded_channel();
+        let (raid_out_tx, mut raid_out_rx) = mpsc::unbounded_channel();
+        let mut seen_raids = Vec::new();
+
+        handle_message(
+            &raid_notification("111", "222"),
+            &uid_to_monitors,
+            &live_tx,
+            &offline_tx,
+            &raid_out_tx,
+            &store,
+            &mut seen_raids,
+        );
+        handle_message(
+            &raid_notification("111", "333"),
+            &uid_to_monitors,
+            &live_tx,
+            &offline_tx,
+            &raid_out_tx,
+            &store,
+            &mut seen_raids,
+        );
+
+        drop(raid_out_tx);
+        let mut signals = Vec::new();
+        while let Ok(sig) = raid_out_rx.try_recv() {
+            signals.push(sig);
+        }
+        assert_eq!(signals.len(), 2);
+    }
 }
