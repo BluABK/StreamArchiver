@@ -153,6 +153,7 @@ pub struct DownloadPlan {
 mod ad_probe;
 mod alerts;
 mod backfill;
+pub(crate) mod backfill_discover;
 mod cache;
 mod chapters;
 mod chat_only;
@@ -168,10 +169,13 @@ mod raid_follow;
 mod remux;
 mod supervisor;
 mod tools;
-mod vod;
+pub(crate) mod vod;
 
 #[allow(unused_imports)]
-use {ad_probe::*, alerts::*, backfill::*, chat_only::*, gap_recover::*, gap_splice::*, supervisor::*, vod::*};
+use {
+    ad_probe::*, alerts::*, backfill::*, backfill_discover::*, chat_only::*, gap_recover::*, gap_splice::*,
+    supervisor::*, vod::*,
+};
 pub use alerts::alert_category;
 pub use ad_probe::K_AD_PROBE;
 pub use chat_only::K_CHAT_NO_RECORD;

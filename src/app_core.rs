@@ -313,6 +313,7 @@ impl AppCore {
         let live_tx_sched = live_tx.clone();
         let ctx_sched = ctx.clone();
         let jobs_sched = self.jobs.clone();
+        let manual_tx_sched = manual_tx.clone();
         self.rt.spawn(async move {
             crate::scheduler::run(
                 ctx_sched,
@@ -321,6 +322,7 @@ impl AppCore {
                 active_sched,
                 shutdown_sched,
                 jobs_sched,
+                manual_tx_sched,
             )
             .await;
         });
@@ -379,6 +381,20 @@ impl AppCore {
         let cp_jobs = self.jobs.clone();
         self.rt.spawn(async move {
             crate::detectors::refresh_community_posts(cp_ctx, cp_events, cp_shutdown, cp_jobs).await;
+        });
+
+        // Periodic missed-stream discovery sweep (K_AUTO_BACKFILL_MISSED,
+        // off by default) — idles to one settings read per tick while off.
+        let bf_ctx = ctx.clone();
+        let bf_events = self.events.clone();
+        let bf_manual_tx = manual_tx.clone();
+        let bf_shutdown = self.shutdown.clone();
+        let bf_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            crate::downloader::backfill_discover::run_missed_stream_backfill_sweep(
+                bf_ctx, bf_events, bf_manual_tx, bf_shutdown, bf_jobs,
+            )
+            .await;
         });
 
         // Supervisor: live signals + manual commands -> recordings.

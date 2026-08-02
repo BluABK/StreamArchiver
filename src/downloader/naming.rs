@@ -281,6 +281,39 @@ pub(super) fn monitor_stem(
     )
 }
 
+/// The `(dir, stem)` a live recording would have used, for a recording row
+/// that never actually captured anything (`output_path` empty — a
+/// `not_recorded` session, or a retroactively-discovered one) and therefore
+/// has no existing filename to derive one from. Mirrors `build_plan`'s
+/// stem/dir logic without needing an in-flight capture, so a VOD-download or
+/// CDN-recovery fallback has somewhere to write a retroactively-fetched
+/// file. Returns `None` if the recording or its monitor can't be resolved.
+pub(crate) fn stem_and_dir_for_recording(store: &Store, rec_id: i64, mode: &str) -> Option<(PathBuf, String)> {
+    let rec = store.get_recording(rec_id).ok().flatten()?;
+    let row = store.get_monitor_with_channel(rec.monitor_id).ok().flatten()?;
+    let m = &row.monitor;
+    let dir = PathBuf::from(&m.output_dir);
+    let quality = resolved_quality(&m.quality);
+    let platform = m.platform().as_str().to_string();
+    let stem = monitor_stem(
+        m,
+        &row.channel.name,
+        rec.started_at,
+        rec.stream_id.as_deref(),
+        &rec.title,
+        row.recording_count,
+        &quality,
+        None,
+        "",
+        m.tool.label(),
+        mode,
+        &platform,
+        rec.went_live_at.unwrap_or(rec.started_at),
+    );
+    let stem = stem_capped_for_child_path(&dir, &stem);
+    Some((dir, stem))
+}
+
 /// The `{name}` value for an on-demand video: the user's Name, else the resolved
 /// title, else a generic fallback.
 pub(super) fn video_name<'a>(v: &'a Video, resolved_title: &'a str) -> &'a str {
@@ -1712,6 +1745,31 @@ mod tests {
         assert_eq!(stem_capped_for_child_path(dir, "short.vod"), "short.vod");
         // Deterministic.
         assert_eq!(capped, stem_capped_for_child_path(dir, &long_stem));
+    }
+
+    #[test]
+    fn stem_and_dir_for_recording_falls_back_for_not_recorded_row() {
+        // A `not_recorded` session (Auto off) never touches disk — its
+        // `output_path` is `''` — so this must compute a dir/stem from the
+        // monitor's configured settings instead of an existing filename.
+        use crate::store::test_util::sample_monitor;
+        use crate::store::Store;
+
+        let store = Store::open_in_memory().unwrap();
+        let ch = store.create_container("Cool Streamer").unwrap();
+        // sample_monitor() already carries output_dir "C:/tmp" and template
+        // "{name}_{date}_{time}" — the exact combination this test asserts on.
+        let mid = store.insert_monitor(&sample_monitor(ch)).unwrap();
+        let rec_id = store
+            .insert_not_recorded_session(mid, 1_700_000_000, Some(1_700_003_600), false, Some("s1"))
+            .unwrap();
+
+        let (dir, stem) = stem_and_dir_for_recording(&store, rec_id, "vod").unwrap();
+        assert_eq!(dir, PathBuf::from("C:/tmp"));
+        assert_eq!(stem, "Cool Streamer_20231114_221320");
+
+        // No such recording → None, doesn't panic.
+        assert!(stem_and_dir_for_recording(&store, rec_id + 1000, "vod").is_none());
     }
 
     #[test]

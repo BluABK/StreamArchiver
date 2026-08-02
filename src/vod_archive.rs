@@ -241,6 +241,61 @@ pub async fn resolve_kick_vod(
     Some(kick_vod_url(&uuid))
 }
 
+/// One entry from a Kick channel videos listing: `(uuid, start_epoch, title)`.
+pub struct KickVodListing {
+    pub uuid: String,
+    pub start: i64,
+    pub title: String,
+}
+
+/// Parse every VOD in a Kick `/videos` JSON body (no window filter) — the
+/// discovery/backfill sweep's raw material, as opposed to
+/// [`parse_kick_vod_uuid`]'s single best-match-in-window pick.
+fn parse_kick_vod_listing(body: &str) -> Vec<KickVodListing> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array().or_else(|| v.get("data").and_then(|d| d.as_array())) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let uuid = item
+                .get("uuid")
+                .or_else(|| item.get("video").and_then(|x| x.get("uuid")))
+                .and_then(|u| u.as_str())?
+                .to_string();
+            let start = item
+                .get("created_at")
+                .or_else(|| item.get("start_time"))
+                .or_else(|| item.get("session_started_at"))
+                .and_then(kick_time_to_epoch)?;
+            let title = item
+                .get("session_title")
+                .or_else(|| item.get("livestream").and_then(|l| l.get("session_title")))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(KickVodListing { uuid, start, title })
+        })
+        .collect()
+}
+
+/// List every VOD Kick currently shows for a channel (no time-window filter,
+/// unlike [`resolve_kick_vod`]) — used by the missed-stream discovery sweep
+/// to find broadcasts with no local trace at all. Best-effort, same as
+/// `resolve_kick_vod`: empty on any API/parse failure.
+pub async fn list_kick_vods(client: &reqwest::Client, slug: &str) -> Vec<KickVodListing> {
+    let url = format!("https://kick.com/api/v2/channels/{slug}/videos");
+    let Ok(resp) = client.get(&url).send().await else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.text().await else {
+        return Vec::new();
+    };
+    parse_kick_vod_listing(&body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +352,22 @@ mod tests {
         let arr = r#"[{"uuid":"a","created_at":10},{"uuid":"b","created_at":20}]"#;
         assert_eq!(parse_kick_vod_uuid(arr, None), Some("b".to_string()));
         assert_eq!(parse_kick_vod_uuid("not json", None), None);
+    }
+
+    #[test]
+    fn parse_kick_vod_listing_returns_every_entry_unfiltered() {
+        let body = r#"{"data":[
+            {"uuid":"a","created_at":10,"session_title":"First"},
+            {"uuid":"b","created_at":20}
+        ]}"#;
+        let out = parse_kick_vod_listing(body);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].uuid, "a");
+        assert_eq!(out[0].start, 10);
+        assert_eq!(out[0].title, "First");
+        assert_eq!(out[1].uuid, "b");
+        assert_eq!(out[1].title, "", "no session_title on this entry");
+        // Malformed body → empty, not a panic.
+        assert!(parse_kick_vod_listing("not json").is_empty());
     }
 }

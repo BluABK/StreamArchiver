@@ -35,6 +35,7 @@ enum PerItemMode {
 }
 
 /// Run the scheduler until shutdown is signaled.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     ctx: Arc<DetectContext>,
     events: EventTx,
@@ -42,6 +43,7 @@ pub async fn run(
     active: ActiveSet,
     shutdown: Arc<AtomicBool>,
     jobs: crate::events::JobRegistry,
+    manual_tx: mpsc::UnboundedSender<crate::events::ManualCommand>,
 ) {
     // Persisted across ticks for the `self.active`/DB consistency check (see
     // `tick`'s use of it) — monitor id -> when the mismatch was first
@@ -67,6 +69,7 @@ pub async fn run(
             &active,
             &mut active_desync_since,
             &mut active_desync_warned,
+            &manual_tx,
         )
         .await;
         crate::events::mark_job(&jobs, "Live poll", wait as i64);
@@ -91,6 +94,7 @@ fn fold_net_history(store: &crate::store::Store) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     ctx: &Arc<DetectContext>,
     events: &EventTx,
@@ -98,6 +102,7 @@ async fn tick(
     active: &ActiveSet,
     active_desync_since: &mut HashMap<i64, Instant>,
     active_desync_warned: &mut HashSet<i64>,
+    manual_tx: &mpsc::UnboundedSender<crate::events::ManualCommand>,
 ) -> u64 {
     let rows = match ctx.store.list_monitors_with_channels() {
         Ok(rows) => rows,
@@ -458,7 +463,21 @@ async fn tick(
         // "error" — a transient poll failure shouldn't fragment one
         // continuous broadcast's history into two sessions.
         if old_state == Some("live") && new_state == "offline" {
-            let _ = ctx.store.close_open_not_recorded_sessions(o.monitor_id, checked_at);
+            match ctx.store.close_open_not_recorded_sessions(o.monitor_id, checked_at) {
+                Ok(closed) if crate::downloader::vod::setting_true(&ctx.store, crate::downloader::vod::K_AUTO_BACKFILL_MISSED) => {
+                    for rec_id in closed {
+                        crate::downloader::vod::attempt_missed_stream_backfill(
+                            ctx.clone(),
+                            ctx.store.clone(),
+                            events.clone(),
+                            manual_tx.clone(),
+                            rec_id,
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("scheduler: failed to close not_recorded session for {}: {e:#}", o.monitor_id),
+            }
         }
 
         // Readable per-poll logging: name [method] result (+ go-live / error

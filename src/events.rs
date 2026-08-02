@@ -83,6 +83,10 @@ pub enum BackgroundTaskKind {
     /// that feature existed or never opened since (see
     /// `ManualCommand::FetchMissingChatEmotes`).
     FetchMissingChatEmotes,
+    /// One channel's on-demand "🔎 Scan for missed streams" pass — the manual
+    /// counterpart to the periodic `K_AUTO_BACKFILL_MISSED` sweep. Carries the
+    /// monitor id (mirrors `ReorganizeMonitor`).
+    BackfillDiscoverScan(i64),
 }
 
 impl BackgroundTaskKind {
@@ -111,6 +115,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ReembedChaptersAll => "Re-embed chapters (all)",
             BackgroundTaskKind::RaidFollow => "Follow raid",
             BackgroundTaskKind::FetchMissingChatEmotes => "Fetch missing chat emotes",
+            BackgroundTaskKind::BackfillDiscoverScan(_) => "Scan for missed streams",
         }
     }
 
@@ -143,7 +148,8 @@ impl BackgroundTaskKind {
             | BackgroundTaskKind::RefreshCdnHosts
             | BackgroundTaskKind::ReembedChaptersAll
             | BackgroundTaskKind::RaidFollow
-            | BackgroundTaskKind::FetchMissingChatEmotes => None,
+            | BackgroundTaskKind::FetchMissingChatEmotes
+            | BackgroundTaskKind::BackfillDiscoverScan(_) => None,
         }
     }
 }
@@ -562,6 +568,16 @@ pub enum ManualCommand {
     /// Download the published VOD for a recording now (manual trigger / retry of the
     /// post-stream archive feature), by recording id.
     ArchiveVodNow(i64),
+    /// Manually run `attempt_missed_stream_backfill` for one not_recorded
+    /// (or discovery-synthesized) row now, by recording id — the unified "⏬
+    /// Backfill missed VOD" action: tries the published VOD first, Twitch
+    /// falls back to CDN recovery. Distinct from `ArchiveVodNow`, which only
+    /// tries the published-VOD path and needs an already-captured take.
+    BackfillMissedVodNow(i64),
+    /// Manually run one discovery pass ("🔎 Scan for missed streams") for a
+    /// single monitor now, by monitor id — the on-demand counterpart to the
+    /// periodic `K_AUTO_BACKFILL_MISSED` sweep.
+    ScanForMissedStreams(i64),
     /// Manually (re)trigger a head backfill for a recording now, by recording id
     /// (Twitch capture-from-start only). User-initiated: forced regardless of the
     /// "fetch new head backfill on new take" setting — unlike the automatic path,

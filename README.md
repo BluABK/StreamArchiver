@@ -2277,6 +2277,47 @@ downloaded VOD** or **Retry download**.
 > the archive `failed` without ever touching the live recording (use **📥 Download VOD
 > now** to retry later).
 
+### Missed-stream backfill
+
+Retroactively grabs whatever's still recoverable about a stream this app
+missed, before the platform prunes/removes it — opt-in, off by default
+(Settings → Downloads → *Twitch VOD recovery* → **Auto-backfill missed
+streams**).
+
+**Is this the same as "📥 Download post-stream VOD"?** No — but they're now
+meant to work together. "Download post-stream VOD" only re-downloads a VOD
+that's *still published* for a recording that's *already tracked* by a take.
+A **👁 "seen live, Auto was off"** row (see *Enabled vs. Auto* above) has no
+file, so before this feature it couldn't hang a download off of anywhere —
+clicking "Download post-stream VOD" (or "🛟 Recover VOD…") on one silently
+did nothing. Both buttons now work correctly on a 👁 row too, computing an
+output folder from the channel's own settings instead of an existing
+filename. This feature layers automation on top of that fix:
+
+- **On session close** — the moment a 👁 row's broadcast ends, automatically
+  try the platform's published VOD first, then (Twitch only) reconstruct it
+  from CDN segments if nothing was ever published — the same fallback order
+  as the manual **⏬ Backfill missed VOD** button (stream/take row context
+  menu), just automatic.
+- **Periodic discovery** — separately, once a day per channel, scan the
+  platform's own VOD/video listing for broadcasts this app has **no record
+  of at all** (it wasn't running or monitoring at the time). Anything found
+  is filed as an ordinary 👁 row (title/start/end time, backdated) and
+  immediately gets the same backfill attempt as above. Twitch and YouTube
+  correlate by the platform's own broadcast/video id (exact); Kick and the
+  generic/yt-dlp-listed platforms (NRK, Nebula) correlate by a time-window
+  overlap against known takes instead, since their listing id isn't in the
+  same space as the stored stream id — best-effort there. Run it on demand
+  for one channel via **🔎 Scan for missed streams** (stream row context
+  menu), independent of the setting.
+
+> **Notes.** Twitch is the only platform with a CDN-recovery fallback — the
+> segment-reconstruction trick only works within Twitch's own storage
+> retention window (see *Twitch VOD recovery* above). YouTube/Kick backfill
+> is "published VOD or nothing" — YouTube in particular rarely prunes stream
+> VODs, so discovery there mostly just catches app-downtime gaps rather than
+> a race against deletion.
+
 ### Audio & subtitle tracks
 
 Both the Streams add/edit form (live recordings) and the Videos download form

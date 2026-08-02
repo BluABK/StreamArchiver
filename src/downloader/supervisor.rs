@@ -194,6 +194,16 @@ impl Supervisor {
                 self.cmd_scan_recoverable_vods(window_days, quality)
             }
             ManualCommand::ArchiveVodNow(rec_id) => self.cmd_archive_vod_now(rec_id),
+            ManualCommand::BackfillMissedVodNow(rec_id) => {
+                attempt_missed_stream_backfill(
+                    self.ctx.clone(),
+                    self.store.clone(),
+                    self.events.clone(),
+                    self.manual_tx.clone(),
+                    rec_id,
+                );
+            }
+            ManualCommand::ScanForMissedStreams(monitor_id) => self.cmd_scan_for_missed_streams(monitor_id),
             ManualCommand::BackfillHeadNow(rec_id) => {
                 let this = self.clone();
                 tokio::spawn(async move {
@@ -475,54 +485,47 @@ progress_info: None,
         let manual_tx = self.manual_tx.clone();
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
-            let Ok(Some((murl, vod_id, stream_id, went_live))) =
-                store.recording_archive_now(rec_id)
-            else {
-                return;
-            };
-            let url = match Platform::detect(&murl) {
-                Platform::Twitch => {
-                    // Re-resolve by broadcast id when we can: a stored vod_id
-                    // may be a wrong-VOD match from the old window-only poll
-                    // (rec 652 downloaded the NEXT stream's VOD). Falls back
-                    // to the stored id when Helix is unavailable.
-                    let repolled = match stream_id.as_deref().filter(|s| !s.is_empty()) {
-                        Some(sid) => {
-                            resolve_twitch_vod_by_stream(&ctx, &murl, sid).await.map(|(v, muted)| {
-                                let _ = store.set_recording_vod_found(rec_id, &v, muted);
-                                v
-                            })
-                        }
-                        None => None,
-                    };
-                    repolled
-                        .or(vod_id.filter(|v| !v.is_empty()))
-                        .map(|v| crate::vod_archive::twitch_vod_url(&v))
-                }
-                Platform::YouTube => stream_id
-                    .filter(|s| !s.is_empty())
-                    .map(|s| crate::vod_archive::youtube_vod_url(&s)),
-                Platform::Kick => match crate::vod_archive::kick_slug(&murl) {
-                    Some(slug) => {
-                        crate::vod_archive::resolve_kick_vod(
-                            &ctx.http_client(),
-                            &slug,
-                            went_live,
-                        )
-                        .await
-                    }
-                    None => None,
-                },
-                _ => None,
-            };
-            match url {
-                Some(u) => {
+            match resolve_vod_url(&ctx, &store, rec_id).await {
+                Some((u, _platform)) => {
                     enqueue_vod_archive(&store, &manual_tx, rec_id, &u);
                 }
                 None => {
                     let _ = store.set_recording_vod_dl(rec_id, "failed", None);
                 }
             }
+        });
+    }
+
+    /// [`ManualCommand::ScanForMissedStreams`]: one on-demand discovery pass
+    /// for a single channel/instance (see `backfill_discover`), independent
+    /// of the `K_AUTO_BACKFILL_MISSED` setting.
+    fn cmd_scan_for_missed_streams(&self, monitor_id: i64) {
+        let Ok(Some(row)) = self.store.get_monitor_with_channel(monitor_id) else {
+            return;
+        };
+        let (ctx, store, events, manual_tx) =
+            (self.ctx.clone(), self.store.clone(), self.events.clone(), self.manual_tx.clone());
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::BackfillDiscoverScan(monitor_id),
+                label: format!("Scan for missed streams · {}", row.channel.name),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: None,
+                progress_info: None,
+            }));
+            let found = crate::downloader::backfill_discover::discover_missed_streams_for_monitor(
+                ctx, store, events.clone(), manual_tx, &row,
+            )
+            .await;
+            let _ = events.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
+                    "{found} missed stream(s) found"
+                )),
+            });
         });
     }
 
@@ -2068,7 +2071,19 @@ progress_info: None,
         // this, any not-recorded session (Auto off; see
         // `insert_not_recorded_session`) opened for this broadcast is left
         // open forever (found live 2026-07-28: monitor 50/GEEGA, rec_id=1098).
-        let _ = self.store.close_open_not_recorded_sessions(monitor_id, now);
+        if let Ok(closed) = self.store.close_open_not_recorded_sessions(monitor_id, now)
+            && crate::downloader::vod::setting_true(&self.store, crate::downloader::vod::K_AUTO_BACKFILL_MISSED)
+        {
+            for rec_id in closed {
+                crate::downloader::vod::attempt_missed_stream_backfill(
+                    self.ctx.clone(),
+                    self.store.clone(),
+                    self.events.clone(),
+                    self.manual_tx.clone(),
+                    rec_id,
+                );
+            }
+        }
     }
 
     /// "Start" command: check the channel now and record if live. A

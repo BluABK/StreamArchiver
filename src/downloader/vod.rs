@@ -124,7 +124,7 @@ pub(super) async fn check_twitch_vod(
 }
 
 /// Read a boolean setting (`"true"`/`"1"` = on), defaulting to `false`.
-pub(super) fn setting_true(store: &Store, key: &str) -> bool {
+pub(crate) fn setting_true(store: &Store, key: &str) -> bool {
     matches!(
         store.get_setting(key).ok().flatten().as_deref(),
         Some("true") | Some("1")
@@ -170,16 +170,28 @@ pub(super) fn enqueue_vod_archive(
     let Ok(Some(mw)) = store.get_monitor_with_channel(monitor_id) else {
         return false;
     };
-    let out = Path::new(&output_path);
-    let Some(dir) = out.parent().map(|p| p.to_string_lossy().into_owned()).filter(|d| !d.is_empty())
-    else {
-        warn!(rec_id, "vod archive: recording has no output dir");
-        return false;
+    // A `not_recorded`/retroactively-discovered row has no `output_path` to
+    // derive a directory/stem from (nothing was ever captured for it) — fall
+    // back to computing the same dir/stem a live recording would have used.
+    let (dir, live_stem) = if output_path.is_empty() {
+        let Some((dir, stem)) = stem_and_dir_for_recording(store, rec_id, "vod") else {
+            warn!(rec_id, "vod archive: recording has no output dir");
+            return false;
+        };
+        (dir.to_string_lossy().into_owned(), stem)
+    } else {
+        let out = Path::new(&output_path);
+        let Some(dir) = out.parent().map(|p| p.to_string_lossy().into_owned()).filter(|d| !d.is_empty())
+        else {
+            warn!(rec_id, "vod archive: recording has no output dir");
+            return false;
+        };
+        let stem = out
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("rec_{rec_id}"));
+        (dir, stem)
     };
-    let live_stem = out
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!("rec_{rec_id}"));
     let m = &mw.monitor;
     let video = crate::models::Video {
         id: 0,
@@ -271,6 +283,89 @@ pub(super) fn spawn_auto_recovery(ctx: &Arc<DetectContext>, store: &Arc<Store>, 
             task_id,
         )
         .await;
+    });
+}
+
+/// Setting: opt-in (off by default) automatic backfill of missed streams —
+/// retroactively finishing a `not_recorded` row (Auto was off, but the app
+/// saw the broadcast live) the moment its session closes, and the periodic
+/// per-channel discovery sweep for broadcasts the app has no record of at
+/// all (`crate::downloader::backfill_discover`). One checkbox for both
+/// halves — see `settings.rs`.
+pub const K_AUTO_BACKFILL_MISSED: &str = "auto_backfill_missed_streams";
+
+/// Resolve the currently-published VOD URL for a recording, regardless of
+/// platform or whether the recording ever captured anything itself —
+/// exactly what "📥 Download post-stream VOD" resolves
+/// (`Supervisor::cmd_archive_vod_now`) and what
+/// [`attempt_missed_stream_backfill`] tries first. Also returns the
+/// detected platform so the caller can decide whether a CDN-recovery
+/// fallback applies. `None` means nothing is (yet) resolvable via the
+/// platform's normal VOD listing.
+pub(super) async fn resolve_vod_url(
+    ctx: &Arc<DetectContext>,
+    store: &Store,
+    rec_id: i64,
+) -> Option<(String, Platform)> {
+    let (murl, vod_id, stream_id, went_live) = store.recording_archive_now(rec_id).ok().flatten()?;
+    let platform = Platform::detect(&murl);
+    let url = match platform {
+        Platform::Twitch => {
+            // Re-resolve by broadcast id when we can: a stored vod_id may be
+            // a wrong-VOD match from the old window-only poll.
+            let repolled = match stream_id.as_deref().filter(|s| !s.is_empty()) {
+                Some(sid) => resolve_twitch_vod_by_stream(ctx, &murl, sid).await.map(|(v, muted)| {
+                    let _ = store.set_recording_vod_found(rec_id, &v, muted);
+                    v
+                }),
+                None => None,
+            };
+            repolled.or(vod_id.filter(|v| !v.is_empty())).map(|v| crate::vod_archive::twitch_vod_url(&v))
+        }
+        Platform::YouTube => {
+            stream_id.filter(|s| !s.is_empty()).map(|s| crate::vod_archive::youtube_vod_url(&s))
+        }
+        Platform::Kick => match crate::vod_archive::kick_slug(&murl) {
+            Some(slug) => crate::vod_archive::resolve_kick_vod(&ctx.http_client(), &slug, went_live).await,
+            None => None,
+        },
+        _ => None,
+    };
+    url.map(|u| (u, platform))
+}
+
+/// Retroactively fetch whatever's still recoverable for a recording that
+/// never actually captured anything — a `not_recorded` session (Auto was
+/// off) or a row synthesized by discovery
+/// (`crate::downloader::backfill_discover`). Tries the platform's normal
+/// published-VOD path first ([`resolve_vod_url`], the same one "📥 Download
+/// post-stream VOD" uses); Twitch additionally falls back to CDN recovery
+/// ([`spawn_auto_recovery`]) when nothing is published (deleted / never
+/// published) — the same "🛟 Recover VOD…" mechanism, just automatic. This
+/// is the ONE routine both the manual "⏬ Backfill missed VOD" action and
+/// the automatic triggers (not_recorded session close, discovery) call, so
+/// they can never drift out of sync.
+pub(crate) fn attempt_missed_stream_backfill(
+    ctx: Arc<DetectContext>,
+    store: Arc<Store>,
+    events: EventTx,
+    manual_tx: mpsc::UnboundedSender<ManualCommand>,
+    rec_id: i64,
+) {
+    tokio::spawn(async move {
+        let Some((murl, ..)) = store.recording_archive_now(rec_id).ok().flatten() else {
+            return;
+        };
+        let platform = Platform::detect(&murl);
+        match resolve_vod_url(&ctx, &store, rec_id).await {
+            Some((url, _platform)) => {
+                enqueue_vod_archive(&store, &manual_tx, rec_id, &url);
+            }
+            None if platform == Platform::Twitch => {
+                spawn_auto_recovery(&ctx, &store, &events, rec_id);
+            }
+            None => {}
+        }
     });
 }
 

@@ -74,6 +74,46 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Retroactively record a broadcast the app has no other trace of — found
+    /// by a platform-side discovery scan (`crate::downloader::backfill_discover`)
+    /// diffing the platform's own VOD/video listing against known
+    /// `stream_id`s. Materializes it as an ordinary `not_recorded` row (see
+    /// [`Self::insert_not_recorded_session`]) with an explicit `ended_at` (the
+    /// session is already over, unlike a live-witnessed one) so it renders
+    /// exactly like a "seen live, Auto was off" row — same grid, same
+    /// context-menu actions, same `attempt_missed_stream_backfill` trigger.
+    /// Skips (returns `Ok(None)`) if a recording for this monitor already
+    /// carries this `stream_id`, so repeated scans never create duplicates.
+    pub fn insert_discovered_not_recorded(
+        &self,
+        monitor_id: i64,
+        started_at: i64,
+        ended_at: i64,
+        stream_id: &str,
+        title: &str,
+    ) -> Result<Option<i64>> {
+        let rec_id = {
+            let conn = self.db();
+            let n = conn.execute(
+                "INSERT INTO recording(monitor_id, started_at, ended_at, output_path, status, stream_id)
+                 SELECT ?1, ?2, ?3, '', 'not_recorded', ?4
+                 WHERE NOT EXISTS (SELECT 1 FROM recording WHERE monitor_id = ?1 AND stream_id = ?4)",
+                params![monitor_id, started_at, ended_at, stream_id],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            conn.last_insert_rowid()
+        };
+        // `title`/`category` are derived from `stream_meta_change`, not a
+        // stored column (see `RECORDING_FULL_COLUMNS`) — give the row its
+        // discovered title the same way a live poll would have logged one.
+        if !title.is_empty() {
+            let _ = self.insert_meta_change(rec_id, 0, "title", "", title);
+        }
+        Ok(Some(rec_id))
+    }
+
     /// Point a take at the chat sidecar being written for it (see
     /// [`crate::models::Recording::chat_path`]). Persisted at spawn for EVERY
     /// chat producer (recorded takes and chat-only sessions alike) since the
@@ -120,17 +160,28 @@ impl Store {
 
     /// Close any open not-recorded session for this monitor (see
     /// [`Self::open_not_recorded_session`]) — the broadcast ended, or a real
-    /// recording just started and supersedes it. A no-op (0 rows) when none
-    /// is open, so callers can call this unconditionally on every relevant
-    /// transition without checking first.
-    pub fn close_open_not_recorded_sessions(&self, monitor_id: i64, ended_at: i64) -> Result<usize> {
+    /// recording just started and supersedes it. A no-op (empty `Vec`) when
+    /// none is open, so callers can call this unconditionally on every
+    /// relevant transition without checking first. Returns the closed rows'
+    /// ids (at most one in practice — one open session per monitor — but a
+    /// `Vec` in case that invariant is ever relaxed) so a genuine
+    /// broadcast-ended close can kick off a missed-stream backfill attempt;
+    /// see `crate::downloader::vod::attempt_missed_stream_backfill`.
+    pub fn close_open_not_recorded_sessions(&self, monitor_id: i64, ended_at: i64) -> Result<Vec<i64>> {
         let conn = self.db();
+        let ids: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM recording
+                 WHERE monitor_id = ?1 AND status = 'not_recorded' AND ended_at IS NULL",
+            )?
+            .query_map(params![monitor_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         conn.execute(
             "UPDATE recording SET ended_at = ?2
              WHERE monitor_id = ?1 AND status = 'not_recorded' AND ended_at IS NULL",
             params![monitor_id, ended_at],
-        )
-        .map_err(Into::into)
+        )?;
+        Ok(ids)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2387,13 +2438,45 @@ mod tests {
 
         // Closing clears the "open" lookup and stamps ended_at.
         let closed = store.close_open_not_recorded_sessions(mid, 2_000).unwrap();
-        assert_eq!(closed, 1);
+        assert_eq!(closed, vec![id]);
         assert!(store.open_not_recorded_session(mid).unwrap().is_none());
         let all = store.recordings_for_monitor(mid).unwrap();
         assert_eq!(all[0].ended_at, Some(2_000));
 
         // Closing again (no open session) is a harmless no-op.
-        assert_eq!(store.close_open_not_recorded_sessions(mid, 3_000).unwrap(), 0);
+        assert!(store.close_open_not_recorded_sessions(mid, 3_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_discovered_not_recorded_dedups_by_stream_id_and_sets_title() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let id = store
+            .insert_discovered_not_recorded(mid, 1_000, 2_000, "s1", "Discovered title")
+            .unwrap();
+        assert!(id.is_some());
+        let rec = store.get_recording(id.unwrap()).unwrap().unwrap();
+        assert_eq!(rec.status, "not_recorded");
+        assert_eq!(rec.ended_at, Some(2_000));
+        assert!(rec.output_path.is_empty());
+        assert_eq!(rec.title, "Discovered title");
+
+        // A repeated scan finding the same stream_id is a no-op, not a
+        // duplicate row.
+        let again = store.insert_discovered_not_recorded(mid, 1_000, 2_000, "s1", "Discovered title").unwrap();
+        assert!(again.is_none());
+        assert_eq!(store.recordings_for_monitor(mid).unwrap().len(), 1);
+
+        // A real recorded take already covering this stream_id also blocks
+        // discovery from filing a duplicate "missed" row for it.
+        store
+            .insert_recording(mid, 5_000, "C:/rec/take.ts", Some(5_000), false, Some("s2"), None, "", "")
+            .unwrap();
+        assert!(store.insert_discovered_not_recorded(mid, 5_000, 6_000, "s2", "").unwrap().is_none());
     }
 
     #[test]

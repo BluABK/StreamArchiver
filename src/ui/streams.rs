@@ -173,6 +173,11 @@ struct StreamsOut {
     open_recording_props: Option<i64>,
     open_recover_take: Option<i64>,
     archive_vod_now: Option<i64>,
+    /// "⏬ Backfill missed VOD" on a not_recorded (or discovery-synthesized)
+    /// row — by recording id.
+    backfill_missed_vod_now: Option<i64>,
+    /// "🔎 Scan for missed streams" — by monitor id.
+    scan_for_missed_streams: Option<i64>,
     backfill_head_now: Option<i64>,
     abort_backfill: Option<i64>,
     /// "📑 Embed chapters"/"🔁 Re-embed chapters" on a take/stream row.
@@ -1959,6 +1964,8 @@ impl StreamArchiverApp {
             open_recording_props,
             open_recover_take,
             archive_vod_now,
+            backfill_missed_vod_now,
+            scan_for_missed_streams,
             backfill_head_now,
             abort_backfill,
             retrigger_chapters,
@@ -2021,6 +2028,14 @@ impl StreamArchiverApp {
         if let Some(rec_id) = archive_vod_now {
             self.core.manual(ManualCommand::ArchiveVodNow(rec_id));
             self.status = "Downloading published VOD…".into();
+        }
+        if let Some(rec_id) = backfill_missed_vod_now {
+            self.core.manual(ManualCommand::BackfillMissedVodNow(rec_id));
+            self.status = "Backfilling missed stream…".into();
+        }
+        if let Some(monitor_id) = scan_for_missed_streams {
+            self.core.manual(ManualCommand::ScanForMissedStreams(monitor_id));
+            self.status = "Scanning for missed streams…".into();
         }
         if let Some(rec_id) = backfill_head_now.or_else(|| acts.backfill_head.take()) {
             self.core.manual(ManualCommand::BackfillHeadNow(rec_id));
@@ -4219,7 +4234,7 @@ impl StreamArchiverApp {
                 {
                     if ui
                         .button("🛟  Recover VOD…")
-                        .on_hover_text("Reconstruct this stream's (latest take's) VOD from segments still on the Twitch CDN (deleted or DMCA-muted).")
+                        .on_hover_text("Reconstruct this stream's (latest take's) VOD from segments still on the Twitch CDN (deleted or DMCA-muted). Works on a \u{1F441} \"seen live, Auto was off\" row too.")
                         .clicked()
                     {
                         out.open_recover_take = Some(t.id);
@@ -4227,10 +4242,26 @@ impl StreamArchiverApp {
                     }
                     if ui
                         .button("📥  Download post-stream VOD")
-                        .on_hover_text("Download the platform's full published VOD for this stream's latest take now (also retries a failed archive). For the missed intro of a from-start capture, use \"Backfill head\" instead.")
+                        .on_hover_text("Download the platform's full published VOD for this stream's latest take now (also retries a failed archive). Also works on a \u{1F441} \"seen live, Auto was off\" row — same as \"\u{23EC} Backfill missed VOD\" without the CDN-recovery fallback. For the missed intro of a from-start capture, use \"Backfill head\" instead.")
                         .clicked()
                     {
                         out.archive_vod_now = Some(t.id);
+                        ui.close();
+                    }
+                    if t.output_path.is_empty()
+                        && ui
+                            .button("⏬  Backfill missed VOD")
+                            .on_hover_text(
+                                "Retroactively fetch this stream's latest take now — the \
+                                 platform's published VOD if still up, else (Twitch) \
+                                 reconstructed from CDN segments if not. The one-click \
+                                 version of \"Download post-stream VOD\"/\"Recover VOD…\" \
+                                 for a \u{1F441} \"seen live, Auto was off\" row or a \
+                                 discovery-found broadcast.",
+                            )
+                            .clicked()
+                    {
+                        out.backfill_missed_vod_now = Some(t.id);
                         ui.close();
                     }
                     let owning_monitor = rows
@@ -4277,6 +4308,22 @@ impl StreamArchiverApp {
                         out.abort_backfill = Some(t.id);
                         ui.close();
                     }
+                }
+                if ui
+                    .button("🔎  Scan for missed streams")
+                    .on_hover_text(
+                        "Check this channel/instance's platform now for broadcasts this \
+                         app has no record of at all (it wasn't running/monitoring at \
+                         the time) — the on-demand version of the \
+                         \"Auto-backfill missed streams\" setting's periodic sweep. Any \
+                         found show up as new \u{1F441} \"seen live\" rows and are \
+                         immediately backfilled the same way \"\u{23EC} Backfill missed \
+                         VOD\" works.",
+                    )
+                    .clicked()
+                {
+                    out.scan_for_missed_streams = Some(mid);
+                    ui.close();
                 }
                 if let Some(t) = g.takes.iter().max_by_key(|t| t.started_at)
                     && t.status == "completed"
@@ -4855,7 +4902,7 @@ impl StreamArchiverApp {
                 if t.stream_id.is_some()
                     && ui
                         .button("🛟  Recover VOD…")
-                        .on_hover_text("Reconstruct this VOD from segments still on the Twitch CDN (deleted or DMCA-muted).")
+                        .on_hover_text("Reconstruct this VOD from segments still on the Twitch CDN (deleted or DMCA-muted). Works on a \u{1F441} \"seen live, Auto was off\" row too.")
                         .clicked()
                 {
                     out.open_recover_take = Some(t.id);
@@ -4871,10 +4918,29 @@ impl StreamArchiverApp {
                 if t.stream_id.is_some()
                     && ui
                         .button("📥  Download post-stream VOD")
-                        .on_hover_text("Download the platform's full published VOD for this recording now (also retries a failed archive). For the missed intro of a from-start capture, use \"Backfill head\" instead.")
+                        .on_hover_text("Download the platform's full published VOD for this recording now (also retries a failed archive). Also works on a \u{1F441} \"seen live, Auto was off\" row. For the missed intro of a from-start capture, use \"Backfill head\" instead.")
                         .clicked()
                 {
                     out.archive_vod_now = Some(t.id);
+                    ui.close();
+                }
+                // One-click "try the published VOD, else (Twitch)
+                // reconstruct from the CDN" — the unified action for a
+                // 👁 "seen live, Auto was off" (or discovery-found) take,
+                // which has no `output_path` for the two actions above to
+                // hang a filename off of before this existed.
+                if t.output_path.is_empty()
+                    && t.stream_id.is_some()
+                    && ui
+                        .button("⏬  Backfill missed VOD")
+                        .on_hover_text(
+                            "Retroactively fetch this take now — the platform's \
+                             published VOD if still up, else (Twitch) reconstructed \
+                             from CDN segments if not.",
+                        )
+                        .clicked()
+                {
+                    out.backfill_missed_vod_now = Some(t.id);
                     ui.close();
                 }
                 // Manually (re)trigger the CDN head-backfill for this

@@ -1110,6 +1110,11 @@ pub(crate) struct SettingsForm {
     auto_recover_muted: bool,
     /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
     auto_recover_deleted: bool,
+    /// Off by default: automatically finish a 👁 "seen live, Auto was off"
+    /// row the moment its session closes, AND periodically scan each
+    /// platform for broadcasts with no local trace at all. See
+    /// `crate::downloader::vod::K_AUTO_BACKFILL_MISSED`.
+    auto_backfill_missed: bool,
     /// Newline/comma CDN host override (empty = built-in list).
     recovery_cdn_hosts: String,
     /// Default recovery quality (empty/`chunked` = source, else e.g. `720p60`).

@@ -3292,6 +3292,25 @@ impl StreamArchiverApp {
                     ui.label("When a stream never publishes a VOD, try to recover it from the CDN automatically.");
                     ui.end_row();
 
+                    ui.checkbox(&mut self.settings.auto_backfill_missed, "Auto-backfill missed streams")
+                        .on_hover_text(
+                            "Off by default. Two things: (1) the moment a 👁 \"seen \
+                             live, Auto was off\" row's broadcast ends, automatically \
+                             try the published VOD, then (Twitch) CDN recovery if \
+                             that's not published — same as clicking \"⏬ Backfill \
+                             missed VOD\" yourself; (2) periodically scan each \
+                             platform for broadcasts this app has no record of at \
+                             all (wasn't running/monitoring at the time) and do the \
+                             same for anything found. Either half can also be run \
+                             on demand: the per-row button, or a channel's \"🔎 Scan \
+                             for missed streams\" action.",
+                        );
+                    ui.label(
+                        "Retroactively finish/discover streams before the platform \
+                         prunes or removes them — see the Streams grid's 👁 rows.",
+                    );
+                    ui.end_row();
+
                     ui.label("Default quality");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.recovery_quality)

@@ -1099,10 +1099,16 @@ pub async fn run_recovery(
                 let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("rec_{id}"));
                 (dir, format!("{stem}.recovered"))
             }
-            _ => {
-                finish_fail("recording has no output path to attach to".into());
-                return;
-            }
+            // A `not_recorded`/retroactively-discovered row has no output path
+            // (nothing was ever captured) — fall back to the dir/stem a live
+            // recording would have used, same as `enqueue_vod_archive`.
+            _ => match crate::downloader::stem_and_dir_for_recording(&store, *id, "recovery") {
+                Some((dir, stem)) => (dir, format!("{stem}.recovered")),
+                None => {
+                    finish_fail("recording has no output path to attach to".into());
+                    return;
+                }
+            },
         },
         RecoverySink::Standalone { output_dir, filename } => {
             let dir = PathBuf::from(output_dir);
