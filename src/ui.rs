@@ -2784,13 +2784,6 @@ impl eframe::App for StreamArchiverApp {
                             {
                                 self.show_notifications = true;
                                 self.notif_refreshed = None; // force an immediate refresh
-                                // Mark-all-read on open so the badge clears when you
-                                // look; items arriving while open stay unread.
-                                let _ = self
-                                    .core
-                                    .store
-                                    .mark_notifications_read_before(crate::models::now_unix());
-                                self.notif_unread = 0;
                             }
                         }
                         {

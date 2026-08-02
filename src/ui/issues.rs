@@ -552,7 +552,8 @@ impl StreamArchiverApp {
                                             "Read"
                                         } else {
                                             "Unread — counts toward the 🔔 badge until \
-                                             the feed is opened or marked read"
+                                             marked read (opening the feed alone doesn't \
+                                             clear it)"
                                         });
                                         ui.label(egui::RichText::new(icon).color(accent))
                                             .on_hover_text(

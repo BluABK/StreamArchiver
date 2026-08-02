@@ -1202,14 +1202,11 @@ impl StreamArchiverApp {
                 }
                 UiCommand::ShowNotifications => {
                     raise_window(ctx);
-                    // Mirror the 🔔 bell button: open, refresh, mark read.
+                    // Mirror the 🔔 bell button: open + refresh, but leave
+                    // read state alone — only an explicit "Mark all read"
+                    // (or per-row action) should clear the badge.
                     self.show_notifications = true;
                     self.notif_refreshed = None;
-                    let _ = self
-                        .core
-                        .store
-                        .mark_notifications_read_before(crate::models::now_unix());
-                    self.notif_unread = 0;
                 }
                 UiCommand::Quit => self.request_quit_detach(ctx),
                 UiCommand::QuitAndStop => {
