@@ -2472,7 +2472,13 @@ live, and archived:
   never conflated. Any partner name that's also one of your own tracked
   channels is coloured with that channel's Streams-grid colour and
   underlined — click it to open that channel's Properties directly, without
-  hunting it down in the grid first.
+  hunting it down in the grid first. A **confirmed** partner name that ISN'T
+  one of your tracked channels can be right-clicked → **"➕ Add as new
+  instance"** — opens the Add-stream form pre-filled with their Twitch login
+  and display name (URL/name still editable before saving), so following up
+  on a real collaborator doesn't mean retyping their channel URL by hand.
+  Title `@mentions` don't offer this (too unverified to commit to a new
+  channel from).
 - **Watch every angle** — while a collab is live, an instance's right-click
   menu gains **"👥⏵ Play all collab instances (current downloads)"** and
   **"👥▷ Play all collab instances (live edge)"**. "Current downloads" opens
@@ -2645,7 +2651,11 @@ while recording. Discrete **stream events** are archived alongside:
   in that channel's Streams-grid colour (custom colour, else its fetched
   Twitch broadcaster colour, else the deterministic palette) and underlined;
   click it to open that channel's Properties. An untracked name (an ordinary
-  viewer) is shown plain, same as before.
+  viewer) is shown plain, same as before. Chat-event names match by the
+  literal chat username; the 🤝 Collabs table below matches by the partner's
+  **Twitch login** specifically (not the local channel container's own
+  display name), so it still resolves correctly even when you've renamed a
+  tracked channel to something other than its current Twitch display name.
 - **Subs, resubs, gift subs and bits** are parsed live out of the Twitch
   chat feed (IRC `USERNOTICE`s and `bits` tags), so they're captured whenever
   the chat logger is running — which, by default, includes broadcasts that

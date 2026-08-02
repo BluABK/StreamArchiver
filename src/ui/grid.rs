@@ -425,22 +425,61 @@ fn collab_partner_color(
     if adjust { readable_color(base, tint.unwrap_or_else(|| ui.visuals().panel_fill)) } else { base }
 }
 
+/// Like [`tracked_name_label`], but for a collab partner specifically: when
+/// the partner does NOT resolve to a tracked channel, right-clicking their
+/// name offers "Add as new instance" — opens the Add-stream form pre-filled
+/// with their Twitch login/display name (`MonitorForm::from_collab_partner`),
+/// so following up on a real-life collaborator doesn't require retyping
+/// their URL by hand. Confirmed partners only (`from_title == false`) — a
+/// title `@mention` is an unverified guess, same reasoning
+/// [`UntrackedCollabPartner`] already applies to auto-play. Returns the
+/// clicked tracked-channel id (if any) plus an add-instance request (if any).
+pub(super) fn collab_name_label(
+    ui: &mut egui::Ui,
+    p: &crate::models::CollabPartner,
+    cid: Option<i64>,
+    color: Option<egui::Color32>,
+) -> (Option<i64>, Option<UntrackedCollabPartner>) {
+    let text = p.display(p.from_title);
+    if cid.is_some() {
+        return (tracked_name_label(ui, &text, cid, color), None);
+    }
+    if p.from_title || p.login.is_empty() {
+        ui.label(text);
+        return (None, None);
+    }
+    let resp = ui
+        .add(egui::Label::new(&text).sense(egui::Sense::click()))
+        .on_hover_text(format!("Right-click to add {} as a new instance.", p.name));
+    let mut add = None;
+    resp.context_menu(|ui| {
+        ui.set_min_width(180.0);
+        if ui.button(format!("➕  Add {} as new instance", p.name)).clicked() {
+            add = Some(UntrackedCollabPartner { login: p.login.clone(), name: p.name.clone() });
+            ui.close();
+        }
+    });
+    (None, add)
+}
+
 /// Render a comma-joined run of collab partner names — shared-chat partners
 /// first, then title `@mentions` as `@name` — each coloured with its own
 /// tracked channel's Streams-grid colour and linked to its Properties window
-/// when `resolve` maps its login to one (see [`tracked_name_label`]); an
-/// untracked or unverified name stays plain. Returns the clicked channel's
-/// id (if any) plus the group's response, so the caller can attach its own
-/// hover text (it needs the full [`crate::models::CollabLive`] for
-/// host/since-when, not just the partners).
+/// when `resolve` maps its login to one (see [`collab_name_label`]); an
+/// untracked or unverified name stays plain (confirmed-but-untracked names
+/// offer "Add as new instance" on right-click). Returns the clicked
+/// channel's id (if any), an add-instance request (if any), plus the group's
+/// response, so the caller can attach its own hover text (it needs the full
+/// [`crate::models::CollabLive`] for host/since-when, not just the partners).
 pub(super) fn collab_names_row(
     ui: &mut egui::Ui,
     partners: &[crate::models::CollabPartner],
     resolve: impl Fn(&str) -> Option<i64>,
     channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
     tint: Option<egui::Color32>,
-) -> (Option<i64>, egui::Response) {
+) -> (Option<i64>, Option<UntrackedCollabPartner>, egui::Response) {
     let mut clicked = None;
+    let mut add = None;
     let resp = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -452,19 +491,24 @@ pub(super) fn collab_names_row(
                 first = false;
                 let pcid = resolve(&p.login);
                 let color = pcid.map(|cid| collab_partner_color(cid, channel_name_colors, tint, ui));
-                if let Some(cid) = tracked_name_label(ui, &p.display(p.from_title), pcid, color) {
-                    clicked = Some(cid);
+                let (c, a) = collab_name_label(ui, p, pcid, color);
+                if c.is_some() {
+                    clicked = c;
+                }
+                if a.is_some() {
+                    add = a;
                 }
             }
         })
         .response;
-    (clicked, resp)
+    (clicked, add, resp)
 }
 
 /// Render a 🤝 Collab cell: comma-joined partner names, truncated to the
 /// column, with a detail hover (who, host, since-when, source). Blank when
-/// not collabing. See [`collab_names_row`] for the per-name colour/link
-/// behaviour. Returns the clicked channel's id, if any.
+/// not collabing. See [`collab_names_row`] for the per-name colour/link/
+/// add-instance behaviour. Returns the clicked channel's id, if any, plus an
+/// add-instance request, if any.
 pub(super) fn collab_cell(
     ui: &mut egui::Ui,
     collab: Option<&crate::models::CollabLive>,
@@ -472,18 +516,18 @@ pub(super) fn collab_cell(
     login_to_mid: &HashMap<String, i64>,
     channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
     tint: Option<egui::Color32>,
-) -> Option<i64> {
-    let c = collab?;
+) -> (Option<i64>, Option<UntrackedCollabPartner>) {
+    let Some(c) = collab else { return (None, None) };
     if c.partners.is_empty() {
-        return None;
+        return (None, None);
     }
     let hover = collab_hover(c);
     let resolve = |login: &str| {
         login_to_mid.get(login).and_then(|&mid| rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id))
     };
-    let (clicked, resp) = collab_names_row(ui, &c.partners, resolve, channel_name_colors, tint);
+    let (clicked, add, resp) = collab_names_row(ui, &c.partners, resolve, channel_name_colors, tint);
     resp.on_hover_text(hover);
-    clicked
+    (clicked, add)
 }
 
 /// The 🤝 hover text: shared-chat partners with the host called out, the
@@ -2222,6 +2266,10 @@ pub(super) struct RowActions {
     /// Monitor id whose most recent raid-out target should open live-edge in
     /// the player, no recording (set by "Follow raid").
     pub(super) follow_raid: Option<i64>,
+    /// A confirmed-but-untracked collab partner to open the pre-filled
+    /// Add-stream form for (set by right-clicking their name in the Name-cell
+    /// " × Partner" suffix or 🤝 Collab column/cell — see [`collab_name_label`]).
+    pub(super) add_collab_instance: Option<UntrackedCollabPartner>,
 }
 
 /// A collab partner confirmed via Twitch Shared Chat (`from_title == false`)
@@ -2801,10 +2849,12 @@ pub(super) fn render_instance_row(
                                             base
                                         }
                                     });
-                                    if let Some(cid) =
-                                        tracked_name_label(ui, &p.display(p.from_title), pcid, color)
-                                    {
+                                    let (cid, add) = collab_name_label(ui, p, pcid, color);
+                                    if let Some(cid) = cid {
                                         a.open_channel_props = Some(cid);
+                                    }
+                                    if add.is_some() {
+                                        a.add_collab_instance = add;
                                     }
                                 }
                             })
@@ -2970,11 +3020,14 @@ pub(super) fn render_instance_row(
                             .and_then(|(_, _, pmid)| *pmid)
                             .and_then(|mid| rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id))
                     };
-                    let (clicked, resp) =
+                    let (clicked, add, resp) =
                         collab_names_row(ui, &c.partners, resolve, channel_name_colors, tint);
                     resp.on_hover_text(hover);
                     if let Some(cid) = clicked {
                         a.open_channel_props = Some(cid);
+                    }
+                    if add.is_some() {
+                        a.add_collab_instance = add;
                     }
                 }
             }

@@ -255,6 +255,39 @@ impl StreamArchiverApp {
     /// reusing the Streams-tab cache, since Channel Stats can be viewed
     /// without ever opening the Streams tab this session.
     fn tracked_name_colors(&mut self) -> HashMap<String, (i64, egui::Color32)> {
+        let colors = self.channel_colors_by_id();
+        self.channels
+            .iter()
+            .filter_map(|ch| colors.get(&ch.id).map(|&c| (ch.name.to_lowercase(), (ch.id, c))))
+            .collect()
+    }
+
+    /// Twitch login (case-insensitive) → (channel id, Streams-grid display
+    /// colour), for every tracked Twitch instance — same colours as
+    /// [`Self::tracked_name_colors`] but keyed by the stable platform login
+    /// instead of the user-editable channel display name. A collab partner is
+    /// only ever known by login/display-name-at-observation-time, and the
+    /// local channel container's own `name` field can freely diverge from
+    /// that (renamed, retyped with different casing, …) — matching by name
+    /// silently failed to link/colour an already-tracked partner whenever it
+    /// did. Chat-event actor/target strings elsewhere in this view don't need
+    /// this: a Twitch chat username already IS the login.
+    fn tracked_login_colors(&mut self) -> HashMap<String, (i64, egui::Color32)> {
+        let colors = self.channel_colors_by_id();
+        self.rows
+            .iter()
+            .filter(|r| r.monitor.platform() == Platform::Twitch)
+            .filter_map(|r| {
+                let login = crate::detectors::twitch_login(&r.monitor.url)?;
+                colors.get(&r.channel.id).map(|&c| (login, (r.channel.id, c)))
+            })
+            .collect()
+    }
+
+    /// Streams-grid display colour for every tracked channel, by channel id —
+    /// shared base computation for [`Self::tracked_name_colors`] and
+    /// [`Self::tracked_login_colors`], which just key it differently.
+    fn channel_colors_by_id(&mut self) -> HashMap<i64, egui::Color32> {
         let mut out = HashMap::new();
         for ch in self.channels.clone() {
             let cid = ch.id;
@@ -280,7 +313,7 @@ impl StreamArchiverApp {
                     None => channel_event_color(cid, ""),
                 }
             };
-            out.insert(ch.name.to_lowercase(), (cid, color));
+            out.insert(cid, color);
         }
         out
     }
@@ -423,10 +456,15 @@ impl StreamArchiverApp {
                 self.load_chstats();
             }
 
-            let name_colors = self.tracked_name_colors();
             match self.chstats_channel {
-                None => self.chstats_overview_section(ui, &name_colors),
-                Some(cid) => self.chstats_channel_section(ui, cid, &name_colors),
+                None => {
+                    let login_colors = self.tracked_login_colors();
+                    self.chstats_overview_section(ui, &login_colors);
+                }
+                Some(cid) => {
+                    let name_colors = self.tracked_name_colors();
+                    self.chstats_channel_section(ui, cid, &name_colors);
+                }
             }
         });
     }
@@ -435,7 +473,7 @@ impl StreamArchiverApp {
     fn chstats_overview_section(
         &mut self,
         ui: &mut egui::Ui,
-        name_colors: &HashMap<String, (i64, egui::Color32)>,
+        login_colors: &HashMap<String, (i64, egui::Color32)>,
     ) {
         let Some(data) = &self.chstats_data else { return };
         ui.heading("Viewers").on_hover_text(
@@ -548,11 +586,12 @@ impl StreamArchiverApp {
                     ui.strong("Last seen")
                         .on_hover_text("When a session with them was last observed");
                     ui.end_row();
-                    for (name, sessions, last_seen) in self.stats_collabs.iter().take(100) {
-                        // `@name` = title-mention-only (unconfirmed) — strip it before
-                        // matching a tracked channel; it'll simply miss otherwise.
-                        let key = name.strip_prefix('@').unwrap_or(name).to_lowercase();
-                        let (cid, color) = match name_colors.get(&key) {
+                    for (login, name, sessions, last_seen) in self.stats_collabs.iter().take(100) {
+                        // Resolve by login, not display name — a partner's
+                        // login is stable and is what `tracked_login_colors`
+                        // is keyed by; the local channel's own `name` field
+                        // can differ from their Twitch display name.
+                        let (cid, color) = match login_colors.get(&login.to_lowercase()) {
                             Some(&(cid, color)) => (Some(cid), Some(color)),
                             None => (None, None),
                         };

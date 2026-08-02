@@ -2222,6 +2222,18 @@ impl StreamArchiverApp {
                 ));
             }
         }
+        if let Some(p) = acts.add_collab_instance {
+            // Right-clicked an untracked-but-confirmed collab partner's name
+            // (Name-cell suffix or 🤝 Collab column) → open the Add-stream
+            // form pre-filled with their Twitch login/display name, same as
+            // a manual "Add stream" but without retyping the URL.
+            self.form = Some(MonitorForm::from_collab_partner(
+                &p.login,
+                &p.name,
+                &self.monitor_defaults,
+                &self.settings.default_output_dir,
+            ));
+        }
         if let Some(mid) = acts.move_instance {
             self.move_instance_dialog = Some((mid, None));
         }
@@ -3028,8 +3040,12 @@ impl StreamArchiverApp {
                                                     base
                                                 }
                                             });
-                                            if let Some(pcid) = tracked_name_label(ui, &p.display(false), pcid, color) {
-                                                out.acts.open_channel_props = Some(pcid);
+                                            let (cid, add) = collab_name_label(ui, p, pcid, color);
+                                            if let Some(cid) = cid {
+                                                out.acts.open_channel_props = Some(cid);
+                                            }
+                                            if add.is_some() {
+                                                out.acts.add_collab_instance = add;
                                             }
                                         }
                                     })
@@ -3214,10 +3230,13 @@ impl StreamArchiverApp {
                         meta_value_cell(ui, &cur_title, fhits.and_then(|f| f.needle("title")));
                     }
                     "collab" => {
-                        if let Some(pcid) =
-                            collab_cell(ui, cur_collab.as_ref(), rows, login_to_mid, channel_name_colors, tint)
-                        {
+                        let (pcid, add) =
+                            collab_cell(ui, cur_collab.as_ref(), rows, login_to_mid, channel_name_colors, tint);
+                        if let Some(pcid) = pcid {
                             out.acts.open_channel_props = Some(pcid);
+                        }
+                        if add.is_some() {
+                            out.acts.add_collab_instance = add;
                         }
                     }
                     "viewers" => {

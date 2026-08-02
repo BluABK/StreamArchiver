@@ -758,6 +758,26 @@ impl MonitorForm {
             exclude_from_auto_play: None,
         }
     }
+
+    /// "Add stream" for a confirmed-but-untracked collab partner — right-click
+    /// → "Add as new instance" on their name in the Streams grid (Name-cell
+    /// suffix or 🤝 Collab column). A brand-new channel, like `new_channel`,
+    /// but with the URL/name already known from the partner's Twitch login/
+    /// display name instead of blank — the dialog's own platform-detected
+    /// re-resolve (`form.last_platform`/`output_dir_platform` mismatch on
+    /// first render) fills in Twitch's tool/detection/output-dir defaults
+    /// exactly as if the user had pasted the URL and typed the name by hand.
+    fn from_collab_partner(
+        login: &str,
+        name: &str,
+        defaults: &MonitorDefaults,
+        default_output_dir: &str,
+    ) -> MonitorForm {
+        let mut mf = Self::new_channel(defaults, default_output_dir);
+        mf.name = name.to_string();
+        mf.url = format!("https://twitch.tv/{login}");
+        mf
+    }
 }
 
 /// A three-state **Inherit / On / Off** dropdown for an `Option<bool>` override
@@ -2069,9 +2089,9 @@ pub struct StreamArchiverApp {
     stats_recordings_daily: Option<Vec<DailyRecordingStat>>,
     /// Selected period for the Recordings breakdown (session-only).
     recordings_period: RecordingsPeriod,
-    /// Cached 🤝 collab-partner overview (name, sessions, last seen) for the
-    /// Stats view — loaded/refreshed together with `stats_snapshot`.
-    stats_collabs: Vec<(String, i64, i64)>,
+    /// Cached 🤝 collab-partner overview (login, name, sessions, last seen)
+    /// for the Stats view — loaded/refreshed together with `stats_snapshot`.
+    stats_collabs: Vec<(String, String, i64, i64)>,
     /// Selected timespan for the Stats view's detection-history graphs
     /// (session-only, defaults to 24 h).
     stats_poll_span: PollSpan,

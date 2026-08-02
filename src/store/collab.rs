@@ -201,9 +201,17 @@ impl Store {
     }
 
     /// Aggregate partner overview for the Stats tab: one entry per partner
-    /// (case-insensitive by name, most recent display casing kept) with the
-    /// session count and the most recent sighting. Sorted by count desc.
-    pub fn collab_partner_overview(&self) -> Result<Vec<(String, i64, i64)>> {
+    /// with the session count and the most recent sighting, most recent
+    /// display casing kept. Grouped by **login** (case-insensitive), not
+    /// display name — a partner's Twitch login is stable while their display
+    /// name can be re-cased or changed between sightings, and matching by
+    /// name also broke resolving a partner to their locally-tracked channel
+    /// whenever that channel's own (user-editable) name differed from the
+    /// partner's current Twitch display name. Falls back to a name-derived
+    /// key only for the rare partner with no login on record (a failed
+    /// Get Users lookup). Sorted by count desc. Returns
+    /// `(login, name, sessions, last_seen)`.
+    pub fn collab_partner_overview(&self) -> Result<Vec<(String, String, i64, i64)>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT participants, last_seen_at FROM collab_session
@@ -212,7 +220,7 @@ impl Store {
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut agg: std::collections::HashMap<String, (String, i64, i64)> =
+        let mut agg: std::collections::HashMap<String, (String, String, i64, i64)> =
             std::collections::HashMap::new();
         for (json, last_seen) in rows {
             let partners: Vec<CollabPartner> = serde_json::from_str(&json).unwrap_or_default();
@@ -220,18 +228,22 @@ impl Store {
                 if p.name.is_empty() {
                     continue;
                 }
+                let key = if p.login.is_empty() {
+                    format!("~{}", p.name.to_lowercase())
+                } else {
+                    p.login.to_lowercase()
+                };
                 // Ascending scan → the last write per key carries the most
-                // recent display casing and last_seen.
-                let e = agg
-                    .entry(p.name.to_lowercase())
-                    .or_insert_with(|| (p.name.clone(), 0, 0));
-                e.0 = p.name.clone();
-                e.1 += 1;
-                e.2 = e.2.max(last_seen);
+                // recent login/display casing and last_seen.
+                let e = agg.entry(key).or_insert_with(|| (p.login.clone(), p.name.clone(), 0, 0));
+                e.0 = p.login.clone();
+                e.1 = p.name.clone();
+                e.2 += 1;
+                e.3 = e.3.max(last_seen);
             }
         }
-        let mut out: Vec<(String, i64, i64)> = agg.into_values().collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        let mut out: Vec<(String, String, i64, i64)> = agg.into_values().collect();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
         Ok(out)
     }
 
@@ -414,10 +426,11 @@ mod tests {
         let closed = store.end_open_collab_sessions(mid, &[], &[], 1060).unwrap();
         assert_eq!(closed, vec!["Shylily, Ironmouse".to_string()]);
 
-        // Overview aggregates across sessions; the stream map merges sources.
+        // Overview aggregates across sessions (grouped by login); the stream
+        // map merges sources.
         let overview = store.collab_partner_overview().unwrap();
-        let lily = overview.iter().find(|(n, _, _)| n == "Shylily").unwrap();
-        assert_eq!((lily.1, lily.2), (1, 1030), "one session, last touched at 1030");
+        let lily = overview.iter().find(|(login, _, _, _)| login == "shylily").unwrap();
+        assert_eq!((lily.1.as_str(), lily.2, lily.3), ("Shylily", 1, 1030), "one session, last touched at 1030");
         let by_stream = store.collab_names_by_stream().unwrap();
         assert_eq!(
             by_stream.get(&(mid, "st-1".into())).unwrap(),
