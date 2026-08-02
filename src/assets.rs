@@ -859,6 +859,36 @@ pub(crate) fn all_twitch_emote_dirs_under(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Precomputed `{filename stem} -> path` index over every dir in
+/// `all_twitch_emote_dirs()` (or a filtered subset), covering both the
+/// current `{id}_{name}` and legacy `{id}` filename forms as-is — no id
+/// parsing needed, since a lookup just needs to reconstruct the same
+/// candidate string a writer would have used and probe the map for it.
+///
+/// This exists ONLY for performance: a chat log routinely repeats the same
+/// handful of first-party emotes hundreds of times (a single spammed emote
+/// can appear 3-4x per message across thousands of messages), and with
+/// several dozen archived channels each contributing a fallback dir, doing a
+/// filesystem `exists_sync` stat per (occurrence × fallback dir × extension ×
+/// filename-form) for every miss made a large chat log's tail-first load take
+/// **over a minute** (found 2026-08-02, the day the fallback search itself
+/// was added) — directory-listing every fallback dir ONCE up front and then
+/// doing an in-memory hashmap lookup per occurrence removes that
+/// multiplication entirely.
+pub(crate) fn index_emote_stems(dirs: &[PathBuf]) -> std::collections::HashMap<String, PathBuf> {
+    let mut map = std::collections::HashMap::new();
+    for dir in dirs {
+        let Ok(entries) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                map.entry(stem.to_string()).or_insert(path);
+            }
+        }
+    }
+    map
+}
+
 // ---------- Asset change history ----------
 
 /// One recorded change to a channel's assets, appended as a JSON line to the
@@ -2692,6 +2722,38 @@ mod tests {
         let mut want = vec![nihmune, old_chan];
         want.sort();
         assert_eq!(dirs, want);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression guard for the perf fix: `index_emote_stems` must key by the
+    /// exact filename stem (new `{id}_{name}` and legacy `{id}` both land as
+    /// literal keys, no id-parsing), across every directory passed in, in ONE
+    /// pass — this is what turned "one `exists_sync` stat per (occurrence ×
+    /// fallback channel × extension × filename-form)" into one directory
+    /// listing per channel + O(1) lookups, after the naive version made a
+    /// 3000-message chat log take over a minute to load (2026-08-02).
+    #[test]
+    fn index_emote_stems_keys_by_stem_across_every_dir() {
+        let root = unique_test_dir("sa-emote-stem-index");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("111_nihmunHeart.png"), b"x").unwrap();
+        std::fs::write(b.join("222.gif"), b"y").unwrap(); // legacy form, other dir
+        // A non-image file (e.g. a stray manifest) still indexes by stem —
+        // the index doesn't filter by extension, callers probe specific keys.
+        std::fs::write(b.join("333_someEmote.webp"), b"z").unwrap();
+
+        let index = index_emote_stems(&[a.clone(), b.clone()]);
+        assert_eq!(index.get("111_nihmunHeart"), Some(&a.join("111_nihmunHeart.png")));
+        assert_eq!(index.get("222"), Some(&b.join("222.gif")));
+        assert_eq!(index.get("333_someEmote"), Some(&b.join("333_someEmote.webp")));
+        assert_eq!(index.get("nope"), None);
+        // A dir that doesn't exist is silently skipped, not an error.
+        let empty = index_emote_stems(&[root.join("missing")]);
+        assert!(empty.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
