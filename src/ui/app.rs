@@ -677,6 +677,7 @@ impl StreamArchiverApp {
             streams_only_recorded,
             streams_allow_delete,
             confirm_delete_file: None,
+            confirm_delete_stream_files: None,
             manual_delete_pending: HashSet::new(),
             manual_delete_done: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             streams_active_view: None,

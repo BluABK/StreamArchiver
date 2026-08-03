@@ -39,6 +39,22 @@ pub(super) struct ConfirmDeleteFile {
     pub(super) method: crate::disposal::DisposalMethod,
 }
 
+/// Pending confirmation for a bulk "🗑🔥 Delete all take files from disk" —
+/// the stream-row equivalent of [`ConfirmDeleteFile`], for cleaning up every
+/// take of one broadcast at once (e.g. an error/retry storm that left a
+/// broadcast with a dozen useless takes). Every take's file, path, size and
+/// resolved method is captured up front at menu-click time — takes can
+/// resolve to different disposal methods (a per-recording trigger override),
+/// so this is a list, not one shared method.
+pub(super) struct ConfirmDeleteStreamFiles {
+    pub(super) channel_id: i64,
+    pub(super) monitor_id: i64,
+    /// `(rec_id, path, bytes, resolved method)`, oldest take first.
+    pub(super) items: Vec<(i64, String, i64, crate::disposal::DisposalMethod)>,
+    /// "{channel name} — {stream date}", for the confirm dialog's text.
+    pub(super) label: String,
+}
+
 /// Backing state for the create/rename channel-container dialog.
 pub(super) struct ChannelForm {
     /// `Some(id)` = renaming an existing channel; `None` = creating a new one.
@@ -196,6 +212,12 @@ struct StreamsOut {
     /// runs after the user confirms. Enabled only when all three
     /// `manual_delete` gates are on for this take's channel/instance.
     delete_recording_file: Option<i64>,
+    /// "🗑🔥 Delete all take files from disk…" on a stream row — every
+    /// eligible (non-active, has a file, not already mid-delete) take id in
+    /// that broadcast. Opens the bulk confirm dialog
+    /// (`ConfirmDeleteStreamFiles`); same three `manual_delete` gates as the
+    /// single-take version, checked once for the whole instance.
+    delete_stream_files: Option<Vec<i64>>,
     open_recording_props: Option<i64>,
     open_recover_take: Option<i64>,
     archive_vod_now: Option<i64>,
@@ -1975,7 +1997,8 @@ impl StreamArchiverApp {
                                     current_recording_group.as_ref().map(|(id, name)| (*id, name.as_str())),
                                     now,
                                     &col_order, &self.rec_alert_badges,
-                                    active_ids, &finalizing_ids, fhits.as_ref(), &mut out,
+                                    active_ids, &finalizing_ids, fhits.as_ref(),
+                                    &self.core, &self.manual_delete_pending, &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -2051,6 +2074,7 @@ impl StreamArchiverApp {
             copy_text,
             delete_recording,
             delete_recording_file,
+            delete_stream_files,
             open_recording_props,
             open_recover_take,
             archive_vod_now,
@@ -2668,6 +2692,50 @@ impl StreamArchiverApp {
                             .unwrap_or_else(|| "this recording".into())
                     ),
                     method,
+                });
+            }
+        }
+        if let Some(rec_ids) = delete_stream_files
+            && !rec_ids.is_empty()
+        {
+            let recs: Vec<crate::models::Recording> = self
+                .rec_cache
+                .values()
+                .flat_map(|v| v.iter())
+                .filter(|r| rec_ids.contains(&r.id))
+                .cloned()
+                .collect();
+            if let Some(monitor_id) = recs.first().map(|r| r.monitor_id)
+                && let Some(channel_id) =
+                    self.rows.iter().find(|r| r.monitor.id == monitor_id).map(|r| r.channel.id)
+            {
+                let channel_name = self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == channel_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                let mut items: Vec<(i64, String, i64, crate::disposal::DisposalMethod)> = recs
+                    .iter()
+                    .map(|rec| {
+                        let method = crate::disposal::effective_method_for_recording(
+                            &self.core.store,
+                            channel_id,
+                            monitor_id,
+                            rec.id,
+                        );
+                        (rec.id, rec.output_path.clone(), rec.bytes, method)
+                    })
+                    .collect();
+                items.sort_by_key(|(rid, ..)| {
+                    recs.iter().find(|r| r.id == *rid).map(|r| r.started_at).unwrap_or(0)
+                });
+                let started = recs.iter().map(|r| r.started_at).min().unwrap_or(0);
+                self.confirm_delete_stream_files = Some(ConfirmDeleteStreamFiles {
+                    channel_id,
+                    monitor_id,
+                    items,
+                    label: format!("{channel_name} — {}", fmt_datetime_short(started)),
                 });
             }
         }
@@ -3942,6 +4010,10 @@ impl StreamArchiverApp {
         // Active header filters, for marking rows/text that contain the
         // match (`None` = no filter set).
         fhits: Option<&FilterHits>,
+        core: &AppCore,
+        // Recording ids with a manual "Delete file from disk" in flight —
+        // see `take_row`'s copy of this parameter.
+        manual_delete_pending: &HashSet<i64>,
         out: &mut StreamsOut,
     ) {
         // The broadcast's stored collab names — shared by the collab cell
@@ -4646,6 +4718,52 @@ impl StreamArchiverApp {
                             g.ended_at().unwrap_or(0),
                         ));
                     }
+                    ui.close();
+                }
+                // Bulk "delete the FILE, keep every row" for the whole
+                // broadcast — the stream-level equivalent of the take row's
+                // "🗑🔥 Delete file from disk…", for cleaning up an
+                // error/retry storm that left a broadcast with a dozen
+                // useless takes in one go. Same three `manual_delete` gates,
+                // checked once for the whole instance (not per-take).
+                let owning_channel_id = rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
+                let allow = owning_channel_id
+                    .map(|cid| crate::manual_delete::deletion_allowed(&core.store, cid, mid))
+                    .unwrap_or(false);
+                let eligible: Vec<i64> = g
+                    .takes
+                    .iter()
+                    .filter(|t| {
+                        !t.is_active()
+                            && !t.output_path.is_empty()
+                            && !manual_delete_pending.contains(&t.id)
+                    })
+                    .map(|t| t.id)
+                    .collect();
+                if ui
+                    .add_enabled(
+                        allow && !eligible.is_empty(),
+                        egui::Button::new("🗑🔥  Delete all take files from disk…"),
+                    )
+                    .on_hover_text(format!(
+                        "Move (or delete, per Settings → Automatic deletion) the captured \
+                         file for every take of this broadcast ({} eligible). Every take's \
+                         history row stays — only the media files go away. Asks to confirm \
+                         first. Handy after an error/retry storm left a broadcast with a \
+                         pile of useless takes.",
+                        eligible.len()
+                    ))
+                    .on_disabled_hover_text(if !allow {
+                        "Blocked: needs \"Allow deletion\" on in the Streams toolbar AND \
+                         \"Allow delete\" enabled on both this channel and this instance \
+                         (all off by default)."
+                    } else {
+                        "No eligible take files to delete (all still recording, already \
+                         gone, or already being deleted)"
+                    })
+                    .clicked()
+                {
+                    out.delete_stream_files = Some(eligible);
                     ui.close();
                 }
             });

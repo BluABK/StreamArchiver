@@ -1638,6 +1638,9 @@ pub struct StreamArchiverApp {
     /// Pending confirmation for a manual "Delete file from disk" — set by the
     /// take-row context-menu item, cleared on Delete/Cancel.
     confirm_delete_file: Option<ConfirmDeleteFile>,
+    /// Pending confirmation for a bulk "Delete all take files from disk" —
+    /// set by the stream-row context-menu item, cleared on Delete/Cancel.
+    confirm_delete_stream_files: Option<ConfirmDeleteStreamFiles>,
     /// Take (recording) ids with a manual file-delete currently in flight —
     /// disables their row's action while the async disposal runs.
     manual_delete_pending: HashSet<i64>,
@@ -3286,6 +3289,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_channel_window(ui.ctx());
         self.drain_manual_delete_results();
         self.confirm_delete_file_window(ui.ctx());
+        self.confirm_delete_stream_files_window(ui.ctx());
         self.move_instance_window(ui.ctx());
         self.merge_channel_window(ui.ctx());
         self.confirm_delete_segment_window(ui.ctx());

@@ -851,6 +851,17 @@ Clicking the menu item still asks for confirmation, naming exactly which
 disposal method will run (Trash folder / Recycle Bin / Delete permanently)
 before anything happens.
 
+**Bulk "🗑🔥 Delete all take files from disk…"** (stream-row context menu) —
+the same action applied to every take of one broadcast at once: every
+eligible take's file (skips whichever are still recording, already gone, or
+already mid-delete) is disposed of, following each one's own resolved
+method — a per-recording trigger override can make them differ, so the
+confirm dialog lists a count per method rather than assuming one. History
+rows are kept, same as the single-take version. Useful after an
+error/retry storm leaves a broadcast with a dozen useless takes: clean up
+the disk in one click instead of doing it take by take. Gated by the exact
+same three switches above, checked once for the whole instance.
+
 **🗑 Trash view.** Every automatic disposal is logged here — reason (post-join
 cleanup, gap-splice cleanup, superseded old head, VOD replace, superseded
 working-dir capture), when, the take's **title** (so several disposals from

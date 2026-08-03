@@ -422,22 +422,169 @@ impl StreamArchiverApp {
         });
     }
 
-    /// Drain completed manual-delete outcomes (see `spawn_manual_delete_file`)
-    /// and surface them: clear the pending flag, status-bar the result either
-    /// way (same feedback path every other manual action in this app uses).
+    /// Drain completed manual-delete outcomes (see `spawn_manual_delete_file`
+    /// and `spawn_manual_delete_stream_files`) and surface them: clear the
+    /// pending flags, status-bar the result (same feedback path every other
+    /// manual action in this app uses). A single outcome keeps the precise
+    /// per-file phrasing; a batch (the bulk stream action, or several
+    /// single-file deletes that happened to land in the same drain pass)
+    /// gets one summary line instead of the last one silently winning.
     pub(super) fn drain_manual_delete_results(&mut self) {
         let drained: Vec<crate::manual_delete::ManualDeleteOutcome> =
             std::mem::take(&mut *self.manual_delete_done.lock().unwrap());
         if drained.is_empty() {
             return;
         }
-        for (rid, result) in drained {
-            self.manual_delete_pending.remove(&rid);
-            self.status = match result {
+        let ok = drained.iter().filter(|(_, r)| r.is_ok()).count();
+        let err = drained.len() - ok;
+        for (rid, _) in &drained {
+            self.manual_delete_pending.remove(rid);
+        }
+        self.status = if let [(_, result)] = drained.as_slice() {
+            match result {
                 Ok(desc) => format!("Recording file {desc}."),
                 Err(e) => format!("Error deleting file: {e}"),
-            };
+            }
+        } else if err == 0 {
+            format!("Deleted {ok} file(s).")
+        } else {
+            format!("Deleted {ok} file(s), {err} failed.")
+        };
+    }
+
+    /// Modal confirmation for a bulk "🗑🔥 Delete all take files from disk"
+    /// (stream-row context menu, see `crate::manual_delete`) — the
+    /// broadcast-level equivalent of `confirm_delete_file_window`. Lists
+    /// every take about to lose its file, grouped by resolved disposal
+    /// method (a per-recording trigger override can make them differ), plus
+    /// the total size being reclaimed.
+    #[allow(deprecated)]
+    pub(super) fn confirm_delete_stream_files_window(&mut self, ctx: &egui::Context) {
+        let Some(cdsf) = self.confirm_delete_stream_files.as_ref() else {
+            return;
+        };
+        let channel_id = cdsf.channel_id;
+        let monitor_id = cdsf.monitor_id;
+        let items = cdsf.items.clone();
+        let label = cdsf.label.clone();
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+
+        let total_bytes: i64 = items.iter().map(|(_, _, b, _)| *b).sum();
+        let mut by_method: Vec<(crate::disposal::DisposalMethod, usize)> = Vec::new();
+        for (_, _, _, m) in &items {
+            match by_method.iter_mut().find(|(bm, _)| bm == m) {
+                Some((_, n)) => *n += 1,
+                None => by_method.push((*m, 1)),
+            }
         }
+        let any_permanent = items
+            .iter()
+            .any(|(_, _, _, m)| *m == crate::disposal::DisposalMethod::Delete);
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_streamfiles_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete all take files")
+                .with_inner_size([460.0, 220.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!(
+                        "Delete {} captured file(s) for “{label}”? ({})",
+                        items.len(),
+                        fmt_bytes(total_bytes)
+                    ));
+                    ui.add_space(6.0);
+                    for (method, n) in &by_method {
+                        ui.label(format!("{n} file(s): {}", method.label()));
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        "Every take's history row stays — title, stats, chat log, chapters, \
+                         notes are all kept.",
+                    );
+                    if any_permanent {
+                        ui.colored_label(
+                            grid::HL_ERROR_TEXT,
+                            "At least one file is permanently deleted — this cannot be undone.",
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(egui::RichText::new("Delete all").color(grid::HL_ERROR_TEXT))
+                            .clicked()
+                        {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_delete {
+            self.confirm_delete_stream_files = None;
+            self.spawn_manual_delete_stream_files(ctx, channel_id, monitor_id, items);
+        } else if do_cancel || !open {
+            self.confirm_delete_stream_files = None;
+        }
+    }
+
+    /// Runs the actual bulk disposal for a confirmed "Delete all take files
+    /// from disk" — one background task, disposing each take's file in
+    /// sequence (same `dispose_media` resolution as the single-take action)
+    /// so every outcome lands in `manual_delete_done` together and
+    /// `drain_manual_delete_results` can report one summary line instead of
+    /// one per file.
+    fn spawn_manual_delete_stream_files(
+        &mut self,
+        ctx: &egui::Context,
+        channel_id: i64,
+        monitor_id: i64,
+        items: Vec<(i64, String, i64, crate::disposal::DisposalMethod)>,
+    ) {
+        for (rec_id, ..) in &items {
+            self.manual_delete_pending.insert(*rec_id);
+        }
+        let store = self.core.store.clone();
+        let events = self.core.events.clone();
+        let done = self.manual_delete_done.clone();
+        let ctx = ctx.clone();
+        self.core.rt.spawn(async move {
+            let mut outcomes = Vec::with_capacity(items.len());
+            for (rec_id, path, ..) in items {
+                let p = std::path::PathBuf::from(&path);
+                let outcome = match crate::disposal::dispose_media(
+                    &store,
+                    channel_id,
+                    monitor_id,
+                    &p,
+                    rec_id,
+                    "manual delete (user action, bulk stream)",
+                )
+                .await
+                {
+                    Ok(d) => {
+                        let _ = store.update_recording_output_path(rec_id, "");
+                        let _ = events
+                            .send(crate::events::AppEvent::RecordingUpdated { recording_id: rec_id });
+                        Ok(d.describe().to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                outcomes.push((rec_id, outcome));
+            }
+            done.lock().unwrap().extend(outcomes);
+            ctx.request_repaint();
+        });
     }
 
     /// "Move instance to another channel" dialog: pick a destination channel
