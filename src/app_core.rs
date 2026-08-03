@@ -17,6 +17,18 @@ use crate::store::Store;
 /// How long to wait for in-flight recordings to remux/finalize on shutdown.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Runtime shutdown grace period when detaching: each active download's
+/// supervising task is parked in a bare `child.wait().await` (no `shutdown`
+/// check — see `downloader::process::run_process`) that structurally cannot
+/// resolve early here, since the whole point of detaching is leaving the
+/// process running rather than killing it. Waiting any longer than it takes
+/// every *other* background loop to notice `shutdown` (all on `~200ms`-
+/// granularity `sleep_cancellable`) buys nothing — the download-watcher
+/// tasks get silently dropped when the timeout elapses either way, which is
+/// safe (`kill_on_drop(false)`, so dropping the task never touches the
+/// child process).
+const DETACH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Sleep `dur`, returning early (within ~200ms) once `shutdown` is set. Shared by
 /// the background loops (scheduler-adjacent tasks, eventsub, websub, ad-free
 /// refresher) so they all stop promptly on quit.
@@ -723,8 +735,11 @@ impl AppCore {
             info!("detaching {n} running download(s) — they keep running after exit");
         }
         if let Some(rt) = self.rt_owned.lock().unwrap().take() {
-            info!("shutting down async runtime (timeout 30s); downloads left running");
-            rt.shutdown_timeout(Duration::from_secs(30));
+            info!(
+                "shutting down async runtime (timeout {}s); downloads left running",
+                DETACH_SHUTDOWN_TIMEOUT.as_secs()
+            );
+            rt.shutdown_timeout(DETACH_SHUTDOWN_TIMEOUT);
             info!("runtime shut down");
         }
     }
