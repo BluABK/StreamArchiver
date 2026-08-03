@@ -305,6 +305,141 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Modal confirmation for a manual "🗑🔥 Delete file from disk" (take-row
+    /// context menu, see `crate::manual_delete`) — the one destructive action
+    /// in this app that removes a MEDIA FILE, not just a history row, so it
+    /// names the resolved disposal method up front rather than a generic
+    /// "are you sure". Reaching this dialog at all already required all three
+    /// `manual_delete` gates to be on; this confirm is the last checkpoint.
+    #[allow(deprecated)]
+    pub(super) fn confirm_delete_file_window(&mut self, ctx: &egui::Context) {
+        let Some(cdf) = self.confirm_delete_file.as_ref() else {
+            return;
+        };
+        let rec_id = cdf.rec_id;
+        let channel_id = cdf.channel_id;
+        let monitor_id = cdf.monitor_id;
+        let path = cdf.path.clone();
+        let label = cdf.label.clone();
+        let method = cdf.method;
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_recfile_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete file from disk")
+                .with_inner_size([460.0, 170.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!("Delete the captured file for “{label}”?"));
+                    ui.label(egui::RichText::new(&path).weak().small());
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "This will: {} (Settings → Automatic deletion).",
+                        method.label()
+                    ));
+                    ui.label(
+                        "The take's history row stays — title, stats, chat log, chapters, \
+                         notes are all kept.",
+                    );
+                    if method == crate::disposal::DisposalMethod::Delete {
+                        ui.colored_label(
+                            grid::HL_ERROR_TEXT,
+                            "Permanent deletion — this cannot be undone.",
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(egui::RichText::new("Delete").color(grid::HL_ERROR_TEXT))
+                            .clicked()
+                        {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_delete {
+            self.confirm_delete_file = None;
+            self.spawn_manual_delete_file(ctx, rec_id, channel_id, monitor_id, path);
+        } else if do_cancel || !open {
+            self.confirm_delete_file = None;
+        }
+    }
+
+    /// Runs the actual disposal for a confirmed manual "Delete file from
+    /// disk" — same `dispose_media` resolution (trash/Recycle Bin/permanent)
+    /// automatic cleanup uses, then clears the row's `output_path` on success
+    /// so the row stays but every file-dependent action on it goes inert.
+    /// `AppEvent::RecordingUpdated` drops the owning monitor's `rec_cache`
+    /// entry on the next event-drain pass, same as a recovery/VOD-archive
+    /// update — the row picks up the cleared path without waiting for F5.
+    fn spawn_manual_delete_file(
+        &mut self,
+        ctx: &egui::Context,
+        rec_id: i64,
+        channel_id: i64,
+        monitor_id: i64,
+        path: String,
+    ) {
+        self.manual_delete_pending.insert(rec_id);
+        let store = self.core.store.clone();
+        let events = self.core.events.clone();
+        let done = self.manual_delete_done.clone();
+        let ctx = ctx.clone();
+        self.core.rt.spawn(async move {
+            let p = std::path::PathBuf::from(&path);
+            let outcome = match crate::disposal::dispose_media(
+                &store,
+                channel_id,
+                monitor_id,
+                &p,
+                rec_id,
+                "manual delete (user action)",
+            )
+            .await
+            {
+                Ok(d) => {
+                    let _ = store.update_recording_output_path(rec_id, "");
+                    let _ = events.send(crate::events::AppEvent::RecordingUpdated { recording_id: rec_id });
+                    Ok(d.describe().to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            done.lock().unwrap().push((rec_id, outcome));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain completed manual-delete outcomes (see `spawn_manual_delete_file`)
+    /// and surface them: clear the pending flag, status-bar the result either
+    /// way (same feedback path every other manual action in this app uses).
+    pub(super) fn drain_manual_delete_results(&mut self) {
+        let drained: Vec<crate::manual_delete::ManualDeleteOutcome> =
+            std::mem::take(&mut *self.manual_delete_done.lock().unwrap());
+        if drained.is_empty() {
+            return;
+        }
+        for (rid, result) in drained {
+            self.manual_delete_pending.remove(&rid);
+            self.status = match result {
+                Ok(desc) => format!("Recording file {desc}."),
+                Err(e) => format!("Error deleting file: {e}"),
+            };
+        }
+    }
+
     /// "Move instance to another channel" dialog: pick a destination channel
     /// container for one capture instance. Everything monitor-keyed
     /// (recordings, schedule, stats, chat) moves implicitly; posts/about
@@ -2964,6 +3099,19 @@ impl StreamArchiverApp {
                                      state entirely — this is the only way to opt it out. Inherit/Never \
                                      both mean \"allowed\".",
                                 );
+                                ui.end_row();
+
+                                ui.label("Allow deleting files");
+                                ui.checkbox(&mut form.allow_delete, "")
+                                    .on_hover_text(
+                                        "Half of the gate for this instance's take rows' \
+                                         \"🗑🔥 Delete file from disk\" action — the OTHER half \
+                                         is a per-channel switch (Rename channel), and BOTH \
+                                         need the Streams toolbar's own \"Allow deletion\" \
+                                         master switch on too. Off by default, on purpose: \
+                                         unlike the settings above, this has no inherited \
+                                         global default to fall back to.",
+                                    );
                                 ui.end_row();
                             });
                     });

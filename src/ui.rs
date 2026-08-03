@@ -591,6 +591,11 @@ struct MonitorForm {
     /// raid target — both independent of the record-side fields above.
     follow_my_raids_play: Option<bool>,
     exclude_from_auto_play: Option<bool>,
+    /// The other half of the gate the manual "🗑🔥 Delete file from disk"
+    /// take-row action needs (see `crate::manual_delete`) — plain bool, not
+    /// an inherit chain: off by default. The channel-level half lives on
+    /// `ChannelForm::allow_delete`.
+    allow_delete: bool,
 }
 
 impl MonitorForm {
@@ -649,6 +654,7 @@ impl MonitorForm {
             record_me_as_raid_target: None,
             follow_my_raids_play: None,
             exclude_from_auto_play: None,
+            allow_delete: false,
         }
     }
 
@@ -703,6 +709,7 @@ impl MonitorForm {
             record_me_as_raid_target: None,
             follow_my_raids_play: None,
             exclude_from_auto_play: None,
+            allow_delete: false,
         }
     }
 
@@ -756,6 +763,7 @@ impl MonitorForm {
             record_me_as_raid_target: None,
             follow_my_raids_play: None,
             exclude_from_auto_play: None,
+            allow_delete: false,
         }
     }
 
@@ -1621,6 +1629,23 @@ pub struct StreamArchiverApp {
     /// this reuses/intersects with rather than a parallel filter dimension).
     /// Persisted immediately on toggle, same shape as `streams_group_visually`.
     streams_only_recorded: bool,
+    /// Streams view "Allow deletion" checkbox: master switch gating the
+    /// take-row "🗑🔥 Delete file from disk…" context-menu item — OFF blocks
+    /// it everywhere regardless of any channel/instance-level allowance.
+    /// Persisted immediately on toggle (`manual_delete::K_STREAMS_ALLOW_DELETE`),
+    /// default off. See `manual_delete` for the full three-gate design.
+    streams_allow_delete: bool,
+    /// Pending confirmation for a manual "Delete file from disk" — set by the
+    /// take-row context-menu item, cleared on Delete/Cancel.
+    confirm_delete_file: Option<ConfirmDeleteFile>,
+    /// Take (recording) ids with a manual file-delete currently in flight —
+    /// disables their row's action while the async disposal runs.
+    manual_delete_pending: HashSet<i64>,
+    /// `(rec_id, outcome)` for a finished manual delete, posted by the
+    /// `core.rt.spawn`'d task — drained once per frame (see
+    /// `drain_manual_delete_results`), same cross-thread shape as
+    /// `trash_action_done`.
+    manual_delete_done: std::sync::Arc<std::sync::Mutex<Vec<crate::manual_delete::ManualDeleteOutcome>>>,
     /// Streams grid's saved views (`crate::saved_views`): the currently-
     /// applied view's name (session-only — re-applying one is a single
     /// click, so this isn't persisted across restarts) and the last-loaded
@@ -2931,6 +2956,7 @@ impl eframe::App for StreamArchiverApp {
                                     record_me_as_raid_target: None,
                                     follow_my_raids_play: None,
                                     exclude_from_auto_play: None,
+                                    allow_delete: false,
                                     primary_group: None,
                                     groups: Default::default(),
                                 });
@@ -3064,6 +3090,31 @@ impl eframe::App for StreamArchiverApp {
                                     if self.streams_only_recorded { "1" } else { "0" },
                                 );
                                 self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                            }
+                            if ui
+                                .checkbox(
+                                    &mut self.streams_allow_delete,
+                                    egui::RichText::new("Allow deletion").color(grid::HL_ERROR_TEXT),
+                                )
+                                .on_hover_text(
+                                    "Master switch for the take-row \"🗑🔥 Delete file from \
+                                     disk\" action, which permanently removes a captured file \
+                                     (moved to trash/Recycle Bin, or deleted outright, per \
+                                     Settings → Automatic deletion) while keeping its history \
+                                     row. Off by default — this alone doesn't enable the \
+                                     action, it only ever UNBLOCKS it: the channel AND the \
+                                     instance each also need their own \"Allow delete\" \
+                                     setting on (Rename channel / Edit instance) before the \
+                                     menu item lights up for a given take. Deliberately three \
+                                     independent off-by-default gates, so this can't be \
+                                     triggered by an accidental click.",
+                                )
+                                .changed()
+                            {
+                                let _ = self.core.store.set_setting(
+                                    crate::manual_delete::K_STREAMS_ALLOW_DELETE,
+                                    if self.streams_allow_delete { "1" } else { "0" },
+                                );
                             }
                             {
                                 let selected_label =
@@ -3201,6 +3252,7 @@ impl eframe::App for StreamArchiverApp {
                 record_me_as_raid_target: None,
                 follow_my_raids_play: None,
                 exclude_from_auto_play: None,
+                allow_delete: false,
                 primary_group: None,
                 groups: Default::default(),
             });
@@ -3224,6 +3276,8 @@ impl eframe::App for StreamArchiverApp {
         self.add_to_recording_group_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
+        self.drain_manual_delete_results();
+        self.confirm_delete_file_window(ui.ctx());
         self.move_instance_window(ui.ctx());
         self.merge_channel_window(ui.ctx());
         self.confirm_delete_segment_window(ui.ctx());

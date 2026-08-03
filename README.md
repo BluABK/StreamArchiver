@@ -826,6 +826,31 @@ missing final, either probe failing, or a final that comes back *shorter*
 get removed goes through the deletion method above, so it stays recoverable.
 Turn it off to keep every working-dir capture forever.
 
+**Manual "🗑🔥 Delete file from disk…"** (take-row context menu — no hotkey,
+deliberately). Removes just the captured MEDIA FILE for one take, following
+the exact same method resolution as the automatic deletions above (so it
+lands in the Trash view too, restorable if the effective method is "Trash
+folder"). The take's history row is kept — title, stats, chat log, chapters,
+notes all stay; only the file itself goes, the same as if it had gone
+missing on disk. This is the deliberate inverse of "🗑 Delete from list"
+(which removes the row but keeps the file).
+
+Because this is the one manual action that can permanently destroy a
+recording, it's gated behind **three independent, off-by-default switches**
+that must ALL be turned on before the menu item even lights up — not an
+inherit chain like most scoped settings, genuinely three separate opt-ins:
+
+1. **Allow deletion** — the Streams view's own toolbar checkbox (shown in
+   red), a session-wide master switch.
+2. The take's **channel's** own "Allow deleting files" checkbox (channel
+   Properties / Rename channel).
+3. The take's **instance's** own "Allow deleting files" checkbox (Edit
+   instance).
+
+Clicking the menu item still asks for confirmation, naming exactly which
+disposal method will run (Trash folder / Recycle Bin / Delete permanently)
+before anything happens.
+
 **🗑 Trash view.** Every automatic disposal is logged here — reason (post-join
 cleanup, gap-splice cleanup, superseded old head, VOD replace, superseded
 working-dir capture), when, the take's **title** (so several disposals from

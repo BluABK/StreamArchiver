@@ -467,6 +467,9 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(false);
+        // "Allow deletion" defaults off — the master switch for a
+        // high-consequence action must be explicitly turned on, never assumed.
+        let streams_allow_delete = crate::manual_delete::master_switch_on(&core.store);
         let streams_views = crate::saved_views::list_views(&core.store, GridTableId::Streams);
 
         let mut download_defaults = core
@@ -672,6 +675,10 @@ impl StreamArchiverApp {
             streams_recording_group_filter: None,
             streams_group_visually,
             streams_only_recorded,
+            streams_allow_delete,
+            confirm_delete_file: None,
+            manual_delete_pending: HashSet::new(),
+            manual_delete_done: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             streams_active_view: None,
             streams_views,
             views_manager_new_name: String::new(),
@@ -1479,6 +1486,7 @@ impl StreamArchiverApp {
         let record_me_as_raid_target = form.record_me_as_raid_target;
         let follow_my_raids_play = form.follow_my_raids_play;
         let exclude_from_auto_play = form.exclude_from_auto_play;
+        let allow_delete = form.allow_delete;
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -1552,6 +1560,12 @@ impl StreamArchiverApp {
                         crate::raid_follow::K_MONITOR_RAID_PLAY_EXCLUDE_SCOPE,
                         mid,
                         exclude_from_auto_play,
+                    );
+                    let _ = crate::raid_follow::save_bool_scope(
+                        &store,
+                        crate::manual_delete::K_MONITOR_ALLOW_DELETE,
+                        mid,
+                        Some(allow_delete),
                     );
                     let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;

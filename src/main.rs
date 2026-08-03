@@ -29,6 +29,7 @@ mod inspector;
 mod io_gate;
 mod iomon;
 mod logfmt;
+mod manual_delete;
 mod models;
 mod notifications;
 mod oauth;

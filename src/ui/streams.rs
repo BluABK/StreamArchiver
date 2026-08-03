@@ -23,6 +23,22 @@ pub(super) struct AddToRecordingGroupDialog {
     new_name: String,
 }
 
+/// Pending confirmation for a manual "🗑🔥 Delete file from disk" — set when
+/// the take-row context-menu item is clicked (see [`crate::manual_delete`]),
+/// cleared on Delete/Cancel. `method` is resolved ONCE at menu-click time
+/// (`crate::disposal::effective_method_for_recording`) so the confirm dialog
+/// can tell the user exactly what's about to happen before they commit —
+/// trash/Recycle Bin/permanent.
+pub(super) struct ConfirmDeleteFile {
+    pub(super) rec_id: i64,
+    pub(super) channel_id: i64,
+    pub(super) monitor_id: i64,
+    pub(super) path: String,
+    /// "{channel name} — Take N" (or similar), for the confirm dialog's text.
+    pub(super) label: String,
+    pub(super) method: crate::disposal::DisposalMethod,
+}
+
 /// Backing state for the create/rename channel-container dialog.
 pub(super) struct ChannelForm {
     /// `Some(id)` = renaming an existing channel; `None` = creating a new one.
@@ -61,6 +77,11 @@ pub(super) struct ChannelForm {
     /// raid target — independent of `record_me_as_raid_target` (auto-play
     /// isn't gated by the disabled-check at all, only by this).
     pub(super) exclude_from_auto_play: Option<bool>,
+    /// One of the two per-channel/instance gates the manual "Delete file from
+    /// disk" take-row action needs (see [`crate::manual_delete`]) — plain
+    /// bool, NOT an inherit chain: off by default, no global default to fall
+    /// back to besides the Streams toolbar's own master switch.
+    pub(super) allow_delete: bool,
     /// The group this channel clusters under in the Streams grid's default
     /// view (`None` = ungrouped there). Always a member of `groups` too —
     /// see `models::Channel::primary_group_id`.
@@ -170,6 +191,11 @@ struct StreamsOut {
     mark_started_stream: Option<(String, i64)>,
     copy_text: Option<String>,
     delete_recording: Option<i64>,
+    /// "🗑🔥 Delete file from disk…" on a take row — by recording id. Opens
+    /// the confirm dialog (`ConfirmDeleteFile`); the actual disposal only
+    /// runs after the user confirms. Enabled only when all three
+    /// `manual_delete` gates are on for this take's channel/instance.
+    delete_recording_file: Option<i64>,
     open_recording_props: Option<i64>,
     open_recover_take: Option<i64>,
     archive_vod_now: Option<i64>,
@@ -558,6 +584,19 @@ impl StreamArchiverApp {
                                 );
                                 ui.end_row();
 
+                                ui.label("Allow deleting files");
+                                ui.checkbox(&mut f.allow_delete, "")
+                                    .on_hover_text(
+                                        "Half of the gate for this channel's take rows' \
+                                         \"🗑🔥 Delete file from disk\" action — the OTHER half \
+                                         is a per-instance switch (Edit instance), and BOTH need \
+                                         the Streams toolbar's own \"Allow deletion\" master \
+                                         switch on too. Off by default, on purpose: unlike the \
+                                         settings above, this has no inherited global default to \
+                                         fall back to.",
+                                    );
+                                ui.end_row();
+
                                 ui.label("Primary group");
                                 egui::ComboBox::from_id_salt("chform_primary_group")
                                     .selected_text(
@@ -728,6 +767,12 @@ impl StreamArchiverApp {
                             crate::raid_follow::K_CHANNEL_RAID_PLAY_EXCLUDE_SCOPE,
                             cid,
                             f.exclude_from_auto_play,
+                        );
+                        let _ = crate::raid_follow::save_bool_scope(
+                            &self.core.store,
+                            crate::manual_delete::K_CHANNEL_ALLOW_DELETE,
+                            cid,
+                            Some(f.allow_delete),
                         );
                         // Diff target membership against what's currently saved
                         // (empty for a brand-new channel) rather than blindly
@@ -1928,7 +1973,8 @@ impl StreamArchiverApp {
                                     &mut self.rename_preview,
                                     &mut self.show_rename_dialog, now, &col_order,
                                     &self.rec_alert_badges,
-                                    active_ids, &finalizing_ids, fhits.as_ref(), &mut out,
+                                    active_ids, &finalizing_ids, fhits.as_ref(),
+                                    &self.manual_delete_pending, &mut out,
                                 );
                             }
                             Vis::VodJob { mid, gi, ti, kind, depth } => {
@@ -1988,6 +2034,7 @@ impl StreamArchiverApp {
             mark_started_stream,
             copy_text,
             delete_recording,
+            delete_recording_file,
             open_recording_props,
             open_recover_take,
             archive_vod_now,
@@ -2213,6 +2260,7 @@ impl StreamArchiverApp {
                     crate::raid_follow::K_MONITOR_RAID_PLAY_EXCLUDE_SCOPE,
                     r.monitor.id,
                 );
+                mf.allow_delete = crate::manual_delete::monitor_gate_on(&self.core.store, r.monitor.id);
                 self.form = Some(mf);
             }
         }
@@ -2317,6 +2365,7 @@ impl StreamArchiverApp {
                     crate::raid_follow::K_CHANNEL_RAID_PLAY_EXCLUDE_SCOPE,
                     cid,
                 );
+                let allow_delete = crate::manual_delete::channel_gate_on(&self.core.store, cid);
                 let primary_group = c.primary_group_id;
                 let groups = self
                     .core
@@ -2342,6 +2391,7 @@ impl StreamArchiverApp {
                     record_me_as_raid_target,
                     follow_my_raids_play,
                     exclude_from_auto_play,
+                    allow_delete,
                     primary_group,
                     groups,
                 });
@@ -2570,6 +2620,40 @@ impl StreamArchiverApp {
             });
             self.rec_props_popups.retain(|p| p.rec_id != rid);
             self.reload_rows();
+        }
+        if let Some(rid) = delete_recording_file {
+            let rec = self.rec_cache.values().flat_map(|v| v.iter()).find(|r| r.id == rid).cloned();
+            if let Some(rec) = rec
+                && let Some(channel_id) =
+                    self.rows.iter().find(|r| r.monitor.id == rec.monitor_id).map(|r| r.channel.id)
+            {
+                let method = crate::disposal::effective_method_for_recording(
+                    &self.core.store,
+                    channel_id,
+                    rec.monitor_id,
+                    rid,
+                );
+                let channel_name = self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == channel_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                self.confirm_delete_file = Some(ConfirmDeleteFile {
+                    rec_id: rid,
+                    channel_id,
+                    monitor_id: rec.monitor_id,
+                    path: rec.output_path.clone(),
+                    label: format!(
+                        "{channel_name} — {}",
+                        std::path::Path::new(&rec.output_path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "this recording".into())
+                    ),
+                    method,
+                });
+            }
         }
         if let Some(rid) = open_recording_props
             && !self.rec_props_popups.iter().any(|p| p.rec_id == rid)
@@ -4588,6 +4672,10 @@ impl StreamArchiverApp {
         // Active header filters, for marking rows/text that contain the
         // match (`None` = no filter set).
         fhits: Option<&FilterHits>,
+        // Recording ids with a manual "Delete file from disk" in flight —
+        // disables the action so it can't be double-fired before the async
+        // disposal finishes (see `crate::manual_delete`).
+        manual_delete_pending: &HashSet<i64>,
         out: &mut StreamsOut,
     ) {
         let t = &g.takes[ti];
@@ -4606,6 +4694,9 @@ impl StreamArchiverApp {
         let is_live = owning_monitor
             .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
             .unwrap_or(false);
+        // For the "🗑🔥 Delete file from disk" gate check (`manual_delete`
+        // needs both the channel and the instance id).
+        let owning_channel_id = rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
         let take_variant = dual_take_variant(g, t);
         let dir = std::path::Path::new(&t.output_path)
             .parent()
@@ -5220,6 +5311,42 @@ impl StreamArchiverApp {
                     .clicked()
                 {
                     out.delete_recording = Some(t.id);
+                    ui.close();
+                }
+                // Manual "delete the FILE, keep the row" — the inverse of
+                // "Delete from list" above. Gated on all three
+                // `manual_delete` switches (Streams toolbar master + this
+                // channel + this instance, all off by default) so it can't
+                // fire from a stray click — see `crate::manual_delete`.
+                let allow = owning_channel_id
+                    .map(|cid| crate::manual_delete::deletion_allowed(&core.store, cid, mid))
+                    .unwrap_or(false);
+                let pending = manual_delete_pending.contains(&t.id);
+                if ui
+                    .add_enabled(
+                        allow && !t.output_path.is_empty() && !t.is_active() && !pending,
+                        egui::Button::new("🗑🔥  Delete file from disk…"),
+                    )
+                    .on_hover_text(
+                        "Move (or delete, per Settings → Automatic deletion) this take's \
+                         captured file from disk. The history row itself stays — title, \
+                         stats, chat log, chapters, notes are all kept; only the media file \
+                         goes away. Asks to confirm first.",
+                    )
+                    .on_disabled_hover_text(if pending {
+                        "Deleting…"
+                    } else if !allow {
+                        "Blocked: needs \"Allow deletion\" on in the Streams toolbar AND \
+                         \"Allow delete\" enabled on both this channel and this instance \
+                         (all off by default)."
+                    } else if t.output_path.is_empty() {
+                        "No file to delete"
+                    } else {
+                        "Stop the recording before deleting its file"
+                    })
+                    .clicked()
+                {
+                    out.delete_recording_file = Some(t.id);
                     ui.close();
                 }
             });
