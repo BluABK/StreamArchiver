@@ -684,6 +684,7 @@ impl StreamArchiverApp {
             views_manager_new_name: String::new(),
             views_manager_rename: None,
             rec_cache: HashMap::new(),
+            take_stats_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
             ad_popups: Vec::new(),
             meta_change_cache: HashMap::new(),
@@ -979,6 +980,7 @@ impl StreamArchiverApp {
         // expanded rows. Stale data (a just-finished recording) is refreshed at
         // the specific UiCommand::Reload sites that already know which monitor changed.
         self.rec_cache.retain(|k, _| live_monitors.contains(k));
+        self.take_stats_cache.retain(|k, _| live_monitors.contains(k));
         self.ad_break_cache.retain(|k, _| live_monitors.contains(k));
         self.meta_change_cache.retain(|k, _| live_monitors.contains(k));
         self.schedule_cache.retain(|k, _| live_monitors.contains(k));
@@ -1367,8 +1369,17 @@ impl StreamArchiverApp {
                     // vod_dl_*), so drop the owning monitor's cached history —
                     // the 🛟/📼 badges refresh on the next rebuild instead of
                     // waiting for F5.
+                    let affected_mids: Vec<i64> = self
+                        .rec_cache
+                        .iter()
+                        .filter(|(_, recs)| recs.iter().any(|r| r.id == recording_id))
+                        .map(|(mid, _)| *mid)
+                        .collect();
                     self.rec_cache
                         .retain(|_, recs| !recs.iter().any(|r| r.id == recording_id));
+                    for mid in affected_mids {
+                        self.take_stats_cache.remove(&mid);
+                    }
                     self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
                     dirty = true;
                 }
@@ -1758,6 +1769,7 @@ impl StreamArchiverApp {
             for r in &save.rows {
                 if old.get(&r.monitor.id).is_some_and(|s| *s != sig(r)) {
                     self.rec_cache.remove(&r.monitor.id);
+                    self.take_stats_cache.remove(&r.monitor.id);
                 }
             }
         }
@@ -1789,6 +1801,7 @@ impl StreamArchiverApp {
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
         let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
         self.rec_cache.retain(|k, _| live_monitors.contains(k));
+        self.take_stats_cache.retain(|k, _| live_monitors.contains(k));
         self.ad_break_cache.retain(|k, _| live_monitors.contains(k));
         self.meta_change_cache.retain(|k, _| live_monitors.contains(k));
         self.schedule_cache.retain(|k, _| live_monitors.contains(k));
@@ -2179,6 +2192,7 @@ impl StreamArchiverApp {
             // reload_rows to avoid per-frame DB queries, but F5 is an explicit
             // user request to see current state (e.g. after an external DB edit).
             self.rec_cache.clear();
+            self.take_stats_cache.clear();
             self.ad_break_cache.clear();
             self.meta_change_cache.clear();
             self.schedule_cache.clear();

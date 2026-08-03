@@ -560,6 +560,69 @@ impl Store {
         Ok(rows)
     }
 
+    /// Per-broadcast breakdown for ONE monitor since `since_unix`, newest
+    /// first — same shape and event-attachment logic as
+    /// `stream_stats_breakdown`, but scoped to a single monitor instead of
+    /// every monitor of a channel. Used to attribute viewer/event stats to a
+    /// specific take (a channel with two simultaneous instances would
+    /// otherwise mix both monitors' samples into one broadcast's numbers).
+    pub fn stream_stats_for_monitor(
+        &self,
+        monitor_id: i64,
+        since_unix: i64,
+    ) -> Result<Vec<StreamStatRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT stream_id, MIN(bucket_t), MAX(bucket_t + span_secs),
+                    MAX(viewers),
+                    CAST(SUM(viewers * span_secs) AS REAL) / MAX(SUM(span_secs), 1),
+                    SUM(span_secs)
+             FROM viewer_history
+             WHERE monitor_id = ?1 AND bucket_t >= ?2 AND stream_id != ''
+             GROUP BY stream_id
+             ORDER BY 2 DESC",
+        )?;
+        let mut rows = stmt
+            .query_map(params![monitor_id, since_unix], |r| {
+                Ok(StreamStatRow {
+                    stream_id: r.get(0)?,
+                    started: r.get(1)?,
+                    ended: r.get(2)?,
+                    peak_viewers: r.get(3)?,
+                    avg_viewers: r.get(4)?,
+                    live_secs: r.get(5)?,
+                    totals: [0; 6],
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        // Release the connection guard before the nested store call below —
+        // the DB mutex is not re-entrant, so holding it here would deadlock.
+        drop(conn);
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        for e in self.stream_events_for_monitor_range(monitor_id, since_unix, i64::MAX)? {
+            let hit = if e.stream_id.is_empty() {
+                rows.iter_mut().find(|s| e.at >= s.started - 900 && e.at <= s.ended + 900)
+            } else {
+                rows.iter_mut().find(|s| s.stream_id == e.stream_id)
+            };
+            if let Some(s) = hit {
+                match e.kind.as_str() {
+                    "sub" | "resub" => s.totals[0] += 1,
+                    "subgift" => s.totals[1] += e.amount.max(1),
+                    "bits" => s.totals[2] += e.amount,
+                    "raid_in" => s.totals[3] += 1,
+                    "raid_out" => s.totals[4] += 1,
+                    "msg_deleted" | "timeout" | "ban" => s.totals[5] += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// Title/category/collab changes for `channel_id`'s monitors in
     /// `[since, until)` — graph markers for the Channel Stats plots.
     /// Returns `(at, kind, new_value)`, oldest first.
@@ -916,6 +979,41 @@ mod tests {
         assert_eq!((a.peak_viewers, a.live_secs), (300, 120));
         assert_eq!(a.totals, [0, 20, 0, 1, 0, 0], "gift batch + time-matched raid");
         assert_eq!(a.ended - a.started, 120, "sample envelope spans both buckets");
+    }
+
+    /// `stream_stats_for_monitor` must never mix a channel's other monitor's
+    /// samples into these numbers — the whole point of the monitor-scoped
+    /// variant over `stream_stats_breakdown` (a multi-instance channel would
+    /// otherwise blend two simultaneous captures' viewer counts together).
+    #[test]
+    fn per_monitor_breakdown_does_not_mix_a_sibling_monitors_samples() {
+        let store = Store::open_in_memory().unwrap();
+        let (cid, mid1) = channel_with_monitor(&store);
+        let mid2 = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let t0: i64 = 5_000_000 - 5_000_000_i64.rem_euclid(60);
+        // Same channel, two instances live at once under different stream ids.
+        store.record_viewer_samples(t0, &[(mid1, 100, None, "sA")]).unwrap();
+        store.record_viewer_samples(t0 + 60, &[(mid1, 300, None, "sA")]).unwrap();
+        store.record_viewer_samples(t0, &[(mid2, 9000, None, "sZ")]).unwrap();
+        store.record_stream_event(mid1, t0 + 30, "sA", "bits", "c", "", 50, "", "").unwrap();
+        store.record_stream_event(mid2, t0 + 30, "sZ", "bits", "c", "", 999, "", "").unwrap();
+
+        let rows = store.stream_stats_for_monitor(mid1, 0).unwrap();
+        assert_eq!(rows.len(), 1, "only mid1's broadcast, not mid2's");
+        assert_eq!(rows[0].stream_id, "sA");
+        assert_eq!(rows[0].peak_viewers, 300, "mid2's 9000 must not leak in");
+        assert_eq!(rows[0].totals, [0, 0, 50, 0, 0, 0], "mid2's bits event excluded");
+
+        let rows2 = store.stream_stats_for_monitor(mid2, 0).unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].stream_id, "sZ");
+        assert_eq!(rows2[0].peak_viewers, 9000);
+        assert_eq!(rows2[0].totals, [0, 0, 999, 0, 0, 0]);
+
+        // Matches the whole-channel view for comparison: both broadcasts
+        // show up when queried unscoped.
+        let channel_rows = store.stream_stats_breakdown(cid, 0).unwrap();
+        assert_eq!(channel_rows.len(), 2, "channel-scoped sees both monitors");
     }
 
     #[test]

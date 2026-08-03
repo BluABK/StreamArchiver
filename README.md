@@ -2780,6 +2780,14 @@ Where to look:
   broadcast.
 - **👁 sparkline** — the Viewers column shows a tiny last-hour trend line
   next to the live count (widen the column if it's cut off).
+- **👁 per-take badge** — an expanded stream's individual take rows show a
+  small peak-viewers badge in the Viewers column once the take has ended
+  (hover for the average, tracked airtime, and sub/bits/raid totals). Scoped
+  strictly to that one take — matched by stream id, or by its own time
+  window when the platform never stamped one — so a channel with two
+  simultaneous instances never gets one capture's numbers blended into the
+  other's. The same numbers also appear in that take's **Properties**
+  window ("Viewer stats" section) as a permanent, no-hover reference.
 
 Viewer history is **kept forever** by default (a sample row is ~30 bytes).
 Under *Settings → Maintenance → Channel stats history* you can compress old

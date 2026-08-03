@@ -1597,6 +1597,21 @@ impl StreamArchiverApp {
                     self.meta_change_cache.insert(rid, v);
                 }
             }
+            // Per-monitor viewer/event stats (one query pair per monitor,
+            // not per take) — powers the take-row 👁 badge and the Recording
+            // Properties "Viewer stats" section. Bounded by expansion like
+            // the ad-break/meta-change caches above (a take row only ever
+            // renders under an expanded instance).
+            for &mid in &expanded_monitors {
+                if !self.take_stats_cache.contains_key(&mid) {
+                    let v = self
+                        .core
+                        .store
+                        .stream_stats_for_monitor(mid, 0)
+                        .unwrap_or_default();
+                    self.take_stats_cache.insert(mid, v);
+                }
+            }
 
             // Preferred-platform-when-multiple-live config: loaded once per
             // rebuild (not per channel row per frame — see `PlatformPrefCtx`).
@@ -1746,6 +1761,7 @@ impl StreamArchiverApp {
         let model = &cache.model;
         let ad_breaks = &self.ad_break_cache;
         let meta_logs = &self.meta_change_cache;
+        let take_stats = &self.take_stats_cache;
         let mut sort = self.streams_sort.clone();
         let mut filters = self.streams_filters.clone();
         if filters.len() != STREAM_COLS {
@@ -1974,7 +1990,7 @@ impl StreamArchiverApp {
                                     &mut self.show_rename_dialog, now, &col_order,
                                     &self.rec_alert_badges,
                                     active_ids, &finalizing_ids, fhits.as_ref(),
-                                    &self.manual_delete_pending, &mut out,
+                                    &self.manual_delete_pending, take_stats, &mut out,
                                 );
                             }
                             Vis::VodJob { mid, gi, ti, kind, depth } => {
@@ -4676,6 +4692,9 @@ impl StreamArchiverApp {
         // disables the action so it can't be double-fired before the async
         // disposal finishes (see `crate::manual_delete`).
         manual_delete_pending: &HashSet<i64>,
+        // Per-monitor broadcast stats (peak/avg viewers, sub/bits/raid
+        // totals) for the 👁 badge — see `Store::stream_stats_for_monitor`.
+        take_stats: &HashMap<i64, Vec<crate::models::StreamStatRow>>,
         out: &mut StreamsOut,
     ) {
         let t = &g.takes[ti];
@@ -4929,6 +4948,31 @@ impl StreamArchiverApp {
                             ui, t.ad_count, t.ad_secs, det, Some(t.id),
                         ) {
                             out.open_ad_popup = Some(r);
+                        }
+                    }
+                    "viewers" => {
+                        // Only for settled takes — a still-live take's badge
+                        // would otherwise freeze at whatever the cache last
+                        // saw instead of tracking the live count already
+                        // shown one row up (the monitor row's 👁 cell).
+                        if t.ended_at.is_some()
+                            && let Some(s) =
+                                take_stats.get(&mid).and_then(|v| find_take_stats(v, t))
+                        {
+                            let mut hover = format!(
+                                "Peak {} · avg {} viewers over this take\n\
+                                 {} of viewer samples tracked",
+                                fmt_viewers(s.peak_viewers),
+                                fmt_viewers(s.avg_viewers.round() as i64),
+                                fmt_duration(s.live_secs),
+                            );
+                            let totals = format_event_totals(s.totals);
+                            if !totals.is_empty() {
+                                hover.push_str("\n\n");
+                                hover.push_str(&totals);
+                            }
+                            ui.weak(format!("👁 {}", fmt_viewers(s.peak_viewers)))
+                                .on_hover_text(hover);
                         }
                     }
                     // Went Live is n/a per take (blank).

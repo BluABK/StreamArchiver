@@ -189,6 +189,54 @@ pub(super) fn take_size_bytes(fs_probes: &mut FsProbes, t: &Recording) -> u64 {
     }
 }
 
+/// Attribute a monitor-scoped `stream_stats_for_monitor` result set to one
+/// specific take: exact `stream_id` match when the take has one (the
+/// reliable case — `stream_stats_for_monitor` only ever groups samples that
+/// carry a stream id), else the broadcast whose sampled `[started, ended]`
+/// envelope overlaps the take's own `[started_at, ended_at]` window (±15 min,
+/// matching `Store::stream_stats_breakdown`'s own time-window fallback) —
+/// covers the take/scrape-path recordings that never got an id stamped.
+/// `None` when nothing overlaps (too old, too short to sample, or the take
+/// is still live and hasn't accumulated a settled window yet).
+pub(super) fn find_take_stats<'a>(
+    stats: &'a [crate::models::StreamStatRow],
+    t: &Recording,
+) -> Option<&'a crate::models::StreamStatRow> {
+    if let Some(sid) = t.stream_id.as_deref().filter(|s| !s.is_empty()) {
+        return stats.iter().find(|s| s.stream_id == sid);
+    }
+    let end = t.ended_at.unwrap_or(t.started_at);
+    stats
+        .iter()
+        .find(|s| t.started_at <= s.ended + 900 && end >= s.started - 900)
+}
+
+/// Compact multi-line summary of a broadcast's event totals (`[subs,
+/// gifted, bits, raids in, raids out, mod actions]`, same layout as
+/// `StreamStatRow::totals`) for a stats hover — a zero category is omitted
+/// entirely rather than padding the tooltip with "0 bits" lines.
+pub(super) fn format_event_totals(totals: [i64; 6]) -> String {
+    let [subs, gifted, bits, rin, rout, mods] = totals;
+    let mut lines = Vec::new();
+    if subs > 0 || gifted > 0 {
+        lines.push(if gifted > 0 {
+            format!("{subs} subs (+{gifted} gifted)")
+        } else {
+            format!("{subs} subs")
+        });
+    }
+    if bits > 0 {
+        lines.push(format!("{bits} bits"));
+    }
+    if rin > 0 || rout > 0 {
+        lines.push(format!("{rin} raids in, {rout} raids out"));
+    }
+    if mods > 0 {
+        lines.push(format!("{mods} mod actions (deletions/timeouts/bans)"));
+    }
+    lines.join("\n")
+}
+
 /// Hover text for a stream group's total-size label: the byte total plus an
 /// average bitrate (a quick way to eyeball whether a take actually captured
 /// at the expected quality — a stream that should be 1080p60 but averages

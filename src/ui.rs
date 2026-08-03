@@ -29,8 +29,8 @@ use crate::models::{
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
     MediaInfoMode, Monitor, MonitorDefaults, MonitorStreamChange, MonitorWithChannel, OcrStats, Platform,
     PollStats, RecurrenceKind, Recording, SabrCodecPref, ScheduleSegment, ScheduledRecording,
-    ScheduledRecordingWithNames, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
-    group_recordings, now_unix,
+    ScheduledRecordingWithNames, StreamGroup, StreamMetaChange, StreamStatRow, Tool, UpcomingStream,
+    Video, group_recordings, now_unix,
 };
 use crate::google_oauth;
 use crate::grid_columns::{self, ColumnEntry, GridCol, GridState, GridTableId};
@@ -1659,6 +1659,14 @@ pub struct StreamArchiverApp {
     views_manager_new_name: String,
     views_manager_rename: Option<(String, String)>,
     rec_cache: HashMap<i64, Vec<Recording>>,
+    /// Lazy per-monitor per-broadcast viewer/event stats (peak/avg viewers,
+    /// sub/bits/raid totals), keyed by monitor id — evicted/cleared at every
+    /// site that touches `rec_cache`, since both go stale for the same
+    /// reasons. Powers the take-row 👁 stats badge and the Recording
+    /// Properties "Viewer stats" section; scoped per-monitor so a
+    /// multi-instance channel's simultaneous captures never mix together
+    /// (see `Store::stream_stats_for_monitor`).
+    take_stats_cache: HashMap<i64, Vec<StreamStatRow>>,
     /// Lazy per-recording ad-break detail (cut list), keyed by recording id;
     /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.
     ad_break_cache: HashMap<i64, Vec<AdBreak>>,

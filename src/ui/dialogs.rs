@@ -1472,6 +1472,17 @@ impl StreamArchiverApp {
             return true;
         };
         let now = crate::models::now_unix();
+        // Scoped strictly to this one take (matched by stream id, or by its
+        // own time window when the platform never stamped one) — never
+        // mixed with another take or another instance of the same channel,
+        // see `Store::stream_stats_for_monitor`. Resolved up front (cloned
+        // out of `take_stats_cache`) so the viewport closure below doesn't
+        // need to borrow `self`.
+        let viewer_stats: Option<crate::models::StreamStatRow> = self
+            .take_stats_cache
+            .get(&rec.monitor_id)
+            .and_then(|v| find_take_stats(v, &rec))
+            .cloned();
         let mut open = true;
         // Collect inter-frame actions so the closure doesn't borrow `self`.
         let mut copy_path: Option<String> = None;
@@ -1641,6 +1652,71 @@ impl StreamArchiverApp {
                                     ui.end_row();
                                 }
                             });
+
+                        // ── Viewer stats ──────────────────────────────────
+                        ui.add_space(8.0);
+                        ui.strong("Viewer stats").on_hover_text(
+                            "Scoped strictly to this take — matched by stream id, or by \
+                             its own time window when the platform never stamped one. \
+                             Never mixed with another take or another instance of the \
+                             same channel.",
+                        );
+                        match &viewer_stats {
+                            Some(s) => {
+                                egui::Grid::new("rp_viewers")
+                                    .num_columns(2)
+                                    .striped(true)
+                                    .min_col_width(90.0)
+                                    .show(ui, |ui| {
+                                        ui.label("Peak");
+                                        ui.label(fmt_viewers(s.peak_viewers));
+                                        ui.end_row();
+                                        ui.label("Average")
+                                            .on_hover_text("Airtime-weighted average viewers");
+                                        ui.label(fmt_viewers(s.avg_viewers.round() as i64));
+                                        ui.end_row();
+                                        ui.label("Tracked").on_hover_text(
+                                            "Sampled live time (viewer-count polling coverage)",
+                                        );
+                                        ui.label(fmt_duration(s.live_secs));
+                                        ui.end_row();
+                                        let [subs, gifted, bits, rin, rout, mods] = s.totals;
+                                        if subs > 0 || gifted > 0 {
+                                            ui.label("Subs");
+                                            ui.label(if gifted > 0 {
+                                                format!("{subs} (+{gifted} gifted)")
+                                            } else {
+                                                subs.to_string()
+                                            });
+                                            ui.end_row();
+                                        }
+                                        if bits > 0 {
+                                            ui.label("Bits");
+                                            ui.label(bits.to_string());
+                                            ui.end_row();
+                                        }
+                                        if rin > 0 || rout > 0 {
+                                            ui.label("Raids");
+                                            ui.label(format!("{rin} in, {rout} out"));
+                                            ui.end_row();
+                                        }
+                                        if mods > 0 {
+                                            ui.label("Mod actions")
+                                                .on_hover_text("Deletions + timeouts + bans");
+                                            ui.label(mods.to_string());
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                            None => {
+                                ui.weak("No viewer stats recorded for this take.").on_hover_text(
+                                    "Either it predates viewer-history tracking, was too \
+                                     short to sample, or the platform never stamped a \
+                                     stream id and this take's window doesn't overlap a \
+                                     tracked broadcast.",
+                                );
+                            }
+                        }
 
                         // ── VOD (Twitch only) ─────────────────────────────
                         if rec.vod_state.is_some() {
