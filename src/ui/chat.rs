@@ -250,6 +250,14 @@ pub(super) struct ChatPopup {
     /// (`StreamArchiverApp::chat_font_pt`/`chat_ts_color`/`chat_text_color`)
     /// are global/shared, same as `render_emotes`.
     pub(super) show_appearance: bool,
+    /// Editable `#RRGGBB` text buffers backing the Chat Appearance panel's
+    /// hex fields — lets a color be pasted in directly, not just picked from
+    /// the wheel/sliders (egui's stock color picker has no paste target of
+    /// its own). Re-synced from the live color whenever the panel opens or
+    /// the swatch picker itself changes it; left alone otherwise so in-
+    /// progress typing isn't clobbered.
+    pub(super) ts_color_hex: String,
+    pub(super) text_color_hex: String,
     /// The currently-open usercard, if any — at most one per chat window.
     pub(super) user_card: Option<UserCardPopup>,
     /// When the popup last triggered a background re-read of the chat file.
@@ -1444,6 +1452,11 @@ pub(super) fn parse_chat_hex_color(s: &str) -> Option<egui::Color32> {
     Some(egui::Color32::from_rgb(r, g, b))
 }
 
+/// `#RRGGBB` for `c`, ignoring alpha — inverse of [`parse_chat_hex_color`].
+pub(super) fn hex_color_string(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
 /// First existing first-party Twitch emote image for `id` in `dir`, trying the
 /// formats Twitch uses (static `.png`, animated `.gif`) plus `.webp`, and —
 /// per extension — the current `{id}_{name}.{ext}` filename the fetcher
@@ -2478,6 +2491,8 @@ impl StreamArchiverApp {
             full_view: false,
             hide_shared: false,
             show_appearance: false,
+            ts_color_hex: String::new(),
+            text_color_hex: String::new(),
             user_card: None,
             last_reload: std::time::Instant::now(),
             emote_map,
@@ -2726,6 +2741,10 @@ impl StreamArchiverApp {
                                 .clicked()
                             {
                                 popup.show_appearance = !popup.show_appearance;
+                                if popup.show_appearance {
+                                    popup.ts_color_hex = hex_color_string(self.chat_ts_color);
+                                    popup.text_color_hex = hex_color_string(self.chat_text_color);
+                                }
                             }
                             ui.checkbox(&mut popup.hide_shared, "Hide shared")
                                 .on_hover_text(
@@ -2770,45 +2789,78 @@ impl StreamArchiverApp {
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Timestamp color:");
-                                    if egui::color_picker::color_edit_button_srgba(
+                                    let wheel_changed = egui::color_picker::color_edit_button_srgba(
                                         ui,
                                         &mut ts_color,
                                         egui::color_picker::Alpha::Opaque,
                                     )
                                     .on_hover_text("Color of the [hh:mm:ss] timestamp prefix.")
-                                    .changed()
+                                    .changed();
+                                    if wheel_changed {
+                                        popup.ts_color_hex = hex_color_string(ts_color);
+                                    }
+                                    // Egui's color-wheel popup only offers a "copy"
+                                    // button (RGB numbers, not hex) with no matching
+                                    // paste target — this hex field is that missing
+                                    // paste target: type or paste a `#RRGGBB` value
+                                    // directly, applied as soon as it parses.
+                                    let hex_changed = ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut popup.ts_color_hex)
+                                                .desired_width(64.0)
+                                                .hint_text("#RRGGBB"),
+                                        )
+                                        .on_hover_text(
+                                            "Type or paste a hex color (e.g. #FFFFFF) — applies \
+                                             as soon as it's a valid 6-digit hex value.",
+                                        )
+                                        .changed();
+                                    if hex_changed
+                                        && let Some(parsed) = parse_chat_hex_color(popup.ts_color_hex.trim())
                                     {
+                                        ts_color = parsed;
+                                    }
+                                    if wheel_changed || (hex_changed && ts_color != self.chat_ts_color) {
                                         self.chat_ts_color = ts_color;
                                         let _ = self.core.store.set_setting(
                                             K_CHAT_TS_COLOR,
-                                            &format!(
-                                                "#{:02X}{:02X}{:02X}",
-                                                ts_color.r(),
-                                                ts_color.g(),
-                                                ts_color.b()
-                                            ),
+                                            &hex_color_string(ts_color),
                                         );
                                     }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Message color:");
-                                    if egui::color_picker::color_edit_button_srgba(
+                                    let wheel_changed = egui::color_picker::color_edit_button_srgba(
                                         ui,
                                         &mut text_color,
                                         egui::color_picker::Alpha::Opaque,
                                     )
                                     .on_hover_text("Color of the message body text.")
-                                    .changed()
+                                    .changed();
+                                    if wheel_changed {
+                                        popup.text_color_hex = hex_color_string(text_color);
+                                    }
+                                    let hex_changed = ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut popup.text_color_hex)
+                                                .desired_width(64.0)
+                                                .hint_text("#RRGGBB"),
+                                        )
+                                        .on_hover_text(
+                                            "Type or paste a hex color (e.g. #FFFFFF) — applies \
+                                             as soon as it's a valid 6-digit hex value.",
+                                        )
+                                        .changed();
+                                    if hex_changed
+                                        && let Some(parsed) = parse_chat_hex_color(popup.text_color_hex.trim())
                                     {
+                                        text_color = parsed;
+                                    }
+                                    if wheel_changed || (hex_changed && text_color != self.chat_text_color) {
                                         self.chat_text_color = text_color;
                                         let _ = self.core.store.set_setting(
                                             K_CHAT_TEXT_COLOR,
-                                            &format!(
-                                                "#{:02X}{:02X}{:02X}",
-                                                text_color.r(),
-                                                text_color.g(),
-                                                text_color.b()
-                                            ),
+                                            &hex_color_string(text_color),
                                         );
                                     }
                                 });
@@ -2821,6 +2873,8 @@ impl StreamArchiverApp {
                                     self.chat_font_pt = CHAT_FONT_PT_DEFAULT;
                                     self.chat_ts_color = egui::Color32::WHITE;
                                     self.chat_text_color = egui::Color32::WHITE;
+                                    popup.ts_color_hex = hex_color_string(egui::Color32::WHITE);
+                                    popup.text_color_hex = hex_color_string(egui::Color32::WHITE);
                                     let _ = self.core.store.set_setting(
                                         K_CHAT_FONT_PT,
                                         &CHAT_FONT_PT_DEFAULT.to_string(),
