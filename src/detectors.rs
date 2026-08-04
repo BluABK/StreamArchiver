@@ -559,6 +559,28 @@ impl DetectContext {
         }
     }
 
+    /// Refresh the OCR image-hash cache for `(monitor_id, source_id)` after a
+    /// forced re-OCR (the manual "rescan this event" action,
+    /// `downloader::supervisor::cmd_rescan_schedule_event`) — without this, the
+    /// next periodic scan would still see the pre-rescan cached hash/segments
+    /// for this unchanged image and reapply the OLD (misread) result, undoing
+    /// the rescan. No-op if the image can no longer be read.
+    pub(crate) async fn refresh_ocr_cache(
+        &self,
+        monitor_id: i64,
+        source_id: &str,
+        image_path: &Path,
+        segs: Vec<ScheduleSegment>,
+    ) {
+        let Ok(bytes) = crate::iomon::fs::read(crate::iomon::Cat::Detector, image_path).await else {
+            return;
+        };
+        let hash = fnv64(&bytes);
+        let key = (monitor_id, source_id.to_string());
+        self.ocr_cache.lock().await.insert(key, (hash, segs));
+        self.persist_ocr_hash(monitor_id, source_id, hash);
+    }
+
     /// Persist the FNV-1a hash for a single `(monitor_id, source_id)` to the
     /// settings store so the OCR cache survives app restarts.
     fn persist_ocr_hash(&self, monitor_id: i64, source_id: &str, hash: u64) {
@@ -1832,6 +1854,7 @@ impl DetectContext {
                                 canceled: seg.canceled_until.is_some(),
                                 video_id: None,
                                 collab: String::new(),
+                                ..Default::default()
                             })
                         })
                         .collect();
@@ -1958,6 +1981,7 @@ impl DetectContext {
                     canceled: false,
                     video_id: Some(id.clone()),
                     collab: String::new(),
+                    ..Default::default()
                 })
             })
             .collect();
@@ -2987,6 +3011,7 @@ impl DetectContext {
                             canceled: ev.canceled,
                             video_id: None,
                             collab: String::new(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -4477,7 +4502,12 @@ pub(crate) fn youtube_streams_url(url: &str) -> String {
 /// [`Store::replace_schedule_source_diffed`]). Returns whether the DB write
 /// succeeded (the caller's `changed` flag). The channel name is resolved once,
 /// only when there are changes to report.
-fn replace_schedule_and_notify(
+///
+/// `pub(crate)`: also called directly by the manual "rescan this event"
+/// action (`downloader::supervisor::cmd_rescan_schedule_event`), which
+/// applies a forced re-OCR result through the exact same write path a normal
+/// periodic scan uses.
+pub(crate) fn replace_schedule_and_notify(
     store: &Store,
     monitor_id: i64,
     source: &str,
@@ -4994,6 +5024,7 @@ fn fallback_seg(body: &str, center: usize, window: usize, start: i64) -> Schedul
         canceled: false,
         video_id: nearest_video_id(slice, rel),
         collab: String::new(),
+        ..Default::default()
     }
 }
 
@@ -5131,6 +5162,7 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
                         canceled: false,
                         video_id: None,
                         collab: String::new(),
+                        ..Default::default()
                     });
                 }
             }
@@ -5148,6 +5180,7 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
                         canceled: false,
                         video_id: Some(vid),
                         collab: String::new(),
+                        ..Default::default()
                     });
                 }
             }
@@ -5946,6 +5979,7 @@ mod tests {
             canceled,
             video_id: None,
             collab: String::new(),
+            ..Default::default()
         }
     }
 

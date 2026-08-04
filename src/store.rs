@@ -35,7 +35,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 83;
+const SCHEMA_VERSION: i64 = 84;
 
 pub struct Store {
     conn: FairMutex<Connection>,

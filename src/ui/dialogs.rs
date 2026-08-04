@@ -30,6 +30,15 @@ pub(super) struct RecPropsPopup {
     pub(super) notes: String,
 }
 
+/// One open "Schedule event properties" window + its rescan draft (model +
+/// effort combo selections, independent per open window so comparing two
+/// events at once doesn't share a draft).
+pub(super) struct EventPropsPopup {
+    pub(super) segment_id: i64,
+    pub(super) rescan_model: String,
+    pub(super) rescan_effort: String,
+}
+
 /// Draft state for the "Edit schedule item" dialog. Times are edited as local
 /// `YYYY-MM-DD` / `HH:MM` strings; on save they're parsed back to unix seconds and
 /// written via [`Store::update_schedule_segment_manual`](crate::store::Store::update_schedule_segment_manual),
@@ -1955,6 +1964,209 @@ impl StreamArchiverApp {
         }
         !open
     }
+
+    pub(super) fn event_properties_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.event_props_popups.len() {
+            let sid = self.event_props_popups[i].segment_id;
+            if self.event_properties_window(ctx, i) {
+                closed.push(sid);
+            }
+        }
+        if !closed.is_empty() {
+            self.event_props_popups.retain(|p| !closed.contains(&p.segment_id));
+        }
+    }
+
+    /// Properties dialog for a single schedule event. Opened by clicking an
+    /// event tile in the Schedule calendar. Shows every field the calendar
+    /// knows about this occurrence plus the OCR attribution (model/confidence,
+    /// when scanned) and a "rescan this event" action.
+    ///
+    /// Closes automatically once its `segment_id` no longer resolves in
+    /// `schedule_all` — covers both manual deletion AND a successful rescan
+    /// (which necessarily replaces the whole source's segment ids, see
+    /// [`crate::downloader::supervisor::Supervisor::cmd_rescan_schedule_event`]).
+    #[allow(deprecated)]
+    pub(super) fn event_properties_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        let sid = self.event_props_popups[idx].segment_id;
+        let Some(s) = self.schedule_all.iter().find(|s| s.segment_id == sid).cloned() else {
+            return true;
+        };
+
+        let rescanning = self.background_tasks.iter().any(|t| {
+            matches!(t.kind, crate::events::BackgroundTaskKind::OcrRescan(id) if id == sid)
+        });
+        let hidden = self.schedule_hidden_segments.contains(&sid);
+        let mut open = true;
+        let mut rescan_clicked = false;
+        let mut model_draft = self.event_props_popups[idx].rescan_model.clone();
+        let mut effort_draft = self.event_props_popups[idx].rescan_effort.clone();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("schedule_event_props_vp", sid)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Schedule event properties — {}", s.title))
+                .with_inner_size([460.0, 460.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.strong("Event");
+                        egui::Grid::new("evp_event")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(90.0)
+                            .show(ui, |ui| {
+                                ui.label("Channel");
+                                ui.label(&s.channel_name);
+                                ui.end_row();
+                                ui.label("Title");
+                                ui.add(egui::Label::new(&s.title).wrap_mode(egui::TextWrapMode::Wrap));
+                                ui.end_row();
+                                if !s.category.is_empty() {
+                                    ui.label("Category");
+                                    ui.label(&s.category);
+                                    ui.end_row();
+                                }
+                                if !s.collab.is_empty() {
+                                    ui.label("With").on_hover_text("Collaborator(s)");
+                                    ui.label(&s.collab);
+                                    ui.end_row();
+                                }
+                                ui.label("Start");
+                                ui.label(fmt_datetime_short(s.start_time));
+                                ui.end_row();
+                                if let Some(end) = s.end_time {
+                                    ui.label("End");
+                                    ui.label(fmt_datetime_short(end));
+                                    ui.end_row();
+                                }
+                                ui.label("Hidden");
+                                ui.label(if hidden { "Yes" } else { "No" });
+                                ui.end_row();
+                            });
+
+                        ui.add_space(8.0);
+                        ui.strong("Source");
+                        egui::Grid::new("evp_source")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(90.0)
+                            .show(ui, |ui| {
+                                ui.label("Source");
+                                let label = if s.is_manual() {
+                                    "Manually edited".to_string()
+                                } else {
+                                    crate::schedule_source::ScheduleSourceKind::from_id(&s.source)
+                                        .map(|k| k.label().to_string())
+                                        .unwrap_or_else(|| s.source.clone())
+                                };
+                                ui.label(label);
+                                ui.end_row();
+                                if !s.ocr_model.is_empty() {
+                                    ui.label("Scanned with").on_hover_text(
+                                        "The CLI model whose output produced this event.",
+                                    );
+                                    let conf = if s.ocr_confidence.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" (confidence: {})", s.ocr_confidence)
+                                    };
+                                    let color = if s.ocr_confidence == "low" {
+                                        egui::Color32::from_rgb(220, 160, 30)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    ui.colored_label(color, format!("{}{conf}", s.ocr_model));
+                                    ui.end_row();
+                                }
+                            });
+
+                        ui.add_space(8.0);
+                        ui.strong("Rescan").on_hover_text(
+                            "Force a fresh OCR pass over this event's source image with a \
+                             different model/effort. Because a source refresh replaces every \
+                             upcoming event from that image at once, this window closes \
+                             afterward — check the calendar for the updated result.",
+                        );
+                        if s.ocr_model.is_empty() {
+                            ui.weak("Not an OCR-scanned event — nothing to rescan.");
+                        } else {
+                            egui::Grid::new("evp_rescan")
+                                .num_columns(2)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Model");
+                                    egui::ComboBox::from_id_salt(("evp_model_combo", sid))
+                                        .selected_text(&model_draft)
+                                        .width(120.0)
+                                        .show_ui(ui, |ui| {
+                                            for m in ["haiku", "sonnet", "opus"] {
+                                                ui.selectable_value(&mut model_draft, m.to_string(), m);
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(
+                                            "CLI model to re-scan this event's source image with.",
+                                        );
+                                    ui.end_row();
+                                    ui.label("Effort");
+                                    egui::ComboBox::from_id_salt(("evp_effort_combo", sid))
+                                        .selected_text(if effort_draft.is_empty() {
+                                            "default"
+                                        } else {
+                                            &effort_draft
+                                        })
+                                        .width(120.0)
+                                        .show_ui(ui, |ui| {
+                                            for level in ["", "low", "medium", "high", "xhigh", "max"] {
+                                                let label = if level.is_empty() { "default" } else { level };
+                                                ui.selectable_value(&mut effort_draft, level.to_string(), label);
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(
+                                            "Effort level passed as --effort to the CLI. 'default' \
+                                             omits the flag entirely.",
+                                        );
+                                    ui.end_row();
+                                });
+                            let btn = ui.add_enabled(
+                                !rescanning,
+                                egui::Button::new(if rescanning { "Rescanning…" } else { "🔄 Rescan this event" }),
+                            );
+                            let btn = if rescanning {
+                                btn.on_hover_text("A rescan for this event is already running.")
+                            } else {
+                                btn.on_hover_text(
+                                    "Re-run OCR on this event's source image now, with the model/effort \
+                                     above, and apply the result.",
+                                )
+                            };
+                            if btn.clicked() {
+                                rescan_clicked = true;
+                            }
+                        }
+                    });
+                });
+            },
+        );
+
+        self.event_props_popups[idx].rescan_model = model_draft.clone();
+        self.event_props_popups[idx].rescan_effort = effort_draft.clone();
+        if rescan_clicked {
+            self.core.manual(ManualCommand::RescanScheduleEvent {
+                segment_id: sid,
+                model: model_draft,
+                effort: effort_draft,
+            });
+        }
+        !open
+    }
+
     /// The "Edit schedule item" dialog (None = closed). Lets the user correct an
     /// occurrence's time/title/category or delete it; saving marks the row
     /// Rename-recording dialog: shows a text-edit for the new file stem, a live

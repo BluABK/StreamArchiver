@@ -1637,7 +1637,20 @@ impl Store {
             conn.execute_batch("ALTER TABLE channel ADD COLUMN posts_hidden INTEGER NOT NULL DEFAULT 0;")?;
             conn.pragma_update(None, "user_version", 83)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 83);
+        if version < 84 {
+            // Per-event OCR attribution: which model produced/accepted the
+            // scanned title, its self-reported confidence, and the on-disk
+            // source image it was read from (so a later per-event "rescan" can
+            // re-target the exact same image). Empty for non-OCR sources
+            // (Twitch/YouTube API, Discord, manual) and for pre-existing rows.
+            conn.execute_batch(
+                "ALTER TABLE schedule_segment ADD COLUMN ocr_model TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE schedule_segment ADD COLUMN ocr_confidence TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE schedule_segment ADD COLUMN ocr_image_path TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 84)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 84);
         Ok(())
     }
 }

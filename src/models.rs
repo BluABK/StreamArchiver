@@ -1662,7 +1662,7 @@ pub struct MonitorStreamChange {
 /// `Serialize`/`Deserialize` let the community-post archive cache decoded events
 /// as `decoded_json`, so an unchanged post image hits the archive instead of
 /// re-running OCR. See [`crate::store`]'s `community_post_archive`.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScheduleSegment {
     #[allow(dead_code)]
     pub id: i64,
@@ -1686,13 +1686,27 @@ pub struct ScheduleSegment {
     /// don't have this field.
     #[serde(default)]
     pub collab: String,
+    /// The CLI model whose output produced this event ("haiku", "sonnet", …).
+    /// Empty for non-OCR sources (Twitch/YouTube API, Discord, manual).
+    /// `serde(default)` for the same reason as `collab` above.
+    #[serde(default)]
+    pub ocr_model: String,
+    /// The OCR model's self-reported transcription confidence for this event's
+    /// title ("high"/"low"). Empty when not OCR-derived or from an older scan.
+    #[serde(default)]
+    pub ocr_confidence: String,
+    /// Local on-disk path of the source image this event was read from (empty
+    /// for non-OCR sources). Lets a later "rescan this event" re-target the
+    /// exact same image without re-deriving source-kind branching.
+    #[serde(default)]
+    pub ocr_image_path: String,
 }
 
 /// One upcoming scheduled stream joined with its channel + monitor, for the
 /// Schedule calendar. Flattens a [`ScheduleSegment`] with the channel name and
 /// the monitor's source URL so the calendar can show who streams when and offer
 /// the URL/platform on a right-click. `platform` is derived from [`Self::url`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct UpcomingStream {
     /// `schedule_segment.id` — the stable DB primary key of this occurrence, so
     /// the calendar can edit / delete / open-source a specific row.
@@ -1727,6 +1741,10 @@ pub struct UpcomingStream {
     /// Collaborator names, comma-joined ('' = none). See
     /// [`ScheduleSegment::collab`].
     pub collab: String,
+    /// See [`ScheduleSegment::ocr_model`].
+    pub ocr_model: String,
+    /// See [`ScheduleSegment::ocr_confidence`].
+    pub ocr_confidence: String,
 }
 
 impl UpcomingStream {

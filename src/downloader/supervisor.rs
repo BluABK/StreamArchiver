@@ -204,6 +204,9 @@ impl Supervisor {
                 );
             }
             ManualCommand::ScanForMissedStreams(monitor_id) => self.cmd_scan_for_missed_streams(monitor_id),
+            ManualCommand::RescanScheduleEvent { segment_id, model, effort } => {
+                self.cmd_rescan_schedule_event(segment_id, model, effort)
+            }
             ManualCommand::PlayVodNow(rec_id) => self.cmd_play_vod_now(rec_id),
             ManualCommand::OpenVodWebpage(rec_id) => self.cmd_open_vod_webpage(rec_id),
             ManualCommand::BackfillHeadNow(rec_id) => {
@@ -574,6 +577,77 @@ progress_info: None,
                     "{found} missed stream(s) found"
                 )),
             });
+        });
+    }
+
+    /// [`ManualCommand::RescanScheduleEvent`]: the event Properties window's
+    /// "🔄 Rescan this event" action. Forces a fresh OCR pass over the
+    /// segment's stored source image with a model/effort override, then
+    /// applies the result through the same write path a normal periodic scan
+    /// uses. Because `replace_schedule_source` deletes-and-reinserts a
+    /// source's future segments (ids aren't stable across a refresh), this
+    /// necessarily re-scans the segment's WHOLE source image, not just the
+    /// one event — the event Properties window closes afterward since its
+    /// `segment_id` no longer refers to a live row.
+    fn cmd_rescan_schedule_event(&self, segment_id: i64, model: String, effort: String) {
+        let (ctx, store, events) = (self.ctx.clone(), self.store.clone(), self.events.clone());
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::OcrRescan(segment_id),
+                label: format!("Rescan schedule event · {model}"),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: None,
+                progress_info: None,
+            }));
+
+            let finish = |outcome: crate::events::TaskOutcome| {
+                let _ = events.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
+            };
+
+            let Ok(Some(seg)) = store.get_schedule_segment(segment_id) else {
+                finish(crate::events::TaskOutcome::Failed("event no longer exists".into()));
+                return;
+            };
+            if seg.ocr_image_path.is_empty() {
+                finish(crate::events::TaskOutcome::Failed("not an OCR-scanned event".into()));
+                return;
+            }
+            let Ok(Some(source)) = store.schedule_segment_source(segment_id) else {
+                finish(crate::events::TaskOutcome::Failed("event no longer exists".into()));
+                return;
+            };
+            let Ok(Some(row)) = store.get_monitor_with_channel(seg.monitor_id) else {
+                finish(crate::events::TaskOutcome::Failed("owning channel no longer exists".into()));
+                return;
+            };
+
+            let cfg = crate::schedule_source::load_channel_cfg(&store, row.channel.id);
+            let mut opts = crate::schedule_ocr::ocr_opts_from_settings(&store, &cfg);
+            opts.model = model;
+            opts.effort = effort;
+
+            let image_path = std::path::PathBuf::from(&seg.ocr_image_path);
+            let result = crate::schedule_ocr::ocr_schedule_image(&image_path, &opts).await;
+            crate::schedule_ocr::accumulate_ocr_stats(&store, &result);
+
+            match result.segments {
+                Some(segs) => {
+                    let n = segs.len();
+                    crate::detectors::replace_schedule_and_notify(&store, seg.monitor_id, &source, &segs);
+                    let _ = store.clear_other_schedule_sources(seg.monitor_id, &source);
+                    ctx.refresh_ocr_cache(seg.monitor_id, &source, &image_path, segs).await;
+                    finish(crate::events::TaskOutcome::CompletedWithNote(format!(
+                        "rescanned with {} — {n} event(s) updated",
+                        result.accepted_model
+                    )));
+                }
+                None => finish(crate::events::TaskOutcome::Failed(
+                    "rescan found no schedule in the source image".into(),
+                )),
+            }
         });
     }
 

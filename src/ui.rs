@@ -1901,6 +1901,10 @@ pub struct StreamArchiverApp {
     /// Open recording-properties windows, one per take (each carries its own
     /// notes draft, synced from the DB on open and written back per keystroke).
     rec_props_popups: Vec<RecPropsPopup>,
+    /// Open schedule-event-properties windows, one per event (each carries its
+    /// own rescan model/effort draft). Opened by clicking an event tile in the
+    /// Schedule calendar — see [`crate::ui::dialogs::EventPropsPopup`].
+    event_props_popups: Vec<EventPropsPopup>,
     /// Per-channel cached icon textures loaded from disk for the Properties window.
     /// A `None` value means the lookup was attempted but no icon file was found.
     channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
@@ -3313,6 +3317,7 @@ impl eframe::App for StreamArchiverApp {
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
         self.edit_schedule_window(ui.ctx());
+        self.event_properties_windows(ui.ctx());
         self.chat_popup_windows(ui.ctx());
         self.instance_properties_windows(ui.ctx());
         self.channel_properties_windows(ui.ctx());

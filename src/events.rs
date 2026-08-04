@@ -87,6 +87,12 @@ pub enum BackgroundTaskKind {
     /// counterpart to the periodic `K_AUTO_BACKFILL_MISSED` sweep. Carries the
     /// monitor id (mirrors `ReorganizeMonitor`).
     BackfillDiscoverScan(i64),
+    /// A single schedule event's "🔄 Rescan this event" forced re-OCR with a
+    /// user-chosen model/effort override (see
+    /// `ManualCommand::RescanScheduleEvent`). Carries the `schedule_segment`
+    /// id at the time the rescan was requested — the event Properties window
+    /// uses this to show "Rescanning…" while it's active.
+    OcrRescan(i64),
 }
 
 impl BackgroundTaskKind {
@@ -116,6 +122,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::RaidFollow => "Follow raid",
             BackgroundTaskKind::FetchMissingChatEmotes => "Fetch missing chat emotes",
             BackgroundTaskKind::BackfillDiscoverScan(_) => "Scan for missed streams",
+            BackgroundTaskKind::OcrRescan(_) => "Rescan schedule event",
         }
     }
 
@@ -149,7 +156,8 @@ impl BackgroundTaskKind {
             | BackgroundTaskKind::ReembedChaptersAll
             | BackgroundTaskKind::RaidFollow
             | BackgroundTaskKind::FetchMissingChatEmotes
-            | BackgroundTaskKind::BackfillDiscoverScan(_) => None,
+            | BackgroundTaskKind::BackfillDiscoverScan(_)
+            | BackgroundTaskKind::OcrRescan(_) => None,
         }
     }
 }
@@ -578,6 +586,15 @@ pub enum ManualCommand {
     /// single monitor now, by monitor id — the on-demand counterpart to the
     /// periodic `K_AUTO_BACKFILL_MISSED` sweep.
     ScanForMissedStreams(i64),
+    /// The event Properties window's "🔄 Rescan this event" action: force a
+    /// fresh OCR pass over the segment's stored source image
+    /// (`ScheduleSegment::ocr_image_path`) with a user-chosen model/effort
+    /// override, then apply the result through the normal schedule-write path
+    /// (see `downloader::supervisor::cmd_rescan_schedule_event`). Because a
+    /// source refresh replaces ALL of that source's future segments (segment
+    /// ids aren't stable across a rescan), this targets the segment's whole
+    /// source image, not just the one event.
+    RescanScheduleEvent { segment_id: i64, model: String, effort: String },
     /// Resolve this take's VOD URL (same lookup `BackfillMissedVodNow` uses)
     /// and open it in the configured media player, by recording id. Works on
     /// a past broadcast regardless of whether it was ever captured — the

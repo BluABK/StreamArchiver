@@ -765,6 +765,7 @@ impl StreamArchiverApp {
             properties_popups: Vec::new(),
             channel_properties_popups: Vec::new(),
             rec_props_popups: Vec::new(),
+            event_props_popups: Vec::new(),
             channel_icons: HashMap::new(),
             channel_icons_small: HashMap::new(),
             instance_icons_small: HashMap::new(),

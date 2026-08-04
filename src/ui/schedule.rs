@@ -693,6 +693,7 @@ impl StreamArchiverApp {
 
         // Actions collected during rendering, applied after the borrowing closures.
         let mut open_day: Option<chrono::NaiveDate> = None;
+        let mut open_event: Option<i64> = None;
         let mut nav_anchor: Option<chrono::NaiveDate> = None;
         let mut set_mode: Option<ScheduleMode> = None;
         let mut do_refresh = false;
@@ -762,25 +763,29 @@ impl StreamArchiverApp {
                 ScheduleMode::Month => {
                     self.schedule_month_grid(
                         ui, anchor, today, &by_day, &collide, &ptex, &avatars, &large_avatars,
-                        &mut open_day, &signals,
+                        &mut open_day, &mut open_event, &signals,
                     )
                 }
                 ScheduleMode::Week => {
                     self.schedule_week_grid(
-                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
+                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day, &mut open_event,
                         &avatars, &large_avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Day => {
                     self.schedule_day_grid(
-                        ui, anchor, today, &by_day, &collide, &mut open_day, &avatars, &large_avatars, &all_day_events, &signals,
+                        ui, anchor, today, &by_day, &collide, &mut open_day, &mut open_event, &avatars, &large_avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Agenda => {
-                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &avatars, &mut open_day, &signals)
+                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &avatars, &mut open_day, &mut open_event, &signals)
                 }
             }
         });
+
+        if let Some(id) = open_event {
+            self.open_event_properties(id);
+        }
 
         // ── Apply collected actions. ──
         self.schedule_apply_actions(
@@ -1711,6 +1716,12 @@ impl StreamArchiverApp {
         }
         if let Some(sid) = ui
             .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_properties")))
+        {
+            self.open_event_properties(sid);
+        }
+        if let Some(sid) = ui
+            .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_open_src")))
         {
             let ctx = ui.ctx().clone();
@@ -1939,6 +1950,7 @@ impl StreamArchiverApp {
         // the mosaic prefers these and falls back to the 64px `avatars`.
         large_avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
         signals: &HashMap<i64, EventSignals>,
     ) {
         use chrono::Datelike;
@@ -2017,6 +2029,7 @@ impl StreamArchiverApp {
                                         avatars,
                                         large_avatars,
                                         open_day,
+                                        open_event,
                                         sched_rec_by_day.get(&day),
                                         signals,
                                     );
@@ -2045,7 +2058,7 @@ impl StreamArchiverApp {
         col_gap: f32,
         zoom: f32,
         all_day_events: &[usize],
-        open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
         avatars: &HashMap<i64, egui::TextureHandle>,
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -2079,7 +2092,7 @@ impl StreamArchiverApp {
         let strip_h = lane_count as f32 * (bar_h + bar_gap);
         let (resp, painter) = ui.allocate_painter(egui::vec2(strip_w, strip_h), egui::Sense::hover());
         let origin = resp.rect.min;
-        let mut clicked_day: Option<chrono::NaiveDate> = None;
+        let mut clicked_event: Option<i64> = None;
         for (idx, start, end, lane, merged_count) in &placed {
             let s = &self.schedule_all[*idx];
             let x0 = origin.x + time_col_w + *start as f32 * (col_w + col_gap);
@@ -2136,7 +2149,7 @@ impl StreamArchiverApp {
                 egui::Color32::WHITE,
             );
             if evt_resp.clicked() {
-                clicked_day = Some(days[*start]);
+                clicked_event = Some(s.segment_id);
             }
             let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
             let merge_label = (*merged_count > 1)
@@ -2146,8 +2159,8 @@ impl StreamArchiverApp {
                 .on_hover_text(format!("{detail}{hover_extra}"))
                 .context_menu(|ui| schedule_copy_menu(ui, s, false, None));
         }
-        if let Some(d) = clicked_day {
-            *open_day = Some(d);
+        if let Some(id) = clicked_event {
+            *open_event = Some(id);
         }
     }
 
@@ -2166,6 +2179,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         _ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
         avatars: &HashMap<i64, egui::TextureHandle>,
         large_avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
@@ -2237,6 +2251,16 @@ impl StreamArchiverApp {
                         let lbl_resp = ui
                             .add(egui::Label::new(text).sense(egui::Sense::click()))
                             .on_hover_text("Open day detail");
+                        lbl_resp.clone().context_menu(|ui| {
+                            if ui
+                                .button("📅 Day properties…")
+                                .on_hover_text("Show every event scheduled this day")
+                                .clicked()
+                            {
+                                *open_day = Some(day);
+                                ui.close();
+                            }
+                        });
                         if show_avatar_row {
                             let _ = ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0 * zoom;
@@ -2278,7 +2302,7 @@ impl StreamArchiverApp {
 
         // All-day event bar strip (Google-Calendar style) — shared with Day
         // view, see `schedule_all_day_bar`.
-        self.schedule_all_day_bar(ui, &days, time_col_w, col_w, col_gap, zoom, all_day_events, open_day, avatars, signals);
+        self.schedule_all_day_bar(ui, &days, time_col_w, col_w, col_gap, zoom, all_day_events, open_event, avatars, signals);
 
         ui.separator();
 
@@ -2294,6 +2318,7 @@ impl StreamArchiverApp {
             collide,
             &exclude_all_day,
             open_day,
+            open_event,
             &self.schedule_hidden_segments,
             &self.schedule_selected,
             &self.schedule_merge_labels,
@@ -2320,6 +2345,7 @@ impl StreamArchiverApp {
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
         open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
         avatars: &HashMap<i64, egui::TextureHandle>,
         large_avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
@@ -2334,7 +2360,18 @@ impl StreamArchiverApp {
         } else {
             egui::RichText::new(hdr).strong()
         };
-        ui.label(text);
+        ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+            .on_hover_text("Right-click for day properties")
+            .context_menu(|ui| {
+                if ui
+                    .button("📅 Day properties…")
+                    .on_hover_text("Show every event scheduled this day")
+                    .clicked()
+                {
+                    *open_day = Some(anchor);
+                    ui.close();
+                }
+            });
         ui.separator();
 
         let zoom = self.schedule_zoom;
@@ -2342,7 +2379,7 @@ impl StreamArchiverApp {
         let avail_w = ui.available_width();
         let col_w = (avail_w - time_col_w - 2.0).max(80.0);
 
-        self.schedule_all_day_bar(ui, &[anchor], time_col_w, col_w, 0.0, zoom, all_day_events, open_day, avatars, signals);
+        self.schedule_all_day_bar(ui, &[anchor], time_col_w, col_w, 0.0, zoom, all_day_events, open_event, avatars, signals);
         ui.separator();
 
         let exclude_all_day: HashSet<usize> = all_day_events.iter().copied().collect();
@@ -2357,6 +2394,7 @@ impl StreamArchiverApp {
             collide,
             &exclude_all_day,
             open_day,
+            open_event,
             &self.schedule_hidden_segments,
             &self.schedule_selected,
             &self.schedule_merge_labels,
@@ -2370,8 +2408,11 @@ impl StreamArchiverApp {
     }
 
     /// Render one month-grid day cell: a bordered box with the day number and up to
-    /// `max_chips` stream chips (overflow folds into a clickable "+N more"). A
-    /// left-click on the day or a chip opens the day popup (`open_day`).
+    /// `max_chips` stream chips (overflow folds into a clickable "+N more").
+    /// Left-click on the day number or "+N more" opens the day popup
+    /// (`open_day`); left-click on a chip opens that event's own Properties
+    /// (`open_event`). Right-click on blank cell space also opens the day
+    /// popup via a "📅 Day properties…" context menu.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn schedule_cell(
         &self,
@@ -2388,12 +2429,21 @@ impl StreamArchiverApp {
         avatars: &HashMap<i64, egui::TextureHandle>,
         large_avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
         sched_recs: Option<&Vec<String>>,
         signals: &HashMap<i64, EventSignals>,
     ) {
         use chrono::Datelike;
         let in_month = day.month() == month;
         let is_today = day == today;
+
+        // Blank-space "Day properties…" context menu: registered FIRST (before
+        // the day-number/chips below), same ordering the time-grid background
+        // uses (`calendar.rs`'s `allocate_painter(Sense::hover())` ahead of its
+        // event blocks) — later-added child widgets with their own
+        // `Sense::click()` take priority over this for their own sub-rects.
+        let bg_id = ui.id().with(("month_cell_bg", day));
+        let bg_resp = ui.interact(ui.max_rect(), bg_id, egui::Sense::click());
 
         let mut frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4));
         if is_today {
@@ -2437,7 +2487,7 @@ impl StreamArchiverApp {
                 let entries = entries.map(Vec::as_slice).unwrap_or(&[]);
                 if self.schedule_month_icons {
                     self.schedule_cell_icons(
-                        ui, day, entries, avatars, large_avatars, signals, open_day,
+                        ui, day, entries, avatars, large_avatars, signals, open_day, open_event,
                     );
                     return;
                 }
@@ -2445,7 +2495,7 @@ impl StreamArchiverApp {
                 for &i in &entries[..shown] {
                     let colliding = collide.contains(&i);
                     if self.schedule_chip(ui, i, colliding, ptex, avatars, signals).clicked() {
-                        *open_day = Some(day);
+                        *open_event = Some(self.schedule_all[i].segment_id);
                     }
                 }
                 if entries.len() > shown {
@@ -2464,6 +2514,16 @@ impl StreamArchiverApp {
                 }
             });
         });
+        bg_resp.context_menu(|ui| {
+            if ui
+                .button("📅 Day properties…")
+                .on_hover_text("Show every event scheduled this day")
+                .clicked()
+            {
+                *open_day = Some(day);
+                ui.close();
+            }
+        });
     }
 
     /// "Icons only" Month day-cell body: one tile per distinct channel with a
@@ -2476,7 +2536,9 @@ impl StreamArchiverApp {
     /// Per-tile state mirrors what the chips convey: every-entry-hidden dims
     /// the tile to a ghost, every-entry-auto-off tints it grey (same signal as
     /// [`dim_for_no_auto`] on chip colors). Hover lists the channel's entries
-    /// for the day; click opens the day popup, exactly like a chip.
+    /// for the day; click opens that event's Properties (like a chip) when the
+    /// tile represents a single stream, else falls back to the day popup (no
+    /// single event to open).
     #[allow(clippy::too_many_arguments)]
     fn schedule_cell_icons(
         &self,
@@ -2487,6 +2549,7 @@ impl StreamArchiverApp {
         large_avatars: &HashMap<i64, egui::TextureHandle>,
         signals: &HashMap<i64, EventSignals>,
         open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
     ) {
         if entries.is_empty() {
             return;
@@ -2605,7 +2668,13 @@ impl StreamArchiverApp {
                         }
                     });
                     if resp.on_hover_text(hover).clicked() {
-                        *open_day = Some(day);
+                        if idxs.len() == 1 {
+                            *open_event = Some(self.schedule_all[idxs[0]].segment_id);
+                        } else {
+                            // Several streams for this channel today: no single
+                            // event to open — fall back to the day list.
+                            *open_day = Some(day);
+                        }
                     }
                 }
             });
@@ -2623,6 +2692,7 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
         avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
+        open_event: &mut Option<i64>,
         signals: &HashMap<i64, EventSignals>,
     ) {
         let zoom = self.schedule_zoom;
@@ -2654,7 +2724,18 @@ impl StreamArchiverApp {
                         .to_string();
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.strong(heading);
+                        ui.add(egui::Label::new(egui::RichText::new(heading).strong()).sense(egui::Sense::click()))
+                            .on_hover_text("Right-click for day properties")
+                            .context_menu(|ui| {
+                                if ui
+                                    .button("📅 Day properties…")
+                                    .on_hover_text("Show every event scheduled this day")
+                                    .clicked()
+                                {
+                                    *open_day = Some(*day);
+                                    ui.close();
+                                }
+                            });
                     });
                     ui.separator();
 
@@ -2755,7 +2836,7 @@ impl StreamArchiverApp {
                         ));
                         row_resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, ml_agenda_owned.as_deref()));
                         if row_resp.clicked() {
-                            *open_day = Some(*day);
+                            *open_event = Some(s.segment_id);
                         }
                         ui.add_space(1.0);
                     }
@@ -2881,6 +2962,20 @@ impl StreamArchiverApp {
     /// Open the "Edit schedule item" dialog for a calendar occurrence (by segment
     /// id), seeding the draft from its current stored values. No-op if the segment
     /// is no longer in the loaded calendar (e.g. a refresh dropped it).
+    /// Open (or focus, if already open) the Properties window for one schedule
+    /// event. The window itself resolves the live row fresh each frame (see
+    /// [`Self::event_properties_window`]) — this just registers the popup.
+    pub(super) fn open_event_properties(&mut self, segment_id: i64) {
+        if self.event_props_popups.iter().any(|p| p.segment_id == segment_id) {
+            return;
+        }
+        self.event_props_popups.push(EventPropsPopup {
+            segment_id,
+            rescan_model: crate::schedule_ocr::DEFAULT_MODEL.to_string(),
+            rescan_effort: String::new(),
+        });
+    }
+
     pub(super) fn open_edit_schedule(&mut self, segment_id: i64) {
         let Some(s) = self
             .schedule_all

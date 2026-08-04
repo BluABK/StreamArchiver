@@ -58,6 +58,10 @@ pub struct OcrRunResult {
     pub cli_failures: u32,
     /// CLI calls that returned output but whose JSON couldn't be parsed as schedule events.
     pub parse_failures: u32,
+    /// Which model's output `segments` was actually taken from — empty if nothing
+    /// succeeded. May be the fallback model even without a parse failure, when the
+    /// primary model flagged a low-confidence read (see [`ocr_schedule_image`]).
+    pub accepted_model: String,
 }
 
 /// JSON envelope returned by `claude --output-format json`.
@@ -231,6 +235,23 @@ struct OcrEvent {
     /// ISO 8601 with offset, or null when there's no exact time.
     #[serde(default)]
     datetime: Option<String>,
+    /// Self-reported transcription confidence ("high"/"low"). Missing/older CLI
+    /// output has no opinion — treated as high-confidence (`is_low_confidence`).
+    #[serde(default)]
+    confidence: Option<String>,
+}
+
+impl OcrEvent {
+    fn is_low_confidence(&self) -> bool {
+        self.confidence.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("low"))
+    }
+}
+
+/// Whether the primary model's call needs a fallback re-run: it failed outright
+/// (`events` is `None`), or it parsed but flagged low confidence on any event.
+/// `model_differs` short-circuits when there's no distinct fallback to try.
+fn events_need_escalation(events: Option<&[OcrEvent]>, model_differs: bool) -> bool {
+    model_differs && (events.is_none() || events.is_some_and(|ev| ev.iter().any(OcrEvent::is_low_confidence)))
 }
 
 /// OCR a schedule image. Always returns an `OcrRunResult` so callers can accumulate
@@ -238,7 +259,13 @@ struct OcrEvent {
 pub async fn ocr_schedule_image(image_path: &Path, opts: &OcrOpts) -> OcrRunResult {
     if !crate::iomon::fs::exists_sync(crate::iomon::Cat::Detector, image_path) {
         debug!("OCR: image not found: {}", image_path.display());
-        return OcrRunResult { segments: None, cli_calls: vec![], cli_failures: 0, parse_failures: 0 };
+        return OcrRunResult {
+            segments: None,
+            cli_calls: vec![],
+            cli_failures: 0,
+            parse_failures: 0,
+            accepted_model: String::new(),
+        };
     }
     let dir = image_path.parent().unwrap_or_else(|| Path::new("."));
     let img = image_path.to_string_lossy().replace('\\', "/");
@@ -249,8 +276,8 @@ pub async fn ocr_schedule_image(image_path: &Path, opts: &OcrOpts) -> OcrRunResu
     let mut cli_failures: u32 = 0;
     let mut parse_failures: u32 = 0;
 
-    // Try the cheap model first, then the stronger fallback on a parse miss.
-    let events = match run_cli(&opts.command, &opts.model, &dir_s, &prompt, opts).await {
+    // Try the cheap model first.
+    let primary_events = match run_cli(&opts.command, &opts.model, &dir_s, &prompt, opts).await {
         Some((raw, call_stats)) => {
             cli_calls.push(call_stats);
             match parse_events(&raw) {
@@ -267,9 +294,17 @@ pub async fn ocr_schedule_image(image_path: &Path, opts: &OcrOpts) -> OcrRunResu
         }
     };
 
-    let events = if events.is_none() && opts.fallback_model != opts.model {
+    // Escalate to the stronger fallback model when the primary call failed
+    // outright (spawn/parse failure) OR when it parsed fine but self-reported a
+    // low-confidence read on at least one event — a wrong-but-well-formed title
+    // (e.g. a stylized-font misread) never fails to parse, so confidence is the
+    // only signal that catches it.
+    let should_escalate =
+        events_need_escalation(primary_events.as_deref(), opts.fallback_model != opts.model);
+
+    let (events, accepted_model) = if should_escalate {
         debug!("OCR: retrying with fallback model {}", opts.fallback_model);
-        match run_cli(&opts.command, &opts.fallback_model, &dir_s, &prompt, opts).await {
+        let fallback_events = match run_cli(&opts.command, &opts.fallback_model, &dir_s, &prompt, opts).await {
             Some((raw, call_stats)) => {
                 cli_calls.push(call_stats);
                 match parse_events(&raw) {
@@ -284,13 +319,18 @@ pub async fn ocr_schedule_image(image_path: &Path, opts: &OcrOpts) -> OcrRunResu
                 cli_failures += 1;
                 None
             }
+        };
+        match fallback_events {
+            Some(ev) => (Some(ev), opts.fallback_model.clone()),
+            None => (primary_events, opts.model.clone()),
         }
     } else {
-        events
+        (primary_events, opts.model.clone())
     };
 
-    let segments = events.map(|ev| map_events(ev, opts));
-    OcrRunResult { segments, cli_calls, cli_failures, parse_failures }
+    let accepted_model = if events.is_some() { accepted_model } else { String::new() };
+    let segments = events.map(|ev| map_events(ev, opts, &accepted_model, &img));
+    OcrRunResult { segments, cli_calls, cli_failures, parse_failures, accepted_model }
 }
 
 /// Substitute the per-image placeholders into the strict OCR→JSON prompt
@@ -355,6 +395,7 @@ RULES:\n\
 - Transcribe titles literally. 'w' or 'W' before a name means 'with' (a collaborator), e.g. 'FEARS TO FATHOM w CRELLY' -> title 'Fears to Fathom', collab 'Crelly'. Do not guess or 'correct' names.\n\
 - Skip any card marked OFFLINE, marked as a non-stream note (e.g. 'podcasting', 'break', 'TBD'), or with an unknown date ('????').\n\
 - If a time is vague (e.g. 'Evening'), set time and datetime to null but keep the raw text in time_label.\n\
+- Some schedule graphics use heavily stylized/decorative fonts where letters can look similar (a decorative 'R' can resemble a 'T', 'O' vs 'D', 'I' vs 'L', etc). Read each letter against the font's actual strokes — do not autocomplete toward a more common-sounding word. If, after careful reading, you are not fully certain of a title's exact spelling, transcribe your best literal reading of the strokes and set confidence to \"low\" for that event; otherwise set confidence to \"high\".\n\
 \n\
 Each object has these fields:\n\
 - title (string)\n\
@@ -365,6 +406,7 @@ Each object has these fields:\n\
 - time_label (raw time text from banner, e.g. '12.00 P.M.' or 'Evening')\n\
 - timezone (IANA name of the timezone you used)\n\
 - datetime (full ISO 8601 instant WITH its UTC offset, e.g. 2026-06-21T13:00:00-07:00, or null if no exact time)\n\
+- confidence (\"high\" or \"low\" — your transcription confidence for this event's title, per the rule above)\n\
 - source_image (set this to the filename: {image_path})",
         year = opts.year,
     )
@@ -475,8 +517,11 @@ fn parse_events(raw: &str) -> Option<Vec<OcrEvent>> {
 }
 
 /// Map decoded events to schedule segments, dropping any without a resolvable
-/// exact start time (vague "Evening" cards carry no datetime).
-fn map_events(events: Vec<OcrEvent>, opts: &OcrOpts) -> Vec<ScheduleSegment> {
+/// exact start time (vague "Evening" cards carry no datetime). `model` is the
+/// CLI model whose output `events` came from; `image_path` is the on-disk
+/// image that produced them — both are stamped onto every segment so a later
+/// per-event "rescan" can show attribution and re-target the same image.
+fn map_events(events: Vec<OcrEvent>, opts: &OcrOpts, model: &str, image_path: &str) -> Vec<ScheduleSegment> {
     let mut out: Vec<ScheduleSegment> = events
         .into_iter()
         .filter_map(|e| {
@@ -488,6 +533,7 @@ fn map_events(events: Vec<OcrEvent>, opts: &OcrOpts) -> Vec<ScheduleSegment> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("")
                 .to_string();
+            let confidence = if e.is_low_confidence() { "low" } else { "high" }.to_string();
             // Collab is BOTH folded into the title (display continuity — the
             // calendar shows the title everywhere) and stored structured in
             // `collab` for the "With: …" detail line / 🤝 marker.
@@ -508,6 +554,9 @@ fn map_events(events: Vec<OcrEvent>, opts: &OcrOpts) -> Vec<ScheduleSegment> {
                 canceled: false,
                 video_id: None,
                 collab,
+                ocr_model: model.to_string(),
+                ocr_confidence: confidence,
+                ocr_image_path: image_path.to_string(),
             })
         })
         .collect();
@@ -589,7 +638,7 @@ mod tests {
           {"title":"Maybe stream","collab":null,"time":null,"datetime":null}
         ]"#;
         let events = parse_events(raw).unwrap();
-        let segs = map_events(events, &opts());
+        let segs = map_events(events, &opts(), "haiku", "img.png");
         // Third (no time) is dropped; first two kept and sorted by start.
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].title, "Fears to Fathom w/ Crelly");
@@ -610,7 +659,7 @@ mod tests {
           {"title":"Art stream","collab":null,"datetime":"2026-06-22T05:00:00+09:00"}
         ]"#;
         let events = parse_events(raw).unwrap();
-        let segs = map_events(events, &opts());
+        let segs = map_events(events, &opts(), "haiku", "img.png");
         assert_eq!(segs.len(), 1, "three timezone printouts are one stream");
         assert_eq!(segs[0].title, "Art stream");
         // 2026-06-21T13:00-07:00 == 2026-06-21T20:00Z == unix 1782072000.
@@ -629,7 +678,7 @@ mod tests {
           {"title":"art STREAM","collab":null,"datetime":"2026-06-22T05:00:00+09:00"}
         ]"#;
         let events = parse_events(raw).unwrap();
-        let segs = map_events(events, &opts());
+        let segs = map_events(events, &opts(), "haiku", "img.png");
         assert_eq!(segs.len(), 1, "same instant => one stream, regardless of title");
         assert_eq!(segs[0].title, "Art stream w/ Guest", "keep the most informative title");
         assert_eq!(segs[0].start_time, 1782072000);
@@ -658,6 +707,52 @@ mod tests {
         o.offset = "-07:00".into();
         let p = build_prompt("img.png", &o);
         assert!(p.contains("America/Los_Angeles (UTC offset -07:00)"));
+    }
+
+    #[test]
+    fn prompt_warns_about_stylized_fonts_and_declares_confidence_field() {
+        let p = build_prompt("img.png", &opts());
+        assert!(p.contains("stylized/decorative fonts"), "must warn about font ambiguity: {p}");
+        assert!(p.contains("confidence"), "must document the confidence field: {p}");
+    }
+
+    #[test]
+    fn map_events_stamps_model_image_and_confidence() {
+        let raw = r#"[
+          {"title":"Tootie Pies Collab","collab":null,"datetime":"2026-08-05T13:00:00-05:00","confidence":"low"},
+          {"title":"ASMR","collab":null,"datetime":"2026-08-05T18:00:00-05:00","confidence":"high"},
+          {"title":"No opinion","collab":null,"datetime":"2026-08-05T20:00:00-05:00"}
+        ]"#;
+        let events = parse_events(raw).unwrap();
+        let segs = map_events(events, &opts(), "sonnet", "C:/banners/cottontail.png");
+        assert_eq!(segs.len(), 3);
+        for s in &segs {
+            assert_eq!(s.ocr_model, "sonnet");
+            assert_eq!(s.ocr_image_path, "C:/banners/cottontail.png");
+        }
+        assert_eq!(segs[0].ocr_confidence, "low");
+        assert_eq!(segs[1].ocr_confidence, "high");
+        assert_eq!(segs[2].ocr_confidence, "high", "missing confidence defaults to high");
+    }
+
+    #[test]
+    fn escalation_triggers_on_primary_failure_or_low_confidence() {
+        let high = parse_events(
+            r#"[{"title":"A","datetime":"2026-08-05T13:00:00-05:00","confidence":"high"}]"#,
+        )
+        .unwrap();
+        let low = parse_events(
+            r#"[{"title":"A","datetime":"2026-08-05T13:00:00-05:00","confidence":"low"}]"#,
+        )
+        .unwrap();
+
+        assert!(!events_need_escalation(Some(&high), true), "high confidence: no escalation needed");
+        assert!(events_need_escalation(Some(&low), true), "low confidence must escalate");
+        assert!(events_need_escalation(None, true), "primary failure must escalate");
+        assert!(
+            !events_need_escalation(Some(&low), false),
+            "no distinct fallback model configured: nothing to escalate to"
+        );
     }
 
     #[test]

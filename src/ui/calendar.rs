@@ -462,6 +462,15 @@ pub(super) fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream, hidden: 
         ui.close();
     }
     ui.separator();
+    if ui
+        .button("🔍  Properties…")
+        .on_hover_text("Show every field for this event, plus OCR attribution and rescan.")
+        .clicked()
+    {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_properties"), s.segment_id));
+        ui.close();
+    }
     if ui.button("✏  Edit…").clicked() {
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("sched_edit"), s.segment_id));
@@ -798,6 +807,7 @@ pub(super) fn schedule_time_grid(
     collide: &HashSet<usize>,
     exclude: &HashSet<usize>,
     open_day: &mut Option<chrono::NaiveDate>,
+    open_event: &mut Option<i64>,
     hidden_segs: &HashSet<i64>,
     selected: &HashSet<i64>,
     merge_labels: &HashMap<i64, String>,
@@ -846,14 +856,36 @@ pub(super) fn schedule_time_grid(
 
     let grid_w = time_col_w + days.len() as f32 * (col_w + col_gap);
 
-    let mut clicked_day: Option<chrono::NaiveDate> = None;
+    let mut clicked_event: Option<i64> = None;
 
     scroll.show(ui, |ui| {
+            // `Sense::click()` (not just `hover()`) so blank grid space can carry
+            // a "Day properties…" context menu — registered here, BEFORE the
+            // event blocks below, so their own `Sense::click()` interacts still
+            // take priority over this background for their own sub-rects.
             let (response, painter) = ui.allocate_painter(
                 egui::vec2(grid_w, total_h),
-                egui::Sense::hover(),
+                egui::Sense::click(),
             );
             let origin = response.rect.min;
+            response.context_menu(|ui| {
+                let day = ui
+                    .ctx()
+                    .input(|i| i.pointer.interact_pos())
+                    .map(|p| (((p.x - origin.x - time_col_w) / (col_w + col_gap)).floor() as i64).max(0))
+                    .and_then(|idx| days.get(idx as usize).copied())
+                    .or_else(|| days.first().copied());
+                if let Some(day) = day {
+                    if ui
+                        .button("📅 Day properties…")
+                        .on_hover_text("Show every event scheduled this day")
+                        .clicked()
+                    {
+                        *open_day = Some(day);
+                        ui.close();
+                    }
+                }
+            });
 
             // ── Hour grid lines + labels ──────────────────────────────────
             let grid_line_color = egui::Color32::from_white_alpha(18);
@@ -1183,24 +1215,24 @@ pub(super) fn schedule_time_grid(
                         .context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, merge_label_owned.as_deref()));
                     if block_clicked {
                         if ctrl_held {
-                            // Ctrl+click: toggle in selection without opening day
+                            // Ctrl+click: toggle in selection without opening properties
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(egui::Id::new("sched_sel_toggle"), s.segment_id)
                             });
                         } else {
-                            // Plain click: select single event + open day popup
+                            // Plain click: select single event + open its properties
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(egui::Id::new("sched_sel_single"), s.segment_id)
                             });
-                            clicked_day = Some(day);
+                            clicked_event = Some(s.segment_id);
                         }
                     }
                 }
             }
         });
 
-    if let Some(day) = clicked_day {
-        *open_day = Some(day);
+    if let Some(id) = clicked_event {
+        *open_event = Some(id);
     }
 }
 
@@ -1224,6 +1256,7 @@ mod tests {
             merged_into: None,
             auto_merge_excluded: false,
             collab: String::new(),
+            ..Default::default()
         }
     }
 
