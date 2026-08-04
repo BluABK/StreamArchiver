@@ -2932,236 +2932,6 @@ impl eframe::App for StreamArchiverApp {
                             self.show_posts_window = true;
                             self.posts_refreshed = None;
                         }
-                        if self.view == View::Streams {
-                            if ui
-                                .button("➕ Stream")
-                                .on_hover_text(
-                                    "Add stream\nCreate a channel with its first instance \
-                                     (a URL to record)",
-                                )
-                                .clicked()
-                            {
-                                self.form = Some(MonitorForm::new_channel(
-                                    &self.monitor_defaults,
-                                    &self.settings.default_output_dir,
-                                ));
-                            }
-                            if ui
-                                .button("➕ Channel")
-                                .on_hover_text(
-                                    "Add channel\nCreate an empty channel container; add \
-                                     instances to it afterwards",
-                                )
-                                .clicked()
-                            {
-                                self.channel_form = Some(ChannelForm {
-                                    id: None,
-                                    name: String::new(),
-                                    color: String::new(),
-                                    vod_download: None,
-                                    vod_replace: None,
-                                    head_backfill_fetch: None,
-                                    head_backfill_replace: None,
-                                    join_cleanup: None,
-                                    disposal_method: None,
-                                    primary_platform_pref: None,
-                                    chapters_enabled: None,
-                                    chapters_coalesce_secs: String::new(),
-                                    follow_my_raids: None,
-                                    record_me_as_raid_target: None,
-                                    follow_my_raids_play: None,
-                                    exclude_from_auto_play: None,
-                                    allow_delete: false,
-                                    primary_group: None,
-                                    groups: Default::default(),
-                                });
-                            }
-                            if ui
-                                .button("🏷 Groups")
-                                .on_hover_text(
-                                    "Manage channel groups\nCreate/rename/delete groups; assign \
-                                     a channel's primary + secondary groups from its own \
-                                     Properties dialog.",
-                                )
-                                .clicked()
-                            {
-                                self.show_group_manager = true;
-                            }
-                            {
-                                // Extracted local: a ComboBox iterating
-                                // `self.channel_groups` while also mutating
-                                // `self.streams_group_filter` inside the same
-                                // closure is exactly the disjoint-field-borrow
-                                // shape the channel/group-manager dialogs hit —
-                                // see their own comments on the same pattern.
-                                let groups = self.channel_groups.clone();
-                                let selected_label = self
-                                    .streams_group_filter
-                                    .and_then(|gid| groups.iter().find(|g| g.id == gid))
-                                    .map(|g| g.name.as_str())
-                                    .unwrap_or("All channels");
-                                egui::ComboBox::from_id_salt("streams_group_filter")
-                                    .selected_text(selected_label)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(self.streams_group_filter.is_none(), "All channels")
-                                            .clicked()
-                                        {
-                                            self.streams_group_filter = None;
-                                            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
-                                        }
-                                        for g in &groups {
-                                            if ui
-                                                .selectable_label(
-                                                    self.streams_group_filter == Some(g.id),
-                                                    &g.name,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.streams_group_filter = Some(g.id);
-                                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
-                                            }
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(
-                                        "Narrow the Streams grid to one group's members \
-                                         (primary or secondary) — the primary-group headers \
-                                         above don't apply while this is set.",
-                                    );
-                            }
-                            {
-                                let rgroups = self.recording_groups.clone();
-                                let selected_label = self
-                                    .streams_recording_group_filter
-                                    .and_then(|gid| rgroups.iter().find(|g| g.id == gid))
-                                    .map(|g| g.name.as_str())
-                                    .unwrap_or("All streams");
-                                egui::ComboBox::from_id_salt("streams_recording_group_filter")
-                                    .selected_text(selected_label)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                self.streams_recording_group_filter.is_none(),
-                                                "All streams",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.streams_recording_group_filter = None;
-                                            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
-                                        }
-                                        for g in &rgroups {
-                                            if ui
-                                                .selectable_label(
-                                                    self.streams_recording_group_filter == Some(g.id),
-                                                    &g.name,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.streams_recording_group_filter = Some(g.id);
-                                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
-                                            }
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(
-                                        "Narrow the Streams grid to one recording group's \
-                                         streams (e.g. \"Numi Subathon 2025\") — channels/\
-                                         instances with no matching stream are hidden, and the \
-                                         ones that remain force-expand down to their matching \
-                                         streams. Select streams (ctrl/shift-click) and use \
-                                         \"➕ Add to group…\" to build one.",
-                                    );
-                            }
-                            if ui
-                                .checkbox(&mut self.streams_group_visually, "Group")
-                                .on_hover_text(
-                                    "Cluster channels under their primary-group headers \
-                                     (🏷 Groups). Off shows a flat list even for channels \
-                                     that have a group assigned — handy for a \"flat, \
-                                     sorted by last added\" view.",
-                                )
-                                .changed()
-                            {
-                                let _ = self.core.store.set_setting(
-                                    K_STREAMS_GROUP_VISUALLY,
-                                    if self.streams_group_visually { "1" } else { "0" },
-                                );
-                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
-                            }
-                            if ui
-                                .checkbox(&mut self.streams_only_recorded, "Only stored")
-                                .on_hover_text(
-                                    "Hide any channel/instance/stream with no take that \
-                                     actually has a file on disk — detected-but-never-\
-                                     recorded (Auto off) and failed/missed streams disappear. \
-                                     The ones that remain force-expand down to their stored \
-                                     takes, same as a Recording group filter.",
-                                )
-                                .changed()
-                            {
-                                let _ = self.core.store.set_setting(
-                                    K_STREAMS_ONLY_RECORDED,
-                                    if self.streams_only_recorded { "1" } else { "0" },
-                                );
-                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
-                            }
-                            if ui
-                                .checkbox(
-                                    &mut self.streams_allow_delete,
-                                    egui::RichText::new("Allow deletion").color(grid::HL_ERROR_TEXT),
-                                )
-                                .on_hover_text(
-                                    "Master switch for the take-row \"🗑🔥 Delete file from \
-                                     disk\" action, which permanently removes a captured file \
-                                     (moved to trash/Recycle Bin, or deleted outright, per \
-                                     Settings → Automatic deletion) while keeping its history \
-                                     row. Off by default — this alone doesn't enable the \
-                                     action, it only ever UNBLOCKS it: the channel AND the \
-                                     instance each also need their own \"Allow delete\" \
-                                     setting on (Rename channel / Edit instance) before the \
-                                     menu item lights up for a given take. Deliberately three \
-                                     independent off-by-default gates, so this can't be \
-                                     triggered by an accidental click.",
-                                )
-                                .changed()
-                            {
-                                let _ = self.core.store.set_setting(
-                                    crate::manual_delete::K_STREAMS_ALLOW_DELETE,
-                                    if self.streams_allow_delete { "1" } else { "0" },
-                                );
-                            }
-                            {
-                                let selected_label =
-                                    self.streams_active_view.as_deref().unwrap_or("Views");
-                                egui::ComboBox::from_id_salt("streams_view_select")
-                                    .selected_text(selected_label)
-                                    // ComboBox defaults to closing on ANY click inside
-                                    // its popup (egui::PopupCloseBehavior::CloseOnClick,
-                                    // meant for plain option lists) — this popup also
-                                    // holds a TextEdit and per-row action buttons the
-                                    // user needs to interact with repeatedly without the
-                                    // popup vanishing after the first click.
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                    .show_ui(ui, |ui| {
-                                        self.views_combo_popup(ui);
-                                    })
-                                    .response
-                                    .on_hover_text(
-                                        "Streams grid views — named presets of this grid's \
-                                         sort, \"Group\" toggle, per-column filters, and \
-                                         Group/Recording group selections. Open it to apply, \
-                                         save, rename, or delete one.",
-                                    );
-                            }
-                            if ui
-                                .button("⇔")
-                                .on_hover_text("Auto-fit all columns to their content width")
-                                .clicked()
-                            {
-                                self.reset_streams_columns = true;
-                            }
-                        }
                         // Report the cluster's used width for next frame's
                         // tab-overflow budget (it renders after the tabs, so
                         // the current frame can only know last frame's value).
@@ -3170,6 +2940,249 @@ impl eframe::App for StreamArchiverApp {
                     self.topbar.right_w = right_w;
                 });
             });
+
+        // Streams-specific toolbar (add/group/filter/view controls) gets its
+        // OWN row rather than competing with the tabs + global status icons
+        // above for the same horizontal space — that packed single-row
+        // layout used to silently overlap/clip its leftmost items on a
+        // narrow window instead of reflowing. `horizontal_wrapped` further
+        // guarantees no item is ever clipped: if even this row's full width
+        // isn't enough, it wraps to a third row rather than overlapping
+        // anything below it.
+        if self.view == View::Streams {
+            egui::Panel::top("streams_toolbar").resizable(false).show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("➕ Stream")
+                        .on_hover_text(
+                            "Add stream\nCreate a channel with its first instance \
+                             (a URL to record)",
+                        )
+                        .clicked()
+                    {
+                        self.form = Some(MonitorForm::new_channel(
+                            &self.monitor_defaults,
+                            &self.settings.default_output_dir,
+                        ));
+                    }
+                    if ui
+                        .button("➕ Channel")
+                        .on_hover_text(
+                            "Add channel\nCreate an empty channel container; add \
+                             instances to it afterwards",
+                        )
+                        .clicked()
+                    {
+                        self.channel_form = Some(ChannelForm {
+                            id: None,
+                            name: String::new(),
+                            color: String::new(),
+                            vod_download: None,
+                            vod_replace: None,
+                            head_backfill_fetch: None,
+                            head_backfill_replace: None,
+                            join_cleanup: None,
+                            disposal_method: None,
+                            primary_platform_pref: None,
+                            chapters_enabled: None,
+                            chapters_coalesce_secs: String::new(),
+                            follow_my_raids: None,
+                            record_me_as_raid_target: None,
+                            follow_my_raids_play: None,
+                            exclude_from_auto_play: None,
+                            allow_delete: false,
+                            primary_group: None,
+                            groups: Default::default(),
+                        });
+                    }
+                    if ui
+                        .button("🏷 Groups")
+                        .on_hover_text(
+                            "Manage channel groups\nCreate/rename/delete groups; assign \
+                             a channel's primary + secondary groups from its own \
+                             Properties dialog.",
+                        )
+                        .clicked()
+                    {
+                        self.show_group_manager = true;
+                    }
+                    {
+                        // Extracted local: a ComboBox iterating
+                        // `self.channel_groups` while also mutating
+                        // `self.streams_group_filter` inside the same
+                        // closure is exactly the disjoint-field-borrow
+                        // shape the channel/group-manager dialogs hit —
+                        // see their own comments on the same pattern.
+                        let groups = self.channel_groups.clone();
+                        let selected_label = self
+                            .streams_group_filter
+                            .and_then(|gid| groups.iter().find(|g| g.id == gid))
+                            .map(|g| g.name.as_str())
+                            .unwrap_or("All channels");
+                        egui::ComboBox::from_id_salt("streams_group_filter")
+                            .selected_text(selected_label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(self.streams_group_filter.is_none(), "All channels")
+                                    .clicked()
+                                {
+                                    self.streams_group_filter = None;
+                                    self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                }
+                                for g in &groups {
+                                    if ui
+                                        .selectable_label(
+                                            self.streams_group_filter == Some(g.id),
+                                            &g.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.streams_group_filter = Some(g.id);
+                                        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Narrow the Streams grid to one group's members \
+                                 (primary or secondary) — the primary-group headers \
+                                 above don't apply while this is set.",
+                            );
+                    }
+                    {
+                        let rgroups = self.recording_groups.clone();
+                        let selected_label = self
+                            .streams_recording_group_filter
+                            .and_then(|gid| rgroups.iter().find(|g| g.id == gid))
+                            .map(|g| g.name.as_str())
+                            .unwrap_or("All streams");
+                        egui::ComboBox::from_id_salt("streams_recording_group_filter")
+                            .selected_text(selected_label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.streams_recording_group_filter.is_none(),
+                                        "All streams",
+                                    )
+                                    .clicked()
+                                {
+                                    self.streams_recording_group_filter = None;
+                                    self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                }
+                                for g in &rgroups {
+                                    if ui
+                                        .selectable_label(
+                                            self.streams_recording_group_filter == Some(g.id),
+                                            &g.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.streams_recording_group_filter = Some(g.id);
+                                        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Narrow the Streams grid to one recording group's \
+                                 streams (e.g. \"Numi Subathon 2025\") — channels/\
+                                 instances with no matching stream are hidden, and the \
+                                 ones that remain force-expand down to their matching \
+                                 streams. Select streams (ctrl/shift-click) and use \
+                                 \"➕ Add to group…\" to build one.",
+                            );
+                    }
+                    if ui
+                        .checkbox(&mut self.streams_group_visually, "Group")
+                        .on_hover_text(
+                            "Cluster channels under their primary-group headers \
+                             (🏷 Groups). Off shows a flat list even for channels \
+                             that have a group assigned — handy for a \"flat, \
+                             sorted by last added\" view.",
+                        )
+                        .changed()
+                    {
+                        let _ = self.core.store.set_setting(
+                            K_STREAMS_GROUP_VISUALLY,
+                            if self.streams_group_visually { "1" } else { "0" },
+                        );
+                        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                    }
+                    if ui
+                        .checkbox(&mut self.streams_only_recorded, "Only stored")
+                        .on_hover_text(
+                            "Hide any channel/instance/stream with no take that \
+                             actually has a file on disk — detected-but-never-\
+                             recorded (Auto off) and failed/missed streams disappear. \
+                             The ones that remain force-expand down to their stored \
+                             takes, same as a Recording group filter.",
+                        )
+                        .changed()
+                    {
+                        let _ = self.core.store.set_setting(
+                            K_STREAMS_ONLY_RECORDED,
+                            if self.streams_only_recorded { "1" } else { "0" },
+                        );
+                        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.streams_allow_delete,
+                            egui::RichText::new("Allow deletion").color(grid::HL_ERROR_TEXT),
+                        )
+                        .on_hover_text(
+                            "Master switch for the take-row \"🗑🔥 Delete file from \
+                             disk\" action, which permanently removes a captured file \
+                             (moved to trash/Recycle Bin, or deleted outright, per \
+                             Settings → Automatic deletion) while keeping its history \
+                             row. Off by default — this alone doesn't enable the \
+                             action, it only ever UNBLOCKS it: the channel AND the \
+                             instance each also need their own \"Allow delete\" \
+                             setting on (Rename channel / Edit instance) before the \
+                             menu item lights up for a given take. Deliberately three \
+                             independent off-by-default gates, so this can't be \
+                             triggered by an accidental click.",
+                        )
+                        .changed()
+                    {
+                        let _ = self.core.store.set_setting(
+                            crate::manual_delete::K_STREAMS_ALLOW_DELETE,
+                            if self.streams_allow_delete { "1" } else { "0" },
+                        );
+                    }
+                    {
+                        let selected_label =
+                            self.streams_active_view.as_deref().unwrap_or("Views");
+                        egui::ComboBox::from_id_salt("streams_view_select")
+                            .selected_text(selected_label)
+                            // ComboBox defaults to closing on ANY click inside
+                            // its popup (egui::PopupCloseBehavior::CloseOnClick,
+                            // meant for plain option lists) — this popup also
+                            // holds a TextEdit and per-row action buttons the
+                            // user needs to interact with repeatedly without the
+                            // popup vanishing after the first click.
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show_ui(ui, |ui| {
+                                self.views_combo_popup(ui);
+                            })
+                            .response
+                            .on_hover_text(
+                                "Streams grid views — named presets of this grid's \
+                                 sort, \"Group\" toggle, per-column filters, and \
+                                 Group/Recording group selections. Open it to apply, \
+                                 save, rename, or delete one.",
+                            );
+                    }
+                    if ui
+                        .button("⇔")
+                        .on_hover_text("Auto-fit all columns to their content width")
+                        .clicked()
+                    {
+                        self.reset_streams_columns = true;
+                    }
+                });
+            });
+        }
 
         egui::Panel::bottom("status")
             .resizable(false)
