@@ -1091,6 +1091,13 @@ progress_info: None,
             // recording/take context to resolve a "which channel" indicator
             // against, and doesn't need one (it never renders the log).
             let empty_partners = std::sync::Arc::new(std::collections::HashMap::new());
+            // Likewise, badge icon resolution doesn't matter here (it never
+            // renders the log either) — global-only dirs are enough to
+            // satisfy the parser's signature.
+            let no_channel_badges = std::sync::Arc::new(crate::ui::chat::TwitchBadgeDirs {
+                channel: None,
+                global: crate::ui::chat::twitch_global_badge_dir(),
+            });
 
             let recs = store.list_recordings_for_chat_migration().unwrap_or_default();
             let candidates: Vec<PathBuf> = recs
@@ -1130,6 +1137,7 @@ progress_info: None,
                     fallback_index.clone(),
                     true,
                     empty_partners.clone(),
+                    no_channel_badges.clone(),
                 )
                 .await
                 {

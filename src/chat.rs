@@ -301,6 +301,17 @@ struct ChatLine<'a> {
     /// partners (`store::collab`) to show which channel a message came from.
     #[serde(skip_serializing_if = "str::is_empty")]
     source_room_id: &'a str,
+    /// Twitch `user-id` — the sender's numeric Twitch id (IRCv3 `user-id`
+    /// tag). Omitted when absent (pre-feature logs); the chat usercard uses
+    /// it to look up the sender's live Twitch avatar/account-created date.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    user_id: &'a str,
+    /// Twitch `badge-info` — exact per-badge counters (e.g.
+    /// `"subscriber/61"` = 61 cumulative months), distinct from the `badges`
+    /// tag's display tier bucket. Omitted when absent; the usercard shows
+    /// "Subscriber · N months" from this when present.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    badge_info: &'a str,
 }
 
 /// Capture `url`'s Twitch chat to `path` until `done` (recording ended) or
@@ -559,8 +570,18 @@ fn parse_privmsg(line: &str) -> Option<String> {
     let text = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
     let login = prefix.split('!').next().unwrap_or(prefix);
 
-    let (mut display, mut color, mut badges, mut emotes, mut id, mut reply_raw, mut ts_ms, mut source_room_id) =
-        ("", "", "", "", "", "", 0i64, "");
+    let (
+        mut display,
+        mut color,
+        mut badges,
+        mut emotes,
+        mut id,
+        mut reply_raw,
+        mut ts_ms,
+        mut source_room_id,
+        mut user_id,
+        mut badge_info,
+    ) = ("", "", "", "", "", "", 0i64, "", "", "");
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -573,6 +594,8 @@ fn parse_privmsg(line: &str) -> Option<String> {
             "reply-parent-display-name" => reply_raw = v,
             "tmi-sent-ts" => ts_ms = v.parse().unwrap_or(0),
             "source-room-id" => source_room_id = v,
+            "user-id" => user_id = v,
+            "badge-info" => badge_info = v,
             _ => {}
         }
     }
@@ -592,6 +615,8 @@ fn parse_privmsg(line: &str) -> Option<String> {
         id,
         reply: &reply,
         source_room_id,
+        user_id,
+        badge_info,
     })
     .ok()
 }
@@ -1182,6 +1207,27 @@ mod tests {
         let json = parse_privmsg(line).expect("should parse");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("source_room_id").is_none());
+    }
+
+    #[test]
+    fn captures_user_id_and_badge_info_for_the_usercard() {
+        let line = "@display-name=Bob;tmi-sent-ts=1700000000000;user-id=12345;\
+                    badge-info=subscriber/61;badges=subscriber/3006 \
+                    :bob!bob@bob.tmi.twitch.tv PRIVMSG #streamer :hi";
+        let json = parse_privmsg(line).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["user_id"], "12345");
+        assert_eq!(v["badge_info"], "subscriber/61");
+    }
+
+    #[test]
+    fn omits_empty_user_id_and_badge_info_tags() {
+        let line = "@display-name=Bob;tmi-sent-ts=1700000000000 \
+                    :bob!bob@bob.tmi.twitch.tv PRIVMSG #streamer :hi";
+        let json = parse_privmsg(line).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("user_id").is_none());
+        assert!(v.get("badge_info").is_none());
     }
 
     #[test]

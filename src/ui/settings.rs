@@ -1480,6 +1480,24 @@ impl StreamArchiverApp {
                 );
             }
             if ui
+                .checkbox(&mut self.fetch_usercard_info, "Fetch live Twitch info for chat usercards")
+                .on_hover_text(
+                    "When you click a username in the chat replay, also fetch their avatar \
+                     and Twitch account-created date from Twitch's API — on top of the badges/ \
+                     color/subscriber-months/message-count that always show from the local log. \
+                     Off by default: unlike other asset fetches, this hits the network every \
+                     time a usercard is opened, not just once per missing file. A failed lookup \
+                     shows \"N/A\" and files a warning in the 🚨 Warnings window instead of \
+                     blocking the rest of the card.",
+                )
+                .changed()
+            {
+                let _ = self.core.store.set_setting(
+                    K_FETCH_USERCARD_INFO,
+                    if self.fetch_usercard_info { "1" } else { "0" },
+                );
+            }
+            if ui
                 .add_enabled(
                     self.render_emotes,
                     egui::Checkbox::new(&mut self.animate_emotes, "Animate emotes"),

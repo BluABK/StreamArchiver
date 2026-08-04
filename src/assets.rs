@@ -560,6 +560,66 @@ async fn fetch_twitch_channel_assets(
     Ok(user.description)
 }
 
+// ---------- Twitch chat usercard (live lookup) ----------
+
+/// Result of a chat usercard's live Twitch lookup — the avatar is cached to
+/// disk (so a second usercard open for the same user doesn't re-download),
+/// `created_at` is Twitch's raw RFC3339 timestamp (the caller formats it).
+pub struct UserCardInfo {
+    pub avatar_path: Option<PathBuf>,
+    pub created_at: Option<String>,
+}
+
+/// Fetch a chat usercard's live Twitch data by numeric user id: avatar image
+/// (cached under `platform_assets_dir()/twitch/usercards/{user_id}/`) and
+/// account-created date. One public Helix `/users` call — no special scope,
+/// just the app token every other Helix call in this module already uses.
+/// Called on-demand from the chat replay's username-click usercard, gated
+/// behind the opt-in "fetch live Twitch info" setting.
+pub async fn fetch_usercard_info(client_id: &str, token: &str, user_id: &str) -> Result<UserCardInfo> {
+    #[derive(Deserialize)]
+    struct TwitchUser {
+        profile_image_url: String,
+        created_at: String,
+    }
+    #[derive(Deserialize)]
+    struct UsersResp {
+        data: Vec<TwitchUser>,
+    }
+
+    let client = Client::new();
+    let resp = client
+        .get("https://api.twitch.tv/helix/users")
+        .query(&[("id", user_id)])
+        .header("Client-Id", client_id)
+        .bearer_auth(token)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("Helix users ({user_id}): {}", resp.status());
+    }
+    let r: UsersResp = resp.json().await?;
+    let Some(user) = r.data.into_iter().next() else {
+        bail!("no Twitch user found for id {user_id}");
+    };
+
+    let dir = crate::app_paths::platform_assets_dir()
+        .join("twitch")
+        .join("usercards")
+        .join(user_id);
+    let ext = ext_from_url(&user.profile_image_url).unwrap_or("jpg");
+    let avatar_path = dir.join(format!("avatar.{ext}"));
+    let mut have_avatar = crate::iomon::fs::exists_sync(Cat::AssetCache, &avatar_path);
+    if !have_avatar {
+        have_avatar = download_image(&client, &user.profile_image_url, &avatar_path).await.is_ok();
+    }
+
+    Ok(UserCardInfo {
+        avatar_path: have_avatar.then_some(avatar_path),
+        created_at: Some(user.created_at),
+    })
+}
+
 // ---------- Twitch badges ----------
 
 #[derive(Deserialize)]

@@ -121,6 +121,25 @@ const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
 /// purely-local rendering, this one gates a NEW network fetch for channels
 /// the user hasn't added. See `assets::twitch_emote_cdn_fetch`.
 const K_FETCH_UNKNOWN_EMOTES: &str = "fetch_unknown_twitch_emotes";
+/// Chat-replay text size in points, applied uniformly to the timestamp,
+/// message body, and username (they render at the same size on Twitch's own
+/// popout chat — the default here used to leave the timestamp noticeably
+/// smaller). Edited from the ⚙ "Chat Appearance" panel inside each chat
+/// window, not Settings — see [`crate::ui::chat`]'s doc.
+const K_CHAT_FONT_PT: &str = "chat_font_size_pt";
+const CHAT_FONT_PT_DEFAULT: f32 = 14.0;
+/// Chat-replay timestamp color (hex `#RRGGBB`). Default white — the previous
+/// hardcoded `weak_text_color()` rendered too dark-grey to read comfortably.
+const K_CHAT_TS_COLOR: &str = "chat_ts_color";
+/// Chat-replay message body color (hex `#RRGGBB`). Default white.
+const K_CHAT_TEXT_COLOR: &str = "chat_text_color";
+/// Whether opening a chat usercard also does a live Twitch Helix lookup for
+/// the user's avatar + account-created date, on top of the always-available
+/// local data (badges/color/sub-months/session stats). Default OFF — unlike
+/// [`K_FETCH_UNKNOWN_EMOTES`] this hits the network on every usercard open,
+/// not just once per missing asset. A failed lookup shows "N/A" and files a
+/// warning (see `ui::chat`'s usercard fetch).
+const K_FETCH_USERCARD_INFO: &str = "fetch_usercard_twitch_info";
 /// Path to the media player binary used by "Play local recording (start)" on
 /// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
 /// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`
@@ -2079,6 +2098,20 @@ pub struct StreamArchiverApp {
     /// whose home channel isn't monitored here. Default on. Persisted under
     /// [`K_FETCH_UNKNOWN_EMOTES`]; separate from `render_emotes` (see its doc).
     fetch_unknown_emotes: bool,
+    /// Chat-replay text size in points (timestamp + message body + username,
+    /// uniformly). Default [`CHAT_FONT_PT_DEFAULT`]. Edited from the chat
+    /// window's ⚙ panel; persisted under [`K_CHAT_FONT_PT`].
+    chat_font_pt: f32,
+    /// Chat-replay timestamp color. Default white. Persisted under
+    /// [`K_CHAT_TS_COLOR`].
+    chat_ts_color: egui::Color32,
+    /// Chat-replay message body color. Default white. Persisted under
+    /// [`K_CHAT_TEXT_COLOR`].
+    chat_text_color: egui::Color32,
+    /// Whether opening a chat usercard also fetches the user's live Twitch
+    /// avatar + account-created date. Default off. Persisted under
+    /// [`K_FETCH_USERCARD_INFO`].
+    fetch_usercard_info: bool,
     /// Set to true by the "⇔ Fit columns" button; consumed in `channels_view`
     /// to call `TableBuilder::reset()` so columns revert to content-fit widths.
     reset_streams_columns: bool,

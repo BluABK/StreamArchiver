@@ -48,6 +48,12 @@ pub(super) struct ChatMessage {
     /// Twitch: raw IRC badge segment per entry, e.g. `"subscriber/12"`.
     /// YouTube: badge tooltip text, e.g. `"Member"`.
     pub(super) badges: Vec<String>,
+    /// Cached icon path per `badges` entry (index-aligned), resolved once at
+    /// parse time via [`resolve_twitch_badge_icon`]. `None` at an index means
+    /// "no cached icon for this badge" (not yet fetched, or YouTube — this
+    /// whole vec is empty for YouTube messages) — the renderer falls back to
+    /// [`badge_display`]'s glyph for that entry.
+    pub(super) badge_icons: Vec<Option<std::path::PathBuf>>,
     /// Explicit hex colour from Twitch USERCOLOR; `None` when unset or YouTube.
     pub(super) color_override: Option<egui::Color32>,
     pub(super) platform: ChatPlatform,
@@ -76,6 +82,16 @@ pub(super) struct ChatMessage {
     /// partner to name), or the id didn't resolve to a known partner. Never
     /// set for YouTube.
     pub(super) source_name: String,
+    /// Twitch numeric user id (IRCv3 `user-id` tag) — used to key the
+    /// usercard's live Helix avatar/account-created lookup. Empty for
+    /// YouTube and pre-feature logs (the usercard's live section then always
+    /// shows "N/A", same as a failed lookup).
+    pub(super) user_id: String,
+    /// Raw Twitch `badge-info` tag (e.g. `"subscriber/61"`) — exact
+    /// cumulative sub-months, distinct from `badges`' display tier bucket.
+    /// The usercard renders "Subscriber · N months" from this when present.
+    /// Empty for YouTube / pre-feature logs / non-subscribers.
+    pub(super) badge_info: String,
 }
 
 /// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
@@ -178,6 +194,38 @@ pub(super) enum ChatLoadState {
     Error(String),
 }
 
+/// State of a usercard's live Twitch Helix lookup (avatar + account-created
+/// date) — separate from the local-only fields on [`UserCardPopup`], which
+/// are available immediately from the click, no network involved.
+pub(super) enum UserCardFetch {
+    /// The "fetch live Twitch info" setting is off — the live section always
+    /// shows "N/A" and no request is made.
+    Disabled,
+    Loading,
+    Loaded { avatar_path: Option<std::path::PathBuf>, created_at: Option<String> },
+    /// The Helix call failed; a warning was filed (see `store::upsert_capture_alert`
+    /// / `AppEvent::CaptureAlert`). The live section shows "N/A".
+    Failed,
+}
+
+/// One open chat usercard (at most one per chat window — clicking a
+/// different username just replaces it, matching Twitch's own popout).
+pub(super) struct UserCardPopup {
+    pub(super) login: String,
+    pub(super) display_name: String,
+    pub(super) color: Option<egui::Color32>,
+    pub(super) badges: Vec<String>,
+    pub(super) badge_icons: Vec<Option<std::path::PathBuf>>,
+    pub(super) badge_info: String,
+    pub(super) user_id: String,
+    /// How many messages from this user are in the currently-loaded log, and
+    /// the earliest one's timestamp — computed once when the card opens by
+    /// scanning the already-loaded `ChatLog`, not re-scanned per frame.
+    pub(super) message_count: usize,
+    pub(super) first_seen_secs: Option<f64>,
+    pub(super) fetch: Arc<Mutex<UserCardFetch>>,
+}
+
 pub(super) struct ChatPopup {
     /// Monitor this window belongs to — keys the viewport id, so each channel
     /// gets its OWN chat window (opening another channel's chat no longer
@@ -192,6 +240,18 @@ pub(super) struct ChatPopup {
     /// When `true`: show the entire log from the top (no cap, stick-to-bottom off).
     /// When `false` (default): show the last 500 msgs and stick to bottom.
     pub(super) full_view: bool,
+    /// When `true`, hide messages whose `source_name` is non-empty (i.e. came
+    /// from a different channel during an active Shared Chat session) — shows
+    /// only this channel's own messages. Per-window, ephemeral (not
+    /// persisted), like `full_view`.
+    pub(super) hide_shared: bool,
+    /// Whether the ⚙ "Chat Appearance" panel is currently open for this
+    /// window. Per-window UI state; the values it edits
+    /// (`StreamArchiverApp::chat_font_pt`/`chat_ts_color`/`chat_text_color`)
+    /// are global/shared, same as `render_emotes`.
+    pub(super) show_appearance: bool,
+    /// The currently-open usercard, if any — at most one per chat window.
+    pub(super) user_card: Option<UserCardPopup>,
     /// When the popup last triggered a background re-read of the chat file.
     /// Used to tail a live recording: the file is re-parsed every few seconds
     /// while `recording.ended_at` is `None`.
@@ -215,6 +275,11 @@ pub(super) struct ChatPopup {
     /// chat log take over a minute to load. Built ONCE on popup-open; empty
     /// for YouTube. `Arc` for the same reason as `emote_map`.
     pub(super) twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
+    /// This channel's badge icon dirs (channel-specific + shared global) —
+    /// see [`TwitchBadgeDirs`]. Channel-level like `emote_map`: built ONCE on
+    /// popup-open, reused unchanged across recording switches within the
+    /// same popup (badges aren't per-broadcast). Empty for YouTube.
+    pub(super) twitch_badge_dirs: Arc<TwitchBadgeDirs>,
     /// This take's recorded Shared Chat / collab partners, keyed by Twitch
     /// broadcaster id (`store::collab::collab_partners_for_stream`) — resolves
     /// each message's raw `source_room_id` tag to a name for the "which
@@ -242,11 +307,11 @@ pub(super) struct ChatPopup {
     /// exponentially instead of re-reading every 3 seconds forever. Reset on a
     /// successful load.
     pub(super) error_retries: u32,
-    /// Cached search-filter result: (lowercased query, message count when
-    /// computed, matching message indices). Recomputed only when the query or
-    /// the message count changes — the filter used to lowercase every message
-    /// every frame.
-    pub(super) filter_cache: Option<(String, usize, Vec<u32>)>,
+    /// Cached search-filter result: (lowercased query, message count, and
+    /// `hide_shared` when computed, matching message indices). Recomputed
+    /// only when the query, message count, or `hide_shared` changes — the
+    /// filter used to lowercase every message every frame.
+    pub(super) filter_cache: Option<(String, usize, bool, Vec<u32>)>,
 }
 /// The Twitch broadcaster's chosen chat name colour for `name`'s `account`, if
 /// the asset fetch cached one (`…/{name}/twitch/{account}/name_color.txt`, e.g.
@@ -279,6 +344,84 @@ pub(super) fn twitch_emotes_dir(name: &str, account: &str) -> std::path::PathBuf
     }
     let legacy = legacy.join("emotes");
     if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &legacy) { legacy } else { primary }
+}
+
+/// Where a Twitch channel's chat badge icons live: a per-channel dir (sub/
+/// VIP/broadcaster badges — earned relative to the channel being watched, so
+/// always resolved against it, not a fallback index like third-party
+/// emotes) plus the shared global dir (mod/staff/bits/etc, downloaded once
+/// for all channels). Built ONCE per popup-open — see [`resolve_twitch_badge_icon`]'s
+/// doc for why resolution happens at parse time, not render time.
+pub(crate) struct TwitchBadgeDirs {
+    pub(crate) channel: Option<std::path::PathBuf>,
+    pub(crate) global: std::path::PathBuf,
+}
+
+/// The Twitch `badges/` dir for (channel, account), mirroring [`twitch_emotes_dir`]'s
+/// account-dir-with-legacy-fallback resolution.
+pub(super) fn twitch_badge_dir(name: &str, account: &str) -> std::path::PathBuf {
+    let [primary, legacy] = crate::assets::asset_read_dirs(name, Platform::Twitch, account);
+    let primary = primary.join("badges");
+    if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &primary) {
+        return primary;
+    }
+    let legacy = legacy.join("badges");
+    if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &legacy) { legacy } else { primary }
+}
+
+/// The shared global Twitch badge dir (mod/staff/turbo/bits/etc — not tied to
+/// any one channel), matching `assets::fetch_twitch_badges`'s own path.
+pub(crate) fn twitch_global_badge_dir() -> std::path::PathBuf {
+    crate::app_paths::platform_assets_dir().join("twitch").join("global_badges")
+}
+
+/// Resolve a raw IRC badge entry (`"subscriber/12"`) to its cached icon file,
+/// checking the channel-specific dir first (sub/VIP/broadcaster badges are
+/// earned per-channel) then the shared global dir (mod/staff/bits/etc).
+/// `None` when the set/version isn't cached (never fetched, still
+/// downloading, or a YouTube badge — this is Twitch-only) — the caller falls
+/// back to a text glyph. Resolved ONCE per message at parse time (like
+/// first-party emotes in [`build_twitch_segments`]) rather than per frame, to
+/// keep filesystem stats out of the render loop.
+pub(super) fn resolve_twitch_badge_icon(
+    raw: &str,
+    dirs: &TwitchBadgeDirs,
+) -> Option<std::path::PathBuf> {
+    let (set_id, version) = raw.split_once('/')?;
+    for base in dirs.channel.iter().chain(std::iter::once(&dirs.global)) {
+        let p = base.join(set_id).join(version).join("2x.png");
+        if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &p) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Human-readable label for a raw badge entry's set id, used as hover text —
+/// e.g. `"subscriber/12"` → `"Subscriber"`. Falls back to the raw set id
+/// title-cased for anything not explicitly named.
+pub(super) fn badge_label(raw: &str) -> String {
+    let set_id = raw.split('/').next().unwrap_or(raw);
+    match set_id {
+        "broadcaster" => "Broadcaster".to_string(),
+        "moderator" => "Moderator".to_string(),
+        "vip" => "VIP".to_string(),
+        "subscriber" => "Subscriber".to_string(),
+        "founder" => "Founder".to_string(),
+        "bits" | "bits-leader" => "Bits".to_string(),
+        "premium" => "Prime Gaming".to_string(),
+        "partner" => "Verified Partner".to_string(),
+        "staff" => "Twitch Staff".to_string(),
+        "admin" => "Twitch Admin".to_string(),
+        "turbo" => "Turbo".to_string(),
+        _ => {
+            let mut c = set_id.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
 }
 
 pub(super) fn build_emote_map(name: &str, account: &str) -> HashMap<String, std::path::PathBuf> {
@@ -601,6 +744,30 @@ pub(super) fn fmt_chat_ts(secs: f64) -> String {
 /// Soft cap on decoded emote-frame GPU memory; the cache is LRU-evicted past this.
 pub(super) const EMOTE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
+/// Chat-replay text appearance: font size (points) applied uniformly to the
+/// timestamp/message/username, plus their colors. Global/shared across every
+/// open chat window (`StreamArchiverApp::chat_font_pt`/`chat_ts_color`/
+/// `chat_text_color`), edited from the ⚙ "Chat Appearance" panel inside each
+/// chat window rather than the global Settings dialog.
+pub(super) struct ChatAppearance {
+    pub(super) font_pt: f32,
+    pub(super) ts_color: egui::Color32,
+    pub(super) text_color: egui::Color32,
+}
+
+/// A username click in the chat replay — everything the usercard needs to
+/// build its local-only fields immediately; the live Twitch lookup (avatar/
+/// account-created date) is fetched separately, keyed by `user_id`.
+pub(super) struct UserCardClick {
+    pub(super) login: String,
+    pub(super) display_name: String,
+    pub(super) color: Option<egui::Color32>,
+    pub(super) badges: Vec<String>,
+    pub(super) badge_icons: Vec<Option<std::path::PathBuf>>,
+    pub(super) badge_info: String,
+    pub(super) user_id: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_chat_message(
     ui: &mut egui::Ui,
@@ -611,15 +778,17 @@ pub(super) fn render_chat_message(
     now: f64,
     misses: &mut Vec<std::path::PathBuf>,
     ctx: &egui::Context,
-) {
+    appearance: &ChatAppearance,
+) -> Option<UserCardClick> {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
-        // Timestamp — muted monospace
+        // Timestamp — monospace, sized/colored to match the message body
+        // (Twitch's own popout renders both at the same size).
         ui.label(
             egui::RichText::new(fmt_chat_ts(msg.timestamp_secs))
                 .monospace()
-                .small()
-                .color(ui.visuals().weak_text_color()),
+                .size(appearance.font_pt)
+                .color(appearance.ts_color),
         );
         // System notice (moderation marker: mode change, timeout/ban, clear)
         // — muted ℹ line, no author/badges.
@@ -632,12 +801,25 @@ pub(super) fn render_chat_message(
             .on_hover_text(
                 "Moderation/room event captured live from Twitch chat while recording",
             );
-            return;
+            return None;
         }
-        // Badges
-        for badge in &msg.badges {
-            let (sym, color) = badge_display(badge, &msg.platform);
-            ui.label(egui::RichText::new(sym).small().color(color));
+        // Badges — real cached Twitch badge icons when resolved (Phase 1's
+        // `ChatMessage::badge_icons`, index-aligned with `badges`), falling
+        // back to the glyph (not yet cached, still downloading, or YouTube —
+        // `badge_icons` is empty there).
+        let badge_h: f32 = (appearance.font_pt * 1.1).clamp(14.0, 32.0);
+        for (i, badge) in msg.badges.iter().enumerate() {
+            let icon = msg.badge_icons.get(i).and_then(|o| o.as_ref());
+            let drawn = icon.and_then(|path| {
+                draw_cached_emote(ui, cache, path, false, badge_h, now, misses, ctx)
+            });
+            if let Some((resp, _tex)) = drawn {
+                resp.on_hover_text(badge_label(badge));
+            } else {
+                let (sym, color) = badge_display(badge, &msg.platform);
+                ui.label(egui::RichText::new(sym).small().color(color))
+                    .on_hover_text(badge_label(badge));
+            }
         }
         // Shared Chat source indicator — a small colored dot naming the OTHER
         // channel this message actually came from (own-channel messages
@@ -653,13 +835,34 @@ pub(super) fn render_chat_message(
             resp.on_hover_text(format!("From {}'s chat (Shared Chat)", msg.source_name));
         }
         // Username — bold, platform/user colour, adjusted for contrast on the
-        // chat panel's background so dark colours stay legible.
+        // chat panel's background so dark colours stay legible. Clickable on
+        // Twitch (opens the usercard) — YouTube messages carry no `login`/
+        // `user_id` to build one from, so they stay a plain label.
         let name_color = chat_username_color(msg, ui.visuals().panel_fill);
-        ui.label(
-            egui::RichText::new(format!("{}:", msg.author))
-                .strong()
-                .color(name_color),
-        );
+        let name_text = egui::RichText::new(format!("{}:", msg.author))
+            .strong()
+            .size(appearance.font_pt)
+            .color(name_color);
+        let mut click: Option<UserCardClick> = None;
+        if matches!(msg.platform, ChatPlatform::Twitch) && !msg.login.is_empty() {
+            let resp = ui
+                .add(egui::Label::new(name_text).sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Click for user info");
+            if resp.clicked() {
+                click = Some(UserCardClick {
+                    login: msg.login.clone(),
+                    display_name: msg.author.clone(),
+                    color: msg.color_override,
+                    badges: msg.badges.clone(),
+                    badge_icons: msg.badge_icons.clone(),
+                    badge_info: msg.badge_info.clone(),
+                    user_id: msg.user_id.clone(),
+                });
+            }
+        } else {
+            ui.label(name_text);
+        }
         // Reply-thread prefix (Twitch): who this message answers.
         if !msg.reply_to.is_empty() {
             ui.label(
@@ -680,21 +883,25 @@ pub(super) fn render_chat_message(
                         fallback_text.as_deref().unwrap_or(name)
                     }
                 };
-                ui.label(egui::RichText::new(t).strikethrough().weak())
+                ui.label(egui::RichText::new(t).strikethrough().weak().size(appearance.font_pt))
                     .on_hover_text(reason);
             }
             ui.label(egui::RichText::new(format!("({reason})")).small().weak().italics());
-            return;
+            return click;
         }
         // Message body — text runs and (when enabled & on disk) inline emote images.
-        let emote_h = (ui.text_style_height(&egui::TextStyle::Body) * 1.5).min(28.0);
+        let emote_h = (appearance.font_pt * 1.5).min(28.0);
         for seg in &msg.segments {
             match seg {
                 ChatSegment::Text(t) => {
                     // One label per run: egui wraps a multi-word galley at word
                     // boundaries inside horizontal_wrapped while preserving the run's
                     // internal/leading/trailing whitespace verbatim.
-                    ui.label(t);
+                    ui.label(
+                        egui::RichText::new(t.as_str())
+                            .size(appearance.font_pt)
+                            .color(appearance.text_color),
+                    );
                 }
                 ChatSegment::Emote { name, file, fallback_text, .. } => {
                     let drawn = render_emotes
@@ -736,7 +943,9 @@ pub(super) fn render_chat_message(
                 }
             }
         }
-    });
+        click
+    })
+    .inner
 }
 
 /// CDN URL for an emote given provider, id, and extension.
@@ -1386,6 +1595,7 @@ pub(super) fn parse_chat_chunk(
     twitch_fallback_index: &HashMap<String, std::path::PathBuf>,
     fetch_unknown_emotes: bool,
     source_partners: &HashMap<String, crate::models::CollabPartner>,
+    badge_dirs: &TwitchBadgeDirs,
 ) -> anyhow::Result<ChatChunk> {
     use std::io::{Read, Seek, SeekFrom};
     // Read window: bounds peak memory on huge logs — the previous whole-range
@@ -1468,6 +1678,7 @@ pub(super) fn parse_chat_chunk(
                     fetch_unknown_emotes,
                     &mut fetches,
                     source_partners,
+                    badge_dirs,
                 ) {
                     messages.push(m);
                 }
@@ -1524,6 +1735,7 @@ pub(crate) async fn parse_chunk_blocking(
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
     fetch_unknown_emotes: bool,
     source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
+    badge_dirs: Arc<TwitchBadgeDirs>,
 ) -> Result<ChatChunk, String> {
     tokio::task::spawn_blocking(move || {
         parse_chat_chunk(
@@ -1536,6 +1748,7 @@ pub(crate) async fn parse_chunk_blocking(
             &twitch_fallback_index,
             fetch_unknown_emotes,
             &source_partners,
+            &badge_dirs,
         )
     })
     .await
@@ -1664,6 +1877,7 @@ pub(super) async fn load_chat(
     fetch_unknown_emotes: bool,
     fetch_emoji: bool,
     source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
+    badge_dirs: Arc<TwitchBadgeDirs>,
     ctx: egui::Context,
 ) {
     let Some(path) = path else {
@@ -1699,6 +1913,7 @@ pub(super) async fn load_chat(
         twitch_fallback_index.clone(),
         fetch_unknown_emotes,
         source_partners.clone(),
+        badge_dirs.clone(),
     )
     .await
     {
@@ -1734,6 +1949,7 @@ pub(super) async fn load_chat(
             twitch_fallback_index.clone(),
             fetch_unknown_emotes,
             source_partners.clone(),
+            badge_dirs.clone(),
         )
         .await
         {
@@ -1792,6 +2008,7 @@ pub(super) async fn tail_chat(
     fetch_unknown_emotes: bool,
     fetch_emoji: bool,
     source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
+    badge_dirs: Arc<TwitchBadgeDirs>,
     ctx: egui::Context,
 ) {
     let from = {
@@ -1817,6 +2034,7 @@ pub(super) async fn tail_chat(
             fetch_unknown_emotes,
             fetch_emoji,
             source_partners,
+            badge_dirs,
             ctx,
         )
         .await;
@@ -1832,6 +2050,7 @@ pub(super) async fn tail_chat(
         twitch_fallback_index,
         fetch_unknown_emotes,
         source_partners,
+        badge_dirs,
     )
     .await
     else {
@@ -1995,6 +2214,7 @@ pub(super) fn yt_action_to_msg(
         text,
         segments,
         badges,
+        badge_icons: Vec::new(),
         color_override: None,
         platform: ChatPlatform::YouTube,
         login: String::new(),
@@ -2003,6 +2223,8 @@ pub(super) fn yt_action_to_msg(
         system: false,
         reply_to: String::new(),
         source_name: String::new(),
+        user_id: String::new(),
+        badge_info: String::new(),
     })
 }
 
@@ -2021,6 +2243,7 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
         segments: vec![ChatSegment::Text(text.clone())],
         text,
         badges: Vec::new(),
+        badge_icons: Vec::new(),
         color_override: None,
         platform: ChatPlatform::Twitch,
         login: String::new(),
@@ -2029,6 +2252,8 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
         system: true,
         reply_to: String::new(),
         source_name: String::new(),
+        user_id: String::new(),
+        badge_info: String::new(),
     };
     match kind {
         "del" => {
@@ -2080,6 +2305,7 @@ pub(super) fn parse_twitch_chat_line(
     fetch_unknown_emotes: bool,
     fetches: &mut Vec<EmojiFetch>,
     source_partners: &HashMap<String, crate::models::CollabPartner>,
+    badge_dirs: &TwitchBadgeDirs,
 ) -> Option<ChatMessage> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let ts_ms = v["ts"].as_f64().unwrap_or(0.0);
@@ -2098,6 +2324,9 @@ pub(super) fn parse_twitch_chat_line(
         .filter(|s| !s.is_empty())
         .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>())
         .unwrap_or_default();
+    // Resolved once here (not per render frame) — see `resolve_twitch_badge_icon`'s doc.
+    let badge_icons: Vec<Option<std::path::PathBuf>> =
+        badges.iter().map(|b| resolve_twitch_badge_icon(b, badge_dirs)).collect();
     // `emotes` tag is absent on pre-feature logs → empty → first-party emotes
     // simply don't render (third-party word-matching still applies).
     let emotes_tag = v["emotes"].as_str().unwrap_or("");
@@ -2131,6 +2360,7 @@ pub(super) fn parse_twitch_chat_line(
         text,
         segments,
         badges,
+        badge_icons,
         color_override,
         platform: ChatPlatform::Twitch,
         login: v["login"].as_str().unwrap_or("").to_lowercase(),
@@ -2139,6 +2369,8 @@ pub(super) fn parse_twitch_chat_line(
         system: false,
         reply_to: v["reply"].as_str().unwrap_or("").to_string(),
         source_name,
+        user_id: v["user_id"].as_str().unwrap_or("").to_string(),
+        badge_info: v["badge_info"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -2171,6 +2403,14 @@ impl StreamArchiverApp {
         } else {
             (Arc::new(HashMap::new()), None, Arc::new(HashMap::new()))
         };
+        let twitch_badge_dirs = Arc::new(if platform == Some(Platform::Twitch) {
+            TwitchBadgeDirs {
+                channel: Some(twitch_badge_dir(&monitor_name, &account)),
+                global: twitch_global_badge_dir(),
+            }
+        } else {
+            TwitchBadgeDirs { channel: None, global: twitch_global_badge_dir() }
+        });
 
         let recs = self
             .core
@@ -2222,6 +2462,7 @@ impl StreamArchiverApp {
                 self.fetch_unknown_emotes,
                 self.render_emotes,
                 source_partners.clone(),
+                twitch_badge_dirs.clone(),
                 ctx.clone(),
             ));
         } else {
@@ -2235,10 +2476,14 @@ impl StreamArchiverApp {
             load_state: state,
             search: String::new(),
             full_view: false,
+            hide_shared: false,
+            show_appearance: false,
+            user_card: None,
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
             twitch_fallback_index,
+            twitch_badge_dirs,
             source_partners,
             fetch_unknown_emotes: self.fetch_unknown_emotes,
             loading,
@@ -2313,6 +2558,7 @@ impl StreamArchiverApp {
             bool,
             Arc<AtomicBool>,
             Arc<HashMap<String, crate::models::CollabPartner>>,
+            Arc<TwitchBadgeDirs>,
         );
         let reload_info: Option<ReloadInfo> =
             if rec_active && popup.last_reload.elapsed() >= reload_after {
@@ -2332,6 +2578,7 @@ impl StreamArchiverApp {
                             popup.fetch_unknown_emotes,
                             popup.loading.clone(),
                             popup.source_partners.clone(),
+                            popup.twitch_badge_dirs.clone(),
                         )
                     })
                 })
@@ -2345,8 +2592,17 @@ impl StreamArchiverApp {
         let anim_cache = self.emote_anim.clone();
         let render_emotes = self.render_emotes;
         let animate_emotes = self.animate_emotes;
+        let appearance = ChatAppearance {
+            font_pt: self.chat_font_pt,
+            ts_color: self.chat_ts_color,
+            text_color: self.chat_text_color,
+        };
         let now = ctx.input(|i| i.time);
         let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
+        // Captured from a username click during this frame's render pass,
+        // consumed after `show_viewport_immediate` returns (same "mutate
+        // through nested closures, consume after" shape as `decode_misses`).
+        let mut usercard_click: Option<UserCardClick> = None;
 
         ctx.show_viewport_immediate(
             vp_id,
@@ -2396,6 +2652,7 @@ impl StreamArchiverApp {
                                             let emap = popup.emote_map.clone();
                                             let tdir = popup.twitch_emote_dir.clone();
                                             let tfallback = popup.twitch_fallback_index.clone();
+                                            let bdirs = popup.twitch_badge_dirs.clone();
                                             let funknown = popup.fetch_unknown_emotes;
                                             // A different recording is a
                                             // different broadcast — its
@@ -2441,6 +2698,7 @@ impl StreamArchiverApp {
                                                 funknown,
                                                 render_emotes,
                                                 source_partners,
+                                                bdirs,
                                                 ctx.clone(),
                                             ));
                                         }
@@ -2462,9 +2720,261 @@ impl StreamArchiverApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.toggle_value(&mut popup.full_view, "View full");
+                            if ui
+                                .button("⚙")
+                                .on_hover_text("Chat appearance: font size and colors")
+                                .clicked()
+                            {
+                                popup.show_appearance = !popup.show_appearance;
+                            }
+                            ui.checkbox(&mut popup.hide_shared, "Hide shared")
+                                .on_hover_text(
+                                    "During an active Shared Chat session, hide messages that \
+                                     came from another channel — show only this channel's own \
+                                     messages. Useful when a merged chat is too noisy to follow.",
+                                );
                         });
                     });
                     ui.separator();
+
+                    if popup.show_appearance {
+                        let mut font_pt = self.chat_font_pt;
+                        let mut ts_color = self.chat_ts_color;
+                        let mut text_color = self.chat_text_color;
+                        egui::Window::new("Chat Appearance")
+                            .id(egui::Id::new(("chat_appearance_win", popup.monitor_id)))
+                            .collapsible(false)
+                            .resizable(false)
+                            .default_pos(egui::pos2(120.0, 60.0))
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Font size:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut font_pt)
+                                                .range(8.0..=32.0)
+                                                .suffix(" pt"),
+                                        )
+                                        .on_hover_text(
+                                            "Exact point size for the timestamp, message text, \
+                                             and username — applies to every open chat window.",
+                                        )
+                                        .changed()
+                                    {
+                                        self.chat_font_pt = font_pt;
+                                        let _ = self.core.store.set_setting(
+                                            K_CHAT_FONT_PT,
+                                            &font_pt.to_string(),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Timestamp color:");
+                                    if egui::color_picker::color_edit_button_srgba(
+                                        ui,
+                                        &mut ts_color,
+                                        egui::color_picker::Alpha::Opaque,
+                                    )
+                                    .on_hover_text("Color of the [hh:mm:ss] timestamp prefix.")
+                                    .changed()
+                                    {
+                                        self.chat_ts_color = ts_color;
+                                        let _ = self.core.store.set_setting(
+                                            K_CHAT_TS_COLOR,
+                                            &format!(
+                                                "#{:02X}{:02X}{:02X}",
+                                                ts_color.r(),
+                                                ts_color.g(),
+                                                ts_color.b()
+                                            ),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Message color:");
+                                    if egui::color_picker::color_edit_button_srgba(
+                                        ui,
+                                        &mut text_color,
+                                        egui::color_picker::Alpha::Opaque,
+                                    )
+                                    .on_hover_text("Color of the message body text.")
+                                    .changed()
+                                    {
+                                        self.chat_text_color = text_color;
+                                        let _ = self.core.store.set_setting(
+                                            K_CHAT_TEXT_COLOR,
+                                            &format!(
+                                                "#{:02X}{:02X}{:02X}",
+                                                text_color.r(),
+                                                text_color.g(),
+                                                text_color.b()
+                                            ),
+                                        );
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                if ui
+                                    .button("Reset to defaults")
+                                    .on_hover_text("Restore the default 14pt white/white appearance.")
+                                    .clicked()
+                                {
+                                    self.chat_font_pt = CHAT_FONT_PT_DEFAULT;
+                                    self.chat_ts_color = egui::Color32::WHITE;
+                                    self.chat_text_color = egui::Color32::WHITE;
+                                    let _ = self.core.store.set_setting(
+                                        K_CHAT_FONT_PT,
+                                        &CHAT_FONT_PT_DEFAULT.to_string(),
+                                    );
+                                    let _ = self.core.store.set_setting(K_CHAT_TS_COLOR, "#FFFFFF");
+                                    let _ = self.core.store.set_setting(K_CHAT_TEXT_COLOR, "#FFFFFF");
+                                }
+                            });
+                    }
+
+                    // ── Usercard ─────────────────────────────────────────────
+                    if let Some(card) = &popup.user_card {
+                        let mut open = true;
+                        egui::Window::new(format!("👤 {}", card.display_name))
+                            .id(egui::Id::new(("chat_usercard_win", popup.monitor_id)))
+                            .collapsible(false)
+                            .resizable(false)
+                            .open(&mut open)
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    // Avatar (live lookup) — reuses the same
+                                    // decode/GPU-upload cache as emotes/badges.
+                                    let avatar_drawn = if let UserCardFetch::Loaded {
+                                        avatar_path: Some(p), ..
+                                    } = &*card.fetch.lock().unwrap()
+                                    {
+                                        draw_cached_emote(
+                                            ui,
+                                            &anim_cache,
+                                            p,
+                                            false,
+                                            64.0,
+                                            now,
+                                            &mut decode_misses,
+                                            ctx,
+                                        )
+                                        .is_some()
+                                    } else {
+                                        false
+                                    };
+                                    if !avatar_drawn {
+                                        ui.allocate_ui(egui::vec2(64.0, 64.0), |ui| {
+                                            ui.centered_and_justified(|ui| ui.weak("👤"));
+                                        });
+                                    }
+                                    ui.vertical(|ui| {
+                                        let color = card.color.unwrap_or_else(|| {
+                                            twitch_username_color(&card.display_name)
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(&card.display_name)
+                                                .strong()
+                                                .size(16.0)
+                                                .color(color),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            for (i, badge) in card.badges.iter().enumerate() {
+                                                let icon =
+                                                    card.badge_icons.get(i).and_then(|o| o.as_ref());
+                                                let drawn = icon.and_then(|path| {
+                                                    draw_cached_emote(
+                                                        ui,
+                                                        &anim_cache,
+                                                        path,
+                                                        false,
+                                                        18.0,
+                                                        now,
+                                                        &mut decode_misses,
+                                                        ctx,
+                                                    )
+                                                });
+                                                if let Some((resp, _)) = drawn {
+                                                    resp.on_hover_text(badge_label(badge));
+                                                } else {
+                                                    let (sym, c) =
+                                                        badge_display(badge, &ChatPlatform::Twitch);
+                                                    ui.label(egui::RichText::new(sym).color(c))
+                                                        .on_hover_text(badge_label(badge));
+                                                }
+                                            }
+                                        });
+                                    });
+                                });
+                                ui.separator();
+                                egui::Grid::new("usercard_grid").num_columns(2).show(ui, |ui| {
+                                    if let Some((set_id, months)) = card
+                                        .badge_info
+                                        .split_once('/')
+                                        .filter(|(s, _)| *s == "subscriber")
+                                    {
+                                        let _ = set_id;
+                                        let tier = card
+                                            .badges
+                                            .iter()
+                                            .find(|b| b.starts_with("subscriber/"))
+                                            .and_then(|b| b.split('/').nth(1))
+                                            .and_then(|v| v.parse::<i64>().ok())
+                                            .map(|v| if v >= 3000 { 3 } else if v >= 2000 { 2 } else { 1 })
+                                            .unwrap_or(1);
+                                        ui.label("Subscriber:");
+                                        ui.label(format!("Tier {tier} · {months} month(s)"));
+                                        ui.end_row();
+                                    }
+                                    ui.label("Messages in this log:");
+                                    ui.label(card.message_count.to_string());
+                                    ui.end_row();
+                                    if !card.user_id.is_empty() {
+                                        ui.label("User ID:");
+                                        ui.label(&card.user_id);
+                                        ui.end_row();
+                                    }
+                                    if let Some(secs) = card.first_seen_secs {
+                                        ui.label("First seen:");
+                                        ui.label(fmt_chat_ts(secs));
+                                        ui.end_row();
+                                    }
+                                    ui.label("Account created:");
+                                    let created = match &*card.fetch.lock().unwrap() {
+                                        UserCardFetch::Loaded { created_at: Some(c), .. } => {
+                                            chrono::DateTime::parse_from_rfc3339(c)
+                                                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                                                .unwrap_or_else(|_| c.clone())
+                                        }
+                                        UserCardFetch::Loading => "…".to_string(),
+                                        _ => "N/A".to_string(),
+                                    };
+                                    ui.label(created);
+                                    ui.end_row();
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("Copy username")
+                                        .on_hover_text("Copy this user's login to the clipboard")
+                                        .clicked()
+                                    {
+                                        ctx.copy_text(card.login.clone());
+                                    }
+                                    if ui
+                                        .button("Open Twitch profile")
+                                        .on_hover_text("Open twitch.tv/{login} in your browser")
+                                        .clicked()
+                                    {
+                                        crate::platform::open_url(&format!(
+                                            "https://twitch.tv/{}",
+                                            card.login
+                                        ));
+                                    }
+                                });
+                            });
+                        if !open {
+                            popup.user_card = None;
+                        }
+                    }
 
                     // ── Content ──────────────────────────────────────────────
                     // Render straight from the mutex guard — the old code
@@ -2497,32 +3007,36 @@ impl StreamArchiverApp {
                             }
                             log.row_heights.resize(n, CHAT_ROW_EST);
 
-                            // Search filter, recomputed only when the query or
-                            // the message count changes — not every frame.
+                            // Search filter + "Hide shared" filter, recomputed only
+                            // when the query, message count, or hide_shared changes
+                            // — not every frame.
                             let q = popup.search.to_lowercase();
-                            if q.is_empty() {
+                            let hide_shared = popup.hide_shared;
+                            if q.is_empty() && !hide_shared {
                                 popup.filter_cache = None;
                             } else {
                                 let stale = popup
                                     .filter_cache
                                     .as_ref()
-                                    .is_none_or(|(cq, cn, _)| *cq != q || *cn != n);
+                                    .is_none_or(|(cq, cn, ch, _)| *cq != q || *cn != n || *ch != hide_shared);
                                 if stale {
                                     let idx: Vec<u32> = log
                                         .messages
                                         .iter()
                                         .enumerate()
                                         .filter(|(_, m)| {
-                                            m.text.to_lowercase().contains(&q)
-                                                || m.author.to_lowercase().contains(&q)
+                                            (q.is_empty()
+                                                || m.text.to_lowercase().contains(&q)
+                                                || m.author.to_lowercase().contains(&q))
+                                                && (!hide_shared || m.source_name.is_empty())
                                         })
                                         .map(|(i, _)| i as u32)
                                         .collect();
-                                    popup.filter_cache = Some((q.clone(), n, idx));
+                                    popup.filter_cache = Some((q.clone(), n, hide_shared, idx));
                                 }
                             }
                             let filtered: Option<&[u32]> =
-                                popup.filter_cache.as_ref().map(|(_, _, v)| v.as_slice());
+                                popup.filter_cache.as_ref().map(|(_, _, _, v)| v.as_slice());
                             let count = filtered.map_or(n, |v| v.len());
 
                             ui.horizontal(|ui| {
@@ -2598,8 +3112,12 @@ impl StreamArchiverApp {
                                                 now,
                                                 &mut decode_misses,
                                                 ctx,
-                                            );
+                                                &appearance,
+                                            )
                                         });
+                                        if let Some(req) = r.inner {
+                                            usercard_click = Some(req);
+                                        }
                                         let h = r.response.rect.height();
                                         if (h - log.row_heights[mi]).abs() > 0.5 {
                                             log.row_heights[mi] = h;
@@ -2628,10 +3146,114 @@ impl StreamArchiverApp {
         // Decode any newly-seen emotes off the UI thread, then LRU-evict the cache.
         self.pump_emote_decodes(decode_misses, now, ctx);
 
+        // A username was clicked this frame: build the usercard. Local fields
+        // (badges/color/sub-months) come straight from the click; session
+        // stats are a fresh scan of the currently-loaded log (cheap — chat
+        // logs are at most tens of thousands of messages, and this only runs
+        // on a click, not per frame).
+        if let Some(req) = usercard_click {
+            let (message_count, first_seen_secs) = {
+                let guard = self.chat_popups[idx].load_state.lock().unwrap();
+                if let ChatLoadState::Loaded(log) = &*guard {
+                    let mut count = 0usize;
+                    let mut first: Option<f64> = None;
+                    for m in &log.messages {
+                        if m.login == req.login {
+                            count += 1;
+                            if first.is_none() {
+                                first = Some(m.timestamp_secs);
+                            }
+                        }
+                    }
+                    (count, first)
+                } else {
+                    (0, None)
+                }
+            };
+            let monitor_id = self.chat_popups[idx].monitor_id;
+            let want_live = self.fetch_usercard_info && !req.user_id.is_empty();
+            let fetch = Arc::new(Mutex::new(if want_live {
+                UserCardFetch::Loading
+            } else {
+                UserCardFetch::Disabled
+            }));
+            if want_live {
+                if let Some(dctx) = self.core.detect_ctx() {
+                    let fetch2 = fetch.clone();
+                    let user_id = req.user_id.clone();
+                    let login = req.login.clone();
+                    let store = self.core.store.clone();
+                    let events = self.core.events.clone();
+                    self.core.rt.spawn(async move {
+                        let result = async {
+                            let (client_id, token) = dctx.twitch_helix_auth().await?;
+                            crate::assets::fetch_usercard_info(&client_id, &token, &user_id).await
+                        }
+                        .await;
+                        match result {
+                            Ok(info) => {
+                                *fetch2.lock().unwrap() = UserCardFetch::Loaded {
+                                    avatar_path: info.avatar_path,
+                                    created_at: info.created_at,
+                                };
+                            }
+                            Err(e) => {
+                                *fetch2.lock().unwrap() = UserCardFetch::Failed;
+                                // File a warning through the same path capture-log
+                                // alerts use, so a failed live lookup shows up in
+                                // the 🚨 Warnings window / 🔔 feed instead of
+                                // silently degrading to "N/A" with no trace.
+                                let alert = crate::store::NewCaptureAlert {
+                                    kind: "usercard_lookup_failed".to_string(),
+                                    severity: "warning".to_string(),
+                                    source: "chat_usercard".to_string(),
+                                    take_key: format!("usercard:{login}"),
+                                    monitor_id: Some(monitor_id),
+                                    recording_id: None,
+                                    video_id: None,
+                                    channel: login.clone(),
+                                    count: 1,
+                                    lost_segments: 0,
+                                    last_line: format!(
+                                        "Twitch usercard lookup failed for {login}: {e:#}"
+                                    ),
+                                };
+                                if let Ok((id, _)) = store.upsert_capture_alert(&alert) {
+                                    let _ = events.send(crate::events::AppEvent::CaptureAlert {
+                                        severity: "warning".to_string(),
+                                        title: format!("Usercard lookup failed: {login}"),
+                                        body: format!("{e:#}"),
+                                        monitor_id: Some(monitor_id),
+                                        channel: login,
+                                        recording_id: None,
+                                        ref_key: format!("usercard:{id}"),
+                                    });
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    *fetch.lock().unwrap() = UserCardFetch::Failed;
+                }
+            }
+            self.chat_popups[idx].user_card = Some(UserCardPopup {
+                login: req.login,
+                display_name: req.display_name,
+                color: req.color,
+                badges: req.badges,
+                badge_icons: req.badge_icons,
+                badge_info: req.badge_info,
+                user_id: req.user_id,
+                message_count,
+                first_seen_secs,
+                fetch,
+            });
+        }
+
         // Tail-reload: while the recording is live, parse only the bytes
         // appended since the last pass and push them onto the shown log —
         // the whole file is never re-read.
-        if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading, spartners)) = reload_info {
+        if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading, spartners, bdirs)) = reload_info {
             self.chat_popups[idx].last_reload = std::time::Instant::now();
             if errored {
                 self.chat_popups[idx].error_retries =
@@ -2648,6 +3270,7 @@ impl StreamArchiverApp {
                 funknown,
                 render_emotes,
                 spartners,
+                bdirs,
                 ctx.clone(),
             ));
         }
@@ -2723,6 +3346,10 @@ mod tests {
     #[allow(unused_imports)]
     use std::path::PathBuf;
 
+    fn empty_badge_dirs() -> TwitchBadgeDirs {
+        TwitchBadgeDirs { channel: None, global: PathBuf::new() }
+    }
+
     fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {
         ChatMessage {
             timestamp_secs: ts,
@@ -2730,6 +3357,7 @@ mod tests {
             text: text.to_string(),
             segments: vec![ChatSegment::Text(text.to_string())],
             badges: Vec::new(),
+            badge_icons: Vec::new(),
             color_override: None,
             platform: ChatPlatform::Twitch,
             login: login.to_string(),
@@ -2738,6 +3366,8 @@ mod tests {
             system: false,
             reply_to: String::new(),
             source_name: String::new(),
+            user_id: String::new(),
+            badge_info: String::new(),
         }
     }
 
@@ -2793,7 +3423,7 @@ mod tests {
         let mut fetches = Vec::new();
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &HashMap::new(),
+            &HashMap::new(), &empty_badge_dirs(),
         )
         .expect("old line parses");
         assert_eq!(m.msg_id, "");
@@ -2820,7 +3450,7 @@ mod tests {
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi","source_room_id":"999"}"#;
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &partners,
+            &partners, &empty_badge_dirs(),
         )
         .expect("parses");
         assert_eq!(m.source_name, "OtherStreamer");
@@ -2830,7 +3460,7 @@ mod tests {
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi","source_room_id":"111"}"#;
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &partners,
+            &partners, &empty_badge_dirs(),
         )
         .expect("parses");
         assert_eq!(m.source_name, "");
@@ -2839,10 +3469,47 @@ mod tests {
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi"}"#;
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &partners,
+            &partners, &empty_badge_dirs(),
         )
         .expect("parses");
         assert_eq!(m.source_name, "");
+    }
+
+    #[test]
+    fn resolve_twitch_badge_icon_prefers_channel_then_falls_back_to_global() {
+        let root = std::env::temp_dir().join(format!("sa-badge-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("channel");
+        let global = root.join("global");
+        std::fs::create_dir_all(channel.join("subscriber").join("12")).unwrap();
+        std::fs::create_dir_all(global.join("subscriber").join("12")).unwrap();
+        std::fs::create_dir_all(global.join("moderator").join("1")).unwrap();
+
+        let dirs = TwitchBadgeDirs { channel: Some(channel.clone()), global: global.clone() };
+
+        // Missing everywhere -> None (glyph fallback).
+        assert!(resolve_twitch_badge_icon("subscriber/12", &dirs).is_none());
+
+        // Only the global copy exists -> falls back to it.
+        std::fs::write(global.join("moderator").join("1").join("2x.png"), b"x").unwrap();
+        assert_eq!(
+            resolve_twitch_badge_icon("moderator/1", &dirs),
+            Some(global.join("moderator").join("1").join("2x.png"))
+        );
+
+        // Both exist -> channel-specific wins (a channel's own sub badge art
+        // can differ from the global default).
+        std::fs::write(channel.join("subscriber").join("12").join("2x.png"), b"x").unwrap();
+        std::fs::write(global.join("subscriber").join("12").join("2x.png"), b"x").unwrap();
+        assert_eq!(
+            resolve_twitch_badge_icon("subscriber/12", &dirs),
+            Some(channel.join("subscriber").join("12").join("2x.png"))
+        );
+
+        // Malformed entry (no '/') -> None, never panics.
+        assert!(resolve_twitch_badge_icon("subscriber", &dirs).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ----- first-party emote offset parsing (IRC `emotes` tag) -----

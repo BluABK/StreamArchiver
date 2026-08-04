@@ -449,6 +449,37 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        let chat_font_pt = core
+            .store
+            .get_setting(K_CHAT_FONT_PT)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(CHAT_FONT_PT_DEFAULT);
+        let chat_ts_color = core
+            .store
+            .get_setting(K_CHAT_TS_COLOR)
+            .ok()
+            .flatten()
+            .and_then(|v| crate::ui::chat::parse_chat_hex_color(&v))
+            .unwrap_or(egui::Color32::WHITE);
+        let chat_text_color = core
+            .store
+            .get_setting(K_CHAT_TEXT_COLOR)
+            .ok()
+            .flatten()
+            .and_then(|v| crate::ui::chat::parse_chat_hex_color(&v))
+            .unwrap_or(egui::Color32::WHITE);
+        // Live Twitch usercard lookup (avatar + account-created date) defaults
+        // OFF — unlike the emote/badge fetchers this hits the network on
+        // every usercard open, not just once per missing asset.
+        let fetch_usercard_info = core
+            .store
+            .get_setting(K_FETCH_USERCARD_INFO)
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
         // Streams grid channel-group clustering defaults on (it always has
         // been); only an explicit "0" flattens it.
         let streams_group_visually = core
@@ -823,6 +854,10 @@ impl StreamArchiverApp {
             render_emotes,
             animate_emotes,
             fetch_unknown_emotes,
+            chat_font_pt,
+            chat_ts_color,
+            chat_text_color,
+            fetch_usercard_info,
             reset_streams_columns: false,
             streams_grid,
             videos_grid,

@@ -2531,6 +2531,9 @@ live, and archived:
   Needs a resolved partner list for that specific broadcast — a take with
   no recorded stream id, or a broadcast where the collab poll never caught
   a session, replays with no dots even if the raw tag is present in the file.
+  A noisy merged chat can be filtered down to just this channel's own
+  messages with the chat window's **Hide shared** toggle (see *Chat logs*
+  below).
 - **Watch every angle** — while a collab is live, an instance's right-click
   menu gains **"👥⏵ Play all collab instances (current downloads)"** and
   **"👥▷ Play all collab instances (live edge)"**. "Current downloads" opens
@@ -3296,6 +3299,35 @@ offers *Copy Image*, *Open File*, and *Open Folder* for the cached emote
 file.
 
 ![Chat log viewer replaying an archived Twitch chat](doc/screenshots/chat-log-viewer.png)
+
+**Twitch-parity look and accessibility controls.** Badges (subscriber/mod/VIP/
+broadcaster/etc.) render as the same cached icon images Twitch itself uses
+(fetched by the normal channel-asset refresh — see *Channel assets* below),
+not glyph symbols — hover any badge for its name. Falls back to a glyph for
+an id that isn't cached locally yet.
+
+A **⚙** button on the chat window's toolbar opens **Chat Appearance**: an
+exact point-size field for the timestamp/message/username text (not a preset
+slider), and separate color pickers for the timestamp and the message body
+(default white for both — the old hardcoded grey read too dark to follow
+comfortably). These are shared preferences, so a change applies instantly to
+every open chat window; **Reset to defaults** restores 14pt white/white.
+
+**Hide shared**, next to *View full*, filters a merged Shared Chat session
+down to just this channel's own messages — useful when the combined chat is
+too noisy to follow (see *Chat replay source indicator* above for how a
+message's origin channel is determined).
+
+**Click a username** to open its usercard: color, real badge icons, and
+(when the raw `badge-info` tag has it) "Subscriber · Tier N · M months",
+plus how many messages that person sent and when they first appeared in the
+currently-loaded log — all available instantly with no network call. Turning
+on **Settings → Interface → Display → "Fetch live Twitch info for chat
+usercards"** (off by default) additionally fetches that user's live avatar
+and Twitch account-created date via the Helix API each time a card opens; a
+failed lookup shows **N/A** for those two fields and files a warning in the
+🔔 feed / 🚨 Warnings window rather than blocking the rest of the card.
+"Copy username" and "Open Twitch profile" round out the card.
 
 ### YouTube community posts (📣 Posts)
 
