@@ -1962,6 +1962,7 @@ impl StreamArchiverApp {
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
                                     fhits.as_ref(), &mut out, &cache.platform_pref,
+                                    self.collab_title_in_name,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -3029,6 +3030,11 @@ impl StreamArchiverApp {
         fhits: Option<&FilterHits>,
         out: &mut StreamsOut,
         platform_pref: &crate::platform_pref::PlatformPrefCtx,
+        // Whether title-`@mention` collab partners also get a Name-cell
+        // suffix here, same as `instance_row`'s `collab_title_in_name` —
+        // must match or a collapsed channel silently drops collab info its
+        // own (expanded) instance row shows.
+        collab_title_in_name: bool,
     ) {
         let ch = &e.channel;
         let cid = ch.id;
@@ -3200,18 +3206,26 @@ impl StreamArchiverApp {
                                 .color(name_color),
                         );
                         // "Stream Together" partners as a " × Partner" suffix
-                        // while a shared-chat session is live (title
-                        // @mentions stay in the 🤝 Collab column only) — each
-                        // name coloured/linked when it resolves to a tracked
-                        // channel (see `tracked_name_label`).
+                        // while a shared-chat session is live; title
+                        // `@mentions` join the same suffix when the setting
+                        // is on, same as `instance_row`'s — otherwise a
+                        // title-mention-only collab (no real shared-chat
+                        // session) would show on the expanded instance row
+                        // but silently vanish the moment its channel is
+                        // collapsed. Each name coloured/linked when it
+                        // resolves to a tracked channel (see
+                        // `tracked_name_label`).
                         if let Some(c) = &cur_collab {
-                            let shared: Vec<&crate::models::CollabPartner> =
-                                c.partners.iter().filter(|p| !p.from_title).collect();
-                            if !shared.is_empty() {
+                            let shown: Vec<&crate::models::CollabPartner> = c
+                                .partners
+                                .iter()
+                                .filter(|p| !p.from_title || collab_title_in_name)
+                                .collect();
+                            if !shown.is_empty() {
                                 let resp = ui
                                     .horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 0.0;
-                                        for p in &shared {
+                                        for p in &shown {
                                             ui.weak(" × ");
                                             let pcid = login_to_mid.get(&p.login).and_then(|&mid| {
                                                 rows.iter()
