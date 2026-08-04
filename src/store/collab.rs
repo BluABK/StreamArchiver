@@ -302,6 +302,47 @@ impl Store {
         Ok(out)
     }
 
+    /// Every distinct collab partner recorded for one broadcast (`monitor_id`
+    /// + Helix `stream_id`), deduped by id (same key as `upsert_collab_session`'s
+    /// merge — title-mention partners with no id key on their lowercased
+    /// name instead). Feeds the chat replay's per-message "which channel was
+    /// this from" indicator: `source-room-id` (Twitch's numeric broadcaster
+    /// id, captured per-message in the `.chat.jsonl` sidecar during a Shared
+    /// Chat session) is matched against these partners' `id` field. Scoped to
+    /// one broadcast (unlike `collab_names_by_stream`'s whole-table preload)
+    /// since a chat popup only ever needs one take's worth.
+    pub fn collab_partners_for_stream(
+        &self,
+        monitor_id: i64,
+        stream_id: &str,
+    ) -> Result<Vec<CollabPartner>> {
+        if stream_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT participants FROM collab_session
+             WHERE monitor_id = ?1 AND stream_id = ?2
+             ORDER BY last_seen_at ASC",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(params![monitor_id, stream_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut merged: Vec<CollabPartner> = Vec::new();
+        let key = |p: &CollabPartner| {
+            if p.id.is_empty() { format!("~{}", p.name.to_lowercase()) } else { p.id.clone() }
+        };
+        for json in rows {
+            let partners: Vec<CollabPartner> = serde_json::from_str(&json).unwrap_or_default();
+            for p in partners {
+                if !merged.iter().any(|q| key(q) == key(&p)) {
+                    merged.push(p);
+                }
+            }
+        }
+        Ok(merged)
+    }
+
     /// `(monitor_id, stream_id) → comma-joined partner names` for every stored
     /// session with a stream id — lets the grid's stream/take rows show which
     /// collab a past broadcast was, from one cheap preloaded map.
@@ -453,5 +494,45 @@ mod tests {
         assert!(zen_sessions[0].co_partners.is_empty());
 
         assert!(store.collab_sessions_for_partner("nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn collab_partners_for_stream_merges_and_dedupes() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Numi").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // Empty stream id: nothing to look up, not an error.
+        assert!(store.collab_partners_for_stream(mid, "").unwrap().is_empty());
+        // No session recorded yet for this (monitor, stream) at all.
+        assert!(store.collab_partners_for_stream(mid, "st-1").unwrap().is_empty());
+
+        let shylily = partner("100", "Shylily", false);
+        store
+            .upsert_collab_session(mid, "shared_chat", "sess-1", "st-1", "650", &[shylily.clone()], 1000, 1010)
+            .unwrap();
+        // Title-mention row for the SAME broadcast — merges in, not a duplicate.
+        let mention = partner("", "Zentreya", true);
+        store
+            .upsert_collab_session(mid, "title", "", "st-1", "", &[mention.clone()], 0, 1020)
+            .unwrap();
+        // A different broadcast on the same monitor stays out of the result.
+        let other = partner("300", "Someone", false);
+        store
+            .upsert_collab_session(mid, "shared_chat", "sess-2", "st-2", "650", &[other], 1000, 1030)
+            .unwrap();
+
+        let partners = store.collab_partners_for_stream(mid, "st-1").unwrap();
+        assert_eq!(partners.len(), 2);
+        assert!(partners.contains(&shylily));
+        assert!(partners.contains(&mention));
+
+        // Re-observing the same id (e.g. a later poll) doesn't duplicate it.
+        store
+            .upsert_collab_session(mid, "shared_chat", "sess-1", "st-1", "650", &[shylily], 1000, 1040)
+            .unwrap();
+        assert_eq!(store.collab_partners_for_stream(mid, "st-1").unwrap().len(), 2);
     }
 }

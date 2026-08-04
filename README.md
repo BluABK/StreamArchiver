@@ -2519,6 +2519,18 @@ live, and archived:
   on a real collaborator doesn't mean retyping their channel URL by hand.
   Title `@mentions` don't offer this (too unverified to commit to a new
   channel from).
+- **Chat replay source indicator** — while a broadcast has a Shared Chat
+  session, Twitch tags every message (including your own channel's) with
+  which room it actually came from. The chat popup captures that tag
+  (`.chat.jsonl`'s `source_room_id`) and, for a message from another
+  confirmed partner, shows a small colored dot next to the username —
+  hover for "From `<name>`'s chat". Colored the same deterministic way a
+  sender with no Twitch USERCOLOR renders, so it's consistent with how
+  that channel's own name would look in its own chat. A message from the
+  channel you're actually viewing gets no dot (nothing to disambiguate).
+  Needs a resolved partner list for that specific broadcast — a take with
+  no recorded stream id, or a broadcast where the collab poll never caught
+  a session, replays with no dots even if the raw tag is present in the file.
 - **Watch every angle** — while a collab is live, an instance's right-click
   menu gains **"👥⏵ Play all collab instances (current downloads)"** and
   **"👥▷ Play all collab instances (live edge)"**. "Current downloads" opens

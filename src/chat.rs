@@ -292,6 +292,15 @@ struct ChatLine<'a> {
     /// — the replay renders an "↩ name" prefix. Omitted when not a reply.
     #[serde(skip_serializing_if = "str::is_empty")]
     reply: &'a str,
+    /// Twitch `source-room-id` — the broadcaster id of the channel this
+    /// message actually originated in, present only while this channel is in
+    /// an active Shared Chat ("Stream Together") session. Equals the local
+    /// channel's own room-id for a locally-typed message, another
+    /// participant's id for a merged-in one. Omitted outside a shared
+    /// session; the replay resolves it against this take's recorded collab
+    /// partners (`store::collab`) to show which channel a message came from.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    source_room_id: &'a str,
 }
 
 /// Capture `url`'s Twitch chat to `path` until `done` (recording ended) or
@@ -550,8 +559,8 @@ fn parse_privmsg(line: &str) -> Option<String> {
     let text = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
     let login = prefix.split('!').next().unwrap_or(prefix);
 
-    let (mut display, mut color, mut badges, mut emotes, mut id, mut reply_raw, mut ts_ms) =
-        ("", "", "", "", "", "", 0i64);
+    let (mut display, mut color, mut badges, mut emotes, mut id, mut reply_raw, mut ts_ms, mut source_room_id) =
+        ("", "", "", "", "", "", 0i64, "");
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -563,6 +572,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
             "id" => id = v,
             "reply-parent-display-name" => reply_raw = v,
             "tmi-sent-ts" => ts_ms = v.parse().unwrap_or(0),
+            "source-room-id" => source_room_id = v,
             _ => {}
         }
     }
@@ -581,6 +591,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
         emotes,
         id,
         reply: &reply,
+        source_room_id,
     })
     .ok()
 }
@@ -1150,6 +1161,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["text"], "hi");
         assert!(v.get("emotes").is_none());
+    }
+
+    #[test]
+    fn captures_source_room_id_during_shared_chat() {
+        // Present only while this channel is in an active Shared Chat session
+        // (Twitch adds it to every message, including ones typed locally).
+        let line = "@display-name=Bob;tmi-sent-ts=1700000000000;source-room-id=999 \
+                    :bob!bob@bob.tmi.twitch.tv PRIVMSG #streamer :hi from elsewhere";
+        let json = parse_privmsg(line).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["source_room_id"], "999");
+    }
+
+    #[test]
+    fn omits_empty_source_room_id_tag() {
+        // No shared-chat session active — the tag is absent entirely, not empty.
+        let line = "@display-name=Bob;tmi-sent-ts=1700000000000 \
+                    :bob!bob@bob.tmi.twitch.tv PRIVMSG #streamer :hi";
+        let json = parse_privmsg(line).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("source_room_id").is_none());
     }
 
     #[test]

@@ -68,6 +68,14 @@ pub(super) struct ChatMessage {
     /// Display name this message replies to (Twitch reply threads) — rendered
     /// as a small "↩ name" prefix. Empty when not a reply / pre-feature logs.
     pub(super) reply_to: String,
+    /// Which channel this message actually came from, during a Twitch Shared
+    /// Chat ("Stream Together") session — resolved once at parse time from
+    /// the raw `source_room_id` tag against this take's recorded collab
+    /// partners (`ChatPopup::source_partners`). Empty when: not a shared
+    /// session, the message originated in the channel being viewed (no
+    /// partner to name), or the id didn't resolve to a known partner. Never
+    /// set for YouTube.
+    pub(super) source_name: String,
 }
 
 /// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
@@ -207,6 +215,15 @@ pub(super) struct ChatPopup {
     /// chat log take over a minute to load. Built ONCE on popup-open; empty
     /// for YouTube. `Arc` for the same reason as `emote_map`.
     pub(super) twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
+    /// This take's recorded Shared Chat / collab partners, keyed by Twitch
+    /// broadcaster id (`store::collab::collab_partners_for_stream`) — resolves
+    /// each message's raw `source_room_id` tag to a name for the "which
+    /// channel was this from" indicator. Built ONCE on popup-open from
+    /// `recording.stream_id`; empty when the recording has no stream id or no
+    /// collab was ever recorded for it (messages then render with no
+    /// indicator, same as a pre-feature log). `Arc` for the same reason as
+    /// `emote_map` — shared with the background (re)parse tasks.
+    pub(super) source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
     /// Snapshot of the "Fetch unknown emotes from Twitch" setting at
     /// popup-open — when true, a first-party id missing from BOTH
     /// `twitch_emote_dir` and `twitch_fallback_index` gets fetched straight
@@ -621,6 +638,19 @@ pub(super) fn render_chat_message(
         for badge in &msg.badges {
             let (sym, color) = badge_display(badge, &msg.platform);
             ui.label(egui::RichText::new(sym).small().color(color));
+        }
+        // Shared Chat source indicator — a small colored dot naming the OTHER
+        // channel this message actually came from (own-channel messages
+        // during the same session get no dot, see `ChatMessage::source_name`'s
+        // doc). Deterministic per-name color, same function used when a
+        // sender has no explicit Twitch USERCOLOR, so it's consistent with
+        // how that channel's own name would render in its own chat.
+        if !msg.source_name.is_empty() {
+            let dot_color = twitch_username_color(&msg.source_name);
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+            resp.on_hover_text(format!("From {}'s chat (Shared Chat)", msg.source_name));
         }
         // Username — bold, platform/user colour, adjusted for contrast on the
         // chat panel's background so dark colours stay legible.
@@ -1355,6 +1385,7 @@ pub(super) fn parse_chat_chunk(
     twitch_dir: Option<&Path>,
     twitch_fallback_index: &HashMap<String, std::path::PathBuf>,
     fetch_unknown_emotes: bool,
+    source_partners: &HashMap<String, crate::models::CollabPartner>,
 ) -> anyhow::Result<ChatChunk> {
     use std::io::{Read, Seek, SeekFrom};
     // Read window: bounds peak memory on huge logs — the previous whole-range
@@ -1436,6 +1467,7 @@ pub(super) fn parse_chat_chunk(
                     twitch_fallback_index,
                     fetch_unknown_emotes,
                     &mut fetches,
+                    source_partners,
                 ) {
                     messages.push(m);
                 }
@@ -1491,6 +1523,7 @@ pub(crate) async fn parse_chunk_blocking(
     twitch_dir: Option<std::path::PathBuf>,
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
     fetch_unknown_emotes: bool,
+    source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
 ) -> Result<ChatChunk, String> {
     tokio::task::spawn_blocking(move || {
         parse_chat_chunk(
@@ -1502,6 +1535,7 @@ pub(crate) async fn parse_chunk_blocking(
             twitch_dir.as_deref(),
             &twitch_fallback_index,
             fetch_unknown_emotes,
+            &source_partners,
         )
     })
     .await
@@ -1629,6 +1663,7 @@ pub(super) async fn load_chat(
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
     fetch_unknown_emotes: bool,
     fetch_emoji: bool,
+    source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
     ctx: egui::Context,
 ) {
     let Some(path) = path else {
@@ -1663,6 +1698,7 @@ pub(super) async fn load_chat(
         twitch_dir.clone(),
         twitch_fallback_index.clone(),
         fetch_unknown_emotes,
+        source_partners.clone(),
     )
     .await
     {
@@ -1697,6 +1733,7 @@ pub(super) async fn load_chat(
             twitch_dir.clone(),
             twitch_fallback_index.clone(),
             fetch_unknown_emotes,
+            source_partners.clone(),
         )
         .await
         {
@@ -1754,6 +1791,7 @@ pub(super) async fn tail_chat(
     twitch_fallback_index: Arc<HashMap<String, std::path::PathBuf>>,
     fetch_unknown_emotes: bool,
     fetch_emoji: bool,
+    source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
     ctx: egui::Context,
 ) {
     let from = {
@@ -1778,6 +1816,7 @@ pub(super) async fn tail_chat(
             twitch_fallback_index,
             fetch_unknown_emotes,
             fetch_emoji,
+            source_partners,
             ctx,
         )
         .await;
@@ -1792,6 +1831,7 @@ pub(super) async fn tail_chat(
         twitch_dir,
         twitch_fallback_index,
         fetch_unknown_emotes,
+        source_partners,
     )
     .await
     else {
@@ -1962,6 +2002,7 @@ pub(super) fn yt_action_to_msg(
         deleted: None,
         system: false,
         reply_to: String::new(),
+        source_name: String::new(),
     })
 }
 
@@ -1987,6 +2028,7 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
         deleted: None,
         system: true,
         reply_to: String::new(),
+        source_name: String::new(),
     };
     match kind {
         "del" => {
@@ -2037,6 +2079,7 @@ pub(super) fn parse_twitch_chat_line(
     twitch_fallback_index: &HashMap<String, std::path::PathBuf>,
     fetch_unknown_emotes: bool,
     fetches: &mut Vec<EmojiFetch>,
+    source_partners: &HashMap<String, crate::models::CollabPartner>,
 ) -> Option<ChatMessage> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let ts_ms = v["ts"].as_f64().unwrap_or(0.0);
@@ -2069,6 +2112,19 @@ pub(super) fn parse_twitch_chat_line(
     );
     // Split literal unicode emoji out of the text segments into colour images.
     let segments = expand_emoji(segments, fetches);
+    // Present only during an active Shared Chat session (Twitch tags every
+    // message with it then, including ones typed locally). Resolved against
+    // this take's recorded partners — a local message's own room id was
+    // never recorded as a "partner" (the monitored channel itself is never
+    // in that list, see `CollabPartner`'s doc), so it naturally falls
+    // through to no indicator; only messages from an actual OTHER channel
+    // resolve to a name.
+    let source_room_id = v["source_room_id"].as_str().unwrap_or("");
+    let source_name = if source_room_id.is_empty() {
+        String::new()
+    } else {
+        source_partners.get(source_room_id).map(|p| p.name.clone()).unwrap_or_default()
+    };
     Some(ChatMessage {
         timestamp_secs: (ts_ms - start_ms) / 1000.0,
         author,
@@ -2082,6 +2138,7 @@ pub(super) fn parse_twitch_chat_line(
         deleted: None,
         system: false,
         reply_to: v["reply"].as_str().unwrap_or("").to_string(),
+        source_name,
     })
 }
 
@@ -2126,6 +2183,31 @@ impl StreamArchiverApp {
             .or_else(|| recs.last())
             .cloned();
 
+        // This take's recorded collab partners, keyed by Twitch broadcaster id
+        // — resolves each message's `source_room_id` tag to a name for the
+        // "which channel was this from" indicator during a Shared Chat
+        // session. Twitch-only; empty when this take has no stream id or no
+        // collab was ever recorded for it (messages then render with no
+        // indicator, same as a pre-feature log).
+        let source_partners: Arc<HashMap<String, crate::models::CollabPartner>> = Arc::new(
+            if platform == Some(Platform::Twitch) {
+                rec.as_ref()
+                    .and_then(|r| r.stream_id.as_deref())
+                    .filter(|sid| !sid.is_empty())
+                    .and_then(|sid| self.core.store.collab_partners_for_stream(monitor_id, sid).ok())
+                    .map(|partners| {
+                        partners
+                            .into_iter()
+                            .filter(|p| !p.id.is_empty())
+                            .map(|p| (p.id.clone(), p))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                HashMap::new()
+            },
+        );
+
         let state = Arc::new(Mutex::new(ChatLoadState::Loading));
         let loading = Arc::new(AtomicBool::new(false));
         if let Some(r) = &rec {
@@ -2139,6 +2221,7 @@ impl StreamArchiverApp {
                 twitch_fallback_index.clone(),
                 self.fetch_unknown_emotes,
                 self.render_emotes,
+                source_partners.clone(),
                 ctx.clone(),
             ));
         } else {
@@ -2156,6 +2239,7 @@ impl StreamArchiverApp {
             emote_map,
             twitch_emote_dir,
             twitch_fallback_index,
+            source_partners,
             fetch_unknown_emotes: self.fetch_unknown_emotes,
             loading,
             error_retries: 0,
@@ -2228,6 +2312,7 @@ impl StreamArchiverApp {
             Arc<HashMap<String, std::path::PathBuf>>,
             bool,
             Arc<AtomicBool>,
+            Arc<HashMap<String, crate::models::CollabPartner>>,
         );
         let reload_info: Option<ReloadInfo> =
             if rec_active && popup.last_reload.elapsed() >= reload_after {
@@ -2246,6 +2331,7 @@ impl StreamArchiverApp {
                             popup.twitch_fallback_index.clone(),
                             popup.fetch_unknown_emotes,
                             popup.loading.clone(),
+                            popup.source_partners.clone(),
                         )
                     })
                 })
@@ -2311,6 +2397,32 @@ impl StreamArchiverApp {
                                             let tdir = popup.twitch_emote_dir.clone();
                                             let tfallback = popup.twitch_fallback_index.clone();
                                             let funknown = popup.fetch_unknown_emotes;
+                                            // A different recording is a
+                                            // different broadcast — its
+                                            // Shared Chat partners (if any)
+                                            // aren't the same set.
+                                            let source_partners: Arc<HashMap<String, crate::models::CollabPartner>> =
+                                                Arc::new(
+                                                    new_rec
+                                                        .stream_id
+                                                        .as_deref()
+                                                        .filter(|sid| !sid.is_empty())
+                                                        .and_then(|sid| {
+                                                            self.core
+                                                                .store
+                                                                .collab_partners_for_stream(popup.monitor_id, sid)
+                                                                .ok()
+                                                        })
+                                                        .map(|partners| {
+                                                            partners
+                                                                .into_iter()
+                                                                .filter(|p| !p.id.is_empty())
+                                                                .map(|p| (p.id.clone(), p))
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default(),
+                                                );
+                                            popup.source_partners = source_partners.clone();
                                             popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
@@ -2328,6 +2440,7 @@ impl StreamArchiverApp {
                                                 tfallback,
                                                 funknown,
                                                 render_emotes,
+                                                source_partners,
                                                 ctx.clone(),
                                             ));
                                         }
@@ -2518,7 +2631,7 @@ impl StreamArchiverApp {
         // Tail-reload: while the recording is live, parse only the bytes
         // appended since the last pass and push them onto the shown log —
         // the whole file is never re-read.
-        if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading)) = reload_info {
+        if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading, spartners)) = reload_info {
             self.chat_popups[idx].last_reload = std::time::Instant::now();
             if errored {
                 self.chat_popups[idx].error_retries =
@@ -2534,6 +2647,7 @@ impl StreamArchiverApp {
                 tfallback,
                 funknown,
                 render_emotes,
+                spartners,
                 ctx.clone(),
             ));
         }
@@ -2623,6 +2737,7 @@ mod tests {
             deleted: None,
             system: false,
             reply_to: String::new(),
+            source_name: String::new(),
         }
     }
 
@@ -2678,11 +2793,56 @@ mod tests {
         let mut fetches = Vec::new();
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
+            &HashMap::new(),
         )
         .expect("old line parses");
         assert_eq!(m.msg_id, "");
         assert_eq!(m.login, "bob");
         assert!(!m.system && m.deleted.is_none());
+    }
+
+    #[test]
+    fn resolves_source_room_id_to_a_known_partner_only() {
+        let mut partners = HashMap::new();
+        partners.insert(
+            "999".to_string(),
+            crate::models::CollabPartner {
+                id: "999".into(),
+                login: "othersteamer".into(),
+                name: "OtherStreamer".into(),
+                from_title: false,
+                is_live: None,
+            },
+        );
+        let mut fetches = Vec::new();
+
+        // Matches a recorded partner -> named indicator.
+        let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi","source_room_id":"999"}"#;
+        let m = parse_twitch_chat_line(
+            line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
+            &partners,
+        )
+        .expect("parses");
+        assert_eq!(m.source_name, "OtherStreamer");
+
+        // Present but unmatched (the local channel's own id, not a
+        // "partner") -> no indicator, not an error/placeholder.
+        let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi","source_room_id":"111"}"#;
+        let m = parse_twitch_chat_line(
+            line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
+            &partners,
+        )
+        .expect("parses");
+        assert_eq!(m.source_name, "");
+
+        // No tag at all (no active shared session, or a pre-feature log) -> no indicator.
+        let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi"}"#;
+        let m = parse_twitch_chat_line(
+            line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
+            &partners,
+        )
+        .expect("parses");
+        assert_eq!(m.source_name, "");
     }
 
     // ----- first-party emote offset parsing (IRC `emotes` tag) -----

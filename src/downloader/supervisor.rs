@@ -1087,6 +1087,10 @@ progress_info: None,
                 .unwrap_or_default(),
             );
             let empty_map = std::sync::Arc::new(std::collections::HashMap::new());
+            // This sweep only backfills missing emote images — it has no
+            // recording/take context to resolve a "which channel" indicator
+            // against, and doesn't need one (it never renders the log).
+            let empty_partners = std::sync::Arc::new(std::collections::HashMap::new());
 
             let recs = store.list_recordings_for_chat_migration().unwrap_or_default();
             let candidates: Vec<PathBuf> = recs
@@ -1125,6 +1129,7 @@ progress_info: None,
                     None,
                     fallback_index.clone(),
                     true,
+                    empty_partners.clone(),
                 )
                 .await
                 {
