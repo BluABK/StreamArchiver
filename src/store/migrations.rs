@@ -1650,7 +1650,27 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 84)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 84);
+        if version < 85 {
+            // Every YouTube `chat_path` written before 2026-08-04 predicted
+            // yt-dlp *appending* `.live_chat.json` to the `-o` value (keeping
+            // its `.mkv` extension). Verified live that yt-dlp's `--write-subs`
+            // actually REPLACES the extension — the real file is
+            // `{stem}.live_chat.json`, never `{stem}.mkv.live_chat.json` — so
+            // every persisted path was wrong and chat replay / finalize
+            // companion-tracking silently found nothing (`chat_path` is the
+            // SOLE lookup candidate once set, see `chat::chat_file_candidates`).
+            // Mechanically correct: this suffix is unambiguous — only ever
+            // produced by the old (wrong) prediction code, never a real
+            // filename a producer intentionally wrote.
+            conn.execute_batch(
+                "UPDATE recording SET chat_path =
+                     substr(chat_path, 1, length(chat_path) - length('.mkv.live_chat.json'))
+                     || '.live_chat.json'
+                 WHERE chat_path LIKE '%.mkv.live_chat.json';",
+            )?;
+            conn.pragma_update(None, "user_version", 85)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 85);
         Ok(())
     }
 }

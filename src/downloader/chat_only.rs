@@ -224,16 +224,17 @@ impl Supervisor {
             twitch,
         );
 
-        // Twitch writes `{stem}.chat.jsonl` itself; yt-dlp *appends*
-        // `.live_chat.json` to its `-o` value, so it gets the same
-        // `{stem}.mkv` base a recorded take would have used (no such file is
-        // ever created — `--skip-download`) and the sidecar comes out at
-        // `{stem}.mkv.live_chat.json`, byte-identical in shape to a recorded
-        // take's. Both are then found by the ordinary companion sweep.
+        // Twitch writes `{stem}.chat.jsonl` itself; yt-dlp's `--write-subs`
+        // REPLACES the `-o` value's extension with the subtitle's own (see
+        // `supervisor.rs`'s matching comment) — the `-o` given below is
+        // `{stem}.mkv` (no such file is ever created — `--skip-download`), so
+        // the sidecar comes out at `{stem}.live_chat.json`, byte-identical in
+        // shape to a recorded take's. Both are then found by the ordinary
+        // companion sweep.
         let chat_path = if twitch {
             dir.join(format!("{stem}.chat.jsonl"))
         } else {
-            dir.join(format!("{stem}.mkv.live_chat.json"))
+            dir.join(format!("{stem}.live_chat.json"))
         };
         // Point the not-recorded take at the sidecar so the chat replay can
         // find it — there's no video path to derive it from.
@@ -312,8 +313,9 @@ impl Supervisor {
     /// YouTube half: the same yt-dlp `live_chat` sidecar a recorded take
     /// spawns, just without a video capture beside it. Its `-o` value is the
     /// `{stem}.mkv` a recording would have written (no such file is created —
-    /// `--skip-download`), so the sidecar lands at `{stem}.mkv.live_chat.json`,
-    /// identical in shape to a recorded take's.
+    /// `--skip-download`), so the sidecar lands at `{stem}.live_chat.json`
+    /// (yt-dlp replaces the `-o` value's extension), identical in shape to a
+    /// recorded take's.
     async fn run_ytdlp_chat_only(
         &self,
         monitor_id: i64,
@@ -421,7 +423,7 @@ fn chat_only_stem(
     // back after an app restart gets its own file rather than reopening one
     // whose contents we can no longer vouch for. Probed against the extension
     // each platform's logger actually writes.
-    unique_stem(dir, &stem, if twitch { "chat.jsonl" } else { "mkv.live_chat.json" }, None)
+    unique_stem(dir, &stem, if twitch { "chat.jsonl" } else { "live_chat.json" }, None)
 }
 
 #[cfg(test)]

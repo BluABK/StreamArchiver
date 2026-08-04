@@ -4172,14 +4172,18 @@ progress_info: None,
             // .cache\ capture: this process outlives the video, so its
             // `.live_chat.json` must not be promoted/purged mid-write. With a
             // dedicated chat root, the base is that root's mirror of the final
-            // path instead — yt-dlp appends `.live_chat.json` to whatever `-o`
-            // it's given, so the sidecar lands in the chat dir.
+            // path instead — yt-dlp's `--write-subs` REPLACES the `-o` value's
+            // extension with the subtitle's own (verified live 2026-08-04,
+            // yt-dlp stable@2026.06.09: `-o ....mkv` -> `....live_chat.json` on
+            // disk, NOT `....mkv.live_chat.json` — an older assumption here had
+            // it appending instead, which persisted a chat_path matching no
+            // real file and broke lookup for every YouTube sidecar since).
             let chat_base = crate::chat::chat_sidecar_path(&plan.final_path);
             // Persist the predicted sidecar name (same prediction chat_only.rs
-            // makes): `{-o value}.live_chat.json`.
+            // makes): `{-o value with its extension replaced}.live_chat.json`.
             if let Err(e) = self.store.set_recording_chat_path(
                 rec_id,
-                &format!("{}.live_chat.json", chat_base.to_string_lossy()),
+                &chat_base.with_extension("live_chat.json").to_string_lossy(),
             ) {
                 warn!("set_recording_chat_path (yt chat take): {e}");
             }
