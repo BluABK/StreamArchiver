@@ -1112,7 +1112,35 @@ impl StreamArchiverApp {
                                 .get(&cid)
                                 .copied()
                                 .unwrap_or_else(|| channel_event_color(cid, ""));
-                            let row = ui.horizontal(|ui| {
+                            // Row background, registered FIRST — before the
+                            // checkbox/expander button below — so right-click
+                            // anywhere on the row (including blank space)
+                            // opens the context menu without stealing clicks
+                            // from those children. Same ordering as the Month
+                            // cell's `bg_resp` (`schedule_cell`): a
+                            // `Sense::click()` interact added AFTER a child
+                            // with its own click sense would win pointer-
+                            // picking over it (egui keeps a widget's z-order
+                            // at its FIRST registration, even across a later
+                            // `Response::interact()` upgrade — only safe when
+                            // no child has independent click sense, which
+                            // isn't true here). The row's real height isn't
+                            // known before `ui.horizontal()` lays it out, so
+                            // this reserves the standard interactive-widget
+                            // height instead — generous enough to cover this
+                            // row's actual content (checkbox/16px avatar/text).
+                            let row_h = ui
+                                .spacing()
+                                .interact_size
+                                .y
+                                .max(ui.text_style_height(&egui::TextStyle::Body) + 4.0);
+                            let row_rect = egui::Rect::from_min_size(
+                                ui.next_widget_position(),
+                                egui::vec2(ui.available_width(), row_h),
+                            );
+                            let bg_id = ui.id().with(("sched_sidebar_ch_bg", cid));
+                            let bg_resp = ui.interact(row_rect, bg_id, egui::Sense::click());
+                            ui.horizontal(|ui| {
                                 // Expander for multi-instance channels; a fixed
                                 // blank slot otherwise so every row's checkbox
                                 // stays column-aligned.
@@ -1181,9 +1209,9 @@ impl StreamArchiverApp {
                                         insts.len()
                                     ));
                                 }
-                            }).response;
+                            });
                             // Context menu — captures only Copy values, uses temp data.
-                            row.context_menu(|ui| {
+                            bg_resp.context_menu(|ui| {
                                 let label = if ch_is_hidden {
                                     "👁  Show channel"
                                 } else {
