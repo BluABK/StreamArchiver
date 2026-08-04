@@ -395,7 +395,12 @@ RULES:\n\
 - Transcribe titles literally. 'w' or 'W' before a name means 'with' (a collaborator), e.g. 'FEARS TO FATHOM w CRELLY' -> title 'Fears to Fathom', collab 'Crelly'. Do not guess or 'correct' names.\n\
 - Skip any card marked OFFLINE, marked as a non-stream note (e.g. 'podcasting', 'break', 'TBD'), or with an unknown date ('????').\n\
 - If a time is vague (e.g. 'Evening'), set time and datetime to null but keep the raw text in time_label.\n\
-- Some schedule graphics use heavily stylized/decorative fonts where letters can look similar (a decorative 'R' can resemble a 'T', 'O' vs 'D', 'I' vs 'L', etc). Read each letter against the font's actual strokes — do not autocomplete toward a more common-sounding word. If, after careful reading, you are not fully certain of a title's exact spelling, transcribe your best literal reading of the strokes and set confidence to \"low\" for that event; otherwise set confidence to \"high\".\n\
+- Some schedule graphics use heavily stylized/decorative fonts where letters can look similar (a decorative 'R' can resemble a 'T', 'O' vs 'D', 'I' vs 'L', etc). Read each letter against the font's actual strokes — do not autocomplete toward a more common-sounding word. If, after careful reading, you are not fully certain of a title's exact spelling, transcribe your best literal reading of the strokes and set confidence to \"low\" for that event.\n\
+- Every visible event card has its own day-of-week label printed on or beside it (a name, abbreviation, or single letter like 'T'/'Th') — read THAT label directly for each card; it is your primary evidence for that card's day. Do not try to count your way there through a fixed grid of slots: many schedule graphics collapse one or more days with nothing scheduled into a single blank/decorative filler band between cards (e.g. one 'nothing this day' graphic standing in for an unknown number of hidden days), so counting rows/positions as if every calendar day gets exactly one slot will silently skip or double-count days whenever such a filler appears — trust the printed label on each visible card over any slot-counting.\n\
+- As a sanity check only (not a substitute for reading each label): the day-of-week labels across all visible cards, read in the graphic's natural order, must be non-decreasing through the week (e.g. Tue, Wed, Thu, Sun is fine — gaps for offline days are normal; Tue, Wed, Mon is not). If a label breaks that ordering, re-examine it — you likely misread a similar-looking abbreviation (e.g. 'TUE' vs 'THU').\n\
+- To convert a card's day-of-week label into an exact date, anchor to a real calendar date using whichever of these the graphic shows (most specific first): (1) an explicit date printed directly on that same card (e.g. '12' beside 'SUN') — use it directly, no arithmetic; (2) a 'WEEK OF <date> - <date>' style header, or a corner date-range badge (e.g. 'AUG 3' / 'AUG 9') spanning the week — its first date is that week's Monday; from there, add the card's own day-of-week offset from Monday (Mon=+0, Tue=+1, Wed=+2, Thu=+3, Fri=+4, Sat=+5, Sun=+6) to get its exact date. Do not derive a card's date from a NEIGHBORING card's date plus an assumed day-count — always go back to the Monday anchor.\n\
+- Do not guess the current real-world date from anything outside the image itself.\n\
+- Set confidence to \"high\" only when you're sure of BOTH the title spelling AND the day/date match; \"low\" if either is uncertain.\n\
 \n\
 Each object has these fields:\n\
 - title (string)\n\
@@ -406,7 +411,7 @@ Each object has these fields:\n\
 - time_label (raw time text from banner, e.g. '12.00 P.M.' or 'Evening')\n\
 - timezone (IANA name of the timezone you used)\n\
 - datetime (full ISO 8601 instant WITH its UTC offset, e.g. 2026-06-21T13:00:00-07:00, or null if no exact time)\n\
-- confidence (\"high\" or \"low\" — your transcription confidence for this event's title, per the rule above)\n\
+- confidence (\"high\" or \"low\" — your transcription confidence for this event's title AND day/date match, per the rules above)\n\
 - source_image (set this to the filename: {image_path})",
         year = opts.year,
     )
