@@ -1042,7 +1042,8 @@ impl StreamArchiverApp {
 
 /// Top contributors of one event kind within the loaded span:
 /// `(display name, total amount)` sorted by total, case-insensitive identity.
-fn top_contributors(events: &[StreamEventRow], kind: &str, limit: usize) -> Vec<(String, i64)> {
+/// `pub(super)`: also reused by `ui::chat`'s per-broadcast leaderboard ticker.
+pub(super) fn top_contributors(events: &[StreamEventRow], kind: &str, limit: usize) -> Vec<(String, i64)> {
     let mut by_actor: std::collections::HashMap<String, (String, i64)> = Default::default();
     for e in events.iter().filter(|e| e.kind == kind && !e.actor.is_empty()) {
         let entry = by_actor

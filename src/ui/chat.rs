@@ -299,6 +299,18 @@ pub(super) struct ChatPopup {
     /// The 👥 Users-in-chat panel, if open — `None` when closed (the panel
     /// content isn't kept around while hidden).
     pub(super) users_panel: Option<UsersPanelState>,
+    /// Top gift-sub contributors for this broadcast (display name, total
+    /// gifted), from `store::stream_event`. Local DB only, no network.
+    /// Computed once on popup-open/recording-switch, refreshed on the same
+    /// cadence as the live tail-reload while the recording is still going.
+    pub(super) top_gifters: Vec<(String, i64)>,
+    /// Top bits contributors for this broadcast (display name, total bits).
+    pub(super) top_cheerers: Vec<(String, i64)>,
+    /// Human-readable Hype Train summary line(s) for this broadcast (already
+    /// formatted by `HypeTrainState::detail()` at capture time — e.g. "level
+    /// 3 · 4,200 pts · top: geega (1,000 bits) (confirmed)"). Usually 0-1,
+    /// occasionally more on a long multi-train broadcast.
+    pub(super) hype_trains: Vec<String>,
     /// When the popup last triggered a background re-read of the chat file.
     /// Used to tail a live recording: the file is re-parsed every few seconds
     /// while `recording.ended_at` is `None`.
@@ -1609,6 +1621,28 @@ pub(super) fn summarize_user_events(
     lines
 }
 
+/// This broadcast's top-supporters leaderboard (gift subs / bits, top 5
+/// each) and any Hype Train summary line(s), from the locally-recorded
+/// `stream_event` history — purely local DB query, no network, no new
+/// capture. Hype Train `detail` strings are already formatted at capture
+/// time by `detectors::HypeTrainState::detail()` (e.g. "level 3 · 4,200 pts
+/// · top: geega (1,000 bits) (confirmed)"). `since`/`until` should be the
+/// viewed recording's span — pass `until = now_unix()` for a still-live
+/// recording so an in-progress train's latest poll is picked up.
+pub(super) fn load_broadcast_stats(
+    store: &crate::store::Store,
+    monitor_id: i64,
+    since: i64,
+    until: i64,
+) -> (Vec<(String, i64)>, Vec<(String, i64)>, Vec<String>) {
+    let events = store.stream_events_for_monitor_range(monitor_id, since, until).unwrap_or_default();
+    let top_gifters = crate::ui::channel_stats::top_contributors(&events, "subgift", 5);
+    let top_cheerers = crate::ui::channel_stats::top_contributors(&events, "bits", 5);
+    let hype_trains: Vec<String> =
+        events.iter().filter(|e| e.kind == "hype_train").map(|e| e.detail.clone()).collect();
+    (top_gifters, top_cheerers, hype_trains)
+}
+
 /// Role section a Twitch chatter is grouped under in the Users-in-chat
 /// panel, from the highest-priority badge on their message. No "Chat Bots"
 /// section (unlike Twitch's own list) — there's no reliable local signal for
@@ -2672,6 +2706,21 @@ impl StreamArchiverApp {
             },
         );
 
+        // This broadcast's top-supporters leaderboard + Hype Train summary —
+        // local DB query, no network. Twitch-only (subgift/bits/hype_train
+        // are all Twitch chat-event kinds).
+        let (top_gifters, top_cheerers, hype_trains) = if platform == Some(Platform::Twitch) {
+            rec.as_ref()
+                .map(|r| {
+                    let since = r.went_live_at.unwrap_or(r.started_at);
+                    let until = r.ended_at.unwrap_or_else(crate::models::now_unix);
+                    load_broadcast_stats(&self.core.store, monitor_id, since, until)
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+
         let state = Arc::new(Mutex::new(ChatLoadState::Loading));
         let loading = Arc::new(AtomicBool::new(false));
         if let Some(r) = &rec {
@@ -2707,6 +2756,9 @@ impl StreamArchiverApp {
             text_color_hex: String::new(),
             user_card: None,
             users_panel: None,
+            top_gifters,
+            top_cheerers,
+            hype_trains,
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
@@ -2909,6 +2961,25 @@ impl StreamArchiverApp {
                                                         .unwrap_or_default(),
                                                 );
                                             popup.source_partners = source_partners.clone();
+                                            // A different recording is a different
+                                            // broadcast — its leaderboard/Hype Train
+                                            // history is scoped to its own time span.
+                                            let is_twitch = self
+                                                .rows
+                                                .iter()
+                                                .find(|r| r.monitor.id == popup.monitor_id)
+                                                .is_some_and(|r| r.monitor.platform() == Platform::Twitch);
+                                            let (top_gifters, top_cheerers, hype_trains) = if is_twitch {
+                                                let since = start_ts;
+                                                let until =
+                                                    new_rec.ended_at.unwrap_or_else(crate::models::now_unix);
+                                                load_broadcast_stats(&self.core.store, popup.monitor_id, since, until)
+                                            } else {
+                                                Default::default()
+                                            };
+                                            popup.top_gifters = top_gifters;
+                                            popup.top_cheerers = top_cheerers;
+                                            popup.hype_trains = hype_trains;
                                             popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
@@ -3422,6 +3493,56 @@ impl StreamArchiverApp {
                         }
                     }
 
+                    // ── Leaderboard / Hype Train ────────────────────────────
+                    // Matches Twitch's own layout: a top-supporters strip and
+                    // an ongoing/reached Hype Train summary sit above the
+                    // message list. Built entirely from `stream_event` (see
+                    // `load_broadcast_stats`'s doc) — no live carousel/train
+                    // capture exists, so this is a local reconstruction: the
+                    // leaderboard won't match Twitch's exact carousel (no
+                    // follow/viewer-count data available to us), and while a
+                    // recording is live the Hype Train line reflects the last
+                    // ~poll (not a smooth animated bar); once a broadcast has
+                    // ended, only its last known snapshot before the train
+                    // ended survives, shown as a static reached-level summary.
+                    if !popup.top_gifters.is_empty()
+                        || !popup.top_cheerers.is_empty()
+                        || !popup.hype_trains.is_empty()
+                    {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                    ui.label(egui::RichText::new("Top supporters:").weak());
+                                    for (name, n) in &popup.top_gifters {
+                                        ui.label(format!("🎁 {name} ×{n}"))
+                                            .on_hover_text("Gift subs given this broadcast");
+                                    }
+                                    for (name, n) in &popup.top_cheerers {
+                                        ui.label(format!("💎 {name} ×{n}"))
+                                            .on_hover_text("Bits cheered this broadcast");
+                                    }
+                                });
+                            }
+                            for line in &popup.hype_trains {
+                                if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() {
+                                    ui.separator();
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("🚂");
+                                    ui.label(line)
+                                        .on_hover_text(
+                                            "Hype Train summary, reconstructed from this app's \
+                                             periodic Twitch poll — not a live animated bar, and \
+                                             only the last poll before the train ended survives \
+                                             for a finished broadcast.",
+                                        );
+                                });
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+
                     // ── Content ──────────────────────────────────────────────
                     // Render straight from the mutex guard — the old code
                     // cloned the entire parsed log (every message + segments)
@@ -3747,6 +3868,20 @@ impl StreamArchiverApp {
         // the whole file is never re-read.
         if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading, spartners, bdirs)) = reload_info {
             self.chat_popups[idx].last_reload = std::time::Instant::now();
+            // Same cadence as the tail-reload: the leaderboard/Hype Train
+            // rows keep changing while the broadcast is still live. Cheap
+            // indexed local query — naturally empty for a non-Twitch monitor
+            // (those event kinds are only ever written by the Twitch chat
+            // parser), so no separate platform check is needed here.
+            let (top_gifters, top_cheerers, hype_trains) = load_broadcast_stats(
+                &self.core.store,
+                self.chat_popups[idx].monitor_id,
+                start_ts,
+                crate::models::now_unix(),
+            );
+            self.chat_popups[idx].top_gifters = top_gifters;
+            self.chat_popups[idx].top_cheerers = top_cheerers;
+            self.chat_popups[idx].hype_trains = hype_trains;
             if errored {
                 self.chat_popups[idx].error_retries =
                     self.chat_popups[idx].error_retries.saturating_add(1);
@@ -3875,6 +4010,26 @@ mod tests {
     fn summarize_user_events_empty_when_no_match() {
         let events = vec![stream_event("bits", "Someone", 10)];
         assert!(summarize_user_events(&events, "NobodyHere").is_empty());
+    }
+
+    #[test]
+    fn load_broadcast_stats_ranks_gifters_cheerers_and_surfaces_hype_trains() {
+        use crate::store::test_util::sample_monitor;
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        store.record_stream_event(mid, 100, "s1", "subgift", "Alice", "", 5, "", "").unwrap();
+        store.record_stream_event(mid, 110, "s1", "subgift", "Bob", "", 2, "", "").unwrap();
+        store.record_stream_event(mid, 120, "s1", "bits", "Alice", "", 300, "", "").unwrap();
+        // Outside the queried window — must not be counted.
+        store.record_stream_event(mid, 9_999, "s1", "bits", "Alice", "", 5_000, "", "").unwrap();
+        store.upsert_hype_train_event(mid, 105, "s1", "train1", 4200, "level 3 · 4,200 pts (confirmed)").unwrap();
+
+        let (gifters, cheerers, trains) = load_broadcast_stats(&store, mid, 0, 200);
+        assert_eq!(gifters, vec![("Alice".to_string(), 5), ("Bob".to_string(), 2)]);
+        assert_eq!(cheerers, vec![("Alice".to_string(), 300)]);
+        assert_eq!(trains, vec!["level 3 · 4,200 pts (confirmed)".to_string()]);
     }
 
     fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {

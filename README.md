@@ -3357,6 +3357,21 @@ chat. Twitch-only, and built entirely from the already-archived log (no
 network) — there's no "Chat Bots" group like Twitch's own list since nothing
 in an anonymous chat capture reliably marks an account as a bot.
 
+**Top supporters and Hype Train**, shown inline above the message list
+whenever a broadcast has data for them — both reconstructed entirely from
+this app's already-recorded `stream_event` history (gift subs, bits, Hype
+Train polls), no new capture. The leaderboard ranks that broadcast's top 5
+gift-sub and top 5 bits contributors; it won't match Twitch's own live
+carousel exactly (that includes follow/viewer-count data this app has no
+access to), but it's an accurate reflection of what was actually recorded.
+The Hype Train line reuses the same human-readable summary
+(`"level N · X pts · top: name (Y bits) (confirmed)"`) this app already
+generates from its periodic (anonymous, unofficial) Twitch poll — while a
+recording is still live it reflects the last poll (not a smooth animated
+bar with a countdown), and for a finished broadcast only the last snapshot
+before the train ended survives, so it reads as "reached Level N" rather
+than a replayable progress history.
+
 ### YouTube community posts (📣 Posts)
 
 ![Posts tab showing a channel's archived community posts](doc/screenshots/community-posts.png)
