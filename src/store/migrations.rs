@@ -1670,7 +1670,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 85)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 85);
+        if version < 86 {
+            // Hype Train percent-to-next-level + countdown, so the chat
+            // replay can draw an actual progress bar instead of a static
+            // "level N · X pts" line — `hype_train` rows only, `0`
+            // elsewhere/unknown (pre-existing rows never had this data).
+            conn.execute_batch(
+                "ALTER TABLE stream_event ADD COLUMN goal INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE stream_event ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE stream_event ADD COLUMN level INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 86)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 86);
         Ok(())
     }
 }

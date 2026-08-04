@@ -306,11 +306,10 @@ pub(super) struct ChatPopup {
     pub(super) top_gifters: Vec<(String, i64)>,
     /// Top bits contributors for this broadcast (display name, total bits).
     pub(super) top_cheerers: Vec<(String, i64)>,
-    /// Human-readable Hype Train summary line(s) for this broadcast (already
-    /// formatted by `HypeTrainState::detail()` at capture time — e.g. "level
-    /// 3 · 4,200 pts · top: geega (1,000 bits) (confirmed)"). Usually 0-1,
-    /// occasionally more on a long multi-train broadcast.
-    pub(super) hype_trains: Vec<String>,
+    /// This broadcast's most recent Hype Train, if any — see
+    /// [`HypeTrainDisplay`]'s doc. A long broadcast may have had several;
+    /// only the latest is kept (see `load_broadcast_stats`'s doc for why).
+    pub(super) hype_train: Option<HypeTrainDisplay>,
     /// When the popup last triggered a background re-read of the chat file.
     /// Used to tail a live recording: the file is re-parsed every few seconds
     /// while `recording.ended_at` is `None`.
@@ -1621,26 +1620,52 @@ pub(super) fn summarize_user_events(
     lines
 }
 
+/// The most recent Hype Train for a broadcast, everything the chat replay
+/// needs to draw a Twitch-style progress bar (or, once it's over, a static
+/// reached-level summary) — see [`load_broadcast_stats`]'s doc for where
+/// `goal`/`expires_at` come from.
+pub(super) struct HypeTrainDisplay {
+    /// Pre-formatted line (`detectors::HypeTrainState::detail()`), shown
+    /// as-is once the train's no longer running (or `goal`/`expires_at`
+    /// weren't captured — pre-v86 rows, or an inference-only "(inferred)"
+    /// row that GQL never confirmed).
+    pub(super) detail: String,
+    pub(super) level: i64,
+    pub(super) total: i64,
+    pub(super) goal: i64,
+    pub(super) expires_at: i64,
+}
+
 /// This broadcast's top-supporters leaderboard (gift subs / bits, top 5
-/// each) and any Hype Train summary line(s), from the locally-recorded
+/// each) and its most recent Hype Train, from the locally-recorded
 /// `stream_event` history — purely local DB query, no network, no new
-/// capture. Hype Train `detail` strings are already formatted at capture
-/// time by `detectors::HypeTrainState::detail()` (e.g. "level 3 · 4,200 pts
-/// · top: geega (1,000 bits) (confirmed)"). `since`/`until` should be the
-/// viewed recording's span — pass `until = now_unix()` for a still-live
-/// recording so an in-progress train's latest poll is picked up.
+/// capture. Only the LATEST train is returned (a long/generous broadcast
+/// can rack up several over its runtime; showing the whole history read as
+/// a wall of text with no clear "this one's current" signal). `since`/
+/// `until` should be the viewed recording's span — pass `until =
+/// now_unix()` for a still-live recording so an in-progress train's latest
+/// poll is picked up.
 pub(super) fn load_broadcast_stats(
     store: &crate::store::Store,
     monitor_id: i64,
     since: i64,
     until: i64,
-) -> (Vec<(String, i64)>, Vec<(String, i64)>, Vec<String>) {
+) -> (Vec<(String, i64)>, Vec<(String, i64)>, Option<HypeTrainDisplay>) {
     let events = store.stream_events_for_monitor_range(monitor_id, since, until).unwrap_or_default();
     let top_gifters = crate::ui::channel_stats::top_contributors(&events, "subgift", 5);
     let top_cheerers = crate::ui::channel_stats::top_contributors(&events, "bits", 5);
-    let hype_trains: Vec<String> =
-        events.iter().filter(|e| e.kind == "hype_train").map(|e| e.detail.clone()).collect();
-    (top_gifters, top_cheerers, hype_trains)
+    let hype_train = events
+        .iter()
+        .filter(|e| e.kind == "hype_train")
+        .max_by_key(|e| e.at)
+        .map(|e| HypeTrainDisplay {
+            detail: e.detail.clone(),
+            level: e.level,
+            total: e.amount,
+            goal: e.goal,
+            expires_at: e.expires_at,
+        });
+    (top_gifters, top_cheerers, hype_train)
 }
 
 /// Role section a Twitch chatter is grouped under in the Users-in-chat
@@ -2709,7 +2734,7 @@ impl StreamArchiverApp {
         // This broadcast's top-supporters leaderboard + Hype Train summary —
         // local DB query, no network. Twitch-only (subgift/bits/hype_train
         // are all Twitch chat-event kinds).
-        let (top_gifters, top_cheerers, hype_trains) = if platform == Some(Platform::Twitch) {
+        let (top_gifters, top_cheerers, hype_train) = if platform == Some(Platform::Twitch) {
             rec.as_ref()
                 .map(|r| {
                     let since = r.went_live_at.unwrap_or(r.started_at);
@@ -2758,7 +2783,7 @@ impl StreamArchiverApp {
             users_panel: None,
             top_gifters,
             top_cheerers,
-            hype_trains,
+            hype_train,
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
@@ -2969,17 +2994,17 @@ impl StreamArchiverApp {
                                                 .iter()
                                                 .find(|r| r.monitor.id == popup.monitor_id)
                                                 .is_some_and(|r| r.monitor.platform() == Platform::Twitch);
-                                            let (top_gifters, top_cheerers, hype_trains) = if is_twitch {
+                                            let (top_gifters, top_cheerers, hype_train) = if is_twitch {
                                                 let since = start_ts;
                                                 let until =
                                                     new_rec.ended_at.unwrap_or_else(crate::models::now_unix);
                                                 load_broadcast_stats(&self.core.store, popup.monitor_id, since, until)
                                             } else {
-                                                Default::default()
+                                                (Vec::new(), Vec::new(), None)
                                             };
                                             popup.top_gifters = top_gifters;
                                             popup.top_cheerers = top_cheerers;
-                                            popup.hype_trains = hype_trains;
+                                            popup.hype_train = hype_train;
                                             popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
@@ -3254,9 +3279,10 @@ impl StreamArchiverApp {
                                         });
                                     }
                                     ui.vertical(|ui| {
-                                        let color = card.color.unwrap_or_else(|| {
+                                        let base = card.color.unwrap_or_else(|| {
                                             twitch_username_color(&card.display_name)
                                         });
+                                        let color = readable_color(base, ui.visuals().panel_fill);
                                         ui.label(
                                             egui::RichText::new(&card.display_name)
                                                 .strong()
@@ -3463,10 +3489,16 @@ impl StreamArchiverApp {
                                                 ui.label(egui::RichText::new(entry.role).weak().strong());
                                                 last_role = Some(entry.role);
                                             }
-                                            let color = entry
+                                            // Same contrast adjustment as the chat rows
+                                            // themselves (`chat_username_color`) — an
+                                            // unadjusted dark USERCOLOR (navy, dark green,
+                                            // etc.) is hard to read on this panel's dark
+                                            // background otherwise.
+                                            let base = entry
                                                 .click
                                                 .color
                                                 .unwrap_or_else(|| twitch_username_color(&entry.click.display_name));
+                                            let color = readable_color(base, ui.visuals().panel_fill);
                                             if ui
                                                 .add(
                                                     egui::Label::new(
@@ -3495,19 +3527,15 @@ impl StreamArchiverApp {
 
                     // ── Leaderboard / Hype Train ────────────────────────────
                     // Matches Twitch's own layout: a top-supporters strip and
-                    // an ongoing/reached Hype Train summary sit above the
+                    // an ongoing/reached Hype Train indicator sit above the
                     // message list. Built entirely from `stream_event` (see
                     // `load_broadcast_stats`'s doc) — no live carousel/train
                     // capture exists, so this is a local reconstruction: the
                     // leaderboard won't match Twitch's exact carousel (no
-                    // follow/viewer-count data available to us), and while a
-                    // recording is live the Hype Train line reflects the last
-                    // ~poll (not a smooth animated bar); once a broadcast has
-                    // ended, only its last known snapshot before the train
-                    // ended survives, shown as a static reached-level summary.
-                    if !popup.top_gifters.is_empty()
-                        || !popup.top_cheerers.is_empty()
-                        || !popup.hype_trains.is_empty()
+                    // follow/viewer-count data available to us), and the
+                    // Hype Train bar reflects this app's own periodic
+                    // (~60s) Twitch poll, not a smooth animated countdown.
+                    if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() || popup.hype_train.is_some()
                     {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() {
@@ -3524,20 +3552,53 @@ impl StreamArchiverApp {
                                     }
                                 });
                             }
-                            for line in &popup.hype_trains {
+                            if let Some(train) = &popup.hype_train {
                                 if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() {
                                     ui.separator();
                                 }
-                                ui.horizontal(|ui| {
-                                    ui.label("🚂");
-                                    ui.label(line)
+                                // `goal`/`expires_at` are only populated (v86+) for a
+                                // GQL-confirmed train; `now < expires_at` is this app's
+                                // best-effort "is it still running" signal (Twitch
+                                // gives no explicit end event) — everything else
+                                // (pre-v86 rows, inference-only rows GQL never
+                                // confirmed, or a train whose timer has lapsed) falls
+                                // back to the plain reached-level summary line.
+                                let now = crate::models::now_unix();
+                                let live = train.goal > 0 && train.expires_at > now;
+                                if live {
+                                    let frac = (train.total as f32 / train.goal as f32).clamp(0.0, 1.0);
+                                    let remaining = (train.expires_at - now).max(0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("🚂");
+                                        ui.add(
+                                            egui::ProgressBar::new(frac)
+                                                .text(format!(
+                                                    "Hype Train · Lvl {} · {}/{} · {}:{:02}",
+                                                    train.level.max(1),
+                                                    crate::models::group_thousands(train.total),
+                                                    crate::models::group_thousands(train.goal),
+                                                    remaining / 60,
+                                                    remaining % 60,
+                                                ))
+                                                .fill(egui::Color32::from_rgb(0x2e, 0xa0, 0x43))
+                                                .desired_width(ui.available_width() - 24.0),
+                                        )
                                         .on_hover_text(
-                                            "Hype Train summary, reconstructed from this app's \
-                                             periodic Twitch poll — not a live animated bar, and \
-                                             only the last poll before the train ended survives \
-                                             for a finished broadcast.",
+                                            "Reconstructed from this app's periodic (~60s) \
+                                             anonymous Twitch poll — not a live push update, \
+                                             so it can lag a few seconds behind Twitch's own bar.",
                                         );
-                                });
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.label("🚂");
+                                        ui.label(&train.detail).on_hover_text(
+                                            "This broadcast's most recent Hype Train — the last \
+                                             confirmed poll before it ended (or a chat-inferred \
+                                             estimate if Twitch's GQL never confirmed it).",
+                                        );
+                                    });
+                                }
                             }
                         });
                         ui.add_space(2.0);
@@ -3873,7 +3934,7 @@ impl StreamArchiverApp {
             // indexed local query — naturally empty for a non-Twitch monitor
             // (those event kinds are only ever written by the Twitch chat
             // parser), so no separate platform check is needed here.
-            let (top_gifters, top_cheerers, hype_trains) = load_broadcast_stats(
+            let (top_gifters, top_cheerers, hype_train) = load_broadcast_stats(
                 &self.core.store,
                 self.chat_popups[idx].monitor_id,
                 start_ts,
@@ -3881,7 +3942,7 @@ impl StreamArchiverApp {
             );
             self.chat_popups[idx].top_gifters = top_gifters;
             self.chat_popups[idx].top_cheerers = top_cheerers;
-            self.chat_popups[idx].hype_trains = hype_trains;
+            self.chat_popups[idx].hype_train = hype_train;
             if errored {
                 self.chat_popups[idx].error_retries =
                     self.chat_popups[idx].error_retries.saturating_add(1);
@@ -3989,6 +4050,9 @@ mod tests {
             amount,
             tier: String::new(),
             detail: String::new(),
+            goal: 0,
+            expires_at: 0,
+            level: 0,
         }
     }
 
@@ -4024,12 +4088,21 @@ mod tests {
         store.record_stream_event(mid, 120, "s1", "bits", "Alice", "", 300, "", "").unwrap();
         // Outside the queried window — must not be counted.
         store.record_stream_event(mid, 9_999, "s1", "bits", "Alice", "", 5_000, "", "").unwrap();
-        store.upsert_hype_train_event(mid, 105, "s1", "train1", 4200, "level 3 · 4,200 pts (confirmed)").unwrap();
+        // Two distinct trains during this broadcast — only the LATEST
+        // (by start time) should come back, not a full history.
+        store
+            .upsert_hype_train_event(mid, 20, "s1", "train0", 1000, "level 1 · 1,000 pts (confirmed)", 1000, 500, 1)
+            .unwrap();
+        store
+            .upsert_hype_train_event(mid, 105, "s1", "train1", 4200, "level 3 · 4,200 pts (confirmed)", 5000, 400, 3)
+            .unwrap();
 
-        let (gifters, cheerers, trains) = load_broadcast_stats(&store, mid, 0, 200);
+        let (gifters, cheerers, train) = load_broadcast_stats(&store, mid, 0, 200);
         assert_eq!(gifters, vec![("Alice".to_string(), 5), ("Bob".to_string(), 2)]);
         assert_eq!(cheerers, vec![("Alice".to_string(), 300)]);
-        assert_eq!(trains, vec!["level 3 · 4,200 pts (confirmed)".to_string()]);
+        let train = train.expect("latest train present");
+        assert_eq!(train.detail, "level 3 · 4,200 pts (confirmed)");
+        assert_eq!((train.level, train.total, train.goal, train.expires_at), (3, 4200, 5000, 400));
     }
 
     fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {

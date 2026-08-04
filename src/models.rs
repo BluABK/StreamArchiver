@@ -2468,6 +2468,22 @@ pub struct StreamEventRow {
     /// Free-text payload (schema v60): deleted-message excerpt, chat-mode
     /// change description, or role-change description.
     pub detail: String,
+    /// Cumulative points needed to complete the CURRENT level (schema v86;
+    /// `hype_train` rows only — confirmed trains from the GQL poll — `0`
+    /// otherwise/unknown). Paired with `amount` (the train's running total)
+    /// to compute a percent-to-next-level, the same way Twitch's own live
+    /// Hype Train bar does.
+    pub goal: i64,
+    /// Unix seconds when the current level's timer runs out (schema v86;
+    /// `hype_train` rows only, `0` otherwise/unknown) — Twitch's own
+    /// `expiresAt`. The chat replay treats `now < expires_at` as "this train
+    /// may still be running" and draws a live-style bar; past that (or for
+    /// an archived broadcast reviewed later) it's shown as a reached-level
+    /// summary instead.
+    pub expires_at: i64,
+    /// Current level (schema v86; `hype_train` rows only, `0` otherwise) —
+    /// stored as its own column rather than parsed back out of `detail`.
+    pub level: i64,
 }
 
 /// One broadcast's aggregate line in the Channel Stats per-stream breakdown

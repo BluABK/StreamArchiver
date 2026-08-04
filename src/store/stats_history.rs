@@ -206,7 +206,7 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT e.monitor_id, e.at, e.stream_id, e.kind, e.actor, e.target, e.amount, e.tier,
-                    e.detail, e.id
+                    e.detail, e.id, e.goal, e.expires_at, e.level
              FROM stream_event e
              JOIN monitor m ON m.id = e.monitor_id
              WHERE m.channel_id = ?1 AND e.at >= ?2 AND e.at < ?3
@@ -225,6 +225,9 @@ impl Store {
                     tier: r.get(7)?,
                     detail: r.get(8)?,
                     id: r.get(9)?,
+                    goal: r.get(10)?,
+                    expires_at: r.get(11)?,
+                    level: r.get(12)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -243,7 +246,8 @@ impl Store {
     ) -> Result<Vec<StreamEventRow>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id,
+                    goal, expires_at, level
              FROM stream_event
              WHERE monitor_id = ?1 AND at >= ?2 AND at <= ?3
              ORDER BY at",
@@ -261,6 +265,9 @@ impl Store {
                     tier: r.get(7)?,
                     detail: r.get(8)?,
                     id: r.get(9)?,
+                    goal: r.get(10)?,
+                    expires_at: r.get(11)?,
+                    level: r.get(12)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -275,7 +282,8 @@ impl Store {
     pub fn latest_raid_out(&self, monitor_id: i64) -> Result<Option<StreamEventRow>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id,
+                    goal, expires_at, level
              FROM stream_event
              WHERE monitor_id = ?1 AND kind = 'raid_out'
              ORDER BY at DESC LIMIT 1",
@@ -293,6 +301,9 @@ impl Store {
                     tier: r.get(7)?,
                     detail: r.get(8)?,
                     id: r.get(9)?,
+                    goal: r.get(10)?,
+                    expires_at: r.get(11)?,
+                    level: r.get(12)?,
                 })
             })
             .optional()?;
@@ -305,7 +316,8 @@ impl Store {
     pub fn latest_raid_outs_all(&self) -> Result<HashMap<i64, StreamEventRow>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id,
+                    goal, expires_at, level
              FROM stream_event
              WHERE kind = 'raid_out'
                AND id IN (SELECT MAX(id) FROM stream_event WHERE kind = 'raid_out' GROUP BY monitor_id)",
@@ -323,6 +335,9 @@ impl Store {
                     tier: r.get(7)?,
                     detail: r.get(8)?,
                     id: r.get(9)?,
+                    goal: r.get(10)?,
+                    expires_at: r.get(11)?,
+                    level: r.get(12)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -358,6 +373,7 @@ impl Store {
     /// updating (level/points/detail) while the train runs. Returns `true`
     /// when this is the FIRST sighting (caller then dedups inferred rows and
     /// feeds the auto-tune).
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_hype_train_event(
         &self,
         monitor_id: i64,
@@ -366,22 +382,25 @@ impl Store {
         train_id: &str,
         total_points: i64,
         detail: &str,
+        goal: i64,
+        expires_at: i64,
+        level: i64,
     ) -> Result<bool> {
         let conn = self.db();
         let updated = conn.execute(
             "UPDATE stream_event
-             SET at = ?3, amount = ?4, detail = ?5,
+             SET at = ?3, amount = ?4, detail = ?5, goal = ?7, expires_at = ?8, level = ?9,
                  stream_id = CASE WHEN ?6 != '' THEN ?6 ELSE stream_id END
              WHERE monitor_id = ?1 AND kind = 'hype_train' AND tier = ?2",
-            params![monitor_id, train_id, started_at, total_points, detail, stream_id],
+            params![monitor_id, train_id, started_at, total_points, detail, stream_id, goal, expires_at, level],
         )?;
         if updated > 0 {
             return Ok(false);
         }
         conn.execute(
-            "INSERT INTO stream_event(monitor_id, at, stream_id, kind, actor, target, amount, tier, detail)
-             VALUES(?1, ?2, ?3, 'hype_train', '', '', ?4, ?5, ?6)",
-            params![monitor_id, started_at, stream_id, total_points, train_id, detail],
+            "INSERT INTO stream_event(monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, goal, expires_at, level)
+             VALUES(?1, ?2, ?3, 'hype_train', '', '', ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![monitor_id, started_at, stream_id, total_points, train_id, detail, goal, expires_at, level],
         )?;
         Ok(true)
     }
@@ -1027,16 +1046,19 @@ mod tests {
             .record_stream_event(mid, t, "s1", "hype_train", "", "", 1500, "", "3 contributions (1500 pts) from 2 chatters in 5 min (inferred)")
             .unwrap();
         // …then GQL confirms the real train: first sighting inserts…
-        assert!(store.upsert_hype_train_event(mid, t + 30, "s1", "tr-1", 2000, "level 1 · 2,000 pts (confirmed)").unwrap());
+        assert!(store.upsert_hype_train_event(mid, t + 30, "s1", "tr-1", 2000, "level 1 · 2,000 pts (confirmed)", 5000, t + 900, 1).unwrap());
         // …and its inferred sibling near the kickoff gets superseded.
         assert_eq!(store.delete_inferred_hype_near(mid, t + 30, 300).unwrap(), 1);
         // Later polls update the SAME row (level/points rise).
-        assert!(!store.upsert_hype_train_event(mid, t + 30, "s1", "tr-1", 9000, "level 4 · 9,000 pts (confirmed)").unwrap());
+        assert!(!store.upsert_hype_train_event(mid, t + 30, "s1", "tr-1", 9000, "level 4 · 9,000 pts (confirmed)", 12000, t + 900, 4).unwrap());
         let events = store.stream_events_range(cid, 0, i64::MAX).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].amount, 9000);
         assert_eq!(events[0].tier, "tr-1");
         assert!(events[0].detail.contains("level 4"));
+        assert_eq!(events[0].goal, 12000, "goal/expires_at/level update on later polls too");
+        assert_eq!(events[0].level, 4);
+        assert_eq!(events[0].expires_at, t + 900);
 
         // Contribution scan feeds hype::observed_burst (only scoreable kinds).
         store.record_stream_event(mid, t + 100, "s1", "sub", "a", "", 1, "1000", "").unwrap();
@@ -1079,7 +1101,7 @@ mod tests {
 
         // A confirmed train lands 200s later — within a 300s window, found;
         // outside a tighter 60s window, not.
-        assert!(store.upsert_hype_train_event(mid, t + 200, "s1", "tr-9", 9000, "level 3 · 9,000 pts (confirmed)").unwrap());
+        assert!(store.upsert_hype_train_event(mid, t + 200, "s1", "tr-9", 9000, "level 3 · 9,000 pts (confirmed)", 10000, t + 400, 3).unwrap());
         assert!(store.confirmed_hype_near(mid, t, 300));
         assert!(!store.confirmed_hype_near(mid, t, 60));
         // Symmetric from the confirmed row's own timestamp too.

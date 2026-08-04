@@ -668,6 +668,9 @@ mod tests {
                 amount: 200,
                 tier: String::new(),
                 detail: String::new(),
+                goal: 0,
+                expires_at: 0,
+                level: 0,
             },
             StreamEventRow {
                 id: 2,
@@ -680,6 +683,9 @@ mod tests {
                 amount: 2,
                 tier: String::new(),
                 detail: String::new(),
+                goal: 0,
+                expires_at: 0,
+                level: 0,
             },
             StreamEventRow {
                 id: 3,
@@ -692,6 +698,9 @@ mod tests {
                 amount: 200,
                 tier: String::new(),
                 detail: String::new(),
+                goal: 0,
+                expires_at: 0,
+                level: 0,
             },
         ];
         let out = raid_chapter_events(&events, 1_000_000, 50);

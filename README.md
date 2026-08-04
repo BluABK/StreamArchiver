@@ -3364,13 +3364,17 @@ Train polls), no new capture. The leaderboard ranks that broadcast's top 5
 gift-sub and top 5 bits contributors; it won't match Twitch's own live
 carousel exactly (that includes follow/viewer-count data this app has no
 access to), but it's an accurate reflection of what was actually recorded.
-The Hype Train line reuses the same human-readable summary
-(`"level N · X pts · top: name (Y bits) (confirmed)"`) this app already
-generates from its periodic (anonymous, unofficial) Twitch poll — while a
-recording is still live it reflects the last poll (not a smooth animated
-bar with a countdown), and for a finished broadcast only the last snapshot
-before the train ended survives, so it reads as "reached Level N" rather
-than a replayable progress history.
+Only the broadcast's MOST RECENT Hype Train is shown (a long, generous
+broadcast can have several — showing the full history read as a wall of
+text with no clear "this one's current" signal): while it's still within
+its countdown window, a real colored progress bar (level, points/goal,
+time remaining) — driven by `goal`/`expiresAt` fields this app's periodic
+(anonymous, unofficial, ~60s) Twitch poll already receives but previously
+discarded — refreshed on the same cadence as everything else while the
+recording is live, so it can lag Twitch's own bar by up to that interval,
+never a live push update. Once the countdown lapses (or for an older
+broadcast reviewed later, whose train ended between polls) it falls back to
+a plain "reached Level N" summary line instead of a bar.
 
 ### YouTube community posts (📣 Posts)
 

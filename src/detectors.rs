@@ -304,6 +304,15 @@ pub struct HypeTrainState {
     pub level: i64,
     /// Total points contributed so far (all levels).
     pub total: i64,
+    /// Points needed to complete the current level — paired with `total` to
+    /// compute a percent, the same way Twitch's own live bar does. `0` if
+    /// Twitch didn't return one (shouldn't happen for a running train, but
+    /// parsed defensively like everything else here).
+    pub goal: i64,
+    /// Unix seconds when the current level's timer runs out (`0` if
+    /// unparsable). Lets a caller tell "still running" (`now < expires_at`)
+    /// from "this snapshot is stale" without a second poll.
+    pub expires_at: i64,
     /// Rare all-emote-unlock golden kappa train.
     pub golden_kappa: bool,
     /// Contribution breakdown: `(action, quantity)` — e.g. `("CHEER", 6349)`,
@@ -325,6 +334,8 @@ fn parse_hype_train(node: &Value) -> Option<HypeTrainState> {
     let started_at = ex["startedAt"].as_str().and_then(parse_rfc3339).unwrap_or(0);
     let level = ex["progress"]["level"]["value"].as_i64().unwrap_or(0);
     let total = ex["progress"]["total"].as_i64().unwrap_or(0);
+    let goal = ex["progress"]["level"]["goal"].as_i64().unwrap_or(0);
+    let expires_at = ex["expiresAt"].as_str().and_then(parse_rfc3339).unwrap_or(0);
     let golden_kappa = ex["isGoldenKappaTrain"].as_bool().unwrap_or(false);
     let participations = ex["participations"]
         .as_array()
@@ -361,6 +372,8 @@ fn parse_hype_train(node: &Value) -> Option<HypeTrainState> {
         started_at,
         level,
         total,
+        goal,
+        expires_at,
         golden_kappa,
         participations,
         conductors,
@@ -1564,7 +1577,7 @@ impl DetectContext {
                     format!(
                         "c{i}: user(login: \"{login}\") {{ channel {{ hypeTrain {{ \
                          execution {{ id startedAt expiresAt \
-                           progress {{ total level {{ value }} }} \
+                           progress {{ total level {{ value goal }} }} \
                            participations {{ action quantity }} \
                            conductors {{ source user {{ login displayName }} \
                              participation {{ quantity }} }} \
@@ -1635,6 +1648,9 @@ impl DetectContext {
                         &t.train_id,
                         t.total,
                         &detail,
+                        t.goal,
+                        t.expires_at,
+                        t.level,
                     ) {
                         Ok(true) => {
                             info!("hype: 🚂 {login} train confirmed — {detail}");
@@ -5566,6 +5582,8 @@ mod tests {
         assert!(t.started_at > 1_700_000_000, "{}", t.started_at);
         assert_eq!(t.level, 17);
         assert_eq!(t.total, 140_909);
+        assert_eq!(t.goal, 163_600);
+        assert!(t.expires_at > t.started_at, "{} vs {}", t.expires_at, t.started_at);
         assert!(!t.golden_kappa);
         assert_eq!(t.participations.len(), 2);
         assert_eq!(t.conductors, vec![("Rose".into(), "BITS".into(), 1000)]);
