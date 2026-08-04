@@ -128,6 +128,12 @@ const K_FETCH_UNKNOWN_EMOTES: &str = "fetch_unknown_twitch_emotes";
 /// window, not Settings — see [`crate::ui::chat`]'s doc.
 const K_CHAT_FONT_PT: &str = "chat_font_size_pt";
 const CHAT_FONT_PT_DEFAULT: f32 = 14.0;
+/// Chat-replay emote size in pixels — independent of `K_CHAT_FONT_PT` (a
+/// reader may want large emotes with small text or vice versa). Applies to
+/// both first/third-party emotes and Unicode emoji; badge icons scale off
+/// the font size instead (see `ui::chat::render_chat_message`).
+const K_CHAT_EMOTE_PT: &str = "chat_emote_size_px";
+const CHAT_EMOTE_PT_DEFAULT: f32 = 24.0;
 /// Chat-replay timestamp color (hex `#RRGGBB`). Default white — the previous
 /// hardcoded `weak_text_color()` rendered too dark-grey to read comfortably.
 const K_CHAT_TS_COLOR: &str = "chat_ts_color";
@@ -2102,6 +2108,9 @@ pub struct StreamArchiverApp {
     /// uniformly). Default [`CHAT_FONT_PT_DEFAULT`]. Edited from the chat
     /// window's ⚙ panel; persisted under [`K_CHAT_FONT_PT`].
     chat_font_pt: f32,
+    /// Chat-replay emote size in pixels, independent of `chat_font_pt`.
+    /// Default [`CHAT_EMOTE_PT_DEFAULT`]. Persisted under [`K_CHAT_EMOTE_PT`].
+    chat_emote_pt: f32,
     /// Chat-replay timestamp color. Default white. Persisted under
     /// [`K_CHAT_TS_COLOR`].
     chat_ts_color: egui::Color32,

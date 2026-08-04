@@ -223,6 +223,15 @@ pub(super) struct UserCardPopup {
     /// scanning the already-loaded `ChatLog`, not re-scanned per frame.
     pub(super) message_count: usize,
     pub(super) first_seen_secs: Option<f64>,
+    /// Up to the last 50 messages from this user in the currently-loaded
+    /// log, oldest first — a local "recent activity" feed, no network
+    /// involved. Same scan pass as `message_count`/`first_seen_secs`.
+    pub(super) recent_messages: Vec<(f64, String)>,
+    /// Human-readable summary lines cross-referencing this user's Twitch
+    /// login against the channel's locally-recorded `stream_event` history
+    /// (bits/gift-subs/raids/timeouts) — computed once from the DB when the
+    /// card opens, not re-queried per frame. Empty when nothing matched.
+    pub(super) channel_stats: Vec<String>,
     pub(super) fetch: Arc<Mutex<UserCardFetch>>,
 }
 
@@ -245,6 +254,11 @@ pub(super) struct ChatPopup {
     /// only this channel's own messages. Per-window, ephemeral (not
     /// persisted), like `full_view`.
     pub(super) hide_shared: bool,
+    /// Twitch login currently highlighted (via a usercard's 🔔 "Highlight
+    /// messages of this user"), if any — at most one at a time, matching
+    /// Twitch's own popout chat. Matched case-sensitively against
+    /// `ChatMessage::login` (already lowercased at parse time).
+    pub(super) highlight_login: Option<String>,
     /// Whether the ⚙ "Chat Appearance" panel is currently open for this
     /// window. Per-window UI state; the values it edits
     /// (`StreamArchiverApp::chat_font_pt`/`chat_ts_color`/`chat_text_color`)
@@ -759,6 +773,9 @@ pub(super) const EMOTE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 /// chat window rather than the global Settings dialog.
 pub(super) struct ChatAppearance {
     pub(super) font_pt: f32,
+    /// Emote/emoji pixel size, independent of `font_pt` — see
+    /// `StreamArchiverApp::chat_emote_pt`'s doc.
+    pub(super) emote_pt: f32,
     pub(super) ts_color: egui::Color32,
     pub(super) text_color: egui::Color32,
 }
@@ -815,20 +832,38 @@ pub(super) fn render_chat_message(
         // `ChatMessage::badge_icons`, index-aligned with `badges`), falling
         // back to the glyph (not yet cached, still downloading, or YouTube —
         // `badge_icons` is empty there).
+        //
+        // Reserved to a FIXED width (`BADGE_SLOTS` worth), regardless of how
+        // many badges this particular message actually has — otherwise every
+        // row's badge count shifts where the username starts, and a chat
+        // full of mixed sub/mod/no-badge senders reads as a ragged mess
+        // instead of a column. Twitch's own popout has the same alignment
+        // issue; this fixes it rather than replicating it. A message with
+        // MORE badges than `BADGE_SLOTS` (rare — broadcaster+mod+sub+bits+
+        // partner all at once) just overflows the reserved width for that
+        // one row rather than being truncated.
+        const BADGE_SLOTS: usize = 3;
         let badge_h: f32 = (appearance.font_pt * 1.1).clamp(14.0, 32.0);
-        for (i, badge) in msg.badges.iter().enumerate() {
-            let icon = msg.badge_icons.get(i).and_then(|o| o.as_ref());
-            let drawn = icon.and_then(|path| {
-                draw_cached_emote(ui, cache, path, false, badge_h, now, misses, ctx)
+        let badge_slot_w = badge_h + ui.spacing().item_spacing.x;
+        let reserved_w = (BADGE_SLOTS.max(msg.badges.len()) as f32) * badge_slot_w;
+        ui.allocate_ui(egui::vec2(reserved_w, badge_h), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for (i, badge) in msg.badges.iter().enumerate() {
+                    let icon = msg.badge_icons.get(i).and_then(|o| o.as_ref());
+                    let drawn = icon.and_then(|path| {
+                        draw_cached_emote(ui, cache, path, false, badge_h, now, misses, ctx)
+                    });
+                    if let Some((resp, _tex)) = drawn {
+                        resp.on_hover_text(badge_label(badge));
+                    } else {
+                        let (sym, color) = badge_display(badge, &msg.platform);
+                        ui.label(egui::RichText::new(sym).small().color(color))
+                            .on_hover_text(badge_label(badge));
+                    }
+                }
             });
-            if let Some((resp, _tex)) = drawn {
-                resp.on_hover_text(badge_label(badge));
-            } else {
-                let (sym, color) = badge_display(badge, &msg.platform);
-                ui.label(egui::RichText::new(sym).small().color(color))
-                    .on_hover_text(badge_label(badge));
-            }
-        }
+        });
         // Shared Chat source indicator — a small colored dot naming the OTHER
         // channel this message actually came from (own-channel messages
         // during the same session get no dot, see `ChatMessage::source_name`'s
@@ -898,7 +933,7 @@ pub(super) fn render_chat_message(
             return click;
         }
         // Message body — text runs and (when enabled & on disk) inline emote images.
-        let emote_h = (appearance.font_pt * 1.5).min(28.0);
+        let emote_h = appearance.emote_pt;
         for seg in &msg.segments {
             match seg {
                 ChatSegment::Text(t) => {
@@ -1455,6 +1490,95 @@ pub(super) fn parse_chat_hex_color(s: &str) -> Option<egui::Color32> {
 /// `#RRGGBB` for `c`, ignoring alpha — inverse of [`parse_chat_hex_color`].
 pub(super) fn hex_color_string(c: egui::Color32) -> String {
     format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+/// Per-channel linear interpolation between two opaque colors, `t` in `0..=1`.
+pub(super) fn lerp_color32(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// Paint a left-to-right gradient banner strip (the user's color fading into
+/// the panel background) at the current cursor, reserving `height` px of
+/// vertical space. Purely decorative — Twitch exposes no per-viewer banner
+/// image via the public API, so this approximates the look of the 7TV/
+/// native usercard banners without a network fetch.
+pub(super) fn paint_user_banner(ui: &mut egui::Ui, user_color: egui::Color32, height: f32) {
+    let width = ui.available_width();
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let bg = ui.visuals().panel_fill;
+    const STRIPS: i32 = 32;
+    for i in 0..STRIPS {
+        let t = (i as f32 / (STRIPS - 1) as f32).powf(1.6);
+        let col = lerp_color32(user_color, bg, t);
+        let x0 = rect.left() + rect.width() * (i as f32 / STRIPS as f32);
+        let x1 = rect.left() + rect.width() * ((i + 1) as f32 / STRIPS as f32);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+            0.0,
+            col,
+        );
+    }
+}
+
+/// Summarize a user's locally-recorded contribution history on this channel
+/// (bits/gift-subs/raids/timeouts-bans) from the already-loaded `stream_event`
+/// rows, matched case-insensitively against their Twitch display name — the
+/// `actor` column stores display names, not logins (see `stream_event`'s
+/// doc). One line per non-zero category; empty when nothing matched (a
+/// lurker, or a channel this app only started recording recently).
+pub(super) fn summarize_user_events(
+    events: &[crate::models::StreamEventRow],
+    display_name: &str,
+) -> Vec<String> {
+    let name_lc = display_name.to_lowercase();
+    let mine: Vec<&crate::models::StreamEventRow> =
+        events.iter().filter(|e| e.actor.to_lowercase() == name_lc).collect();
+    let of_kind = |kind: &str| -> Vec<&&crate::models::StreamEventRow> {
+        mine.iter().filter(|e| e.kind == kind).collect()
+    };
+
+    let mut lines = Vec::new();
+    let bits = of_kind("bits");
+    if !bits.is_empty() {
+        let total: i64 = bits.iter().map(|e| e.amount).sum();
+        lines.push(format!(
+            "💎 {total} bits cheered ({} message{})",
+            bits.len(),
+            if bits.len() == 1 { "" } else { "s" }
+        ));
+    }
+    let gifts = of_kind("subgift");
+    if !gifts.is_empty() {
+        let total: i64 = gifts.iter().map(|e| e.amount.max(1)).sum();
+        lines.push(format!(
+            "🎁 {total} sub(s) gifted ({} event{})",
+            gifts.len(),
+            if gifts.len() == 1 { "" } else { "s" }
+        ));
+    }
+    let raids = of_kind("raid_in");
+    if !raids.is_empty() {
+        let viewers: i64 = raids.iter().map(|e| e.amount).sum();
+        lines.push(format!(
+            "📡 Raided this channel {} time{} (brought {viewers} viewer(s) total)",
+            raids.len(),
+            if raids.len() == 1 { "" } else { "s" }
+        ));
+    }
+    let sub_n = of_kind("sub").len() + of_kind("resub").len();
+    if sub_n > 0 {
+        lines.push(format!("⭐ {sub_n} subscription event(s) recorded"));
+    }
+    let timeouts = of_kind("timeout").len();
+    let bans = of_kind("ban").len();
+    if timeouts > 0 || bans > 0 {
+        lines.push(format!(
+            "⚠ {timeouts} timeout(s), {bans} ban(s) in this channel's recorded history"
+        ));
+    }
+    lines
 }
 
 /// First existing first-party Twitch emote image for `id` in `dir`, trying the
@@ -2490,6 +2614,7 @@ impl StreamArchiverApp {
             search: String::new(),
             full_view: false,
             hide_shared: false,
+            highlight_login: None,
             show_appearance: false,
             ts_color_hex: String::new(),
             text_color_hex: String::new(),
@@ -2609,6 +2734,7 @@ impl StreamArchiverApp {
         let animate_emotes = self.animate_emotes;
         let appearance = ChatAppearance {
             font_pt: self.chat_font_pt,
+            emote_pt: self.chat_emote_pt,
             ts_color: self.chat_ts_color,
             text_color: self.chat_text_color,
         };
@@ -2758,6 +2884,7 @@ impl StreamArchiverApp {
 
                     if popup.show_appearance {
                         let mut font_pt = self.chat_font_pt;
+                        let mut emote_pt = self.chat_emote_pt;
                         let mut ts_color = self.chat_ts_color;
                         let mut text_color = self.chat_text_color;
                         egui::Window::new("Chat Appearance")
@@ -2784,6 +2911,28 @@ impl StreamArchiverApp {
                                         let _ = self.core.store.set_setting(
                                             K_CHAT_FONT_PT,
                                             &font_pt.to_string(),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Emote size:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut emote_pt)
+                                                .range(12.0..=64.0)
+                                                .suffix(" px"),
+                                        )
+                                        .on_hover_text(
+                                            "Pixel size for emotes and emoji in the chat replay \
+                                             — independent of the text font size, applies to \
+                                             every open chat window.",
+                                        )
+                                        .changed()
+                                    {
+                                        self.chat_emote_pt = emote_pt;
+                                        let _ = self.core.store.set_setting(
+                                            K_CHAT_EMOTE_PT,
+                                            &emote_pt.to_string(),
                                         );
                                     }
                                 });
@@ -2867,10 +3016,11 @@ impl StreamArchiverApp {
                                 ui.add_space(4.0);
                                 if ui
                                     .button("Reset to defaults")
-                                    .on_hover_text("Restore the default 14pt white/white appearance.")
+                                    .on_hover_text("Restore the default 14pt / 24px white/white appearance.")
                                     .clicked()
                                 {
                                     self.chat_font_pt = CHAT_FONT_PT_DEFAULT;
+                                    self.chat_emote_pt = CHAT_EMOTE_PT_DEFAULT;
                                     self.chat_ts_color = egui::Color32::WHITE;
                                     self.chat_text_color = egui::Color32::WHITE;
                                     popup.ts_color_hex = hex_color_string(egui::Color32::WHITE);
@@ -2878,6 +3028,10 @@ impl StreamArchiverApp {
                                     let _ = self.core.store.set_setting(
                                         K_CHAT_FONT_PT,
                                         &CHAT_FONT_PT_DEFAULT.to_string(),
+                                    );
+                                    let _ = self.core.store.set_setting(
+                                        K_CHAT_EMOTE_PT,
+                                        &CHAT_EMOTE_PT_DEFAULT.to_string(),
                                     );
                                     let _ = self.core.store.set_setting(K_CHAT_TS_COLOR, "#FFFFFF");
                                     let _ = self.core.store.set_setting(K_CHAT_TEXT_COLOR, "#FFFFFF");
@@ -2891,9 +3045,14 @@ impl StreamArchiverApp {
                         egui::Window::new(format!("👤 {}", card.display_name))
                             .id(egui::Id::new(("chat_usercard_win", popup.monitor_id)))
                             .collapsible(false)
-                            .resizable(false)
+                            .resizable(true)
+                            .default_width(340.0)
                             .open(&mut open)
                             .show(ctx, |ui| {
+                                let banner_color = card
+                                    .color
+                                    .unwrap_or_else(|| twitch_username_color(&card.display_name));
+                                paint_user_banner(ui, banner_color, 40.0);
                                 ui.horizontal(|ui| {
                                     // Avatar (live lookup) — reuses the same
                                     // decode/GPU-upload cache as emotes/badges.
@@ -3004,8 +3163,62 @@ impl StreamArchiverApp {
                                     ui.label(created);
                                     ui.end_row();
                                 });
+
+                                // Cross-referenced against this channel's locally-recorded
+                                // event history (bits/gifts/raids/timeouts) — see
+                                // `summarize_user_events`'s doc. Local-only, no network.
+                                if !card.channel_stats.is_empty() {
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("This channel:").weak());
+                                    for line in &card.channel_stats {
+                                        ui.label(line);
+                                    }
+                                }
+
+                                // A local "recent activity" feed — this user's own messages
+                                // from the currently-loaded log, newest at the bottom.
+                                if !card.recent_messages.is_empty() {
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Recent messages in this log ({}):",
+                                            card.recent_messages.len()
+                                        ))
+                                        .weak(),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("usercard_recent_messages")
+                                        .max_height(150.0)
+                                        .auto_shrink([false, true])
+                                        .stick_to_bottom(true)
+                                        .show(ui, |ui| {
+                                            for (ts, text) in &card.recent_messages {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                                    ui.label(
+                                                        egui::RichText::new(fmt_chat_ts(*ts))
+                                                            .monospace()
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                    ui.label(egui::RichText::new(text).small());
+                                                });
+                                            }
+                                        });
+                                }
+
                                 ui.separator();
                                 ui.horizontal(|ui| {
+                                    let highlighted =
+                                        popup.highlight_login.as_deref() == Some(card.login.as_str());
+                                    if ui
+                                        .selectable_label(highlighted, "🔔")
+                                        .on_hover_text("Highlight messages of this user")
+                                        .clicked()
+                                    {
+                                        popup.highlight_login =
+                                            if highlighted { None } else { Some(card.login.clone()) };
+                                    }
                                     if ui
                                         .button("Copy username")
                                         .on_hover_text("Copy this user's login to the clipboard")
@@ -3154,22 +3367,47 @@ impl StreamArchiverApp {
                                     let total = y;
                                     ui.add_space(offset as f32);
                                     let mut mismeasured = false;
+                                    // A translucent tint of the theme's own selection color for
+                                    // the highlighted user's rows (🔔 "Highlight messages of
+                                    // this user" in the usercard) — reuses the same visual
+                                    // language egui already uses for "this is selected/marked",
+                                    // just softened so message text stays legible on top.
+                                    let sel = ui.visuals().selection.bg_fill;
+                                    let highlight_bg =
+                                        egui::Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 40);
                                     for di in first..last {
                                         let mi = filtered.map_or(di, |v| v[di] as usize);
-                                        let r = ui.scope(|ui| {
-                                            render_chat_message(
-                                                ui,
-                                                &log.messages[mi],
-                                                &anim_cache,
-                                                render_emotes,
-                                                animate_emotes,
-                                                now,
-                                                &mut decode_misses,
-                                                ctx,
-                                                &appearance,
-                                            )
-                                        });
-                                        if let Some(req) = r.inner {
+                                        let highlighted = popup
+                                            .highlight_login
+                                            .as_deref()
+                                            .is_some_and(|hl| {
+                                                let login = &log.messages[mi].login;
+                                                !login.is_empty() && login == hl
+                                            });
+                                        let r = egui::Frame::new()
+                                            .fill(if highlighted {
+                                                highlight_bg
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            })
+                                            .inner_margin(egui::Margin::symmetric(2, 1))
+                                            .corner_radius(2.0)
+                                            .show(ui, |ui| {
+                                                ui.scope(|ui| {
+                                                    render_chat_message(
+                                                        ui,
+                                                        &log.messages[mi],
+                                                        &anim_cache,
+                                                        render_emotes,
+                                                        animate_emotes,
+                                                        now,
+                                                        &mut decode_misses,
+                                                        ctx,
+                                                        &appearance,
+                                                    )
+                                                })
+                                            });
+                                        if let Some(req) = r.inner.inner {
                                             usercard_click = Some(req);
                                         }
                                         let h = r.response.rect.height();
@@ -3206,25 +3444,44 @@ impl StreamArchiverApp {
         // logs are at most tens of thousands of messages, and this only runs
         // on a click, not per frame).
         if let Some(req) = usercard_click {
-            let (message_count, first_seen_secs) = {
+            const RECENT_MESSAGES_CAP: usize = 50;
+            let (message_count, first_seen_secs, recent_messages) = {
                 let guard = self.chat_popups[idx].load_state.lock().unwrap();
                 if let ChatLoadState::Loaded(log) = &*guard {
-                    let mut count = 0usize;
-                    let mut first: Option<f64> = None;
-                    for m in &log.messages {
-                        if m.login == req.login {
-                            count += 1;
-                            if first.is_none() {
-                                first = Some(m.timestamp_secs);
-                            }
-                        }
+                    let mut all: Vec<(f64, String)> = log
+                        .messages
+                        .iter()
+                        .filter(|m| m.login == req.login)
+                        .map(|m| (m.timestamp_secs, m.text.clone()))
+                        .collect();
+                    let count = all.len();
+                    let first = all.first().map(|(ts, _)| *ts);
+                    if all.len() > RECENT_MESSAGES_CAP {
+                        all.drain(0..all.len() - RECENT_MESSAGES_CAP);
                     }
-                    (count, first)
+                    (count, first, all)
                 } else {
-                    (0, None)
+                    (0, None, Vec::new())
                 }
             };
             let monitor_id = self.chat_popups[idx].monitor_id;
+            // Cross-reference this user's Twitch display name against the
+            // channel's locally-recorded `stream_event` history — local DB
+            // query, no network, so it's fine to run inline on the click.
+            let channel_stats = self
+                .core
+                .store
+                .get_monitor_with_channel(monitor_id)
+                .ok()
+                .flatten()
+                .and_then(|m| {
+                    self.core
+                        .store
+                        .stream_events_range(m.channel.id, 0, crate::models::now_unix())
+                        .ok()
+                })
+                .map(|events| summarize_user_events(&events, &req.display_name))
+                .unwrap_or_default();
             let want_live = self.fetch_usercard_info && !req.user_id.is_empty();
             let fetch = Arc::new(Mutex::new(if want_live {
                 UserCardFetch::Loading
@@ -3300,6 +3557,8 @@ impl StreamArchiverApp {
                 user_id: req.user_id,
                 message_count,
                 first_seen_secs,
+                recent_messages,
+                channel_stats,
                 fetch,
             });
         }
@@ -3402,6 +3661,41 @@ mod tests {
 
     fn empty_badge_dirs() -> TwitchBadgeDirs {
         TwitchBadgeDirs { channel: None, global: PathBuf::new() }
+    }
+
+    fn stream_event(kind: &str, actor: &str, amount: i64) -> crate::models::StreamEventRow {
+        crate::models::StreamEventRow {
+            id: 0,
+            monitor_id: 1,
+            at: 0,
+            stream_id: String::new(),
+            kind: kind.to_string(),
+            actor: actor.to_string(),
+            target: String::new(),
+            amount,
+            tier: String::new(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn summarize_user_events_matches_actor_case_insensitively_and_ignores_others() {
+        let events = vec![
+            stream_event("bits", "CoolViewer", 100),
+            stream_event("bits", "coolviewer", 50),
+            stream_event("subgift", "CoolViewer", 3),
+            stream_event("raid_in", "SomeoneElse", 20),
+        ];
+        let lines = summarize_user_events(&events, "coolVIEWER");
+        assert!(lines.iter().any(|l| l.contains("150 bits") && l.contains("2 message")));
+        assert!(lines.iter().any(|l| l.contains("3 sub(s) gifted")));
+        assert!(!lines.iter().any(|l| l.contains("Raided")));
+    }
+
+    #[test]
+    fn summarize_user_events_empty_when_no_match() {
+        let events = vec![stream_event("bits", "Someone", 10)];
+        assert!(summarize_user_events(&events, "NobodyHere").is_empty());
     }
 
     fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {

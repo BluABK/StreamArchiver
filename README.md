@@ -3304,30 +3304,48 @@ file.
 broadcaster/etc.) render as the same cached icon images Twitch itself uses
 (fetched by the normal channel-asset refresh — see *Channel assets* below),
 not glyph symbols — hover any badge for its name. Falls back to a glyph for
-an id that isn't cached locally yet.
+an id that isn't cached locally yet. Every row reserves a **fixed-width badge
+column** (3 slots) regardless of how many badges that particular message
+actually has, so usernames line up in a straight column instead of drifting
+left/right with each sender's badge count — only a message with more than 3
+badges at once (rare) overflows its own row.
 
 A **⚙** button on the chat window's toolbar opens **Chat Appearance**: an
 exact point-size field for the timestamp/message/username text (not a preset
-slider), and separate color pickers for the timestamp and the message body
-(default white for both — the old hardcoded grey read too dark to follow
-comfortably). These are shared preferences, so a change applies instantly to
-every open chat window; **Reset to defaults** restores 14pt white/white.
+slider), a separate pixel-size field for emotes/emoji (independent of the
+text size — go big text/small emotes or vice versa), and separate color
+pickers for the timestamp and the message body (default white for both — the
+old hardcoded grey read too dark to follow comfortably; each color picker
+also has a `#RRGGBB` field beside it you can type or **paste** into, since
+egui's own color wheel only offers a *copy* button with no matching paste
+target). These are shared preferences, so a change applies instantly to
+every open chat window; **Reset to defaults** restores 14pt / 24px white/white.
 
 **Hide shared**, next to *View full*, filters a merged Shared Chat session
 down to just this channel's own messages — useful when the combined chat is
 too noisy to follow (see *Chat replay source indicator* above for how a
 message's origin channel is determined).
 
-**Click a username** to open its usercard: color, real badge icons, and
-(when the raw `badge-info` tag has it) "Subscriber · Tier N · M months",
-plus how many messages that person sent and when they first appeared in the
-currently-loaded log — all available instantly with no network call. Turning
-on **Settings → Interface → Display → "Fetch live Twitch info for chat
-usercards"** (off by default) additionally fetches that user's live avatar
-and Twitch account-created date via the Helix API each time a card opens; a
-failed lookup shows **N/A** for those two fields and files a warning in the
-🔔 feed / 🚨 Warnings window rather than blocking the rest of the card.
-"Copy username" and "Open Twitch profile" round out the card.
+**Click a username** to open its usercard: a decorative color banner (Twitch
+exposes no per-viewer banner image via its public API, so this is generated
+locally from the sender's own chat color, not fetched), real badge icons,
+and — when the raw `badge-info` tag has it — "Subscriber · Tier N · M
+months", plus how many messages that person sent and when they first
+appeared in the currently-loaded log, all available instantly with no
+network call. Below that, **This channel:** cross-references the sender's
+Twitch display name against this channel's locally-recorded event history
+(bits cheered, subs gifted, raids brought in, timeouts/bans) — again purely
+local, no network — and **Recent messages in this log** shows a scrollable
+feed of up to their last 50 messages in the log currently open. A 🔔
+**"Highlight messages of this user"** toggle tints that person's rows
+throughout the chat so they're easy to track while scrolling (one
+highlighted user per chat window at a time). Turning on **Settings →
+Interface → Display → "Fetch live Twitch info for chat usercards"** (off by
+default) additionally fetches that user's live avatar and Twitch
+account-created date via the Helix API each time a card opens; a failed
+lookup shows **N/A** for those two fields and files a warning in the 🔔 feed
+/ 🚨 Warnings window rather than blocking the rest of the card. "Copy
+username" and "Open Twitch profile" round out the card.
 
 ### YouTube community posts (📣 Posts)
 

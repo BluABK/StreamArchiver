@@ -456,6 +456,13 @@ impl StreamArchiverApp {
             .flatten()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(CHAT_FONT_PT_DEFAULT);
+        let chat_emote_pt = core
+            .store
+            .get_setting(K_CHAT_EMOTE_PT)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(CHAT_EMOTE_PT_DEFAULT);
         let chat_ts_color = core
             .store
             .get_setting(K_CHAT_TS_COLOR)
@@ -855,6 +862,7 @@ impl StreamArchiverApp {
             animate_emotes,
             fetch_unknown_emotes,
             chat_font_pt,
+            chat_emote_pt,
             chat_ts_color,
             chat_text_color,
             fetch_usercard_info,
