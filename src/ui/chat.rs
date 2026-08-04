@@ -235,6 +235,28 @@ pub(super) struct UserCardPopup {
     pub(super) fetch: Arc<Mutex<UserCardFetch>>,
 }
 
+/// One entry in the Users-in-chat panel: everything needed to open that
+/// person's usercard on click (same shape as a username click,
+/// [`UserCardClick`]) plus their role-grouping label.
+pub(super) struct ChatUserEntry {
+    pub(super) click: UserCardClick,
+    /// Section this user is listed under — highest-priority badge on their
+    /// LATEST message in the log (so a promotion mid-broadcast reflects
+    /// their current role, not whatever they were when they first spoke).
+    pub(super) role: &'static str,
+}
+
+/// State for the 👥 "Users in chat" panel — the set of unique Twitch
+/// chatters in the currently-loaded log, grouped by role. Built by scanning
+/// the log once (not per frame); [`Self::stale`] says when to rebuild (the
+/// message count grew — e.g. a live tail-reload appended new messages).
+pub(super) struct UsersPanelState {
+    pub(super) filter: String,
+    pub(super) entries: Vec<ChatUserEntry>,
+    /// `ChatLog::messages.len()` when `entries` was last built.
+    pub(super) built_at_count: usize,
+}
+
 pub(super) struct ChatPopup {
     /// Monitor this window belongs to — keys the viewport id, so each channel
     /// gets its OWN chat window (opening another channel's chat no longer
@@ -274,6 +296,9 @@ pub(super) struct ChatPopup {
     pub(super) text_color_hex: String,
     /// The currently-open usercard, if any — at most one per chat window.
     pub(super) user_card: Option<UserCardPopup>,
+    /// The 👥 Users-in-chat panel, if open — `None` when closed (the panel
+    /// content isn't kept around while hidden).
+    pub(super) users_panel: Option<UsersPanelState>,
     /// When the popup last triggered a background re-read of the chat file.
     /// Used to tail a live recording: the file is re-parsed every few seconds
     /// while `recording.ended_at` is `None`.
@@ -782,7 +807,10 @@ pub(super) struct ChatAppearance {
 
 /// A username click in the chat replay — everything the usercard needs to
 /// build its local-only fields immediately; the live Twitch lookup (avatar/
-/// account-created date) is fetched separately, keyed by `user_id`.
+/// account-created date) is fetched separately, keyed by `user_id`. Also
+/// built (cloned) for each row of the Users-in-chat panel, which needs the
+/// same shape to open a usercard on click without re-scanning the log.
+#[derive(Clone)]
 pub(super) struct UserCardClick {
     pub(super) login: String,
     pub(super) display_name: String,
@@ -1579,6 +1607,65 @@ pub(super) fn summarize_user_events(
         ));
     }
     lines
+}
+
+/// Role section a Twitch chatter is grouped under in the Users-in-chat
+/// panel, from the highest-priority badge on their message. No "Chat Bots"
+/// section (unlike Twitch's own list) — there's no reliable local signal for
+/// bot accounts (no badge marks a bot as such); they just land in Users.
+pub(super) fn user_role_label(badges: &[String]) -> &'static str {
+    let has = |set: &str| badges.iter().any(|b| b.split('/').next() == Some(set));
+    if has("broadcaster") {
+        "Broadcaster"
+    } else if has("moderator") {
+        "Moderators"
+    } else if has("vip") {
+        "VIPs"
+    } else if has("subscriber") || has("founder") {
+        "Subscribers"
+    } else {
+        "Users"
+    }
+}
+
+/// Build the Users-in-chat panel's entries: one per unique Twitch login that
+/// sent at least one message in `log`, using their LATEST message's
+/// name/color/badges (so a mid-broadcast promotion — e.g. new mod — shows
+/// their current role, not whoever they were when they first spoke).
+/// Ordered by [`user_role_label`]'s priority, alphabetical within each
+/// group. YouTube messages (empty `login`) are never included — this panel
+/// is Twitch-only, same as the usercard it feeds.
+pub(super) fn build_users_panel(log: &ChatLog) -> Vec<ChatUserEntry> {
+    let mut latest: HashMap<&str, &ChatMessage> = HashMap::new();
+    for m in &log.messages {
+        if matches!(m.platform, ChatPlatform::Twitch) && !m.login.is_empty() {
+            latest.insert(&m.login, m);
+        }
+    }
+    let mut entries: Vec<ChatUserEntry> = latest
+        .into_values()
+        .map(|m| ChatUserEntry {
+            role: user_role_label(&m.badges),
+            click: UserCardClick {
+                login: m.login.clone(),
+                display_name: m.author.clone(),
+                color: m.color_override,
+                badges: m.badges.clone(),
+                badge_icons: m.badge_icons.clone(),
+                badge_info: m.badge_info.clone(),
+                user_id: m.user_id.clone(),
+            },
+        })
+        .collect();
+    const ROLE_ORDER: [&str; 5] = ["Broadcaster", "Moderators", "VIPs", "Subscribers", "Users"];
+    entries.sort_by(|a, b| {
+        let ra = ROLE_ORDER.iter().position(|r| *r == a.role).unwrap_or(usize::MAX);
+        let rb = ROLE_ORDER.iter().position(|r| *r == b.role).unwrap_or(usize::MAX);
+        ra.cmp(&rb).then_with(|| {
+            a.click.display_name.to_lowercase().cmp(&b.click.display_name.to_lowercase())
+        })
+    });
+    entries
 }
 
 /// First existing first-party Twitch emote image for `id` in `dir`, trying the
@@ -2619,6 +2706,7 @@ impl StreamArchiverApp {
             ts_color_hex: String::new(),
             text_color_hex: String::new(),
             user_card: None,
+            users_panel: None,
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
@@ -2871,6 +2959,21 @@ impl StreamArchiverApp {
                                     popup.ts_color_hex = hex_color_string(self.chat_ts_color);
                                     popup.text_color_hex = hex_color_string(self.chat_text_color);
                                 }
+                            }
+                            if ui
+                                .button("👥")
+                                .on_hover_text("Users in chat (from this log)")
+                                .clicked()
+                            {
+                                popup.users_panel = if popup.users_panel.is_some() {
+                                    None
+                                } else {
+                                    Some(UsersPanelState {
+                                        filter: String::new(),
+                                        entries: Vec::new(),
+                                        built_at_count: 0,
+                                    })
+                                };
                             }
                             ui.checkbox(&mut popup.hide_shared, "Hide shared")
                                 .on_hover_text(
@@ -3240,6 +3343,82 @@ impl StreamArchiverApp {
                             });
                         if !open {
                             popup.user_card = None;
+                        }
+                    }
+
+                    // ── Users in chat ────────────────────────────────────────
+                    if let Some(panel) = &mut popup.users_panel {
+                        // Rebuild whenever the log has grown since the last
+                        // build (a live tail-reload appended new messages) —
+                        // cheap staleness check, not a per-frame rescan.
+                        let count = match &*popup.load_state.lock().unwrap() {
+                            ChatLoadState::Loaded(log) => log.messages.len(),
+                            _ => 0,
+                        };
+                        if count != panel.built_at_count {
+                            panel.entries = match &*popup.load_state.lock().unwrap() {
+                                ChatLoadState::Loaded(log) => build_users_panel(log),
+                                _ => Vec::new(),
+                            };
+                            panel.built_at_count = count;
+                        }
+                        let mut open = true;
+                        let mut clicked: Option<UserCardClick> = None;
+                        egui::Window::new("👥 Users in chat")
+                            .id(egui::Id::new(("chat_users_panel_win", popup.monitor_id)))
+                            .collapsible(false)
+                            .resizable(true)
+                            .default_width(220.0)
+                            .default_height(400.0)
+                            .open(&mut open)
+                            .show(ctx, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut panel.filter)
+                                        .hint_text("Filter…")
+                                        .desired_width(f32::INFINITY),
+                                )
+                                .on_hover_text("Narrow the list by username (case-insensitive).");
+                                ui.separator();
+                                let q = panel.filter.to_lowercase();
+                                egui::ScrollArea::vertical().auto_shrink([false, false]).show(
+                                    ui,
+                                    |ui| {
+                                        let mut last_role: Option<&str> = None;
+                                        for entry in panel.entries.iter().filter(|e| {
+                                            q.is_empty() || e.click.display_name.to_lowercase().contains(&q)
+                                        }) {
+                                            if last_role != Some(entry.role) {
+                                                ui.add_space(if last_role.is_some() { 6.0 } else { 0.0 });
+                                                ui.label(egui::RichText::new(entry.role).weak().strong());
+                                                last_role = Some(entry.role);
+                                            }
+                                            let color = entry
+                                                .click
+                                                .color
+                                                .unwrap_or_else(|| twitch_username_color(&entry.click.display_name));
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&entry.click.display_name)
+                                                            .color(color),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("Click for user info")
+                                                .clicked()
+                                            {
+                                                clicked = Some(entry.click.clone());
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        if let Some(c) = clicked {
+                            usercard_click = Some(c);
+                        }
+                        if !open {
+                            popup.users_panel = None;
                         }
                     }
 
@@ -3717,6 +3896,53 @@ mod tests {
             user_id: String::new(),
             badge_info: String::new(),
         }
+    }
+
+    #[test]
+    fn user_role_label_prioritizes_broadcaster_over_everything() {
+        assert_eq!(
+            user_role_label(&["subscriber/12".into(), "broadcaster/1".into()]),
+            "Broadcaster"
+        );
+        assert_eq!(user_role_label(&["moderator/1".into()]), "Moderators");
+        assert_eq!(user_role_label(&["vip/1".into()]), "VIPs");
+        assert_eq!(user_role_label(&["founder/0".into()]), "Subscribers");
+        assert_eq!(user_role_label(&[]), "Users");
+        assert_eq!(user_role_label(&["glhf-pledge/1".into()]), "Users");
+    }
+
+    #[test]
+    fn build_users_panel_dedupes_by_login_using_the_latest_message() {
+        let mut log = ChatLog {
+            messages: vec![
+                plain_msg(0.0, "bob", "1", "hi"),
+                plain_msg(5.0, "alice", "2", "hey"),
+                {
+                    let mut m = plain_msg(10.0, "bob", "3", "back again");
+                    m.author = "Bob".to_string();
+                    m.badges = vec!["moderator/1".to_string()];
+                    m
+                },
+            ],
+            row_heights: Vec::new(),
+            measured_width: 0.0,
+            parsed_to: 0,
+            loading_older: false,
+            markers: Vec::new(),
+        };
+        // A YouTube message (no login) must never show up in a Twitch-only panel.
+        let mut yt = plain_msg(1.0, "", "", "yt viewer");
+        yt.platform = ChatPlatform::YouTube;
+        log.messages.push(yt);
+
+        let entries = build_users_panel(&log);
+        // Deduped: one entry for "bob" (not two), using their later, mod-badged message.
+        assert_eq!(entries.len(), 2);
+        let bob = entries.iter().find(|e| e.click.login == "bob").expect("bob present");
+        assert_eq!(bob.role, "Moderators");
+        // Moderators sort before Users (alice has no badges).
+        assert_eq!(entries[0].click.login, "bob");
+        assert_eq!(entries[1].click.login, "alice");
     }
 
     #[test]

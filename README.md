@@ -3347,6 +3347,16 @@ lookup shows **N/A** for those two fields and files a warning in the 🔔 feed
 / 🚨 Warnings window rather than blocking the rest of the card. "Copy
 username" and "Open Twitch profile" round out the card.
 
+A **👥** button opens **Users in chat**: every unique Twitch sender in the
+currently-loaded log, grouped by role (Broadcaster → Moderators → VIPs →
+Subscribers → Users, alphabetical within each group) using their most recent
+message's badges — so a mid-broadcast promotion shows their current role,
+not whoever they were when they first spoke. A filter box narrows by name;
+clicking anyone opens their usercard the same as clicking their name in
+chat. Twitch-only, and built entirely from the already-archived log (no
+network) — there's no "Chat Bots" group like Twitch's own list since nothing
+in an anonymous chat capture reliably marks an account as a bot.
+
 ### YouTube community posts (📣 Posts)
 
 ![Posts tab showing a channel's archived community posts](doc/screenshots/community-posts.png)
