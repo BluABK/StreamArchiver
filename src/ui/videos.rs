@@ -334,11 +334,13 @@ impl StreamArchiverApp {
             }
         }
         if let Some(tmpl) = preset_save_tmpl {
-            self.save_preset_dialog = Some(SavePresetDraft {
+            self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                 template: tmpl,
                 name: String::new(),
                 error: String::new(),
-            });
+                do_save: false,
+                closed: false,
+            })));
         }
         if let Some((is_folder, plat, current)) = browse_req {
             self.pending_browse = Some(if is_folder {
@@ -475,10 +477,12 @@ impl StreamArchiverApp {
                         }
                     });
                 if want_reorder {
-                    self.reorder_columns = Some(ReorderColumnsState {
+                    self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                         table: GridTableId::Videos,
                         draft: entries.clone(),
-                    });
+                        apply: false,
+                        cancel: false,
+                    })));
                 }
                 table.body(|body| {
                         let order = ordered_rows(model, &sort, &filters);
@@ -1083,11 +1087,13 @@ impl StreamArchiverApp {
             }
         }
         if let Some(tmpl) = vf_preset_save_tmpl {
-            self.save_preset_dialog = Some(SavePresetDraft {
+            self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                 template: tmpl,
                 name: String::new(),
                 error: String::new(),
-            });
+                do_save: false,
+                closed: false,
+            })));
         }
     }
 
@@ -2032,11 +2038,13 @@ impl StreamArchiverApp {
         }
 
         if fd_save_preset {
-            self.save_preset_dialog = Some(SavePresetDraft {
+            self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                 template: new_template.clone(),
                 name: String::new(),
                 error: String::new(),
-            });
+                do_save: false,
+                closed: false,
+            })));
         }
 
         if apply {

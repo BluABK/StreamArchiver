@@ -2388,11 +2388,13 @@ impl StreamArchiverApp {
                 }
             }
             if let Some(tmpl) = mdef_preset_save_tmpl {
-                self.save_preset_dialog = Some(SavePresetDraft {
+                self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                     template: tmpl,
                     name: String::new(),
                     error: String::new(),
-                });
+                    do_save: false,
+                    closed: false,
+                })));
             }
 
             }
@@ -4132,11 +4134,13 @@ impl StreamArchiverApp {
                 }
             }
             if let Some(tmpl) = maint_preset_save_tmpl {
-                self.save_preset_dialog = Some(SavePresetDraft {
+                self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                     template: tmpl,
                     name: String::new(),
                     error: String::new(),
-                });
+                    do_save: false,
+                    closed: false,
+                })));
             }
 
             }

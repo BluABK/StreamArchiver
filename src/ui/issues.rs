@@ -2175,10 +2175,12 @@ impl StreamArchiverApp {
                 let c = &ISSUES_COLUMNS[i];
                 h.col(|ui| {
                     if grid_header_cell_plain(ui, GridTableId::Issues, c, issues_entries, &ISSUES_COLUMNS) {
-                        self.reorder_columns = Some(ReorderColumnsState {
+                        self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                             table: GridTableId::Issues,
                             draft: issues_entries.to_vec(),
-                        });
+                            apply: false,
+                            cancel: false,
+                        })));
                     }
                 });
             }

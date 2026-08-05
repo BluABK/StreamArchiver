@@ -1936,7 +1936,7 @@ pub struct StreamArchiverApp {
     /// User-defined filename template presets loaded from the DB.
     custom_presets: Vec<(i64, String, String)>,
     /// Open "Save preset" naming dialog (None = closed).
-    save_preset_dialog: Option<SavePresetDraft>,
+    save_preset_dialog: Option<Arc<Mutex<SavePresetDraft>>>,
     /// Chat log viewer popup (None = closed).
     /// Open chat windows, one per monitor (each is its own OS viewport).
     chat_popups: Vec<ChatPopup>,
@@ -2167,7 +2167,7 @@ pub struct StreamArchiverApp {
     /// a working copy of one table's entries, only written back + persisted
     /// (and only forcing one table reset, not one per intermediate move) when
     /// the user hits Apply. See [`ReorderColumnsState`].
-    reorder_columns: Option<ReorderColumnsState>,
+    reorder_columns: Option<Arc<Mutex<ReorderColumnsState>>>,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest

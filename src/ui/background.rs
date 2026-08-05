@@ -487,10 +487,12 @@ impl StreamArchiverApp {
                                     let c = &BG_ACTIVE_COLUMNS[i];
                                     h.col(|ui| {
                                         if grid_header_cell_plain(ui, GridTableId::BgActive, c, &mut bg_active_entries, &BG_ACTIVE_COLUMNS) {
-                                            self.reorder_columns = Some(ReorderColumnsState {
+                                            self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                                                 table: GridTableId::BgActive,
                                                 draft: bg_active_entries.clone(),
-                                            });
+                                                apply: false,
+                                                cancel: false,
+                                            })));
                                         }
                                     });
                                 }
@@ -700,10 +702,12 @@ impl StreamArchiverApp {
                                     let c = &BG_RECENT_COLUMNS[i];
                                     h.col(|ui| {
                                         if grid_header_cell_plain(ui, GridTableId::BgRecent, c, &mut bg_recent_entries, &BG_RECENT_COLUMNS) {
-                                            self.reorder_columns = Some(ReorderColumnsState {
+                                            self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                                                 table: GridTableId::BgRecent,
                                                 draft: bg_recent_entries.clone(),
-                                            });
+                                                apply: false,
+                                                cancel: false,
+                                            })));
                                         }
                                     });
                                 }

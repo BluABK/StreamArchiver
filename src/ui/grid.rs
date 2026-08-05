@@ -843,6 +843,10 @@ pub(super) fn table_display_name(table: GridTableId) -> &'static str {
 pub(super) struct ReorderColumnsState {
     pub(super) table: GridTableId,
     pub(super) draft: Vec<ColumnEntry>,
+    /// Set by the deferred closure on Apply/Cancel/close; read back by
+    /// `reorder_columns_window` next call.
+    pub(super) apply: bool,
+    pub(super) cancel: bool,
 }
 
 /// One sort level: a column index (into the table's static `*_COLUMNS` array) +

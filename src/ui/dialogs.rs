@@ -258,6 +258,11 @@ pub(super) struct SavePresetDraft {
     pub(super) name: String,
     /// Validation or save error message (empty = none).
     pub(super) error: String,
+    /// Set by the deferred closure on Save/Enter; read back by
+    /// `save_preset_window` next call.
+    pub(super) do_save: bool,
+    /// Set by the deferred closure on Cancel/close.
+    pub(super) closed: bool,
 }
 
 impl StreamArchiverApp {
@@ -2718,25 +2723,25 @@ impl StreamArchiverApp {
     }
 
     /// Dialog for naming and saving a custom filename-template preset.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn save_preset_window(&mut self, ctx: &egui::Context) {
-        if self.save_preset_dialog.is_none() {
+        let Some(state) = self.save_preset_dialog.clone() else {
             return;
-        }
-        let mut open = true;
-        let mut do_save = false;
-
-        ctx.show_viewport_immediate(
+        };
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("save_preset_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Save as preset")
                 .with_inner_size([340.0, 120.0])
                 .with_resizable(false),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, d, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    d.closed = true;
                 }
-                let Some(d) = self.save_preset_dialog.as_mut() else { return; };
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label("Preset name:");
                     let resp = ui.add(
@@ -2745,7 +2750,7 @@ impl StreamArchiverApp {
                             .desired_width(310.0),
                     );
                     if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_save = true;
+                        d.do_save = true;
                     }
                     if !d.error.is_empty() {
                         ui.colored_label(HL_ERROR_TEXT, &d.error);
@@ -2754,35 +2759,39 @@ impl StreamArchiverApp {
                     ui.horizontal(|ui| {
                         let can_save = !d.name.trim().is_empty();
                         if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
-                            do_save = true;
+                            d.do_save = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            open = false;
+                            d.closed = true;
                         }
                     });
                 });
             },
         );
 
+        let (do_save, closed) = {
+            let d = state.lock().unwrap();
+            (d.do_save, d.closed)
+        };
         if do_save {
-            if let Some(d) = self.save_preset_dialog.take() {
-                let name = d.name.trim().to_string();
-                match self.core.store.save_filename_preset(&name, &d.template) {
-                    Ok(_) => {
-                        self.custom_presets =
-                            self.core.store.get_filename_presets().unwrap_or_default();
-                        self.status = format!("Preset \"{name}\" saved.");
-                    }
-                    Err(e) => {
-                        self.save_preset_dialog = Some(SavePresetDraft {
-                            name: d.name,
-                            template: d.template,
-                            error: format!("Error saving: {e:#}"),
-                        });
-                    }
+            let (name, template) = {
+                let d = state.lock().unwrap();
+                (d.name.trim().to_string(), d.template.clone())
+            };
+            match self.core.store.save_filename_preset(&name, &template) {
+                Ok(_) => {
+                    self.custom_presets =
+                        self.core.store.get_filename_presets().unwrap_or_default();
+                    self.status = format!("Preset \"{name}\" saved.");
+                    self.save_preset_dialog = None;
+                }
+                Err(e) => {
+                    let mut d = state.lock().unwrap();
+                    d.error = format!("Error saving: {e:#}");
+                    d.do_save = false;
                 }
             }
-        } else if !open {
+        } else if closed {
             self.save_preset_dialog = None;
         }
     }
@@ -2793,45 +2802,50 @@ impl StreamArchiverApp {
     /// Cancel.
     #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn reorder_columns_window(&mut self, ctx: &egui::Context) {
-        let Some(state) = &mut self.reorder_columns else {
+        let Some(state) = self.reorder_columns.clone() else {
             return;
         };
-        let table = state.table;
-        let mut apply = false;
-        let mut cancel = false;
-
-        ctx.show_viewport_immediate(
+        let table = state.lock().unwrap().table;
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("reorder_columns_vp", table.key())),
             egui::ViewportBuilder::default()
                 .with_title(format!("Reorder columns — {}", table_display_name(table)))
                 .with_inner_size([320.0, 480.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            move |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    cancel = true;
+                    s.cancel = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label("Move columns into the order you want, then Apply.");
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         grid_columns::column_chooser_editor(
-                            ui, &mut state.draft, columns_for(table), |id| id == "actions", true,
+                            ui, &mut s.draft, columns_for(table), |id| id == "actions", true,
                         );
                     });
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("✔  Apply").clicked() {
-                            apply = true;
+                            s.apply = true;
                         }
                         if ui.button("✖  Cancel").clicked() {
-                            cancel = true;
+                            s.cancel = true;
                         }
                     });
                 });
             },
         );
 
+        let (apply, cancel) = {
+            let s = state.lock().unwrap();
+            (s.apply, s.cancel)
+        };
         if apply {
-            let entries = state.draft.clone();
+            let entries = state.lock().unwrap().draft.clone();
             self.apply_reordered_columns(table, entries);
         }
         if apply || cancel {
@@ -2993,10 +3007,12 @@ impl StreamArchiverApp {
                             let c = &PROCESSES_COLUMNS[i];
                             let (rect, _) = h.col(|ui| {
                                 if grid_header_cell_plain(ui, GridTableId::Processes, c, &mut processes_entries, &PROCESSES_COLUMNS) {
-                                    self.reorder_columns = Some(ReorderColumnsState {
+                                    self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                                         table: GridTableId::Processes,
                                         draft: processes_entries.clone(),
-                                    });
+                                        apply: false,
+                                        cancel: false,
+                                    })));
                                 }
                             });
                             self.processes_grid.widths.note(c.id, rect.width());
@@ -3811,11 +3827,13 @@ impl StreamArchiverApp {
             }
         }
         if let Some(tmpl) = form_preset_save_tmpl {
-            self.save_preset_dialog = Some(SavePresetDraft {
+            self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                 template: tmpl,
                 name: String::new(),
                 error: String::new(),
-            });
+                do_save: false,
+                closed: false,
+            })));
         }
     }
 }

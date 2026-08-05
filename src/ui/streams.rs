@@ -1938,10 +1938,12 @@ impl StreamArchiverApp {
                     }
                 });
                 if want_reorder {
-                    self.reorder_columns = Some(ReorderColumnsState {
+                    self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                         table: GridTableId::Streams,
                         draft: entries.clone(),
-                    });
+                        apply: false,
+                        cancel: false,
+                    })));
                 }
                 table.body(|body| {
                     // Virtualized: only the rows in view are laid out — the old
