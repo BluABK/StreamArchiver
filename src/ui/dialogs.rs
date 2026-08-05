@@ -195,42 +195,37 @@ pub(super) struct SavePresetDraft {
 
 impl StreamArchiverApp {
     /// Modal confirmation for deleting a monitor (the only destructive action).
-    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn confirm_delete_window(&mut self, ctx: &egui::Context) {
-        let Some((id, name)) = self.confirm_delete.clone() else {
+        let Some(state) = self.confirm_delete.clone() else {
             return;
         };
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_monitor_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete monitor")
                 .with_inner_size([380.0, 130.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(format!("Delete this capture instance for “{name}”?"));
-                    ui.label("Removes the monitor and its settings. Recorded files are kept.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+            &state,
+            |ui, (_, name), result| {
+                ui.label(format!("Delete this capture instance for “{name}”?"));
+                ui.label("Removes the monitor and its settings. Recorded files are kept.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
+        if result == Some(true) {
+            let id = state.lock().unwrap().payload.0;
             // Stop a running capture first so the process isn't orphaned when its
             // history row is cascade-deleted.
             if self.core.active.lock().unwrap().contains_key(&id) {
@@ -247,49 +242,44 @@ impl StreamArchiverApp {
             }
             self.confirm_delete = None;
             self.reload_rows();
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_delete = None;
         }
     }
 
     /// Modal confirmation for deleting a whole channel (and all its instances +
     /// their history rows; recorded files are kept).
-    #[allow(deprecated)]
     pub(super) fn confirm_delete_channel_window(&mut self, ctx: &egui::Context) {
-        let Some((id, name)) = self.confirm_delete_channel.clone() else {
+        let Some(state) = self.confirm_delete_channel.clone() else {
             return;
         };
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_channel_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete channel")
                 .with_inner_size([400.0, 130.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(format!("Delete the channel “{name}” and all its instances?"));
-                    ui.label("Removes every instance and its history. Recorded files are kept.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+            &state,
+            |ui, (_, name), result| {
+                ui.label(format!("Delete the channel “{name}” and all its instances?"));
+                ui.label("Removes every instance and its history. Recorded files are kept.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
+        if result == Some(true) {
+            let id = state.lock().unwrap().payload.0;
             // Stop any of this channel's instances that are recording, so no
             // capture is left running after its rows are cascade-deleted.
             let active: std::collections::HashSet<i64> =
@@ -309,7 +299,7 @@ impl StreamArchiverApp {
             }
             self.confirm_delete_channel = None;
             self.reload_rows();
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_delete_channel = None;
         }
     }
@@ -320,69 +310,61 @@ impl StreamArchiverApp {
     /// names the resolved disposal method up front rather than a generic
     /// "are you sure". Reaching this dialog at all already required all three
     /// `manual_delete` gates to be on; this confirm is the last checkpoint.
-    #[allow(deprecated)]
     pub(super) fn confirm_delete_file_window(&mut self, ctx: &egui::Context) {
-        let Some(cdf) = self.confirm_delete_file.as_ref() else {
+        let Some(state) = self.confirm_delete_file.clone() else {
             return;
         };
-        let rec_id = cdf.rec_id;
-        let channel_id = cdf.channel_id;
-        let monitor_id = cdf.monitor_id;
-        let path = cdf.path.clone();
-        let label = cdf.label.clone();
-        let method = cdf.method;
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_recfile_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete file from disk")
                 .with_inner_size([460.0, 170.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(format!("Delete the captured file for “{label}”?"));
-                    ui.label(egui::RichText::new(&path).weak().small());
-                    ui.add_space(6.0);
-                    ui.label(format!(
-                        "This will: {} (Settings → Automatic deletion).",
-                        method.label()
-                    ));
-                    ui.label(
-                        "The take's history row stays — title, stats, chat log, chapters, \
-                         notes are all kept.",
+            &state,
+            |ui, cdf, result| {
+                ui.label(format!("Delete the captured file for “{}”?", cdf.label));
+                ui.label(egui::RichText::new(&cdf.path).weak().small());
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "This will: {} (Settings → Automatic deletion).",
+                    cdf.method.label()
+                ));
+                ui.label(
+                    "The take's history row stays — title, stats, chat log, chapters, \
+                     notes are all kept.",
+                );
+                if cdf.method == crate::disposal::DisposalMethod::Delete {
+                    ui.colored_label(
+                        grid::HL_ERROR_TEXT,
+                        "Permanent deletion — this cannot be undone.",
                     );
-                    if method == crate::disposal::DisposalMethod::Delete {
-                        ui.colored_label(
-                            grid::HL_ERROR_TEXT,
-                            "Permanent deletion — this cannot be undone.",
-                        );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("Delete").color(grid::HL_ERROR_TEXT))
+                        .clicked()
+                    {
+                        *result = Some(true);
                     }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(egui::RichText::new("Delete").color(grid::HL_ERROR_TEXT))
-                            .clicked()
-                        {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
+        if result == Some(true) {
             self.confirm_delete_file = None;
+            let cdf = state.lock().unwrap();
+            let (rec_id, channel_id, monitor_id, path) =
+                (cdf.payload.rec_id, cdf.payload.channel_id, cdf.payload.monitor_id, cdf.payload.path.clone());
+            drop(cdf);
             self.spawn_manual_delete_file(ctx, rec_id, channel_id, monitor_id, path);
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_delete_file = None;
         }
     }
@@ -467,82 +449,78 @@ impl StreamArchiverApp {
     /// every take about to lose its file, grouped by resolved disposal
     /// method (a per-recording trigger override can make them differ), plus
     /// the total size being reclaimed.
-    #[allow(deprecated)]
     pub(super) fn confirm_delete_stream_files_window(&mut self, ctx: &egui::Context) {
-        let Some(cdsf) = self.confirm_delete_stream_files.as_ref() else {
+        let Some(state) = self.confirm_delete_stream_files.clone() else {
             return;
         };
-        let channel_id = cdsf.channel_id;
-        let monitor_id = cdsf.monitor_id;
-        let items = cdsf.items.clone();
-        let label = cdsf.label.clone();
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-
-        let total_bytes: i64 = items.iter().map(|(_, _, b, _)| *b).sum();
-        let mut by_method: Vec<(crate::disposal::DisposalMethod, usize)> = Vec::new();
-        for (_, _, _, m) in &items {
-            match by_method.iter_mut().find(|(bm, _)| bm == m) {
-                Some((_, n)) => *n += 1,
-                None => by_method.push((*m, 1)),
-            }
-        }
-        let any_permanent = items
-            .iter()
-            .any(|(_, _, _, m)| *m == crate::disposal::DisposalMethod::Delete);
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_streamfiles_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete all take files")
                 .with_inner_size([460.0, 220.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+            &state,
+            |ui, cdsf, result| {
+                let total_bytes: i64 = cdsf.items.iter().map(|(_, _, b, _)| *b).sum();
+                let mut by_method: Vec<(crate::disposal::DisposalMethod, usize)> = Vec::new();
+                for (_, _, _, m) in &cdsf.items {
+                    match by_method.iter_mut().find(|(bm, _)| bm == m) {
+                        Some((_, n)) => *n += 1,
+                        None => by_method.push((*m, 1)),
+                    }
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(format!(
-                        "Delete {} captured file(s) for “{label}”? ({})",
-                        items.len(),
-                        fmt_bytes(total_bytes)
-                    ));
-                    ui.add_space(6.0);
-                    for (method, n) in &by_method {
-                        ui.label(format!("{n} file(s): {}", method.label()));
-                    }
-                    ui.add_space(6.0);
-                    ui.label(
-                        "Every take's history row stays — title, stats, chat log, chapters, \
-                         notes are all kept.",
+                let any_permanent = cdsf
+                    .items
+                    .iter()
+                    .any(|(_, _, _, m)| *m == crate::disposal::DisposalMethod::Delete);
+
+                ui.label(format!(
+                    "Delete {} captured file(s) for “{}”? ({})",
+                    cdsf.items.len(),
+                    cdsf.label,
+                    fmt_bytes(total_bytes)
+                ));
+                ui.add_space(6.0);
+                for (method, n) in &by_method {
+                    ui.label(format!("{n} file(s): {}", method.label()));
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    "Every take's history row stays — title, stats, chat log, chapters, \
+                     notes are all kept.",
+                );
+                if any_permanent {
+                    ui.colored_label(
+                        grid::HL_ERROR_TEXT,
+                        "At least one file is permanently deleted — this cannot be undone.",
                     );
-                    if any_permanent {
-                        ui.colored_label(
-                            grid::HL_ERROR_TEXT,
-                            "At least one file is permanently deleted — this cannot be undone.",
-                        );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("Delete all").color(grid::HL_ERROR_TEXT))
+                        .clicked()
+                    {
+                        *result = Some(true);
                     }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(egui::RichText::new("Delete all").color(grid::HL_ERROR_TEXT))
-                            .clicked()
-                        {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
+        if result == Some(true) {
             self.confirm_delete_stream_files = None;
+            let cdsf = state.lock().unwrap();
+            let (channel_id, monitor_id, items) =
+                (cdsf.payload.channel_id, cdsf.payload.monitor_id, cdsf.payload.items.clone());
+            drop(cdsf);
             self.spawn_manual_delete_stream_files(ctx, channel_id, monitor_id, items);
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_delete_stream_files = None;
         }
     }
@@ -815,42 +793,37 @@ impl StreamArchiverApp {
 
     /// Modal confirmation for tombstoning a schedule segment (it won't reappear
     /// on the next refresh).
-    #[allow(deprecated)]
     pub(super) fn confirm_delete_segment_window(&mut self, ctx: &egui::Context) {
-        let Some(sid) = self.confirm_delete_segment else {
+        let Some(state) = self.confirm_delete_segment.clone() else {
             return;
         };
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_segment_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete schedule item")
                 .with_inner_size([400.0, 120.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label("Permanently delete this schedule item?");
-                    ui.label("It will be suppressed and won't reappear on refresh.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+            &state,
+            |ui, _sid, result| {
+                ui.label("Permanently delete this schedule item?");
+                ui.label("It will be suppressed and won't reappear on refresh.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
+        if result == Some(true) {
+            let sid = state.lock().unwrap().payload;
             if let Err(e) = self.core.store.delete_schedule_segment(sid) {
                 self.status = format!("Error deleting schedule item: {e}");
             } else {
@@ -859,23 +832,22 @@ impl StreamArchiverApp {
                 self.status = "Schedule item deleted.".into();
             }
             self.confirm_delete_segment = None;
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_delete_segment = None;
         }
     }
 
     /// Confirmation dialog for "Quit & stop recordings" tray action.
-    #[allow(deprecated)]
     pub(super) fn confirm_quit_stop_window(&mut self, ctx: &egui::Context) {
-        if !self.confirm_quit_stop {
+        let Some(state) = self.confirm_quit_stop.clone() else {
             self.confirm_quit_stop_raised = false;
             return;
-        }
-        let mut open = true;
-        let mut confirmed = false;
-
+        };
+        let shared = self.popup_shared();
         let vp_id = egui::ViewportId::from_hash_of("confirm_quit_stop_vp");
-        ctx.show_viewport_immediate(
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             vp_id,
             egui::ViewportBuilder::default()
                 .with_title("Stop recordings and quit?")
@@ -885,25 +857,21 @@ impl StreamArchiverApp {
                 // (observed: it did, and quitting looked wedged). Keep it on
                 // top; it's a tiny short-lived dialog.
                 .with_always_on_top(),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add_space(4.0);
-                    ui.label("This will terminate all active recordings immediately.");
-                    ui.label("In-progress captures will be finalized from whatever was written.");
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        let stop_btn = egui::Button::new("Stop & Quit")
-                            .fill(egui::Color32::from_rgb(180, 40, 40));
-                        if ui.add(stop_btn).clicked() {
-                            confirmed = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                    });
+            &state,
+            |ui, (), result| {
+                ui.add_space(4.0);
+                ui.label("This will terminate all active recordings immediately.");
+                ui.label("In-progress captures will be finalized from whatever was written.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let stop_btn = egui::Button::new("Stop & Quit")
+                        .fill(egui::Color32::from_rgb(180, 40, 40));
+                    if ui.add(stop_btn).clicked() {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
@@ -915,7 +883,7 @@ impl StreamArchiverApp {
             ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::Focus);
         }
 
-        if confirmed {
+        if result == Some(true) {
             self.core
                 .force_stop_on_quit
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -924,10 +892,10 @@ impl StreamArchiverApp {
             // stop-recordings exit blocks the UI thread even longer (kill +
             // finalize drain before the runtime shutdown).
             self.heartbeat.set_active(false);
-            self.confirm_quit_stop = false;
+            self.confirm_quit_stop = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if !open {
-            self.confirm_quit_stop = false;
+        } else if result == Some(false) {
+            self.confirm_quit_stop = None;
         }
     }
     /// Render every open ad-breaks window (one per take).

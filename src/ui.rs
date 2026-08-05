@@ -511,6 +511,7 @@ mod history;
 pub(crate) mod io_view;
 mod issues;
 pub(crate) mod player;
+mod popup;
 mod posts;
 mod pot_log;
 mod properties;
@@ -521,7 +522,7 @@ mod trash;
 mod videos;
 
 #[allow(unused_imports)]
-use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, trash::*, videos::*};
+use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, player::*, popup::*, posts::*, properties::*, schedule::*, settings::*, streams::*, trash::*, videos::*};
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
 /// `url` is this *instance's* source URL (the platform is derived from it).
@@ -1320,6 +1321,11 @@ pub struct StreamArchiverApp {
     tray: TrayIcon,
     ui_rx: Receiver<UiCommand>,
     events_rx: crate::events::EventRx,
+    /// Sending half handed to every deferred-viewport popup's [`PopupShared`]
+    /// (`popup.rs`) — cloned in, never used directly on `self`.
+    popup_actions_tx: std::sync::mpsc::Sender<PopupAction>,
+    /// Drained once per frame by `pump_popup_actions` (`popup.rs`).
+    popup_actions_rx: std::sync::mpsc::Receiver<PopupAction>,
     autostart: AutoStart,
     autostart_on: bool,
     /// When false (the default), quitting detaches downloads so they keep running
@@ -1557,9 +1563,9 @@ pub struct StreamArchiverApp {
     /// Monitor id of the currently selected row (target for keyboard shortcuts).
     selected_monitor: Option<i64>,
     /// Pending instance-delete confirmation: (monitor id, channel name).
-    confirm_delete: Option<(i64, String)>,
+    confirm_delete: Option<Arc<Mutex<ConfirmDialogState<(i64, String)>>>>,
     /// Pending channel-delete confirmation: (channel id, name).
-    confirm_delete_channel: Option<(i64, String)>,
+    confirm_delete_channel: Option<Arc<Mutex<ConfirmDialogState<(i64, String)>>>>,
     /// "Move instance to another channel" dialog: `(monitor id, chosen
     /// destination channel id)`. The destination lives here (not a per-frame
     /// local) so the ComboBox selection persists across frames.
@@ -1568,7 +1574,7 @@ pub struct StreamArchiverApp {
     /// destination channel id)`.
     merge_channel_dialog: Option<(i64, Option<i64>)>,
     /// Pending schedule-segment-delete confirmation: segment id.
-    confirm_delete_segment: Option<i64>,
+    confirm_delete_segment: Option<Arc<Mutex<ConfirmDialogState<i64>>>>,
     /// Backing state for the create/rename-channel dialog.
     channel_form: Option<ChannelForm>,
     /// "Manage groups" dialog: open flag, new-group name draft, and an
@@ -1594,7 +1600,7 @@ pub struct StreamArchiverApp {
     show_scheduled_recordings: bool,
     scheduled_recordings: Vec<crate::models::ScheduledRecordingWithNames>,
     scheduled_recording_form: Option<ScheduledRecordingForm>,
-    confirm_delete_scheduled_recording: Option<(i64, String)>,
+    confirm_delete_scheduled_recording: Option<Arc<Mutex<ConfirmDialogState<(i64, String)>>>>,
     /// Scheduled recordings window: the "+ Add new" instance-picker
     /// dropdown's selection (session-only, not persisted to the DB). Must
     /// live on `self`, not a per-frame local — a local re-initialized to
@@ -1662,10 +1668,10 @@ pub struct StreamArchiverApp {
     streams_allow_delete: bool,
     /// Pending confirmation for a manual "Delete file from disk" — set by the
     /// take-row context-menu item, cleared on Delete/Cancel.
-    confirm_delete_file: Option<ConfirmDeleteFile>,
+    confirm_delete_file: Option<Arc<Mutex<ConfirmDialogState<ConfirmDeleteFile>>>>,
     /// Pending confirmation for a bulk "Delete all take files from disk" —
     /// set by the stream-row context-menu item, cleared on Delete/Cancel.
-    confirm_delete_stream_files: Option<ConfirmDeleteStreamFiles>,
+    confirm_delete_stream_files: Option<Arc<Mutex<ConfirmDialogState<ConfirmDeleteStreamFiles>>>>,
     /// Take (recording) ids with a manual file-delete currently in flight —
     /// disables their row's action while the async disposal runs.
     manual_delete_pending: HashSet<i64>,
@@ -1771,7 +1777,7 @@ pub struct StreamArchiverApp {
     /// dialog (an irreversible action, unlike Restore) — one row's worth for
     /// the per-row 🗑 button, or every checked row's worth for the toolbar's
     /// "Delete selected".
-    confirm_permadelete_trash: Option<Vec<(i64, String)>>,
+    confirm_permadelete_trash: Option<Arc<Mutex<ConfirmDialogState<Vec<(i64, String)>>>>>,
     /// Checked disposal-record ids in the Trash view (session-only) — backs
     /// the per-row checkbox + toolbar "Delete selected". Only ever holds ids
     /// of `SoftDeleted` rows (the only state with a delete action); pruned on
@@ -1903,7 +1909,7 @@ pub struct StreamArchiverApp {
     /// Open merge-preview dialog (None = closed).
     merge_preview: Option<MergePreviewDraft>,
     /// Pending multi-delete confirmation for schedule segments (None = closed).
-    confirm_delete_segments: Option<Vec<i64>>,
+    confirm_delete_segments: Option<Arc<Mutex<ConfirmDialogState<Vec<i64>>>>>,
     /// Computed from `schedule_all`: primary segment_id → merge badge text.
     /// Built by [`Self::recompute_merge_state`]; drives the 🔀 indicator.
     schedule_merge_labels: HashMap<i64, String>,
@@ -2162,7 +2168,7 @@ pub struct StreamArchiverApp {
     format_designer: Option<FormatDesignerState>,
     /// Pending "Stop recordings & quit" confirmation (triggered by the tray
     /// item or the top-bar StreamArchiver ▾ menu).
-    confirm_quit_stop: bool,
+    confirm_quit_stop: Option<Arc<Mutex<ConfirmDialogState<()>>>>,
     /// One-shot: the confirmation viewport got its focus raise this showing.
     confirm_quit_stop_raised: bool,
     /// Cached (ocr_stats, global_stats, poll_stats) for the Stats view; None = not yet loaded.
@@ -2473,6 +2479,9 @@ impl eframe::App for StreamArchiverApp {
         }
 
         self.pump_messages(ctx);
+        // Apply side effects deferred-viewport popups queued instead of
+        // touching `&mut self` directly (see `popup.rs`).
+        self.pump_popup_actions();
         // Install filesystem-probe results the background worker finished
         // since last frame (never blocks — see `FsProbes`).
         self.fs_probes.lock().unwrap().drain_results();
@@ -2553,7 +2562,7 @@ impl eframe::App for StreamArchiverApp {
                             .clicked()
                         {
                             ui.close();
-                            self.confirm_quit_stop = true;
+                            self.confirm_quit_stop = Some(ConfirmDialogState::open(()));
                         }
                     })
                     .response

@@ -2363,7 +2363,7 @@ impl StreamArchiverApp {
             self.reload_rows();
         }
         if let Some((id, name)) = acts.delete {
-            self.confirm_delete = Some((id, name));
+            self.confirm_delete = Some(ConfirmDialogState::open((id, name)));
         }
         if let Some((cid, on)) = toggle_channel_enabled {
             if let Err(e) = self.core.store.set_channel_enabled(cid, on) {
@@ -2439,7 +2439,7 @@ impl StreamArchiverApp {
             }
         }
         if let Some((cid, name)) = delete_channel {
-            self.confirm_delete_channel = Some((cid, name));
+            self.confirm_delete_channel = Some(ConfirmDialogState::open((cid, name)));
         }
         if let Some(cid) = merge_channel {
             self.merge_channel_dialog = Some((cid, None));
@@ -2680,7 +2680,7 @@ impl StreamArchiverApp {
                     .find(|c| c.id == channel_id)
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
-                self.confirm_delete_file = Some(ConfirmDeleteFile {
+                self.confirm_delete_file = Some(ConfirmDialogState::open(ConfirmDeleteFile {
                     rec_id: rid,
                     channel_id,
                     monitor_id: rec.monitor_id,
@@ -2693,7 +2693,7 @@ impl StreamArchiverApp {
                             .unwrap_or_else(|| "this recording".into())
                     ),
                     method,
-                });
+                }));
             }
         }
         if let Some(rec_ids) = delete_stream_files
@@ -2732,12 +2732,12 @@ impl StreamArchiverApp {
                     recs.iter().find(|r| r.id == *rid).map(|r| r.started_at).unwrap_or(0)
                 });
                 let started = recs.iter().map(|r| r.started_at).min().unwrap_or(0);
-                self.confirm_delete_stream_files = Some(ConfirmDeleteStreamFiles {
+                self.confirm_delete_stream_files = Some(ConfirmDialogState::open(ConfirmDeleteStreamFiles {
                     channel_id,
                     monitor_id,
                     items,
                     label: format!("{channel_name} — {}", fmt_datetime_short(started)),
-                });
+                }));
             }
         }
         if let Some(rid) = open_recording_props

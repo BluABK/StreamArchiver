@@ -1617,8 +1617,9 @@ impl StreamArchiverApp {
                     .on_hover_text("Delete all selected events")
                     .clicked()
                 {
-                    self.confirm_delete_segments =
-                        Some(self.schedule_selected.iter().copied().collect());
+                    self.confirm_delete_segments = Some(ConfirmDialogState::open(
+                        self.schedule_selected.iter().copied().collect(),
+                    ));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("✕ Clear").on_hover_text("Clear selection").clicked() {
@@ -1769,7 +1770,7 @@ impl StreamArchiverApp {
             .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_delete")))
         {
-            self.confirm_delete_segment = Some(sid);
+            self.confirm_delete_segment = Some(ConfirmDialogState::open(sid));
         }
         if let Some(cid) = ui
             .ctx()
@@ -3219,77 +3220,72 @@ impl StreamArchiverApp {
     }
 
     /// Confirmation dialog for deleting multiple selected schedule events at once.
-    #[allow(deprecated)]
     pub(super) fn confirm_delete_segments_window(&mut self, ctx: &egui::Context) {
-        let Some(ids) = self.confirm_delete_segments.as_ref() else {
+        let Some(state) = self.confirm_delete_segments.clone() else {
             return;
         };
-        let count = ids.len();
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_segments_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete schedule items")
                 .with_inner_size([400.0, 130.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(format!(
-                        "Permanently delete {count} selected schedule item{}?",
-                        if count == 1 { "" } else { "s" }
-                    ));
-                    ui.label("They will be suppressed and won't reappear on refresh.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(egui::RichText::new("🗑 Delete").color(HL_ERROR_TEXT))
-                            .clicked()
-                        {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+            &state,
+            |ui, ids, result| {
+                let count = ids.len();
+                ui.label(format!(
+                    "Permanently delete {count} selected schedule item{}?",
+                    if count == 1 { "" } else { "s" }
+                ));
+                ui.label("They will be suppressed and won't reappear on refresh.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("🗑 Delete").color(HL_ERROR_TEXT))
+                        .clicked()
+                    {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
-            if let Some(ids) = self.confirm_delete_segments.take() {
-                let mut errors = 0usize;
-                for sid in &ids {
-                    match self.core.store.delete_schedule_segment(*sid) {
-                        Ok(_) => {
-                            self.schedule_hidden_segments.remove(sid);
-                        }
-                        Err(e) => {
-                            warn!("Error deleting schedule segment {sid}: {e:#}");
-                            errors += 1;
-                        }
+        if result == Some(true) {
+            let ids = state.lock().unwrap().payload.clone();
+            let count = ids.len();
+            let mut errors = 0usize;
+            for sid in &ids {
+                match self.core.store.delete_schedule_segment(*sid) {
+                    Ok(_) => {
+                        self.schedule_hidden_segments.remove(sid);
+                    }
+                    Err(e) => {
+                        warn!("Error deleting schedule segment {sid}: {e:#}");
+                        errors += 1;
                     }
                 }
-                self.schedule_selected.clear();
-                self.spawn_reload_schedule();
-                if errors == 0 {
-                    self.status = format!(
-                        "Deleted {count} schedule item{}.",
-                        if count == 1 { "" } else { "s" }
-                    );
-                } else {
-                    self.status = format!(
-                        "Deleted {} of {count} items; {errors} error(s) — check logs.",
-                        count - errors
-                    );
-                }
             }
-        } else if do_cancel || !open {
+            self.schedule_selected.clear();
+            self.spawn_reload_schedule();
+            if errors == 0 {
+                self.status = format!(
+                    "Deleted {count} schedule item{}.",
+                    if count == 1 { "" } else { "s" }
+                );
+            } else {
+                self.status = format!(
+                    "Deleted {} of {count} items; {errors} error(s) — check logs.",
+                    count - errors
+                );
+            }
+            self.confirm_delete_segments = None;
+        } else if result == Some(false) {
             self.confirm_delete_segments = None;
         }
     }
@@ -3901,7 +3897,7 @@ impl StreamArchiverApp {
                 }
             }
             Some(Act::Delete(id, name)) => {
-                self.confirm_delete_scheduled_recording = Some((id, name));
+                self.confirm_delete_scheduled_recording = Some(ConfirmDialogState::open((id, name)));
             }
             Some(Act::ToggleEnabled(id, enabled)) => {
                 let next_run_at = if enabled {
@@ -3926,39 +3922,35 @@ impl StreamArchiverApp {
     }
 
     /// Modal confirmation for deleting a scheduled recording.
-    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn confirm_delete_scheduled_recording_window(&mut self, ctx: &egui::Context) {
-        let Some((id, name)) = self.confirm_delete_scheduled_recording.clone() else {
+        let Some(state) = self.confirm_delete_scheduled_recording.clone() else {
             return;
         };
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("del_sched_rec_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete scheduled recording")
                 .with_inner_size([380.0, 120.0])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(format!("Delete the scheduled recording for “{name}”?"));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            do_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                    });
+            &state,
+            |ui, (_, name), result| {
+                ui.label(format!("Delete the scheduled recording for “{name}”?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
-        if do_delete {
+        if result == Some(true) {
+            let id = state.lock().unwrap().payload.0;
             match self.core.store.delete_scheduled_recording(id) {
                 Ok(()) => {
                     self.confirm_delete_scheduled_recording = None;
@@ -3967,7 +3959,7 @@ impl StreamArchiverApp {
                 }
                 Err(e) => self.status = format!("Error: {e}"),
             }
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_delete_scheduled_recording = None;
         }
     }

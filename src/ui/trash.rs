@@ -195,7 +195,7 @@ impl StreamArchiverApp {
                     .map(|r| (r.row.id, r.row.trash_path.clone()))
                     .collect();
                 if !pairs.is_empty() {
-                    self.confirm_permadelete_trash = Some(pairs);
+                    self.confirm_permadelete_trash = Some(ConfirmDialogState::open(pairs));
                 }
             }
             if n_selected > 0 && ui.button("✕ Clear selection").clicked() {
@@ -424,8 +424,9 @@ impl StreamArchiverApp {
                                         .on_hover_text("Permanently delete")
                                         .clicked()
                                     {
-                                        self.confirm_permadelete_trash =
-                                            Some(vec![(row.id, current_path.to_string())]);
+                                        self.confirm_permadelete_trash = Some(ConfirmDialogState::open(
+                                            vec![(row.id, current_path.to_string())],
+                                        ));
                                     }
                                 }
                                 let path_buf =
@@ -541,64 +542,59 @@ impl StreamArchiverApp {
     /// back; this removes it for good). `items` is one `(id, path)` pair for
     /// the per-row 🗑 button, or every checked row's worth for the toolbar's
     /// "Delete selected".
-    #[allow(deprecated)] // CentralPanel::show inside show_viewport_immediate — same as the other confirm_* windows
     pub(super) fn confirm_permadelete_trash_window(&mut self, ctx: &egui::Context) {
-        let Some(items) = self.confirm_permadelete_trash.clone() else {
+        let Some(state) = self.confirm_permadelete_trash.clone() else {
             return;
         };
-        let mut open = true;
-        let mut do_delete = false;
-        let mut do_cancel = false;
         const MAX_SHOWN: usize = 12;
-
-        ctx.show_viewport_immediate(
+        let n = state.lock().unwrap().payload.len();
+        let shared = self.popup_shared();
+        let result = confirm_dialog_deferred(
+            ctx,
+            shared,
             egui::ViewportId::from_hash_of("confirm_permadelete_trash_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Permanently delete")
-                .with_inner_size([480.0, if items.len() > 1 { 320.0 } else { 150.0 }])
+                .with_inner_size([480.0, if n > 1 { 320.0 } else { 150.0 }])
                 .with_resizable(false),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if items.len() == 1 {
-                        ui.label("Permanently delete this file? This cannot be undone.");
-                        ui.add_space(4.0);
-                        ui.add(egui::Label::new(egui::RichText::new(&items[0].1).small().monospace()).truncate());
-                    } else {
-                        ui.label(format!(
-                            "Permanently delete {} files? This cannot be undone.",
-                            items.len()
-                        ));
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                            for (_, path) in items.iter().take(MAX_SHOWN) {
-                                ui.add(egui::Label::new(egui::RichText::new(path).small().monospace()).truncate());
-                            }
-                            if items.len() > MAX_SHOWN {
-                                ui.weak(format!("(+{} more)", items.len() - MAX_SHOWN));
-                            }
-                        });
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
-                            do_delete = true;
+            &state,
+            |ui, items, result| {
+                if items.len() == 1 {
+                    ui.label("Permanently delete this file? This cannot be undone.");
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&items[0].1).small().monospace()).truncate());
+                } else {
+                    ui.label(format!(
+                        "Permanently delete {} files? This cannot be undone.",
+                        items.len()
+                    ));
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        for (_, path) in items.iter().take(MAX_SHOWN) {
+                            ui.add(egui::Label::new(egui::RichText::new(path).small().monospace()).truncate());
                         }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                        if items.len() > MAX_SHOWN {
+                            ui.weak(format!("(+{} more)", items.len() - MAX_SHOWN));
                         }
                     });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        *result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *result = Some(false);
+                    }
                 });
             },
         );
 
-        if do_delete {
-            let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+        if result == Some(true) {
+            let ids: Vec<i64> = state.lock().unwrap().payload.iter().map(|(id, _)| *id).collect();
             self.spawn_trash_batch_permadelete(ctx, ids);
             self.confirm_permadelete_trash = None;
-        } else if do_cancel || !open {
+        } else if result == Some(false) {
             self.confirm_permadelete_trash = None;
         }
     }

@@ -25,6 +25,7 @@ impl StreamArchiverApp {
         egui_ctx: egui::Context,
     ) -> StreamArchiverApp {
         let events_rx = core.subscribe();
+        let (popup_actions_tx, popup_actions_rx) = std::sync::mpsc::channel();
         let autostart = AutoStart::new();
         let autostart_on = autostart.is_enabled();
         // Detach-on-quit is the default; only `=="1"` opts into stopping downloads.
@@ -588,6 +589,8 @@ impl StreamArchiverApp {
             tray,
             ui_rx,
             events_rx,
+            popup_actions_tx,
+            popup_actions_rx,
             autostart,
             autostart_on,
             keep_downloads_on_quit,
@@ -879,7 +882,7 @@ impl StreamArchiverApp {
             finished_tasks: Vec::new(),
             job_toggles,
             format_designer: None,
-            confirm_quit_stop: false,
+            confirm_quit_stop: None,
             confirm_quit_stop_raised: false,
             debug_monitor_idx: 0,
             debug_test_title: "Test Stream Title".into(),
@@ -1288,7 +1291,7 @@ impl StreamArchiverApp {
                 UiCommand::Quit => self.request_quit_detach(ctx),
                 UiCommand::QuitAndStop => {
                     // Show confirmation before stopping active recordings.
-                    self.confirm_quit_stop = true;
+                    self.confirm_quit_stop = Some(ConfirmDialogState::open(()));
                     // Bring the window to the foreground so the dialog is visible.
                     raise_window(ctx);
                 }
@@ -1298,7 +1301,7 @@ impl StreamArchiverApp {
                     // shutdown. Captures are detached processes; whatever the
                     // OS then kills is finalized by the next launch's
                     // reconcile, exactly like a crash.
-                    self.confirm_quit_stop = false;
+                    self.confirm_quit_stop = None;
                     self.request_quit_detach(ctx);
                 }
             }
@@ -2273,7 +2276,7 @@ impl StreamArchiverApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
                 if let Some(id) = self.selected_monitor {
                     if let Some(row) = self.rows.iter().find(|r| r.monitor.id == id) {
-                        self.confirm_delete = Some((id, row.channel.name.clone()));
+                        self.confirm_delete = Some(ConfirmDialogState::open((id, row.channel.name.clone())));
                     }
                 }
             }
