@@ -1816,7 +1816,8 @@ impl StreamArchiverApp {
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_schedule_rec")))
             .and_then(|sid| self.schedule_all.iter().find(|s| s.segment_id == sid))
         {
-            self.scheduled_recording_form = Some(ScheduledRecordingForm::from_schedule_entry(s));
+            self.scheduled_recording_form =
+                Some(Arc::new(Mutex::new(ScheduledRecordingForm::from_schedule_entry(s))));
         }
         if let Some(sid) = ui
             .ctx()
@@ -3588,23 +3589,22 @@ impl StreamArchiverApp {
     /// Add/Edit dialog for a [`ScheduledRecording`] (schema v51).
     #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn scheduled_recording_form_window(&mut self, ctx: &egui::Context) {
-        if self.scheduled_recording_form.is_none() {
+        let Some(state) = self.scheduled_recording_form.clone() else {
             return;
-        }
-        let mut open = true;
-        let mut do_save = false;
-        ctx.show_viewport_immediate(
+        };
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("sched_rec_form_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Schedule recording")
                 .with_inner_size([460.0, 420.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, f, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    f.closed = true;
                 }
-                let Some(f) = self.scheduled_recording_form.as_mut() else {
-                    return;
-                };
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong(&f.channel_name);
@@ -3717,21 +3717,27 @@ impl StreamArchiverApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("💾  Save").clicked() {
-                            do_save = true;
+                            f.do_save = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            open = false;
+                            f.closed = true;
                         }
                     });
                 });
             },
         );
 
+        let (do_save, closed) = {
+            let mut s = state.lock().unwrap();
+            let result = (s.do_save, s.closed);
+            s.do_save = false;
+            result
+        };
         if do_save {
             self.save_scheduled_recording_form();
             return;
         }
-        if !open {
+        if closed {
             self.scheduled_recording_form = None;
         }
     }
@@ -3814,19 +3820,17 @@ impl StreamArchiverApp {
     }
 
     pub(super) fn save_scheduled_recording_form(&mut self) {
-        let Some(f) = self.scheduled_recording_form.as_ref() else {
+        let Some(state) = self.scheduled_recording_form.clone() else {
             return;
         };
         let now = now_unix();
-        let built = Self::build_scheduled_recording_fields(f, now);
-        let monitor_id = f.monitor_id;
-        let id = f.id;
-        let enabled = f.enabled;
+        let (built, monitor_id, id, enabled) = {
+            let f = state.lock().unwrap();
+            (Self::build_scheduled_recording_fields(&f, now), f.monitor_id, f.id, f.enabled)
+        };
         match built {
             Err(msg) => {
-                if let Some(f) = self.scheduled_recording_form.as_mut() {
-                    f.error = msg.to_string();
-                }
+                state.lock().unwrap().error = msg.to_string();
             }
             Ok((kind, label, start_at, days_of_week, time_of_day_secs, until, duration_secs, next_run_at)) => {
                 let result = match id {
@@ -3856,9 +3860,7 @@ impl StreamArchiverApp {
                         self.status = "Scheduled recording saved.".into();
                     }
                     Err(e) => {
-                        if let Some(f) = self.scheduled_recording_form.as_mut() {
-                            f.error = format!("Error saving: {e}");
-                        }
+                        state.lock().unwrap().error = format!("Error saving: {e}");
                     }
                 }
             }
@@ -4005,16 +4007,18 @@ impl StreamArchiverApp {
         match act {
             Some(SchedRecsAct::AddNew(monitor_id)) => {
                 if let Some(row) = self.rows.iter().find(|r| r.monitor.id == monitor_id) {
-                    self.scheduled_recording_form = Some(ScheduledRecordingForm::new_for_monitor(
-                        monitor_id,
-                        &row.channel.name,
-                        &row.monitor.url,
-                    ));
+                    self.scheduled_recording_form =
+                        Some(Arc::new(Mutex::new(ScheduledRecordingForm::new_for_monitor(
+                            monitor_id,
+                            &row.channel.name,
+                            &row.monitor.url,
+                        ))));
                 }
             }
             Some(SchedRecsAct::Edit(id)) => {
                 if let Some(row) = self.scheduled_recordings.iter().find(|r| r.rec.id == id) {
-                    self.scheduled_recording_form = Some(ScheduledRecordingForm::from_existing(row));
+                    self.scheduled_recording_form =
+                        Some(Arc::new(Mutex::new(ScheduledRecordingForm::from_existing(row))));
                 }
             }
             Some(SchedRecsAct::Delete(id, name)) => {

@@ -1659,7 +1659,7 @@ pub struct StreamArchiverApp {
     /// the add/edit dialog (`None` = closed), and a pending delete confirmation.
     show_scheduled_recordings: bool,
     scheduled_recordings: Vec<crate::models::ScheduledRecordingWithNames>,
-    scheduled_recording_form: Option<ScheduledRecordingForm>,
+    scheduled_recording_form: Option<Arc<Mutex<ScheduledRecordingForm>>>,
     confirm_delete_scheduled_recording: Option<Arc<Mutex<ConfirmDialogState<(i64, String)>>>>,
     /// Deferred-viewport state while the Scheduled recordings window is open
     /// (None = closed) — see [`schedule::SchedRecsPopupState`].

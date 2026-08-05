@@ -205,6 +205,8 @@ pub(super) struct ScheduledRecordingForm {
     pub(super) enabled: bool,
     /// Validation message shown in red (empty = none).
     pub(super) error: String,
+    pub(super) do_save: bool,
+    pub(super) closed: bool,
 }
 
 impl ScheduledRecordingForm {
@@ -225,6 +227,8 @@ impl ScheduledRecordingForm {
             duration_minutes: "60".to_string(),
             enabled: true,
             error: String::new(),
+            do_save: false,
+            closed: false,
         }
     }
 
@@ -254,6 +258,8 @@ impl ScheduledRecordingForm {
             duration_minutes: (r.duration_secs.unwrap_or(3600) / 60).max(1).to_string(),
             enabled: r.enabled,
             error: String::new(),
+            do_save: false,
+            closed: false,
         }
     }
 
@@ -282,6 +288,8 @@ impl ScheduledRecordingForm {
             duration_minutes,
             enabled: true,
             error: String::new(),
+            do_save: false,
+            closed: false,
         }
     }
 }
