@@ -2003,6 +2003,9 @@ pub struct StreamArchiverApp {
     instance_props_registry: PopupRegistry<i64, properties::InstancePropsPopupState>,
     /// Open channel-Properties windows (one per channel).
     channel_properties_popups: Vec<i64>,
+    /// Deferred-viewport state for each open channel-Properties window,
+    /// keyed by channel id — see [`properties::ChannelPropsPopupState`].
+    channel_props_registry: PopupRegistry<i64, properties::ChannelPropsPopupState>,
     /// [`properties::PropsLoadingPlaceholderState`] for `drive_props_load`'s
     /// "Loading…" placeholder, keyed by the real window's own viewport id —
     /// shared by both instance- and channel-Properties loads.

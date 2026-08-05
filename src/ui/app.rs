@@ -754,6 +754,7 @@ impl StreamArchiverApp {
             properties_popups: Vec::new(),
             instance_props_registry: Default::default(),
             channel_properties_popups: Vec::new(),
+            channel_props_registry: Default::default(),
             props_loading_registry: Default::default(),
             rec_props_popups: Vec::new(),
             event_props_popups: Vec::new(),
