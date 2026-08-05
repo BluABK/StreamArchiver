@@ -1892,8 +1892,8 @@ pub struct StreamArchiverApp {
     /// changes when the grid data reloads, while the streams cache itself also
     /// rebuilds every second during an active capture.
     deep_filter_texts: Option<(u64, DeepFilterTexts)>,
-    /// The day whose full stream list is shown in a popup (local date; None = closed).
-    schedule_day_popup: Option<chrono::NaiveDate>,
+    /// The day whose full stream list is shown in a popup (None = closed).
+    schedule_day_popup: Option<Arc<Mutex<ScheduleDayState>>>,
     /// Whether the "Schedule sources" dialog is open.
     show_schedule_sources: bool,
     /// Editable draft of the ordered source list, shown in the dialog. Loaded from

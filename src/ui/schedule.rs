@@ -10,6 +10,15 @@ pub(super) struct SchedulePopupContent {
     pub(super) closed: bool,
 }
 
+/// Backing state for `schedule_day_window` — just the trigger date plus a
+/// close flag; the actual content is recomputed fresh every call (this
+/// window's data is live, not derive-once, since it reflects whatever the
+/// calendar currently shows).
+pub(super) struct ScheduleDayState {
+    pub(super) date: chrono::NaiveDate,
+    pub(super) closed: bool,
+}
+
 /// The Schedule tab's calendar granularity.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ScheduleMode {
@@ -1718,7 +1727,7 @@ impl StreamArchiverApp {
             self.schedule_collisions = v;
         }
         if let Some(d) = open_day {
-            self.schedule_day_popup = Some(d);
+            self.schedule_day_popup = Some(Arc::new(Mutex::new(ScheduleDayState { date: d, closed: false })));
         }
         if do_refresh {
             // Trigger a real network re-fetch (not just a DB reload); the refresher
@@ -2892,18 +2901,22 @@ impl StreamArchiverApp {
 
     /// Popup listing every (visible) stream on one calendar day, with the same
     /// per-entry copy menu as the calendar chips.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn schedule_day_window(&mut self, ctx: &egui::Context) {
-        let Some(date) = self.schedule_day_popup else {
+        let Some(state) = self.schedule_day_popup.clone() else {
             return;
         };
+        let date = state.lock().unwrap().date;
         let ptex = self
             .platform_tex
             .get_or_insert_with(|| PlatformTextures::load(ctx))
             .clone();
         // Visible streams on that local date (respects the sidebar filter,
-        // channel- and instance-level).
-        let entries: Vec<&UpcomingStream> = self
+        // channel- and instance-level). Cloned into owned data — this window
+        // is its own render pass, recomputed fresh every call (not
+        // derive-once), same as before the migration; a deferred closure
+        // just can't borrow `self` to do it inline anymore.
+        let entries: Vec<UpcomingStream> = self
             .schedule_all
             .iter()
             .filter(|s| {
@@ -2911,6 +2924,7 @@ impl StreamArchiverApp {
                     && !self.schedule_hidden_monitors.contains(&s.monitor_id)
             })
             .filter(|s| local_date(s.start_time) == Some(date))
+            .cloned()
             .collect();
         // Weekday + the user's chosen date format (so the heading matches the chips).
         let heading = date
@@ -2922,17 +2936,23 @@ impl StreamArchiverApp {
         // Just this day's handful of entries — cheap enough to compute fresh
         // per popup-open rather than reusing the whole-calendar `signals` map
         // `schedule_view` builds (this window is its own render pass).
-        let signals = self.build_event_signals(entries.iter().copied());
-        let mut open = true;
-        let mut copy_all: Option<String> = None;
-        ctx.show_viewport_immediate(
+        let signals = self.build_event_signals(entries.iter());
+        // Colors are a pure self.schedule_chan_colors lookup — precomputed
+        // per entry since the deferred closure can't call self.sched_color.
+        let colors: std::collections::HashMap<i64, egui::Color32> =
+            entries.iter().map(|s| (s.segment_id, self.sched_color(s))).collect();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("schedule_day_vp"),
             egui::ViewportBuilder::default()
                 .with_title(format!("Streams · {heading}"))
                 .with_inner_size([480.0, 360.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            move |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if entries.is_empty() {
@@ -2950,7 +2970,8 @@ impl StreamArchiverApp {
                                 let hidden = hidden_segs.contains(&s.segment_id);
                                 let ml = merge_labels.get(&s.segment_id).map(String::as_str);
                                 schedule_detail_row(
-                                    ui, s, false, hidden, &ptex, ml, self.sched_color(s),
+                                    ui, s, false, hidden, &ptex, ml,
+                                    colors.get(&s.segment_id).copied().unwrap_or_default(),
                                     signals.get(&s.segment_id),
                                 );
                                 // Action button strip — writes to the same temp-data keys
@@ -2986,21 +3007,17 @@ impl StreamArchiverApp {
                         });
                     ui.add_space(6.0);
                     if ui.button("📋  Copy all").clicked() {
-                        copy_all = Some(
-                            entries
-                                .iter()
-                                .map(|s| schedule_detail_line(s))
-                                .collect::<Vec<_>>()
-                                .join("\n\n"),
-                        );
+                        let text = entries
+                            .iter()
+                            .map(|s| schedule_detail_line(s))
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        ui.ctx().copy_text(text);
                     }
                 });
             },
         );
-        if let Some(t) = copy_all {
-            ctx.copy_text(t);
-        }
-        if !open {
+        if state.lock().unwrap().closed {
             self.schedule_day_popup = None;
         }
     }
