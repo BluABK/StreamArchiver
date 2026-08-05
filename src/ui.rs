@@ -1535,6 +1535,9 @@ pub struct StreamArchiverApp {
     /// render fn): loaded rows, load throttle, session-only channel + text
     /// filters, and a lazy visible-only texture cache keyed by content hash.
     show_posts_window: bool,
+    /// Deferred-viewport state while the pop-out Posts window is open (None =
+    /// closed) — see [`posts::PostsPopupState`].
+    posts_popup: Option<Arc<Mutex<posts::PostsPopupState>>>,
     /// "🚫 Excluded channels…" management window: which channels' posts are
     /// hidden from the feed (`Channel::posts_hidden`, session filter text).
     show_posts_excluded: bool,
@@ -1560,7 +1563,7 @@ pub struct StreamArchiverApp {
     /// channel/search/viewer filters entirely while set; the "✕ Show all"
     /// button (and any filter edit) clears it.
     posts_focus_post: Option<String>,
-    post_img_cache: PostImageCache,
+    post_img_cache: Arc<Mutex<PostImageCache>>,
     /// The widget inspector (F12): whether the window is open (session-only,
     /// like the other window flags) and its tab/selection/snapshot state.
     show_inspector: bool,
