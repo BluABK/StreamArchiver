@@ -1920,11 +1920,11 @@ pub struct StreamArchiverApp {
     instance_block_drafts: HashMap<i64, crate::triggers::TriggerScope>,
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
-    edit_schedule: Option<EditScheduleDraft>,
+    edit_schedule: Option<Arc<Mutex<EditScheduleDraft>>>,
     /// Segment IDs selected in the schedule calendar (Ctrl+click multi-select).
     schedule_selected: HashSet<i64>,
     /// Open merge-preview dialog (None = closed).
-    merge_preview: Option<MergePreviewDraft>,
+    merge_preview: Option<Arc<Mutex<MergePreviewDraft>>>,
     /// Pending multi-delete confirmation for schedule segments (None = closed).
     confirm_delete_segments: Option<Arc<Mutex<ConfirmDialogState<Vec<i64>>>>>,
     /// Computed from `schedule_all`: primary segment_id → merge badge text.

@@ -129,6 +129,11 @@ pub(super) struct EditScheduleDraft {
     pub(super) end_time: String,
     /// Validation message shown in red (empty = none).
     pub(super) error: String,
+    /// Set by the deferred closure's button clicks; read back by
+    /// `edit_schedule_window` next call.
+    pub(super) save: bool,
+    pub(super) delete: bool,
+    pub(super) closed: bool,
 }
 
 /// Backing state for the scheduled-recording Add/Edit dialog (schema v51).
@@ -249,6 +254,10 @@ pub(super) struct MergePreviewDraft {
     pub(super) primary_idx: usize,
     /// Validation/error message (empty = none).
     pub(super) error: String,
+    /// Set by the deferred closure's button clicks; read back by
+    /// `merge_preview_window` next call.
+    pub(super) merge: bool,
+    pub(super) cancel: bool,
 }
 
 pub(super) struct SavePresetDraft {

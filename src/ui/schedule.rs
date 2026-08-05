@@ -1632,11 +1632,13 @@ impl StreamArchiverApp {
                         .collect();
                     // Sort highest priority first (YouTube first) so index 0 is the default primary.
                     segs.sort_by_key(|s| merge_source_priority(&s.source));
-                    self.merge_preview = Some(MergePreviewDraft {
+                    self.merge_preview = Some(Arc::new(Mutex::new(MergePreviewDraft {
                         segments: segs,
                         primary_idx: 0,
                         error: String::new(),
-                    });
+                        merge: false,
+                        cancel: false,
+                    })));
                 }
                 if ui
                     .button("🗑 Delete")
@@ -3052,7 +3054,7 @@ impl StreamArchiverApp {
             Some(e) => split_local_datetime(e),
             None => (String::new(), String::new()),
         };
-        self.edit_schedule = Some(EditScheduleDraft {
+        self.edit_schedule = Some(Arc::new(Mutex::new(EditScheduleDraft {
             segment_id,
             channel_name: s.channel_name.clone(),
             source: s.source.clone(),
@@ -3063,7 +3065,10 @@ impl StreamArchiverApp {
             end_date,
             end_time,
             error: String::new(),
-        });
+            save: false,
+            delete: false,
+            closed: false,
+        })));
     }
 
     /// Open where a calendar item's schedule came from: the platform schedule page,
@@ -3142,27 +3147,24 @@ impl StreamArchiverApp {
     /// The user picks which event is the "primary" (its time/title/URL is shown);
     /// the others become hidden secondaries. The merge is stored in the DB via
     /// `merge_segments_manual`.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn merge_preview_window(&mut self, ctx: &egui::Context) {
-        if self.merge_preview.is_none() {
+        let Some(state) = self.merge_preview.clone() else {
             return;
-        }
-        let mut open = true;
-        let mut do_merge = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        };
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("merge_preview_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Merge schedule events")
                 .with_inner_size([520.0, 380.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, d, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    d.cancel = true;
                 }
-                let Some(d) = self.merge_preview.as_mut() else {
-                    return;
-                };
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label("Select which event is the primary. The primary's time, title and URL will be shown on the calendar; the others will be hidden as part of the group.");
                     ui.add_space(8.0);
@@ -3209,46 +3211,55 @@ impl StreamArchiverApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("🔀 Merge").clicked() {
-                            do_merge = true;
+                            d.merge = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                            d.cancel = true;
                         }
                     });
                 });
             },
         );
 
+        let (do_merge, do_cancel) = {
+            let d = state.lock().unwrap();
+            (d.merge, d.cancel)
+        };
         if do_merge {
-            if let Some(d) = self.merge_preview.take() {
-                let primary_id = d.segments[d.primary_idx].segment_id;
-                let secondary_ids: Vec<i64> = d
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != d.primary_idx)
-                    .map(|(_, s)| s.segment_id)
-                    .collect();
-                match self.core.store.merge_segments_manual(primary_id, &secondary_ids) {
-                    Ok(()) => {
-                        self.schedule_selected.clear();
-                        self.spawn_reload_schedule();
-                        self.status = format!(
-                            "Merged {} events.",
-                            secondary_ids.len() + 1
-                        );
-                    }
-                    Err(e) => {
-                        // Re-open the dialog with the error shown.
-                        self.merge_preview = Some(MergePreviewDraft {
-                            segments: d.segments,
-                            primary_idx: d.primary_idx,
-                            error: format!("Error merging: {e:#}"),
-                        });
-                    }
+            let d = state.lock().unwrap();
+            let primary_id = d.segments[d.primary_idx].segment_id;
+            let secondary_ids: Vec<i64> = d
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != d.primary_idx)
+                .map(|(_, s)| s.segment_id)
+                .collect();
+            let primary_idx = d.primary_idx;
+            let segments = d.segments.clone();
+            drop(d);
+            match self.core.store.merge_segments_manual(primary_id, &secondary_ids) {
+                Ok(()) => {
+                    self.schedule_selected.clear();
+                    self.spawn_reload_schedule();
+                    self.status = format!(
+                        "Merged {} events.",
+                        secondary_ids.len() + 1
+                    );
+                    self.merge_preview = None;
+                }
+                Err(e) => {
+                    // Re-open the dialog with the error shown.
+                    self.merge_preview = Some(Arc::new(Mutex::new(MergePreviewDraft {
+                        segments,
+                        primary_idx,
+                        error: format!("Error merging: {e:#}"),
+                        merge: false,
+                        cancel: false,
+                    })));
                 }
             }
-        } else if do_cancel || !open {
+        } else if do_cancel {
             self.merge_preview = None;
         }
     }
@@ -3325,28 +3336,24 @@ impl StreamArchiverApp {
     }
 
     /// `"manual"` so a later automatic refresh leaves the correction intact.
-    #[allow(deprecated)] // CentralPanel::show inside a viewport (matches the other dialogs)
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn edit_schedule_window(&mut self, ctx: &egui::Context) {
-        if self.edit_schedule.is_none() {
+        let Some(state) = self.edit_schedule.clone() else {
             return;
-        }
-        let mut open = true;
-        // Actions collected inside the closure, applied after it (the closure
-        // borrows the draft mutably; these touch the store / reload).
-        let mut do_save = false;
-        let mut do_delete = false;
-        ctx.show_viewport_immediate(
+        };
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("edit_schedule_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Edit schedule item")
                 .with_inner_size([440.0, 320.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, d, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    d.closed = true;
                 }
-                let Some(d) = self.edit_schedule.as_mut() else {
-                    return;
-                };
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let (badge, label) = source_badge(&d.source);
                     ui.horizontal(|ui| {
@@ -3421,10 +3428,10 @@ impl StreamArchiverApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("💾  Save").clicked() {
-                            do_save = true;
+                            d.save = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            open = false;
+                            d.closed = true;
                         }
                         ui.add_space(16.0);
                         if ui
@@ -3432,25 +3439,29 @@ impl StreamArchiverApp {
                             .on_hover_text("Remove this occurrence from the calendar.")
                             .clicked()
                         {
-                            do_delete = true;
+                            d.delete = true;
                         }
                     });
                 });
             },
         );
 
+        let (do_save, do_delete, closed) = {
+            let d = state.lock().unwrap();
+            (d.save, d.delete, d.closed)
+        };
         if do_delete {
-            if let Some(d) = self.edit_schedule.take() {
-                match self.core.store.delete_schedule_segment(d.segment_id) {
-                    Err(e) => self.status = format!("Error deleting item: {e}"),
-                    Ok(0) => {
-                        self.spawn_reload_schedule();
-                        self.status = "Schedule item was already gone.".into();
-                    }
-                    Ok(_) => {
-                        self.spawn_reload_schedule();
-                        self.status = "Schedule item deleted.".into();
-                    }
+            let segment_id = state.lock().unwrap().segment_id;
+            self.edit_schedule = None;
+            match self.core.store.delete_schedule_segment(segment_id) {
+                Err(e) => self.status = format!("Error deleting item: {e}"),
+                Ok(0) => {
+                    self.spawn_reload_schedule();
+                    self.status = "Schedule item was already gone.".into();
+                }
+                Ok(_) => {
+                    self.spawn_reload_schedule();
+                    self.status = "Schedule item deleted.".into();
                 }
             }
             return;
@@ -3459,46 +3470,44 @@ impl StreamArchiverApp {
         if do_save {
             // Validate against the draft, writing the error back into it on failure
             // (so the dialog stays open and shows why).
-            let parsed = self.edit_schedule.as_ref().and_then(|d| {
-                let start = parse_local_datetime(&d.date, &d.time)?;
-                // End is optional; when both fields are blank there's no end. When
-                // partially filled or unparseable, treat as an error below. A start
-                // before today's local midnight is rejected up front: the calendar
-                // only loads start ≥ today, so saving a past time would silently
-                // drop the row from every view despite a "success" message.
-                let end = if start < today_start_unix() {
-                    Err("Start must be today or later.")
-                } else if d.end_date.trim().is_empty() && d.end_time.trim().is_empty() {
-                    Ok(None)
-                } else {
-                    match parse_local_datetime(&d.end_date, &d.end_time) {
-                        Some(e) if e > start => Ok(Some(e)),
-                        Some(_) => Err("End must be after start."),
-                        None => Err("End date/time is invalid."),
-                    }
-                };
-                Some((d.segment_id, start, end, d.title.trim().to_string(), d.category.trim().to_string()))
-            });
+            let parsed = {
+                let d = state.lock().unwrap();
+                (|| {
+                    let start = parse_local_datetime(&d.date, &d.time)?;
+                    // End is optional; when both fields are blank there's no end. When
+                    // partially filled or unparseable, treat as an error below. A start
+                    // before today's local midnight is rejected up front: the calendar
+                    // only loads start ≥ today, so saving a past time would silently
+                    // drop the row from every view despite a "success" message.
+                    let end = if start < today_start_unix() {
+                        Err("Start must be today or later.")
+                    } else if d.end_date.trim().is_empty() && d.end_time.trim().is_empty() {
+                        Ok(None)
+                    } else {
+                        match parse_local_datetime(&d.end_date, &d.end_time) {
+                            Some(e) if e > start => Ok(Some(e)),
+                            Some(_) => Err("End must be after start."),
+                            None => Err("End date/time is invalid."),
+                        }
+                    };
+                    Some((d.segment_id, start, end, d.title.trim().to_string(), d.category.trim().to_string()))
+                })()
+            };
             match parsed {
                 None => {
-                    if let Some(d) = self.edit_schedule.as_mut() {
-                        d.error = "Start date/time is invalid (use YYYY-MM-DD and HH:MM).".into();
-                    }
+                    state.lock().unwrap().error =
+                        "Start date/time is invalid (use YYYY-MM-DD and HH:MM).".into();
                 }
                 Some((_, _, Err(msg), _, _)) => {
-                    if let Some(d) = self.edit_schedule.as_mut() {
-                        d.error = msg.into();
-                    }
+                    state.lock().unwrap().error = msg.into();
                 }
                 Some((id, start, Ok(end), title, category)) if !title.is_empty() => {
                     match self.core.store.update_schedule_segment_manual(
                         id, start, end, &title, &category,
                     ) {
                         Ok(0) => {
-                            if let Some(d) = self.edit_schedule.as_mut() {
-                                d.error =
-                                    "This item no longer exists (a refresh may have cleared it).".into();
-                            }
+                            state.lock().unwrap().error =
+                                "This item no longer exists (a refresh may have cleared it).".into();
                         }
                         Ok(_) => {
                             self.edit_schedule = None;
@@ -3506,21 +3515,17 @@ impl StreamArchiverApp {
                             self.status = "Schedule item updated (marked manual).".into();
                         }
                         Err(e) => {
-                            if let Some(d) = self.edit_schedule.as_mut() {
-                                d.error = format!("Error saving: {e}");
-                            }
+                            state.lock().unwrap().error = format!("Error saving: {e}");
                         }
                     }
                 }
                 Some(_) => {
-                    if let Some(d) = self.edit_schedule.as_mut() {
-                        d.error = "Title can't be empty.".into();
-                    }
+                    state.lock().unwrap().error = "Title can't be empty.".into();
                 }
             }
         }
 
-        if !open {
+        if closed {
             self.edit_schedule = None;
         }
     }
