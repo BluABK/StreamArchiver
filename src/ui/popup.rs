@@ -119,6 +119,13 @@ impl<K: Eq + std::hash::Hash + Clone, T> PopupRegistry<K, T> {
     pub(super) fn retain(&mut self, keep: &[K]) {
         self.states.retain(|k, _| keep.contains(k));
     }
+
+    /// Drop state for one key — for a registry whose entries are removed
+    /// individually rather than via a caller-side open-id list (e.g. once a
+    /// background load completes and the entry's job is done).
+    pub(super) fn remove(&mut self, key: &K) {
+        self.states.remove(key);
+    }
 }
 
 /// Backing state for the generic "are you sure?" confirm dialog

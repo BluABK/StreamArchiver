@@ -1998,8 +1998,15 @@ pub struct StreamArchiverApp {
     platform_tex: Option<PlatformTextures>,
     /// Which monitor's Properties window is open (None = closed).
     properties_popups: Vec<i64>,
+    /// Deferred-viewport state for each open instance-Properties window,
+    /// keyed by monitor id — see [`properties::InstancePropsPopupState`].
+    instance_props_registry: PopupRegistry<i64, properties::InstancePropsPopupState>,
     /// Open channel-Properties windows (one per channel).
     channel_properties_popups: Vec<i64>,
+    /// [`properties::PropsLoadingPlaceholderState`] for `drive_props_load`'s
+    /// "Loading…" placeholder, keyed by the real window's own viewport id —
+    /// shared by both instance- and channel-Properties loads.
+    props_loading_registry: PopupRegistry<egui::ViewportId, properties::PropsLoadingPlaceholderState>,
     /// Open recording-properties windows, one per take (each carries its own
     /// notes draft, synced from the DB on open and written back per keystroke).
     rec_props_popups: Vec<RecPropsPopup>,

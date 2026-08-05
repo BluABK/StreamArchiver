@@ -3,256 +3,72 @@
 
 use super::*;
 
-impl StreamArchiverApp {
-    /// Instance (monitor) properties window — header + monitor-specific info.
-    #[allow(deprecated)]
-    /// Render every open instance-properties window (one per monitor).
-    /// True if any open instance-Properties popup belongs to the given channel
-    /// (those windows share the channel's per-open asset caches).
-    pub(super) fn instance_props_open_for_channel(&self, cid: i64) -> bool {
-        self.properties_popups
-            .iter()
-            .any(|&pm| self.rows.iter().any(|r| r.monitor.id == pm && r.channel.id == cid))
-    }
+/// Trivial deferred-viewport state for `drive_props_load`'s "Loading…"
+/// placeholder — it touches no other state at all, just whether the user
+/// closed it mid-load. Keyed by the SAME `egui::ViewportId` the real window
+/// will use once loaded (so it "morphs in place"), in its own registry
+/// rather than [`InstancePropsPopupState`]/[`ChannelPropsPopupState`]'s —
+/// this can be showing for either window kind, before either's real state
+/// even exists yet.
+pub(super) struct PropsLoadingPlaceholderState {
+    /// The spinner's label text (NOT the OS window title, which is set fresh
+    /// on the `ViewportBuilder` every wrapper call and isn't part of this
+    /// state) — e.g. "Loading {channel}'s assets…".
+    pub(super) label: String,
+    pub(super) closed: bool,
+}
 
-    pub(super) fn instance_properties_windows(&mut self, ctx: &egui::Context) {
-        let mut closed: Vec<i64> = Vec::new();
-        // Snapshot: a window closed mid-load removes itself from the list
-        // inside drive_props_load, so indexed iteration could skip/overrun.
-        let ids: Vec<i64> = self.properties_popups.clone();
-        for mid in ids {
-            if !self.properties_popups.contains(&mid) {
-                continue; // removed mid-loop (closed while loading)
-            }
-            if self.instance_properties_window(ctx, mid) {
-                closed.push(mid);
-            }
-        }
-        if !closed.is_empty() {
-            self.properties_popups.retain(|m| !closed.contains(m));
-            for mid in closed {
-                self.instance_scope_drafts.remove(&mid);
-                self.instance_trigger_drafts.remove(&mid);
-                self.instance_block_drafts.remove(&mid);
-                // Free the shared per-channel asset caches when this was the
-                // last Properties window (channel or instance) showing them.
-                let cid = self.rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
-                if let Some(cid) = cid
-                    && !self.channel_properties_popups.contains(&cid)
-                    && !self.instance_props_open_for_channel(cid)
-                {
-                    self.channel_asset_thumbs.remove(&cid);
-                    self.channel_emote_counts.remove(&cid);
-                    self.channel_asset_status.remove(&cid);
-                }
-            }
-        }
-    }
+/// Deferred-viewport state for `instance_properties_window`. Everything the
+/// closure reads is snapshotted in by the wrapper every call (cheap — this
+/// data was already recomputed/cloned fresh every frame pre-migration, just
+/// via `&mut self` reads instead of a struct copy); `platform_tex`/
+/// `provider_tex` and the three scope/trigger/block drafts are read back OUT
+/// by the wrapper afterward and written into the real `self.*` caches, since
+/// those are shared with other windows (channel Properties of the same
+/// channel, `issues_window`, `schedule.rs`, …) that this popup can't reach.
+pub(super) struct InstancePropsPopupState {
+    pub(super) ch: Channel,
+    pub(super) m: Monitor,
+    pub(super) recording_count: i64,
+    pub(super) accounts: Vec<AssetAccount>,
+    pub(super) inst_account: Option<AssetAccount>,
+    pub(super) thumbs: Vec<AssetThumb>,
+    pub(super) emote_counts: Vec<(AssetAccount, [(EmoteProvider, usize); 4])>,
+    pub(super) asset_status: Vec<PlatformAssetStatus>,
+    pub(super) icon_tex: Option<egui::TextureHandle>,
+    /// Snapshotted in from `self.platform_tex`/`self.provider_tex`; lazily
+    /// built here (same as before the migration) if still `None`, then read
+    /// back out and written into the real cache so every other reader
+    /// benefits from the build too, not just this one popup.
+    pub(super) platform_tex: Option<PlatformTextures>,
+    pub(super) provider_tex: Option<ProviderTextures>,
+    pub(super) scope_draft: crate::schedule_source::SourceScopeConfig,
+    pub(super) trigger_draft: crate::triggers::TriggerScope,
+    pub(super) block_draft: crate::triggers::TriggerScope,
+    pub(super) global_order: Vec<SourceEntry>,
+    /// Set by the deferred closure; drained by the wrapper next call, same
+    /// as every other Pattern-C conversion this session — including the
+    /// plain `bool`s, which must be reset after reading (see `form_window`'s
+    /// `do_save`/`closed` bug fixed in commit 1f7a7a0) or a failed action
+    /// re-fires every subsequent call and can permanently starve later ones.
+    pub(super) refetch: bool,
+    pub(super) open_emote_viewer: Option<(EmoteProvider, AssetAccount)>,
+    pub(super) open_asset_history: bool,
+    pub(super) open_about: bool,
+    pub(super) open_change_history: bool,
+    pub(super) scope_dirty: bool,
+    pub(super) trigger_dirty: bool,
+    pub(super) block_dirty: bool,
+    pub(super) closed: bool,
+}
 
-    /// One instance-properties window; returns true when it should close.
-    #[allow(deprecated)]
-    pub(super) fn instance_properties_window(&mut self, ctx: &egui::Context, mid: i64) -> bool {
-        let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid).cloned() else {
-            return true;
-        };
-        let ch = &row.channel;
-        let m = &row.monitor;
-        let cid = ch.id;
 
-        let accounts = {
-            let mons: Vec<&MonitorWithChannel> =
-                self.rows.iter().filter(|r| r.channel.id == cid).collect();
-            channel_asset_accounts(&mons)
-        };
-        // This instance's own asset account (None for Generic URLs — no asset
-        // fetcher, so no assets section). Matched by (platform, slug) rather
-        // than monitor id: two tools on one URL share the sibling's entry.
-        let inst_account: Option<AssetAccount> = if !m.platform().has_asset_fetcher() {
-            None
-        } else {
-            let slug = asset_account(&m.url, m.platform());
-            accounts
-                .iter()
-                .find(|a| a.platform == m.platform() && a.account == slug)
-                .cloned()
-        };
-
-        // The assets shown below come from the same per-channel caches the
-        // channel Properties window uses, filtered to this account — loaded
-        // OFF the UI thread on first open (see drive_props_load).
-        if inst_account.is_some()
-            && !self.channel_asset_status.contains_key(&cid)
-            && !self.drive_props_load(cid, ch, &accounts, Some(mid), ctx)
-        {
-            return false; // still loading — placeholder is on screen
-        }
-
-        let (thumbs, emote_counts, asset_status, icon_tex) =
-            self.instance_props_cached_assets(cid, ch, &accounts, &inst_account, ctx);
-
-        let mut refetch = false;
-        let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
-        let mut open_asset_history = false;
-        let mut open_about = false;
-        let mut open_change_history = false;
-
-        self.instance_scope_drafts
-            .entry(m.id)
-            .or_insert_with(|| load_monitor_scope(&self.core.store, m.id));
-        self.instance_trigger_drafts
-            .entry(m.id)
-            .or_insert_with(|| crate::triggers::load_monitor_trigger_scope(&self.core.store, m.id));
-        self.instance_block_drafts
-            .entry(m.id)
-            .or_insert_with(|| crate::triggers::load_monitor_block_scope(&self.core.store, m.id));
-        let global_order = load_source_order(&self.core.store);
-        let mut scope_dirty = false;
-        let mut trigger_dirty = false;
-        let mut block_dirty = false;
-
-        let mut open = true;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of(("instance_props_vp", mid)),
-            egui::ViewportBuilder::default()
-                .with_title(format!("Instance — {}", ch.name))
-                .with_inner_size([480.0, 560.0]),
-            |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                // ── Header ──────────────────────────────────────────────
-                self.instance_props_header(ui, ch, m, &icon_tex);
-
-                ui.separator();
-
-                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-
-                // ── Monitor (instance) ───────────────────────────────────
-                Self::instance_props_monitor_section(ui, m, row.recording_count, &mut open_change_history);
-
-                // ── Assets (this instance's account) ─────────────────────
-                // The same data the channel Properties window shows, filtered
-                // to the account this instance's URL resolves to.
-                if let Some(acc) = &inst_account {
-                    self.instance_props_assets_section(
-                        ui,
-                        ch,
-                        acc,
-                        &thumbs,
-                        &emote_counts,
-                        &asset_status,
-                        &mut refetch,
-                        &mut open_emote_viewer,
-                        &mut open_asset_history,
-                        &mut open_about,
-                    );
-                }
-
-                // ── Trigger words (this instance) ────────────────────────
-                self.instance_props_triggers_section(ui, mid, &mut trigger_dirty, &mut block_dirty);
-
-                // ── Schedule sources (this instance) ─────────────────────
-                self.instance_props_sched_section(ui, mid, &global_order, &mut scope_dirty);
-
-                }); // ScrollArea
-                });
-                draw_alt_image_preview(ctx);
-            },
-        );
-
-        self.instance_props_apply_actions(
-            mid,
-            cid,
-            ch,
-            &inst_account,
-            scope_dirty,
-            trigger_dirty,
-            block_dirty,
-            refetch,
-            open_emote_viewer,
-            open_asset_history,
-            open_about,
-            open_change_history,
-        );
-
-        !open
-    }
-
-    /// Cached per-channel asset data filtered for the instance window (all
-    /// empty when the instance has no asset account), plus the header icon.
-    #[allow(clippy::type_complexity)]
-    fn instance_props_cached_assets(
-        &mut self,
-        cid: i64,
-        ch: &Channel,
-        accounts: &[AssetAccount],
-        inst_account: &Option<AssetAccount>,
-        ctx: &egui::Context,
-    ) -> (
-        Vec<AssetThumb>,
-        Vec<(AssetAccount, [(EmoteProvider, usize); 4])>,
-        Vec<PlatformAssetStatus>,
-        Option<egui::TextureHandle>,
-    ) {
-        let thumbs = if inst_account.is_some() {
-            self.channel_asset_thumbs
-                .entry(cid)
-                .or_insert_with(|| load_channel_asset_thumbs(ch, accounts, ctx))
-                .clone()
-        } else {
-            Vec::new()
-        };
-        let emote_counts = if inst_account.is_some() {
-            self.channel_emote_counts
-                .entry(cid)
-                .or_insert_with(|| emote_provider_counts(&ch.name, accounts))
-                .clone()
-        } else {
-            Vec::new()
-        };
-        let asset_status = if inst_account.is_some() {
-            self.channel_asset_status
-                .entry(cid)
-                .or_insert_with(|| build_platform_asset_status(&ch.name, accounts))
-                .clone()
-        } else {
-            Vec::new()
-        };
-
-        // Header icon: this instance's own account avatar when fetched; the
-        // channel-level icon as the fallback (nothing fetched yet / Generic).
-        let icon_tex = inst_account
-            .as_ref()
-            .and_then(|acc| {
-                thumbs
-                    .iter()
-                    .find(|t| {
-                        t.kind == "icon" && t.platform == acc.platform && t.account == acc.account
-                    })
-                    .map(|t| t.tex.clone())
-            })
-            .or_else(|| {
-                self.channel_icons
-                    .entry(cid)
-                    .or_insert_with(|| resolve_channel_icon(ch, accounts, ctx))
-                    .clone()
-            });
-
-        (thumbs, emote_counts, asset_status, icon_tex)
-    }
-
+impl InstancePropsPopupState {
     /// Header row: account avatar (or placeholder), channel name, and this
     /// instance's platform icon + source-URL link.
-    fn instance_props_header(
-        &mut self,
-        ui: &mut egui::Ui,
-        ch: &Channel,
-        m: &Monitor,
-        icon_tex: &Option<egui::TextureHandle>,
-    ) {
+    fn instance_props_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if let Some(tex) = icon_tex {
+            if let Some(tex) = &self.icon_tex {
                 let resp = ui.add(
                     egui::Image::from_texture(tex)
                         .max_size(egui::vec2(96.0, 96.0))
@@ -273,22 +89,22 @@ impl StreamArchiverApp {
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                ui.heading(&ch.name);
+                ui.heading(&self.ch.name);
                 // This instance's platform + source URL (not the
                 // channel-wide platform list — that's channel Properties).
                 ui.horizontal(|ui| {
                     let ptex = self
                         .platform_tex
                         .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
-                    if let Some(t) = ptex.get(m.platform()) {
+                    if let Some(t) = ptex.get(self.m.platform()) {
                         ui.add(
                             egui::Image::from_texture(t)
                                 .max_size(egui::vec2(14.0, 14.0)),
                         );
                     }
-                    if ui.link(instance_label(&m.url)).on_hover_text(&m.url).clicked()
+                    if ui.link(instance_label(&self.m.url)).on_hover_text(&self.m.url).clicked()
                     {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(m.url.clone()));
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(self.m.url.clone()));
                     }
                 });
             });
@@ -372,20 +188,12 @@ impl StreamArchiverApp {
     /// "Assets (this account)" section — refetch/folder/history/about buttons,
     /// this account's thumbnails, its status row and emote-viewer launchers.
     #[allow(deprecated)] // egui::ImageButton in the emote launchers
-    #[allow(clippy::too_many_arguments)]
-    fn instance_props_assets_section(
-        &mut self,
-        ui: &mut egui::Ui,
-        ch: &Channel,
-        acc: &AssetAccount,
-        thumbs: &[AssetThumb],
-        emote_counts: &[(AssetAccount, [(EmoteProvider, usize); 4])],
-        asset_status: &[PlatformAssetStatus],
-        refetch: &mut bool,
-        open_emote_viewer: &mut Option<(EmoteProvider, AssetAccount)>,
-        open_asset_history: &mut bool,
-        open_about: &mut bool,
-    ) {
+    fn instance_props_assets_section(&mut self, ui: &mut egui::Ui, shared: &PopupShared) {
+        let ch = self.ch.clone();
+        let acc = self.inst_account.clone().expect("caller only calls this when inst_account is Some");
+        let thumbs = self.thumbs.clone();
+        let emote_counts = self.emote_counts.clone();
+        let asset_status = self.asset_status.clone();
         egui::CollapsingHeader::new(
             egui::RichText::new("Assets (this account)").strong(),
         )
@@ -402,7 +210,7 @@ impl StreamArchiverApp {
                 ))
                 .clicked()
             {
-                *refetch = true;
+                self.refetch = true;
             }
             if ui
                 .button("📂")
@@ -432,7 +240,7 @@ impl StreamArchiverApp {
                 )
                 .clicked()
             {
-                *open_asset_history = true;
+                self.open_asset_history = true;
             }
             if ui
                 .button("ℹ About")
@@ -444,7 +252,7 @@ impl StreamArchiverApp {
                 )
                 .clicked()
             {
-                *open_about = true;
+                self.open_about = true;
             }
         });
 
@@ -453,7 +261,7 @@ impl StreamArchiverApp {
         // has passed through.
         if acc.platform == Platform::Twitch
             && let Some((btype, created)) =
-                crate::detectors::cached_twitch_user_info(&self.core.store, &acc.account)
+                crate::detectors::cached_twitch_user_info(&shared.core.store, &acc.account)
         {
             let mut parts: Vec<String> = Vec::new();
             match btype.as_str() {
@@ -593,7 +401,7 @@ impl StreamArchiverApp {
                             ))
                             .clicked()
                         {
-                            *open_emote_viewer = Some((provider, eacc.clone()));
+                            self.open_emote_viewer = Some((provider, eacc.clone()));
                         }
                     }
                 });
@@ -602,13 +410,7 @@ impl StreamArchiverApp {
     }
 
     /// "Trigger words" section — this instance's trigger-scope editor.
-    fn instance_props_triggers_section(
-        &mut self,
-        ui: &mut egui::Ui,
-        mid: i64,
-        trigger_dirty: &mut bool,
-        block_dirty: &mut bool,
-    ) {
+    fn instance_props_triggers_section(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
             .id_salt("inst_props_sec_triggers")
             .default_open(true)
@@ -622,10 +424,8 @@ impl StreamArchiverApp {
                 .small()
                 .weak(),
             );
-            if let Some(scope) = self.instance_trigger_drafts.get_mut(&mid)
-                && trigger_scope_editor(ui, scope, "inst_triggers", true)
-            {
-                *trigger_dirty = true;
+            if trigger_scope_editor(ui, &mut self.trigger_draft, "inst_triggers", true) {
+                self.trigger_dirty = true;
             }
             });
         egui::CollapsingHeader::new(egui::RichText::new("Blacklist triggers").strong())
@@ -642,23 +442,15 @@ impl StreamArchiverApp {
                 .small()
                 .weak(),
             );
-            if let Some(scope) = self.instance_block_drafts.get_mut(&mid)
-                && trigger_scope_editor(ui, scope, "inst_block_triggers", false)
-            {
-                *block_dirty = true;
+            if trigger_scope_editor(ui, &mut self.block_draft, "inst_block_triggers", false) {
+                self.block_dirty = true;
             }
             });
     }
 
     /// "Schedule sources (this instance)" section — the per-monitor scope
     /// override editor.
-    fn instance_props_sched_section(
-        &mut self,
-        ui: &mut egui::Ui,
-        mid: i64,
-        global_order: &[SourceEntry],
-        scope_dirty: &mut bool,
-    ) {
+    fn instance_props_sched_section(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(
             egui::RichText::new("Schedule sources (this instance)").strong(),
         )
@@ -674,13 +466,349 @@ impl StreamArchiverApp {
             .small()
             .weak(),
         );
-        if let Some(scope) = self.instance_scope_drafts.get_mut(&mid) {
-            if scope_override_editor(ui, scope, global_order) {
-                *scope_dirty = true;
-            }
+        let global_order = self.global_order.clone();
+        if scope_override_editor(ui, &mut self.scope_draft, &global_order) {
+            self.scope_dirty = true;
         }
         });
     }
+}
+
+impl StreamArchiverApp {
+    /// Instance (monitor) properties window — header + monitor-specific info.
+    #[allow(deprecated)]
+    /// Render every open instance-properties window (one per monitor).
+    /// True if any open instance-Properties popup belongs to the given channel
+    /// (those windows share the channel's per-open asset caches).
+    pub(super) fn instance_props_open_for_channel(&self, cid: i64) -> bool {
+        self.properties_popups
+            .iter()
+            .any(|&pm| self.rows.iter().any(|r| r.monitor.id == pm && r.channel.id == cid))
+    }
+
+    pub(super) fn instance_properties_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        // Snapshot: a window closed mid-load removes itself from the list
+        // inside drive_props_load, so indexed iteration could skip/overrun.
+        let ids: Vec<i64> = self.properties_popups.clone();
+        for mid in ids {
+            if !self.properties_popups.contains(&mid) {
+                continue; // removed mid-loop (closed while loading)
+            }
+            if self.instance_properties_window(ctx, mid) {
+                closed.push(mid);
+            }
+        }
+        if !closed.is_empty() {
+            self.properties_popups.retain(|m| !closed.contains(m));
+            for mid in closed {
+                self.instance_scope_drafts.remove(&mid);
+                self.instance_trigger_drafts.remove(&mid);
+                self.instance_block_drafts.remove(&mid);
+                // Free the shared per-channel asset caches when this was the
+                // last Properties window (channel or instance) showing them.
+                let cid = self.rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
+                if let Some(cid) = cid
+                    && !self.channel_properties_popups.contains(&cid)
+                    && !self.instance_props_open_for_channel(cid)
+                {
+                    self.channel_asset_thumbs.remove(&cid);
+                    self.channel_emote_counts.remove(&cid);
+                    self.channel_asset_status.remove(&cid);
+                }
+            }
+        }
+        self.instance_props_registry.retain(&self.properties_popups);
+    }
+
+    /// One instance-properties window; returns true when it should close.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    pub(super) fn instance_properties_window(&mut self, ctx: &egui::Context, mid: i64) -> bool {
+        let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid).cloned() else {
+            return true;
+        };
+        let ch = &row.channel;
+        let m = &row.monitor;
+        let cid = ch.id;
+
+        let accounts = {
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|r| r.channel.id == cid).collect();
+            channel_asset_accounts(&mons)
+        };
+        // This instance's own asset account (None for Generic URLs — no asset
+        // fetcher, so no assets section). Matched by (platform, slug) rather
+        // than monitor id: two tools on one URL share the sibling's entry.
+        let inst_account: Option<AssetAccount> = if !m.platform().has_asset_fetcher() {
+            None
+        } else {
+            let slug = asset_account(&m.url, m.platform());
+            accounts
+                .iter()
+                .find(|a| a.platform == m.platform() && a.account == slug)
+                .cloned()
+        };
+
+        // The assets shown below come from the same per-channel caches the
+        // channel Properties window uses, filtered to this account — loaded
+        // OFF the UI thread on first open (see drive_props_load).
+        if inst_account.is_some()
+            && !self.channel_asset_status.contains_key(&cid)
+            && !self.drive_props_load(cid, ch, &accounts, Some(mid), ctx)
+        {
+            return false; // still loading — placeholder is on screen
+        }
+
+        let (thumbs, emote_counts, asset_status, icon_tex) =
+            self.instance_props_cached_assets(cid, ch, &accounts, &inst_account, ctx);
+
+        self.instance_scope_drafts
+            .entry(m.id)
+            .or_insert_with(|| load_monitor_scope(&self.core.store, m.id));
+        self.instance_trigger_drafts
+            .entry(m.id)
+            .or_insert_with(|| crate::triggers::load_monitor_trigger_scope(&self.core.store, m.id));
+        self.instance_block_drafts
+            .entry(m.id)
+            .or_insert_with(|| crate::triggers::load_monitor_block_scope(&self.core.store, m.id));
+        let global_order = load_source_order(&self.core.store);
+
+        let popup_state = self.instance_props_registry.get_or_init(mid, || InstancePropsPopupState {
+            ch: ch.clone(),
+            m: m.clone(),
+            recording_count: row.recording_count,
+            accounts: accounts.clone(),
+            inst_account: inst_account.clone(),
+            thumbs: thumbs.clone(),
+            emote_counts: emote_counts.clone(),
+            asset_status: asset_status.clone(),
+            icon_tex: icon_tex.clone(),
+            platform_tex: self.platform_tex.clone(),
+            provider_tex: self.provider_tex.clone(),
+            scope_draft: self.instance_scope_drafts.get(&mid).cloned().unwrap_or_default(),
+            trigger_draft: self.instance_trigger_drafts.get(&mid).cloned().unwrap_or_default(),
+            block_draft: self.instance_block_drafts.get(&mid).cloned().unwrap_or_default(),
+            global_order: global_order.clone(),
+            refetch: false,
+            open_emote_viewer: None,
+            open_asset_history: false,
+            open_about: false,
+            open_change_history: false,
+            scope_dirty: false,
+            trigger_dirty: false,
+            block_dirty: false,
+            closed: false,
+        });
+        // Refreshed every call — same data the wrapper already just
+        // recomputed above, snapshotted in since the deferred closure can't
+        // reach `self`.
+        {
+            let mut s = popup_state.lock().unwrap();
+            s.ch = ch.clone();
+            s.m = m.clone();
+            s.recording_count = row.recording_count;
+            s.accounts = accounts.clone();
+            s.inst_account = inst_account.clone();
+            s.thumbs = thumbs;
+            s.emote_counts = emote_counts;
+            s.asset_status = asset_status;
+            s.icon_tex = icon_tex;
+            s.platform_tex = self.platform_tex.clone();
+            s.provider_tex = self.provider_tex.clone();
+            s.scope_draft = self.instance_scope_drafts.get(&mid).cloned().unwrap_or_default();
+            s.trigger_draft = self.instance_trigger_drafts.get(&mid).cloned().unwrap_or_default();
+            s.block_draft = self.instance_block_drafts.get(&mid).cloned().unwrap_or_default();
+            s.global_order = global_order;
+        }
+
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
+            egui::ViewportId::from_hash_of(("instance_props_vp", mid)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Instance — {}", ch.name))
+                .with_inner_size([480.0, 560.0]),
+            popup_state.clone(),
+            shared,
+            |ctx, s, shared| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    s.closed = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                // ── Header ──────────────────────────────────────────────
+                s.instance_props_header(ui);
+
+                ui.separator();
+
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+
+                // ── Monitor (instance) ───────────────────────────────────
+                InstancePropsPopupState::instance_props_monitor_section(
+                    ui,
+                    &s.m,
+                    s.recording_count,
+                    &mut s.open_change_history,
+                );
+
+                // ── Assets (this instance's account) ─────────────────────
+                // The same data the channel Properties window shows, filtered
+                // to the account this instance's URL resolves to.
+                if s.inst_account.is_some() {
+                    s.instance_props_assets_section(ui, shared);
+                }
+
+                // ── Trigger words (this instance) ────────────────────────
+                s.instance_props_triggers_section(ui);
+
+                // ── Schedule sources (this instance) ─────────────────────
+                s.instance_props_sched_section(ui);
+
+                }); // ScrollArea
+                });
+                draw_alt_image_preview(ctx);
+            },
+        );
+
+        let (
+            platform_tex,
+            provider_tex,
+            scope_draft,
+            trigger_draft,
+            block_draft,
+            closed,
+            refetch,
+            open_emote_viewer,
+            open_asset_history,
+            open_about,
+            open_change_history,
+            scope_dirty,
+            trigger_dirty,
+            block_dirty,
+        ) = {
+            let mut s = popup_state.lock().unwrap();
+            let result = (
+                s.platform_tex.clone(),
+                s.provider_tex.clone(),
+                s.scope_draft.clone(),
+                s.trigger_draft.clone(),
+                s.block_draft.clone(),
+                s.closed,
+                s.refetch,
+                s.open_emote_viewer.take(),
+                s.open_asset_history,
+                s.open_about,
+                s.open_change_history,
+                s.scope_dirty,
+                s.trigger_dirty,
+                s.block_dirty,
+            );
+            // Consume the plain-bool flags — an action that fails/doesn't
+            // fully apply must not keep re-firing every subsequent call (see
+            // commit 1f7a7a0).
+            s.closed = false;
+            s.refetch = false;
+            s.open_asset_history = false;
+            s.open_about = false;
+            s.open_change_history = false;
+            s.scope_dirty = false;
+            s.trigger_dirty = false;
+            s.block_dirty = false;
+            result
+        };
+        // Propagate the lazily-built texture caches back to the shared
+        // fields other windows (channel Properties, issues.rs, schedule.rs,
+        // …) read, so the GPU upload only ever happens once.
+        if platform_tex.is_some() {
+            self.platform_tex = platform_tex;
+        }
+        if provider_tex.is_some() {
+            self.provider_tex = provider_tex;
+        }
+        self.instance_scope_drafts.insert(mid, scope_draft);
+        self.instance_trigger_drafts.insert(mid, trigger_draft);
+        self.instance_block_drafts.insert(mid, block_draft);
+
+        self.instance_props_apply_actions(
+            mid,
+            cid,
+            ch,
+            &inst_account,
+            scope_dirty,
+            trigger_dirty,
+            block_dirty,
+            refetch,
+            open_emote_viewer,
+            open_asset_history,
+            open_about,
+            open_change_history,
+        );
+
+        closed
+    }
+
+    /// Cached per-channel asset data filtered for the instance window (all
+    /// empty when the instance has no asset account), plus the header icon.
+    #[allow(clippy::type_complexity)]
+    fn instance_props_cached_assets(
+        &mut self,
+        cid: i64,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        inst_account: &Option<AssetAccount>,
+        ctx: &egui::Context,
+    ) -> (
+        Vec<AssetThumb>,
+        Vec<(AssetAccount, [(EmoteProvider, usize); 4])>,
+        Vec<PlatformAssetStatus>,
+        Option<egui::TextureHandle>,
+    ) {
+        let thumbs = if inst_account.is_some() {
+            self.channel_asset_thumbs
+                .entry(cid)
+                .or_insert_with(|| load_channel_asset_thumbs(ch, accounts, ctx))
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let emote_counts = if inst_account.is_some() {
+            self.channel_emote_counts
+                .entry(cid)
+                .or_insert_with(|| emote_provider_counts(&ch.name, accounts))
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let asset_status = if inst_account.is_some() {
+            self.channel_asset_status
+                .entry(cid)
+                .or_insert_with(|| build_platform_asset_status(&ch.name, accounts))
+                .clone()
+        } else {
+            Vec::new()
+        };
+
+        // Header icon: this instance's own account avatar when fetched; the
+        // channel-level icon as the fallback (nothing fetched yet / Generic).
+        let icon_tex = inst_account
+            .as_ref()
+            .and_then(|acc| {
+                thumbs
+                    .iter()
+                    .find(|t| {
+                        t.kind == "icon" && t.platform == acc.platform && t.account == acc.account
+                    })
+                    .map(|t| t.tex.clone())
+            })
+            .or_else(|| {
+                self.channel_icons
+                    .entry(cid)
+                    .or_insert_with(|| resolve_channel_icon(ch, accounts, ctx))
+                    .clone()
+            });
+
+        (thumbs, emote_counts, asset_status, icon_tex)
+    }
+
 
     /// Post-render actions for the instance window: persist dirty scope/trigger
     /// drafts, dispatch ⟳ Refetch (outside the viewport closure) and open the
@@ -890,29 +1018,42 @@ impl StreamArchiverApp {
                 [480.0, 640.0],
             ),
         };
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let spinner_label = format!("Loading {} assets…", ch.name);
+        let placeholder_state = self
+            .props_loading_registry
+            .get_or_init(vp_id, || PropsLoadingPlaceholderState { label: spinner_label.clone(), closed: false });
+        placeholder_state.lock().unwrap().label = spinner_label;
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             vp_id,
-            egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_inner_size(size),
-            |ctx, _class| {
+            egui::ViewportBuilder::default().with_title(title).with_inner_size(size),
+            placeholder_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(220.0);
                         ui.spinner();
                         ui.add_space(8.0);
-                        ui.label(format!("Loading {} assets…", ch.name));
+                        ui.label(&s.label);
                     });
                 });
             },
         );
-        if !open {
+        let closed = {
+            let mut s = placeholder_state.lock().unwrap();
+            let closed = s.closed;
+            s.closed = false;
+            closed
+        };
+        if closed {
             // Closed mid-load: forget the popup; drop the in-flight load only
             // when no other window (channel or sibling instance) still wants it.
+            self.props_loading_registry.remove(&vp_id);
             match instance_mid {
                 Some(mid) => self.properties_popups.retain(|m| *m != mid),
                 None => self.channel_properties_popups.retain(|c| *c != cid),
