@@ -1942,7 +1942,7 @@ pub struct StreamArchiverApp {
     save_preset_dialog: Option<Arc<Mutex<SavePresetDraft>>>,
     /// Chat log viewer popup (None = closed).
     /// Open chat windows, one per monitor (each is its own OS viewport).
-    chat_popups: Vec<ChatPopup>,
+    chat_popups: Vec<Arc<Mutex<ChatPopup>>>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
     /// Which monitor's Properties window is open (None = closed).
@@ -2124,34 +2124,11 @@ pub struct StreamArchiverApp {
     /// instead of the full datetime. The full value appears in a tooltip. Persisted
     /// under [`K_SHORT_TIMESTAMPS`].
     shorten_timestamps: bool,
-    /// Render chat emotes as inline images in the chat replay (off ⇒ show the
-    /// emote code as text). Default on. Persisted under [`K_RENDER_EMOTES`].
-    render_emotes: bool,
-    /// Play animated emotes (off ⇒ static first frame). Default on. Persisted under
-    /// [`K_ANIMATE_EMOTES`].
-    animate_emotes: bool,
-    /// Fetch a first-party Twitch emote id that's missing from every
-    /// locally-cached channel straight from Twitch's CDN by id, for a poster
-    /// whose home channel isn't monitored here. Default on. Persisted under
-    /// [`K_FETCH_UNKNOWN_EMOTES`]; separate from `render_emotes` (see its doc).
-    fetch_unknown_emotes: bool,
-    /// Chat-replay text size in points (timestamp + message body + username,
-    /// uniformly). Default [`CHAT_FONT_PT_DEFAULT`]. Edited from the chat
-    /// window's ⚙ panel; persisted under [`K_CHAT_FONT_PT`].
-    chat_font_pt: f32,
-    /// Chat-replay emote size in pixels, independent of `chat_font_pt`.
-    /// Default [`CHAT_EMOTE_PT_DEFAULT`]. Persisted under [`K_CHAT_EMOTE_PT`].
-    chat_emote_pt: f32,
-    /// Chat-replay timestamp color. Default white. Persisted under
-    /// [`K_CHAT_TS_COLOR`].
-    chat_ts_color: egui::Color32,
-    /// Chat-replay message body color. Default white. Persisted under
-    /// [`K_CHAT_TEXT_COLOR`].
-    chat_text_color: egui::Color32,
-    /// Whether opening a chat usercard also fetches the user's live Twitch
-    /// avatar + account-created date. Default off. Persisted under
-    /// [`K_FETCH_USERCARD_INFO`].
-    fetch_usercard_info: bool,
+    /// Global chat-replay settings (render/animate emotes, unknown-emote CDN
+    /// fetch, live usercard lookup, font size, colors) — shared by the
+    /// Settings dialog's Display section and every open chat window's own
+    /// ⚙ panel. See [`chat::ChatSettingsState`].
+    chat_settings: Arc<Mutex<chat::ChatSettingsState>>,
     /// Set to true by the "⇔ Fit columns" button; consumed in `channels_view`
     /// to call `TableBuilder::reset()` so columns revert to content-fit widths.
     reset_streams_columns: bool,

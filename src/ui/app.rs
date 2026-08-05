@@ -425,69 +425,7 @@ impl StreamArchiverApp {
             .unwrap_or(false);
         set_short_ts(shorten_timestamps);
 
-        // Inline chat emotes default on; only an explicit "0" disables.
-        let render_emotes = core
-            .store
-            .get_setting(K_RENDER_EMOTES)
-            .ok()
-            .flatten()
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        // Animated emotes default on; only an explicit "0" disables.
-        let animate_emotes = core
-            .store
-            .get_setting(K_ANIMATE_EMOTES)
-            .ok()
-            .flatten()
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        // Fetching unknown-channel emotes from Twitch's CDN defaults on; only
-        // an explicit "0" disables.
-        let fetch_unknown_emotes = core
-            .store
-            .get_setting(K_FETCH_UNKNOWN_EMOTES)
-            .ok()
-            .flatten()
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let chat_font_pt = core
-            .store
-            .get_setting(K_CHAT_FONT_PT)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(CHAT_FONT_PT_DEFAULT);
-        let chat_emote_pt = core
-            .store
-            .get_setting(K_CHAT_EMOTE_PT)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(CHAT_EMOTE_PT_DEFAULT);
-        let chat_ts_color = core
-            .store
-            .get_setting(K_CHAT_TS_COLOR)
-            .ok()
-            .flatten()
-            .and_then(|v| crate::ui::chat::parse_chat_hex_color(&v))
-            .unwrap_or(egui::Color32::WHITE);
-        let chat_text_color = core
-            .store
-            .get_setting(K_CHAT_TEXT_COLOR)
-            .ok()
-            .flatten()
-            .and_then(|v| crate::ui::chat::parse_chat_hex_color(&v))
-            .unwrap_or(egui::Color32::WHITE);
-        // Live Twitch usercard lookup (avatar + account-created date) defaults
-        // OFF — unlike the emote/badge fetchers this hits the network on
-        // every usercard open, not just once per missing asset.
-        let fetch_usercard_info = core
-            .store
-            .get_setting(K_FETCH_USERCARD_INFO)
-            .ok()
-            .flatten()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let chat_settings = Arc::new(Mutex::new(chat::ChatSettingsState::load(&core.store)));
         // Streams grid channel-group clustering defaults on (it always has
         // been); only an explicit "0" flattens it.
         let streams_group_visually = core
@@ -869,14 +807,7 @@ impl StreamArchiverApp {
             status_bgcolor,
             show_actions,
             shorten_timestamps,
-            render_emotes,
-            animate_emotes,
-            fetch_unknown_emotes,
-            chat_font_pt,
-            chat_emote_pt,
-            chat_ts_color,
-            chat_text_color,
-            fetch_usercard_info,
+            chat_settings,
             reset_streams_columns: false,
             streams_grid,
             videos_grid,

@@ -257,12 +257,84 @@ pub(super) struct UsersPanelState {
     pub(super) built_at_count: usize,
 }
 
+/// Global chat-replay settings shared across every open chat window (and
+/// the Settings dialog's Display section) — replaces what used to be 8
+/// separate `StreamArchiverApp` fields (`render_emotes`/`animate_emotes`/
+/// `fetch_unknown_emotes`/`fetch_usercard_info`/`chat_font_pt`/
+/// `chat_emote_pt`/`chat_ts_color`/`chat_text_color`). One `Arc<Mutex<>>` on
+/// `self`, cloned into every `ChatPopup` at open time — a change from
+/// either the Settings window or one chat window's own ⚙ panel is visible
+/// to every other open window immediately, since they all lock the SAME
+/// instance.
+pub(super) struct ChatSettingsState {
+    pub(super) render_emotes: bool,
+    pub(super) animate_emotes: bool,
+    pub(super) fetch_unknown_emotes: bool,
+    pub(super) fetch_usercard_info: bool,
+    pub(super) font_pt: f32,
+    pub(super) emote_pt: f32,
+    pub(super) ts_color: egui::Color32,
+    pub(super) text_color: egui::Color32,
+}
+
+impl ChatSettingsState {
+    pub(super) fn load(store: &crate::store::Store) -> ChatSettingsState {
+        let flag = |key: &str, default: bool| {
+            store
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .map(|v| if default { v != "0" } else { v == "1" })
+                .unwrap_or(default)
+        };
+        ChatSettingsState {
+            // Inline/animated emotes and the unknown-emote CDN fetch all
+            // default on; only an explicit "0" disables each.
+            render_emotes: flag(K_RENDER_EMOTES, true),
+            animate_emotes: flag(K_ANIMATE_EMOTES, true),
+            fetch_unknown_emotes: flag(K_FETCH_UNKNOWN_EMOTES, true),
+            // Live Twitch usercard lookup defaults OFF — unlike the emote/
+            // badge fetchers this hits the network on every usercard open,
+            // not just once per missing asset.
+            fetch_usercard_info: flag(K_FETCH_USERCARD_INFO, false),
+            font_pt: store
+                .get_setting(K_CHAT_FONT_PT)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(CHAT_FONT_PT_DEFAULT),
+            emote_pt: store
+                .get_setting(K_CHAT_EMOTE_PT)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(CHAT_EMOTE_PT_DEFAULT),
+            ts_color: store
+                .get_setting(K_CHAT_TS_COLOR)
+                .ok()
+                .flatten()
+                .and_then(|v| parse_chat_hex_color(&v))
+                .unwrap_or(egui::Color32::WHITE),
+            text_color: store
+                .get_setting(K_CHAT_TEXT_COLOR)
+                .ok()
+                .flatten()
+                .and_then(|v| parse_chat_hex_color(&v))
+                .unwrap_or(egui::Color32::WHITE),
+        }
+    }
+}
+
 pub(super) struct ChatPopup {
     /// Monitor this window belongs to — keys the viewport id, so each channel
     /// gets its OWN chat window (opening another channel's chat no longer
     /// replaces the one already open).
     pub(super) monitor_id: i64,
     pub(super) monitor_name: String,
+    /// Snapshot of the monitor's platform at popup-open — the deferred
+    /// closure can't reach `self.rows` to look this up itself, and the
+    /// platform of an existing monitor never changes mid-session.
+    pub(super) is_twitch: bool,
     /// Currently-viewed recording (`None` = monitor has no recordings at all).
     pub(super) recording: Option<Recording>,
     pub(super) all_recordings: Vec<Recording>,
@@ -370,6 +442,20 @@ pub(super) struct ChatPopup {
     /// only when the query, message count, or `hide_shared` changes — the
     /// filter used to lowercase every message every frame.
     pub(super) filter_cache: Option<(String, usize, bool, Vec<u32>)>,
+    /// Shared with every other open chat window and the Settings dialog —
+    /// see [`ChatSettingsState`].
+    pub(super) settings: Arc<Mutex<ChatSettingsState>>,
+    /// Set by the deferred closure on close; read back by `chat_popup_window`
+    /// next call.
+    pub(super) closed: bool,
+    /// Emote decode-cache misses queued this render pass — drained by
+    /// `chat_popup_window`'s wrapper via `pump_emote_decodes`, same as
+    /// before the migration, just relocated from a captured local.
+    pub(super) decode_misses: Vec<std::path::PathBuf>,
+    /// A username click this render pass, consumed by the wrapper to spawn
+    /// the (optional) live usercard lookup — same "mutate inside the
+    /// closure, consume after" shape `decode_misses` already used.
+    pub(super) usercard_click: Option<UserCardClick>,
 }
 /// The Twitch broadcaster's chosen chat name colour for `name`'s `account`, if
 /// the asset fetch cached one (`…/{name}/twitch/{account}/name_color.txt`, e.g.
@@ -2746,6 +2832,10 @@ impl StreamArchiverApp {
             Default::default()
         };
 
+        let (fetch_unknown_emotes, render_emotes) = {
+            let cs = self.chat_settings.lock().unwrap();
+            (cs.fetch_unknown_emotes, cs.render_emotes)
+        };
         let state = Arc::new(Mutex::new(ChatLoadState::Loading));
         let loading = Arc::new(AtomicBool::new(false));
         if let Some(r) = &rec {
@@ -2757,8 +2847,8 @@ impl StreamArchiverApp {
                 emote_map.clone(),
                 twitch_emote_dir.clone(),
                 twitch_fallback_index.clone(),
-                self.fetch_unknown_emotes,
-                self.render_emotes,
+                fetch_unknown_emotes,
+                render_emotes,
                 source_partners.clone(),
                 twitch_badge_dirs.clone(),
                 ctx.clone(),
@@ -2769,6 +2859,7 @@ impl StreamArchiverApp {
         let popup = ChatPopup {
             monitor_id,
             monitor_name,
+            is_twitch: platform == Some(Platform::Twitch),
             recording: rec,
             all_recordings: recs,
             load_state: state,
@@ -2790,17 +2881,21 @@ impl StreamArchiverApp {
             twitch_fallback_index,
             twitch_badge_dirs,
             source_partners,
-            fetch_unknown_emotes: self.fetch_unknown_emotes,
+            fetch_unknown_emotes,
             loading,
             error_retries: 0,
             filter_cache: None,
+            settings: self.chat_settings.clone(),
+            closed: false,
+            decode_misses: Vec::new(),
+            usercard_click: None,
         };
         // One chat window per monitor: re-targeting an already-open window
         // (e.g. "View chat" on another take) replaces its content in place;
         // a different monitor gets its own window.
-        match self.chat_popups.iter_mut().find(|p| p.monitor_id == monitor_id) {
-            Some(slot) => *slot = popup,
-            None => self.chat_popups.push(popup),
+        match self.chat_popups.iter_mut().find(|p| p.lock().unwrap().monitor_id == monitor_id) {
+            Some(slot) => *slot.lock().unwrap() = popup,
+            None => self.chat_popups.push(Arc::new(Mutex::new(popup))),
         }
     }
 
@@ -2810,11 +2905,11 @@ impl StreamArchiverApp {
         let mut closed: Vec<i64> = Vec::new();
         for idx in 0..self.chat_popups.len() {
             if self.chat_popup_window(ctx, idx) {
-                closed.push(self.chat_popups[idx].monitor_id);
+                closed.push(self.chat_popups[idx].lock().unwrap().monitor_id);
             }
         }
         if !closed.is_empty() {
-            self.chat_popups.retain(|p| !closed.contains(&p.monitor_id));
+            self.chat_popups.retain(|p| !closed.contains(&p.lock().unwrap().monitor_id));
             if self.chat_popups.is_empty() {
                 // Free all decoded emote frame textures once the last chat
                 // window is gone.
@@ -2827,11 +2922,11 @@ impl StreamArchiverApp {
     #[allow(deprecated)]
     pub(super) fn chat_popup_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
         const CHAT_RELOAD_SECS: u64 = 3;
-        let popup = &mut self.chat_popups[idx];
+        let popup_arc = self.chat_popups[idx].clone();
+        let mut popup = popup_arc.lock().unwrap();
         // Watchdog: name this phase so a freeze dialog points at the chat popup.
         self.heartbeat.set_context(format!("Chat: {}", popup.monitor_name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Chat);
-        let mut open = true;
         let title = format!("💬  Chat — {}", popup.monitor_name);
         let vp_id = egui::ViewportId::from_hash_of(("chat_popup_vp", popup.monitor_id));
 
@@ -2896,30 +2991,44 @@ impl StreamArchiverApp {
         // without borrowing `self`. Copy the render toggles out too. `now` is the
         // global animation clock — all instances of an emote animate in lockstep.
         let anim_cache = self.emote_anim.clone();
-        let render_emotes = self.render_emotes;
-        let animate_emotes = self.animate_emotes;
-        let appearance = ChatAppearance {
-            font_pt: self.chat_font_pt,
-            emote_pt: self.chat_emote_pt,
-            ts_color: self.chat_ts_color,
-            text_color: self.chat_text_color,
+        let (render_emotes, animate_emotes, appearance) = {
+            let cs = self.chat_settings.lock().unwrap();
+            (
+                cs.render_emotes,
+                cs.animate_emotes,
+                ChatAppearance {
+                    font_pt: cs.font_pt,
+                    emote_pt: cs.emote_pt,
+                    ts_color: cs.ts_color,
+                    text_color: cs.text_color,
+                },
+            )
         };
         let now = ctx.input(|i| i.time);
-        let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
-        // Captured from a username click during this frame's render pass,
-        // consumed after `show_viewport_immediate` returns (same "mutate
-        // through nested closures, consume after" shape as `decode_misses`).
-        let mut usercard_click: Option<UserCardClick> = None;
 
-        ctx.show_viewport_immediate(
+        // Release the lock before registering the deferred closure — it
+        // takes its own lock on the SAME Arc each time it repaints, which
+        // would deadlock against this one if it were still held.
+        drop(popup);
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             vp_id,
             egui::ViewportBuilder::default()
                 .with_title(title.clone())
                 .with_inner_size([480.0, 600.0]),
-            |ctx, _class| {
+            popup_arc.clone(),
+            shared,
+            move |ctx, popup, shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    popup.closed = true;
                 }
+                // Consumed at the end of this closure into `popup.decode_misses`/
+                // `popup.usercard_click` — the deferred closure doesn't run
+                // synchronously with the wrapper call, so these can't be plain
+                // captured locals the wrapper reads back after the call returns.
+                let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
+                let mut usercard_click: Option<UserCardClick> = None;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // ── Toolbar ──────────────────────────────────────────────
                     ui.horizontal(|ui| {
@@ -2929,7 +3038,7 @@ impl StreamArchiverApp {
                         // paths each) — direct stats here were measured in the
                         // thousands per second against the recordings drive.
                         let recs_with_chat: Vec<_> = {
-                            let mut fs_guard = self.fs_probes.lock().unwrap();
+                            let mut fs_guard = shared.fs_probes.lock().unwrap();
                             popup
                                 .all_recordings
                                 .iter()
@@ -2978,7 +3087,8 @@ impl StreamArchiverApp {
                                                         .as_deref()
                                                         .filter(|sid| !sid.is_empty())
                                                         .and_then(|sid| {
-                                                            self.core
+                                                            shared
+                                                                .core
                                                                 .store
                                                                 .collab_partners_for_stream(popup.monitor_id, sid)
                                                                 .ok()
@@ -2996,16 +3106,11 @@ impl StreamArchiverApp {
                                             // A different recording is a different
                                             // broadcast — its leaderboard/Hype Train
                                             // history is scoped to its own time span.
-                                            let is_twitch = self
-                                                .rows
-                                                .iter()
-                                                .find(|r| r.monitor.id == popup.monitor_id)
-                                                .is_some_and(|r| r.monitor.platform() == Platform::Twitch);
-                                            let (top_gifters, top_cheerers, hype_train) = if is_twitch {
+                                            let (top_gifters, top_cheerers, hype_train) = if popup.is_twitch {
                                                 let since = start_ts;
                                                 let until =
                                                     new_rec.ended_at.unwrap_or_else(crate::models::now_unix);
-                                                load_broadcast_stats(&self.core.store, popup.monitor_id, since, until)
+                                                load_broadcast_stats(&shared.core.store, popup.monitor_id, since, until)
                                             } else {
                                                 (Vec::new(), Vec::new(), None)
                                             };
@@ -3019,7 +3124,7 @@ impl StreamArchiverApp {
                                             // different log with the same count
                                             // would reuse stale match indices.
                                             popup.filter_cache = None;
-                                            self.core.rt.spawn(load_chat(
+                                            shared.core.rt.spawn(load_chat(
                                                 state,
                                                 popup.loading.clone(),
                                                 path,
@@ -3059,8 +3164,11 @@ impl StreamArchiverApp {
                             {
                                 popup.show_appearance = !popup.show_appearance;
                                 if popup.show_appearance {
-                                    popup.ts_color_hex = hex_color_string(self.chat_ts_color);
-                                    popup.text_color_hex = hex_color_string(self.chat_text_color);
+                                    let cs = popup.settings.lock().unwrap();
+                                    let (ts, tx) = (cs.ts_color, cs.text_color);
+                                    drop(cs);
+                                    popup.ts_color_hex = hex_color_string(ts);
+                                    popup.text_color_hex = hex_color_string(tx);
                                 }
                             }
                             if ui
@@ -3089,10 +3197,10 @@ impl StreamArchiverApp {
                     ui.separator();
 
                     if popup.show_appearance {
-                        let mut font_pt = self.chat_font_pt;
-                        let mut emote_pt = self.chat_emote_pt;
-                        let mut ts_color = self.chat_ts_color;
-                        let mut text_color = self.chat_text_color;
+                        let (mut font_pt, mut emote_pt, mut ts_color, mut text_color) = {
+                            let cs = popup.settings.lock().unwrap();
+                            (cs.font_pt, cs.emote_pt, cs.ts_color, cs.text_color)
+                        };
                         egui::Window::new("Chat Appearance")
                             .id(egui::Id::new(("chat_appearance_win", popup.monitor_id)))
                             .collapsible(false)
@@ -3113,8 +3221,8 @@ impl StreamArchiverApp {
                                         )
                                         .changed()
                                     {
-                                        self.chat_font_pt = font_pt;
-                                        let _ = self.core.store.set_setting(
+                                        popup.settings.lock().unwrap().font_pt = font_pt;
+                                        let _ = shared.core.store.set_setting(
                                             K_CHAT_FONT_PT,
                                             &font_pt.to_string(),
                                         );
@@ -3135,8 +3243,8 @@ impl StreamArchiverApp {
                                         )
                                         .changed()
                                     {
-                                        self.chat_emote_pt = emote_pt;
-                                        let _ = self.core.store.set_setting(
+                                        popup.settings.lock().unwrap().emote_pt = emote_pt;
+                                        let _ = shared.core.store.set_setting(
                                             K_CHAT_EMOTE_PT,
                                             &emote_pt.to_string(),
                                         );
@@ -3175,9 +3283,10 @@ impl StreamArchiverApp {
                                     {
                                         ts_color = parsed;
                                     }
-                                    if wheel_changed || (hex_changed && ts_color != self.chat_ts_color) {
-                                        self.chat_ts_color = ts_color;
-                                        let _ = self.core.store.set_setting(
+                                    let ts_color_was = popup.settings.lock().unwrap().ts_color;
+                                    if wheel_changed || (hex_changed && ts_color != ts_color_was) {
+                                        popup.settings.lock().unwrap().ts_color = ts_color;
+                                        let _ = shared.core.store.set_setting(
                                             K_CHAT_TS_COLOR,
                                             &hex_color_string(ts_color),
                                         );
@@ -3211,9 +3320,10 @@ impl StreamArchiverApp {
                                     {
                                         text_color = parsed;
                                     }
-                                    if wheel_changed || (hex_changed && text_color != self.chat_text_color) {
-                                        self.chat_text_color = text_color;
-                                        let _ = self.core.store.set_setting(
+                                    let text_color_was = popup.settings.lock().unwrap().text_color;
+                                    if wheel_changed || (hex_changed && text_color != text_color_was) {
+                                        popup.settings.lock().unwrap().text_color = text_color;
+                                        let _ = shared.core.store.set_setting(
                                             K_CHAT_TEXT_COLOR,
                                             &hex_color_string(text_color),
                                         );
@@ -3225,22 +3335,25 @@ impl StreamArchiverApp {
                                     .on_hover_text("Restore the default 14pt / 24px white/white appearance.")
                                     .clicked()
                                 {
-                                    self.chat_font_pt = CHAT_FONT_PT_DEFAULT;
-                                    self.chat_emote_pt = CHAT_EMOTE_PT_DEFAULT;
-                                    self.chat_ts_color = egui::Color32::WHITE;
-                                    self.chat_text_color = egui::Color32::WHITE;
+                                    {
+                                        let mut cs = popup.settings.lock().unwrap();
+                                        cs.font_pt = CHAT_FONT_PT_DEFAULT;
+                                        cs.emote_pt = CHAT_EMOTE_PT_DEFAULT;
+                                        cs.ts_color = egui::Color32::WHITE;
+                                        cs.text_color = egui::Color32::WHITE;
+                                    }
                                     popup.ts_color_hex = hex_color_string(egui::Color32::WHITE);
                                     popup.text_color_hex = hex_color_string(egui::Color32::WHITE);
-                                    let _ = self.core.store.set_setting(
+                                    let _ = shared.core.store.set_setting(
                                         K_CHAT_FONT_PT,
                                         &CHAT_FONT_PT_DEFAULT.to_string(),
                                     );
-                                    let _ = self.core.store.set_setting(
+                                    let _ = shared.core.store.set_setting(
                                         K_CHAT_EMOTE_PT,
                                         &CHAT_EMOTE_PT_DEFAULT.to_string(),
                                     );
-                                    let _ = self.core.store.set_setting(K_CHAT_TS_COLOR, "#FFFFFF");
-                                    let _ = self.core.store.set_setting(K_CHAT_TEXT_COLOR, "#FFFFFF");
+                                    let _ = shared.core.store.set_setting(K_CHAT_TS_COLOR, "#FFFFFF");
+                                    let _ = shared.core.store.set_setting(K_CHAT_TEXT_COLOR, "#FFFFFF");
                                 }
                             });
                     }
@@ -3801,9 +3914,14 @@ impl StreamArchiverApp {
                     }
                 });
                 draw_alt_image_preview(ctx);
+                popup.decode_misses.extend(decode_misses);
+                if usercard_click.is_some() {
+                    popup.usercard_click = usercard_click;
+                }
             },
         );
         // Decode any newly-seen emotes off the UI thread, then LRU-evict the cache.
+        let decode_misses = std::mem::take(&mut popup_arc.lock().unwrap().decode_misses);
         self.pump_emote_decodes(decode_misses, now, ctx);
 
         // A username was clicked this frame: build the usercard. Local fields
@@ -3811,10 +3929,12 @@ impl StreamArchiverApp {
         // stats are a fresh scan of the currently-loaded log (cheap — chat
         // logs are at most tens of thousands of messages, and this only runs
         // on a click, not per frame).
+        let usercard_click = popup_arc.lock().unwrap().usercard_click.take();
         if let Some(req) = usercard_click {
             const RECENT_MESSAGES_CAP: usize = 50;
             let (message_count, first_seen_secs, recent_messages) = {
-                let guard = self.chat_popups[idx].load_state.lock().unwrap();
+                let load_state = popup_arc.lock().unwrap().load_state.clone();
+                let guard = load_state.lock().unwrap();
                 if let ChatLoadState::Loaded(log) = &*guard {
                     let mut all: Vec<(f64, String)> = log
                         .messages
@@ -3832,7 +3952,7 @@ impl StreamArchiverApp {
                     (0, None, Vec::new())
                 }
             };
-            let monitor_id = self.chat_popups[idx].monitor_id;
+            let monitor_id = popup_arc.lock().unwrap().monitor_id;
             // Cross-reference this user's Twitch display name against the
             // channel's locally-recorded `stream_event` history — local DB
             // query, no network, so it's fine to run inline on the click.
@@ -3850,7 +3970,8 @@ impl StreamArchiverApp {
                 })
                 .map(|events| summarize_user_events(&events, &req.display_name))
                 .unwrap_or_default();
-            let want_live = self.fetch_usercard_info && !req.user_id.is_empty();
+            let want_live =
+                self.chat_settings.lock().unwrap().fetch_usercard_info && !req.user_id.is_empty();
             let fetch = Arc::new(Mutex::new(if want_live {
                 UserCardFetch::Loading
             } else {
@@ -3915,7 +4036,7 @@ impl StreamArchiverApp {
                     *fetch.lock().unwrap() = UserCardFetch::Failed;
                 }
             }
-            self.chat_popups[idx].user_card = Some(UserCardPopup {
+            popup_arc.lock().unwrap().user_card = Some(UserCardPopup {
                 login: req.login,
                 display_name: req.display_name,
                 color: req.color,
@@ -3935,7 +4056,8 @@ impl StreamArchiverApp {
         // appended since the last pass and push them onto the shown log —
         // the whole file is never re-read.
         if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading, spartners, bdirs)) = reload_info {
-            self.chat_popups[idx].last_reload = std::time::Instant::now();
+            let mut p = popup_arc.lock().unwrap();
+            p.last_reload = std::time::Instant::now();
             // Same cadence as the tail-reload: the leaderboard/Hype Train
             // rows keep changing while the broadcast is still live. Cheap
             // indexed local query — naturally empty for a non-Twitch monitor
@@ -3943,17 +4065,17 @@ impl StreamArchiverApp {
             // parser), so no separate platform check is needed here.
             let (top_gifters, top_cheerers, hype_train) = load_broadcast_stats(
                 &self.core.store,
-                self.chat_popups[idx].monitor_id,
+                p.monitor_id,
                 start_ts,
                 crate::models::now_unix(),
             );
-            self.chat_popups[idx].top_gifters = top_gifters;
-            self.chat_popups[idx].top_cheerers = top_cheerers;
-            self.chat_popups[idx].hype_train = hype_train;
+            p.top_gifters = top_gifters;
+            p.top_cheerers = top_cheerers;
+            p.hype_train = hype_train;
             if errored {
-                self.chat_popups[idx].error_retries =
-                    self.chat_popups[idx].error_retries.saturating_add(1);
+                p.error_retries = p.error_retries.saturating_add(1);
             }
+            drop(p);
             self.core.rt.spawn(tail_chat(
                 state,
                 loading,
@@ -3975,7 +4097,7 @@ impl StreamArchiverApp {
             ctx.request_repaint_after(std::time::Duration::from_secs(CHAT_RELOAD_SECS));
         }
 
-        !open
+        popup_arc.lock().unwrap().closed
     }
 
     /// Drop all decoded emote frames and bump the epoch so any in-flight decode

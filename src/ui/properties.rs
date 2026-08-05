@@ -2031,7 +2031,7 @@ impl StreamArchiverApp {
         // Render toggles + shared cache copied out before borrowing the viewer, so
         // the closure never has to touch `self`.
         let anim_cache = self.emote_anim.clone();
-        let animate_emotes = self.animate_emotes;
+        let animate_emotes = self.chat_settings.lock().unwrap().animate_emotes;
         let now = ctx.input(|i| i.time);
         let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
 

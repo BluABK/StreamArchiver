@@ -1446,77 +1446,80 @@ impl StreamArchiverApp {
                     if self.show_actions { "1" } else { "0" },
                 );
             }
-            if ui
-                .checkbox(&mut self.render_emotes, "Render emotes in chat")
-                .on_hover_text(
-                    "Show Twitch / BTTV / FFZ / 7TV emotes (and color emoji) as inline \
-                     images in the chat replay. Off shows the emote code as plain text. \
-                     Local/cross-channel-cached images need each channel's own \"Fetch chat \
-                     assets\"; \"Fetch unknown emotes from Twitch\" below fetches anything \
-                     still missing directly from Twitch's CDN. Applies immediately.",
-                )
-                .changed()
             {
-                let _ = self.core.store.set_setting(
-                    K_RENDER_EMOTES,
-                    if self.render_emotes { "1" } else { "0" },
-                );
-            }
-            if ui
-                .add_enabled(
-                    self.render_emotes,
-                    egui::Checkbox::new(&mut self.fetch_unknown_emotes, "Fetch unknown emotes from Twitch"),
-                )
-                .on_hover_text(
-                    "A chat message can use ANY Twitch subscriber emote, not just the ones \
-                     belonging to a channel this app monitors — Twitch lets any subscriber \
-                     use their sub emotes in any chat. When an emote id isn't cached under \
-                     any monitored channel, fetch it directly from Twitch's public CDN by id \
-                     (no login needed) into a shared cache, so it still renders 1:1 instead of \
-                     showing as plain text. Off = only locally-cached emotes render. Applies \
-                     immediately.",
-                )
-                .changed()
-            {
-                let _ = self.core.store.set_setting(
-                    K_FETCH_UNKNOWN_EMOTES,
-                    if self.fetch_unknown_emotes { "1" } else { "0" },
-                );
-            }
-            if ui
-                .checkbox(&mut self.fetch_usercard_info, "Fetch live Twitch info for chat usercards")
-                .on_hover_text(
-                    "When you click a username in the chat replay, also fetch their avatar \
-                     and Twitch account-created date from Twitch's API — on top of the badges/ \
-                     color/subscriber-months/message-count that always show from the local log. \
-                     Off by default: unlike other asset fetches, this hits the network every \
-                     time a usercard is opened, not just once per missing file. A failed lookup \
-                     shows \"N/A\" and files a warning in the 🚨 Warnings window instead of \
-                     blocking the rest of the card.",
-                )
-                .changed()
-            {
-                let _ = self.core.store.set_setting(
-                    K_FETCH_USERCARD_INFO,
-                    if self.fetch_usercard_info { "1" } else { "0" },
-                );
-            }
-            if ui
-                .add_enabled(
-                    self.render_emotes,
-                    egui::Checkbox::new(&mut self.animate_emotes, "Animate emotes"),
-                )
-                .on_hover_text(
-                    "Play animated GIF / WebP emotes (Twitch, BTTV/FFZ, 7TV) and animated \
-                     emoji. Off shows a static first frame — turn it off if a busy channel's \
-                     animations use too much memory or CPU. Applies immediately.",
-                )
-                .changed()
-            {
-                let _ = self.core.store.set_setting(
-                    K_ANIMATE_EMOTES,
-                    if self.animate_emotes { "1" } else { "0" },
-                );
+                let mut cs = self.chat_settings.lock().unwrap();
+                if ui
+                    .checkbox(&mut cs.render_emotes, "Render emotes in chat")
+                    .on_hover_text(
+                        "Show Twitch / BTTV / FFZ / 7TV emotes (and color emoji) as inline \
+                         images in the chat replay. Off shows the emote code as plain text. \
+                         Local/cross-channel-cached images need each channel's own \"Fetch chat \
+                         assets\"; \"Fetch unknown emotes from Twitch\" below fetches anything \
+                         still missing directly from Twitch's CDN. Applies immediately.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        K_RENDER_EMOTES,
+                        if cs.render_emotes { "1" } else { "0" },
+                    );
+                }
+                if ui
+                    .add_enabled(
+                        cs.render_emotes,
+                        egui::Checkbox::new(&mut cs.fetch_unknown_emotes, "Fetch unknown emotes from Twitch"),
+                    )
+                    .on_hover_text(
+                        "A chat message can use ANY Twitch subscriber emote, not just the ones \
+                         belonging to a channel this app monitors — Twitch lets any subscriber \
+                         use their sub emotes in any chat. When an emote id isn't cached under \
+                         any monitored channel, fetch it directly from Twitch's public CDN by id \
+                         (no login needed) into a shared cache, so it still renders 1:1 instead of \
+                         showing as plain text. Off = only locally-cached emotes render. Applies \
+                         immediately.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        K_FETCH_UNKNOWN_EMOTES,
+                        if cs.fetch_unknown_emotes { "1" } else { "0" },
+                    );
+                }
+                if ui
+                    .checkbox(&mut cs.fetch_usercard_info, "Fetch live Twitch info for chat usercards")
+                    .on_hover_text(
+                        "When you click a username in the chat replay, also fetch their avatar \
+                         and Twitch account-created date from Twitch's API — on top of the badges/ \
+                         color/subscriber-months/message-count that always show from the local log. \
+                         Off by default: unlike other asset fetches, this hits the network every \
+                         time a usercard is opened, not just once per missing file. A failed lookup \
+                         shows \"N/A\" and files a warning in the 🚨 Warnings window instead of \
+                         blocking the rest of the card.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        K_FETCH_USERCARD_INFO,
+                        if cs.fetch_usercard_info { "1" } else { "0" },
+                    );
+                }
+                if ui
+                    .add_enabled(
+                        cs.render_emotes,
+                        egui::Checkbox::new(&mut cs.animate_emotes, "Animate emotes"),
+                    )
+                    .on_hover_text(
+                        "Play animated GIF / WebP emotes (Twitch, BTTV/FFZ, 7TV) and animated \
+                         emoji. Off shows a static first frame — turn it off if a busy channel's \
+                         animations use too much memory or CPU. Applies immediately.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        K_ANIMATE_EMOTES,
+                        if cs.animate_emotes { "1" } else { "0" },
+                    );
+                }
             }
             ui.label(
                 egui::RichText::new(
