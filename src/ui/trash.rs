@@ -430,7 +430,7 @@ impl StreamArchiverApp {
                                 }
                                 let path_buf =
                                     (!current_path.is_empty()).then(|| std::path::PathBuf::from(current_path));
-                                let file_ok = path_buf.as_ref().is_some_and(|p| self.fs_probes.is_file(p));
+                                let file_ok = path_buf.as_ref().is_some_and(|p| self.fs_probes.lock().unwrap().is_file(p));
                                 if ui
                                     .add_enabled(file_ok, egui::Button::new("▶"))
                                     .on_hover_text("Open file")
@@ -442,7 +442,7 @@ impl StreamArchiverApp {
                                 let dir_ok = path_buf
                                     .as_ref()
                                     .and_then(|p| p.parent())
-                                    .is_some_and(|d| self.fs_probes.is_dir(d));
+                                    .is_some_and(|d| self.fs_probes.lock().unwrap().is_dir(d));
                                 if ui
                                     .add_enabled(dir_ok, egui::Button::new("📂"))
                                     .on_hover_text("Open containing folder")

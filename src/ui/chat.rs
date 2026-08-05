@@ -2870,7 +2870,8 @@ impl StreamArchiverApp {
                 // Sidecar located via the probe cache: this runs on the UI
                 // thread every 3s per live popup, and a direct stat against
                 // the recordings drive can block the frame for seconds.
-                let fs = &mut self.fs_probes;
+                let mut fs_guard = self.fs_probes.lock().unwrap();
+                let fs = &mut *fs_guard;
                 popup.recording.as_ref().and_then(|r| {
                     chat_file_for_recording_cached(fs, r).map(|path| {
                         (
@@ -2927,12 +2928,18 @@ impl StreamArchiverApp {
                         // over the monitor's whole take history (4 candidate
                         // paths each) — direct stats here were measured in the
                         // thousands per second against the recordings drive.
-                        let fs = &mut self.fs_probes;
-                        let recs_with_chat: Vec<_> = popup
-                            .all_recordings
-                            .iter()
-                            .filter(|r| chat_file_for_recording_cached(fs, r).is_some())
-                            .collect();
+                        let recs_with_chat: Vec<_> = {
+                            let mut fs_guard = self.fs_probes.lock().unwrap();
+                            popup
+                                .all_recordings
+                                .iter()
+                                .filter(|r| chat_file_for_recording_cached(&mut fs_guard, r).is_some())
+                                .collect()
+                            // `fs_guard` dropped here — the rest of this closure
+                            // (recording-switch handler, etc.) may take its own
+                            // `self.fs_probes` lock elsewhere; a `std::sync::Mutex`
+                            // is not reentrant.
+                        };
                         if recs_with_chat.len() > 1 {
                             let cur_label = popup
                                 .recording

@@ -1320,10 +1320,15 @@ impl StreamArchiverApp {
 
         // Sizes go through the TTL probe cache — this runs every frame while
         // the Issues window is open.
-        let fs = &mut self.fs_probes;
-        let n_empty = self.issues_recs.iter().filter(|r| {
-            fs.len(std::path::Path::new(&r.output_path)) == 0
-        }).count();
+        let n_empty = {
+            let mut fs_guard = self.fs_probes.lock().unwrap();
+            self.issues_recs.iter().filter(|r| {
+                fs_guard.len(std::path::Path::new(&r.output_path)) == 0
+            }).count()
+            // `fs_guard` dropped here — the closure below (and everything it
+            // calls) may take its own `self.fs_probes` lock; a `std::sync::Mutex`
+            // is not reentrant, so holding this one any longer would deadlock.
+        };
         let n_missing = self.issues_missing.len();
         let n_errors = self.issues_errors.len();
         let n_missing_errors = self.issues_errors_no_file.len();
@@ -1645,7 +1650,7 @@ impl StreamArchiverApp {
                             format!("{} — ~{mins} min muted", m.channel),
                         );
                         let live_ok = !m.output_path.is_empty()
-                            && self.fs_probes.is_file(std::path::Path::new(&m.output_path));
+                            && self.fs_probes.lock().unwrap().is_file(std::path::Path::new(&m.output_path));
                         if ui
                             .add_enabled(live_ok, egui::Button::new("▶ Open live recording"))
                             .clicked()
@@ -1654,7 +1659,7 @@ impl StreamArchiverApp {
                         }
                         let rec = m.recovered_path.as_deref().unwrap_or("");
                         let rec_ok = !rec.is_empty()
-                            && self.fs_probes.is_file(std::path::Path::new(rec));
+                            && self.fs_probes.lock().unwrap().is_file(std::path::Path::new(rec));
                         if ui
                             .add_enabled(rec_ok, egui::Button::new("📼 Open recovered VOD"))
                             .clicked()
@@ -1815,7 +1820,7 @@ impl StreamArchiverApp {
                             .unwrap_or_else(|| rec.output_path.clone());
                         let total: u64 = parts
                             .iter()
-                            .map(|p| self.fs_probes.len(p))
+                            .map(|p| self.fs_probes.lock().unwrap().len(p))
                             .sum();
                         let partial = parts
                             .iter()
@@ -1897,7 +1902,7 @@ impl StreamArchiverApp {
                                 text.push_str(&format!(
                                     "\n  {} ({})",
                                     p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
-                                    fmt_bytes(self.fs_probes.len(p) as i64),
+                                    fmt_bytes(self.fs_probes.lock().unwrap().len(p) as i64),
                                 ));
                             }
                             if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
@@ -2213,7 +2218,7 @@ impl StreamArchiverApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let file_bytes = self.fs_probes.len(path);
+            let file_bytes = self.fs_probes.lock().unwrap().len(path);
             let empty = file_bytes == 0;
             // Parse the recording mode from "(p <mode>  )" in the filename.
             let mode = parse_capture_mode(&fname).unwrap_or_default();
@@ -2382,7 +2387,7 @@ impl StreamArchiverApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let file_bytes = self.fs_probes.len(path);
+            let file_bytes = self.fs_probes.lock().unwrap().len(path);
             let mode = parse_capture_mode(&fname).unwrap_or_default();
             body.row(22.0, |mut row| {
                 for &ci in issues_order {
@@ -2635,7 +2640,7 @@ impl StreamArchiverApp {
                 .map(|(n, p)| (n.as_str(), *p))
                 .unwrap_or(("?", crate::models::Platform::Generic));
             let has_file = !rec.output_path.is_empty()
-                && self.fs_probes.is_file(std::path::Path::new(&rec.output_path));
+                && self.fs_probes.lock().unwrap().is_file(std::path::Path::new(&rec.output_path));
             let has_ts = rec.output_path.ends_with(".ts");
             let path = std::path::Path::new(&rec.output_path);
             let fname = if rec.output_path.is_empty() {
@@ -2646,7 +2651,7 @@ impl StreamArchiverApp {
                     .unwrap_or_else(|| rec.output_path.clone())
             };
             let file_size = if has_file {
-                self.fs_probes.len(path)
+                self.fs_probes.lock().unwrap().len(path)
             } else {
                 0
             };

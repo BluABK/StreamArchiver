@@ -1970,7 +1970,7 @@ impl StreamArchiverApp {
                                     &mut tr, &self.rows[ri], depth, groups,
                                     active_recordings, twitch_login_to_mid,
                                     &self.rows, channel_name_colors, latest_raid_out,
-                                    &mut self.fs_probes, &self.settings,
+                                    &mut *self.fs_probes.lock().unwrap(), &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
                                     &exp_instances, instance_avatars,
@@ -1985,13 +1985,13 @@ impl StreamArchiverApp {
                             Vis::Period { mid, kind, gi_start, gi_end, depth, expanded } => {
                                 Self::period_row(
                                     &mut tr, mid, kind, &groups[&mid][gi_start..gi_end], depth,
-                                    expanded, &mut self.fs_probes, now, &col_order, &mut out,
+                                    expanded, &mut *self.fs_probes.lock().unwrap(), now, &col_order, &mut out,
                                 );
                             }
                             Vis::Stream { mid, gi, depth } => {
                                 Self::stream_row(
                                     &mut tr, &groups[&mid][gi], mid, depth, &self.rows,
-                                    &mut self.fs_probes, &self.settings,
+                                    &mut *self.fs_probes.lock().unwrap(), &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
                                     meta_logs, &self.collab_by_stream, &exp_streams,
                                     &selected_streams, sel_color,
@@ -2006,7 +2006,7 @@ impl StreamArchiverApp {
                                 Self::take_row(
                                     &mut tr, &groups[&mid][gi], ti, depth, &self.rows,
                                     mid, &self.core, &mut self.status,
-                                    &mut self.fs_probes, &self.settings,
+                                    &mut *self.fs_probes.lock().unwrap(), &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
                                     meta_logs, &self.collab_by_stream,
                                     &mut self.rename_rec_id, &mut self.rename_draft,
@@ -2021,7 +2021,7 @@ impl StreamArchiverApp {
                                 Self::vod_job_row(
                                     &mut tr, &groups[&mid][gi], ti, kind, depth,
                                     &self.background_tasks, &vid_progress,
-                                    &mut self.fs_probes, &col_order, &mut out,
+                                    &mut *self.fs_probes.lock().unwrap(), &col_order, &mut out,
                                 );
                             }
                         }

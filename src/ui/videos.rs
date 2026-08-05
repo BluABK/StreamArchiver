@@ -494,13 +494,13 @@ impl StreamArchiverApp {
                                 // an open context menu re-runs its closure
                                 // every frame, and direct stats can block for
                                 // seconds on a sleeping/network drive.
+                                let mut fs_guard = self.fs_probes.lock().unwrap();
                                 let row_file_ok = !v.output_path.is_empty()
-                                    && self
-                                        .fs_probes
+                                    && fs_guard
                                         .is_file(std::path::Path::new(&v.output_path));
-                                let row_dir_ok = self
-                                    .fs_probes
+                                let row_dir_ok = fs_guard
                                     .is_dir(std::path::Path::new(&v.output_dir));
+                                drop(fs_guard);
                                 // Reusable menu body (a `Fn`), attached to the row and
                                 // each inline action button so right-clicking anywhere
                                 // on the row opens it. Open/copy are handled inline;

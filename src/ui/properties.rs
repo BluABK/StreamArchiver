@@ -2220,7 +2220,7 @@ impl StreamArchiverApp {
                 if let Some(ep) = &current_properties {
                     let url = emote_cdn_url(provider, &ep.id, &ep.ext);
                     // Probe cache: this runs every frame while the window is open.
-                    let size_bytes = self.fs_probes.len(&ep.path);
+                    let size_bytes = self.fs_probes.lock().unwrap().len(&ep.path);
                     let mut prop_open = true;
                     egui::Window::new("Emote Properties")
                         .collapsible(false)

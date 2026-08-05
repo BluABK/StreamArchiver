@@ -819,7 +819,7 @@ impl StreamArchiverApp {
             pending_reload: None,
             reload_queued: false,
             last_auto_reload: now_unix(),
-            fs_probes: FsProbes::new(egui_ctx),
+            fs_probes: Arc::new(Mutex::new(FsProbes::new(egui_ctx))),
             videos_refreshed: None,
             videos_rev: 0,
             videos_model_cache: None,

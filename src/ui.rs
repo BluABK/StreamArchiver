@@ -2000,8 +2000,13 @@ pub struct StreamArchiverApp {
     /// update the DB (e.g. `last_checked_at`) without emitting an event, so a
     /// slow cadence reload keeps sorted columns correct without F5.
     last_auto_reload: i64,
-    /// TTL cache for per-row filesystem probes (see [`FsProbes`]).
-    fs_probes: FsProbes,
+    /// TTL cache for per-row filesystem probes (see [`FsProbes`]). `Arc<Mutex<>>`
+    /// (not a plain field) so deferred-viewport popup closures — which must be
+    /// `Send + Sync + 'static` and so cannot hold `&mut self` — can still reach
+    /// it; `Mutex::lock` only needs `&self`, so this also sidesteps the old
+    /// exclusive-borrow-of-`self` conflicts that came from `let fs = &mut
+    /// self.fs_probes;` inside a closure that also touched other `self` fields.
+    fs_probes: Arc<Mutex<FsProbes>>,
     /// When the Videos list was last re-read from the store. The tab shows
     /// live progress, but a 1s TTL replaces the old full SELECT every frame.
     videos_refreshed: Option<std::time::Instant>,
@@ -2470,7 +2475,7 @@ impl eframe::App for StreamArchiverApp {
         self.pump_messages(ctx);
         // Install filesystem-probe results the background worker finished
         // since last frame (never blocks — see `FsProbes`).
-        self.fs_probes.drain_results();
+        self.fs_probes.lock().unwrap().drain_results();
         self.drain_pending_browse();
         self.drain_pending_save();
         self.drain_pending_reload();
@@ -2487,7 +2492,7 @@ impl eframe::App for StreamArchiverApp {
             // Bound the probe cache: age out entries no longer being rendered.
             // (Never clear() wholesale — that used to force every visible path
             // back through a probe in a single frame.)
-            self.fs_probes.evict_unused();
+            self.fs_probes.lock().unwrap().evict_unused();
         }
 
         // Keep repainting at 50ms while a background DB load is in-flight so
