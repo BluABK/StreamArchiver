@@ -2137,7 +2137,7 @@ pub struct StreamArchiverApp {
     pending_schedule: Option<std::sync::mpsc::Receiver<Option<Vec<UpcomingStream>>>>,
     /// Open emote-viewer windows (one per channel+provider). Reuse the shared
     /// `emote_anim` decode cache, so emotes animate on the chat-replay clock.
-    emote_viewers: Vec<EmoteViewer>,
+    emote_viewers: Vec<Arc<Mutex<EmoteViewer>>>,
     /// Open asset change-history popup (None = closed). Holds the channel's
     /// `asset_changes.jsonl` parsed + formatted once on open (newest first).
     asset_histories: Vec<Arc<Mutex<AssetHistoryView>>>,

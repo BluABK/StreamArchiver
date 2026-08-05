@@ -153,6 +153,13 @@ pub(super) struct EmoteViewer {
     pub(super) filter: String,
     /// Current sort order for the grids.
     pub(super) sort: EmoteSort,
+    /// Set by the deferred closure on close; read back by
+    /// `emote_viewer_window` next call.
+    pub(super) closed: bool,
+    /// Emote decode-cache misses queued this render pass — drained by
+    /// `emote_viewer_window`'s wrapper via `pump_emote_decodes`, same as
+    /// `ChatPopup::decode_misses`.
+    pub(super) decode_misses: Vec<std::path::PathBuf>,
 }
 
 /// Sort orders for the emote-viewer grids.
@@ -213,6 +220,8 @@ impl EmoteViewer {
             stale: false,
             filter: String::new(),
             sort: EmoteSort::NameAsc,
+            closed: false,
+            decode_misses: Vec::new(),
         }
     }
 }

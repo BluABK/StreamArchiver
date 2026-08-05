@@ -1300,7 +1300,8 @@ impl StreamArchiverApp {
                             // If the emote viewer is open for this channel, its
                             // enumerated list was loaded once on open and is now
                             // stale — flag it so the window can show a re-open banner.
-                            for v in &mut self.emote_viewers {
+                            for v in &self.emote_viewers {
+                                let mut v = v.lock().unwrap();
                                 if v.channel_name == task.label {
                                     v.stale = true;
                                 }

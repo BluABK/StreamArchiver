@@ -1509,10 +1509,11 @@ impl StreamArchiverApp {
                 provider,
             );
             match self.emote_viewers.iter_mut().find(|v| {
+                let v = v.lock().unwrap();
                 v.channel_name == ch.name && v.account == acc.account && v.provider == provider
             }) {
-                Some(slot) => *slot = fresh,
-                None => self.emote_viewers.push(fresh),
+                Some(slot) => *slot.lock().unwrap() = fresh,
+                None => self.emote_viewers.push(Arc::new(Mutex::new(fresh))),
             }
         }
         // 🕑 History — the asset-history popup scoped to this account only.
@@ -2161,10 +2162,11 @@ impl StreamArchiverApp {
                 provider,
             );
             match self.emote_viewers.iter_mut().find(|v| {
+                let v = v.lock().unwrap();
                 v.channel_name == ch.name && v.account == acc.account && v.provider == provider
             }) {
-                Some(slot) => *slot = fresh, // re-enumerated → stale flag reset
-                None => self.emote_viewers.push(fresh),
+                Some(slot) => *slot.lock().unwrap() = fresh, // re-enumerated → stale flag reset
+                None => self.emote_viewers.push(Arc::new(Mutex::new(fresh))),
             }
         }
         // The "🕑 History" button was clicked — load and open the asset-history popup.
@@ -2233,17 +2235,17 @@ impl StreamArchiverApp {
     pub(super) fn emote_viewer_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<(String, String, EmoteProvider)> = Vec::new();
         for i in 0..self.emote_viewers.len() {
-            let key = (
-                self.emote_viewers[i].channel_name.clone(),
-                self.emote_viewers[i].account.clone(),
-                self.emote_viewers[i].provider,
-            );
+            let key = {
+                let v = self.emote_viewers[i].lock().unwrap();
+                (v.channel_name.clone(), v.account.clone(), v.provider)
+            };
             if self.emote_viewer_window(ctx, i) {
                 closed.push(key);
             }
         }
         if !closed.is_empty() {
             self.emote_viewers.retain(|v| {
+                let v = v.lock().unwrap();
                 !closed.contains(&(v.channel_name.clone(), v.account.clone(), v.provider))
             });
             if self.emote_viewers.is_empty() {
@@ -2255,58 +2257,36 @@ impl StreamArchiverApp {
         }
     }
 
-    /// One emote-viewer window; returns true when it should close.
-    #[allow(deprecated)]
+    /// One emote-viewer window; returns true when it should close. `view` is
+    /// a live-shared `Arc<Mutex<>>` (same reasoning as `asset_history_window`'s
+    /// own doc) — closed is checked at the top of the NEXT call rather than
+    /// read back after `show_deferred_popup`, since the deferred closure may
+    /// not even run the frame this function returns.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn emote_viewer_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        let view = self.emote_viewers[idx].clone();
+        if view.lock().unwrap().closed {
+            return true;
+        }
         // Watchdog: name this phase (REPRO 2 — emote viewer grid left open).
         self.heartbeat.set_activity(crate::watchdog::Activity::EmoteViewerGrid);
-        // Render toggles + shared cache copied out before borrowing the viewer, so
-        // the closure never has to touch `self`.
         let anim_cache = self.emote_anim.clone();
         let animate_emotes = self.chat_settings.lock().unwrap().animate_emotes;
         let now = ctx.input(|i| i.time);
-        let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
 
-        // Extract everything we need from the viewer up front, so the borrow ends
-        // before we need to mutably borrow self later (for NLL borrow checker).
-        let viewer = &self.emote_viewers[idx];
-        // Were this channel's assets refetched while the window stayed open? The
-        // lists below were enumerated once on open, so they no longer reflect disk.
-        let stale = viewer.stale;
-        let provider = viewer.provider;
-        let channel_name = viewer.channel_name.clone();
-        let account = viewer.account.clone();
-        let title_channel = if viewer.has_siblings {
-            format!("{channel_name} ({account})")
-        } else {
-            channel_name.clone()
+        let (provider, channel_name, account, title_channel) = {
+            let v = view.lock().unwrap();
+            let title_channel = if v.has_siblings {
+                format!("{} ({})", v.channel_name, v.account)
+            } else {
+                v.channel_name.clone()
+            };
+            (v.provider, v.channel_name.clone(), v.account.clone(), title_channel)
         };
-        let mut filter = viewer.filter.clone();
-        let mut sort = viewer.sort;
-        // Filter + sort applied to on-open snapshots each frame (the lists are
-        // small — a few hundred entries at most for a big 7TV channel).
-        let shown = |list: &[ViewerEmote]| -> Vec<ViewerEmote> {
-            let q = filter.trim().to_lowercase();
-            let mut out: Vec<ViewerEmote> = list
-                .iter()
-                .filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q))
-                .cloned()
-                .collect();
-            sort.apply(&mut out);
-            out
-        };
-        let active_all = viewer.active.len();
-        let active = shown(&viewer.active);
-        let deprecated = shown(&viewer.deprecated);
-        let deprecated_all = viewer.deprecated.len();
-        let current_properties = viewer.emote_properties.clone();
-        // viewer borrow ends here; all derived values are owned or Copy
 
-        let mut open = true;
-        let mut pending_properties: Option<ViewerEmote> = None;
-        let mut clear_properties = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of((
                 "emote_viewer_vp",
                 &channel_name,
@@ -2316,12 +2296,35 @@ impl StreamArchiverApp {
             egui::ViewportBuilder::default()
                 .with_title(format!("{} emotes — {title_channel}", provider.label()))
                 .with_inner_size([560.0, 600.0]),
-            |ctx, _class| {
+            view,
+            shared,
+            move |ctx, v, shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    v.closed = true;
                 }
+                // Filter + sort applied to on-open snapshots each frame (the lists
+                // are small — a few hundred entries at most for a big 7TV channel).
+                let shown = |filter: &str, sort: EmoteSort, list: &[ViewerEmote]| -> Vec<ViewerEmote> {
+                    let q = filter.trim().to_lowercase();
+                    let mut out: Vec<ViewerEmote> = list
+                        .iter()
+                        .filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q))
+                        .cloned()
+                        .collect();
+                    sort.apply(&mut out);
+                    out
+                };
+                let active_all = v.active.len();
+                let active = shown(&v.filter, v.sort, &v.active);
+                let deprecated = shown(&v.filter, v.sort, &v.deprecated);
+                let deprecated_all = v.deprecated.len();
+                let current_properties = v.emote_properties.clone();
+                let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
+                let mut pending_properties: Option<ViewerEmote> = None;
+                let mut clear_properties = false;
+
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if stale {
+                    if v.stale {
                         // Assets were refetched behind this window; the lists are a
                         // snapshot from when it opened. Amber, matching other
                         // "outdated info" hints elsewhere in the UI.
@@ -2337,7 +2340,7 @@ impl StreamArchiverApp {
                         // Active tally, plus the deprecated count when any — so the two
                         // reconcile with the launcher button (which counts the universe).
                         // While filtering, show "matches of total".
-                        let filtering = !filter.trim().is_empty();
+                        let filtering = !v.filter.trim().is_empty();
                         let mut tally = if filtering {
                             format!("· {} of {} emotes", active.len(), active_all)
                         } else {
@@ -2363,7 +2366,7 @@ impl StreamArchiverApp {
                     ui.horizontal(|ui| {
                         ui.label("🔍");
                         let resp = ui.add(
-                            egui::TextEdit::singleline(&mut filter)
+                            egui::TextEdit::singleline(&mut v.filter)
                                 .hint_text("Filter emotes…")
                                 .desired_width(180.0),
                         );
@@ -2371,16 +2374,16 @@ impl StreamArchiverApp {
                             "Show only emotes whose code contains this text \
                              (case-insensitive)",
                         );
-                        if !filter.is_empty() && ui.small_button("✖").on_hover_text("Clear filter").clicked() {
-                            filter.clear();
+                        if !v.filter.is_empty() && ui.small_button("✖").on_hover_text("Clear filter").clicked() {
+                            v.filter.clear();
                         }
                         ui.separator();
                         ui.label("Sort:");
                         egui::ComboBox::from_id_salt("emote_viewer_sort")
-                            .selected_text(sort.label())
+                            .selected_text(v.sort.label())
                             .show_ui(ui, |ui| {
                                 for s in EmoteSort::ALL {
-                                    ui.selectable_value(&mut sort, s, s.label());
+                                    ui.selectable_value(&mut v.sort, s, s.label());
                                 }
                             })
                             .response
@@ -2452,7 +2455,7 @@ impl StreamArchiverApp {
                 if let Some(ep) = &current_properties {
                     let url = emote_cdn_url(provider, &ep.id, &ep.ext);
                     // Probe cache: this runs every frame while the window is open.
-                    let size_bytes = self.fs_probes.lock().unwrap().len(&ep.path);
+                    let size_bytes = shared.fs_probes.lock().unwrap().len(&ep.path);
                     let mut prop_open = true;
                     egui::Window::new("Emote Properties")
                         .collapsible(false)
@@ -2506,28 +2509,22 @@ impl StreamArchiverApp {
                 }
 
                 draw_alt_image_preview(ctx);
+
+                // Apply context-menu / properties-window state changes collected
+                // during this render, and queue decode misses for the wrapper.
+                if let Some(ep) = pending_properties {
+                    v.emote_properties = Some(ep);
+                } else if clear_properties {
+                    v.emote_properties = None;
+                }
+                v.decode_misses.extend(decode_misses);
             },
         );
 
-        // Apply context-menu / properties-window state changes collected during render.
-        if let Some(ep) = pending_properties {
-            if let Some(viewer) = self.emote_viewers.get_mut(idx) {
-                viewer.emote_properties = Some(ep);
-            }
-        } else if clear_properties {
-            if let Some(viewer) = self.emote_viewers.get_mut(idx) {
-                viewer.emote_properties = None;
-            }
-        }
-        // Persist the filter/sort edits for the next frame (session-only state).
-        if let Some(viewer) = self.emote_viewers.get_mut(idx) {
-            viewer.filter = filter;
-            viewer.sort = sort;
-        }
-
+        let decode_misses = std::mem::take(&mut self.emote_viewers[idx].lock().unwrap().decode_misses);
         self.pump_emote_decodes(decode_misses, now, ctx);
 
-        !open
+        false
     }
 
     /// Asset change-history popup: the recorded add/remove of emotes plus
