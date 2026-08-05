@@ -31,6 +31,38 @@ pub(super) enum WarningsAct {
     OpenPatches(i64),
 }
 
+/// Deferred-viewport state for `notifications_window`. `search`/
+/// `kind_filter`/`bgcolor` mirror `self.notif_*` (seeded from them at open,
+/// synced back after every call, same shape as [`WarningsPopupState`]);
+/// `rows`/`ident`/`live_mids`/`have_player` are refreshed by the wrapper on
+/// the same throttle as the DB reload, not every frame. `act` is the one
+/// action the user picked this pass, applied by the wrapper next call.
+pub(super) struct NotificationsPopupState {
+    pub(super) search: String,
+    pub(super) kind_filter: Option<crate::models::NotificationKind>,
+    pub(super) bgcolor: bool,
+    pub(super) rows: Vec<crate::store::NotificationRow>,
+    pub(super) ident: HashMap<i64, (Option<egui::TextureHandle>, (egui::Color32, bool))>,
+    /// notification id → still-tracked monitor id, for rows whose
+    /// "Watch in player" button should be offered.
+    pub(super) live_mids: HashMap<i64, i64>,
+    pub(super) have_player: bool,
+    pub(super) act: Option<NotifAct>,
+    pub(super) closed: bool,
+}
+
+pub(super) enum NotifAct {
+    OpenUrl(String),
+    MarkAllRead,
+    /// Show one community post in the 📣 Posts window (`post_id`).
+    ViewPost(String),
+    /// Tune into a channel's live edge in the media player (`monitor_id`).
+    WatchInPlayer(i64),
+    /// Open the 🚨 Capture warnings window (a capture-alert row's
+    /// "Details" — the feed no longer repeats the alert body).
+    OpenWarnings,
+}
+
 /// Deferred-viewport state for `issues_window`. Field names deliberately
 /// mirror `self.issues_*`/`self.yt_*`/`self.background_tasks`/etc. exactly —
 /// the eight `issues_*_section`/`issues_*_rows`/`issues_toolbar`/
@@ -1624,6 +1656,7 @@ impl StreamArchiverApp {
     /// bell stays live. Both the count and the row list are cheap SQLite reads,
     /// done synchronously.
     #[allow(deprecated)] // CentralPanel::show inside a viewport (matches issues_window)
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn notifications_window(&mut self, ctx: &egui::Context) {
         use std::time::{Duration, Instant};
         let interval = if self.show_notifications {
@@ -1650,113 +1683,129 @@ impl StreamArchiverApp {
             self.notif_refreshed = Some(Instant::now());
         }
         if !self.show_notifications {
+            self.notifications_popup = None;
             return;
         }
 
-        let now = crate::models::now_unix();
-        let bg_before = self.notif_bgcolor;
-        let mut open = true;
-        // Deferred actions (applied after the viewport closure releases &self).
-        enum Act {
-            OpenUrl(String),
-            MarkAllRead,
-            /// Show one community post in the 📣 Posts window (`post_id`).
-            ViewPost(String),
-            /// Tune into a channel's live edge in the media player (`monitor_id`).
-            WatchInPlayer(i64),
-            /// Open the 🚨 Capture warnings window (a capture-alert row's
-            /// "Details" — the feed no longer repeats the alert body).
-            OpenWarnings,
+        // Ensure a popup instance exists, seeded from the persisted filter
+        // fields (remembered across a close/reopen, same as before).
+        if self.notifications_popup.is_none() {
+            self.notifications_popup = Some(Arc::new(Mutex::new(NotificationsPopupState {
+                search: self.notif_search.clone(),
+                kind_filter: self.notif_kind_filter,
+                bgcolor: self.notif_bgcolor,
+                rows: Vec::new(),
+                ident: HashMap::new(),
+                live_mids: HashMap::new(),
+                have_player: false,
+                act: None,
+                closed: false,
+            })));
         }
-        let mut act: Option<Act> = None;
+        let popup_state = self.notifications_popup.clone().unwrap();
 
-        // Per-row channel identity (avatar + name colour), via the resolver
-        // shared with the 🚨 Warnings window.
-        let keys: Vec<(i64, Option<i64>, String)> = self
-            .notifications
-            .iter()
-            .map(|r| (r.id, r.monitor_id, r.channel.clone()))
-            .collect();
-        let ident = self.feed_identities(ctx, &keys);
-        // Which feed rows can offer "Watch in player" — only rows that NAMED a
-        // still-tracked monitor (a name-only identity match resolves a colour,
-        // not a source URL to tune into).
-        let tracked: std::collections::HashSet<i64> =
-            self.rows.iter().map(|r| r.monitor.id).collect();
-        let live_mids: HashMap<i64, i64> = self
-            .notifications
-            .iter()
-            .filter_map(|r| Some((r.id, r.monitor_id.filter(|m| tracked.contains(m))?)))
-            .collect();
-        let have_player = !self.settings.media_player_path.trim().is_empty();
+        // Refresh rows/channel-identity/live-player-eligibility into the popup
+        // on the same throttle as the DB reload above — not every frame.
+        if stale {
+            let keys: Vec<(i64, Option<i64>, String)> = self
+                .notifications
+                .iter()
+                .map(|r| (r.id, r.monitor_id, r.channel.clone()))
+                .collect();
+            let ident = self.feed_identities(ctx, &keys);
+            // Which feed rows can offer "Watch in player" — only rows that NAMED a
+            // still-tracked monitor (a name-only identity match resolves a colour,
+            // not a source URL to tune into).
+            let tracked: std::collections::HashSet<i64> =
+                self.rows.iter().map(|r| r.monitor.id).collect();
+            let live_mids: HashMap<i64, i64> = self
+                .notifications
+                .iter()
+                .filter_map(|r| Some((r.id, r.monitor_id.filter(|m| tracked.contains(m))?)))
+                .collect();
+            let have_player = !self.settings.media_player_path.trim().is_empty();
+            let mut s = popup_state.lock().unwrap();
+            s.rows = self.notifications.clone();
+            s.ident = ident;
+            s.live_mids = live_mids;
+            s.have_player = have_player;
+        }
 
-        // Session-only category + text filter over the loaded rows → surviving
-        // indices (recomputed each frame from last frame's filter values).
-        let q = self.notif_search.trim().to_lowercase();
-        let kind_filter = self.notif_kind_filter;
-        let visible: Vec<usize> = self
-            .notifications
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| {
-                kind_filter.map(|k| r.kind == k.id()).unwrap_or(true)
-                    && (q.is_empty()
-                        || r.title.to_lowercase().contains(&q)
-                        || r.body.to_lowercase().contains(&q)
-                        || r.channel.to_lowercase().contains(&q))
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("notifications_vp"),
             egui::ViewportBuilder::default()
                 .with_title("🔔 Notifications")
                 .with_inner_size([720.0, 520.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
+
+                // Session-only category + text filter over the loaded rows → surviving
+                // indices (recomputed each frame from last frame's filter values).
+                let q = s.search.trim().to_lowercase();
+                let kind_filter = s.kind_filter;
+                let visible: Vec<usize> = s
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| {
+                        kind_filter.map(|k| r.kind == k.id()).unwrap_or(true)
+                            && (q.is_empty()
+                                || r.title.to_lowercase().contains(&q)
+                                || r.body.to_lowercase().contains(&q)
+                                || r.channel.to_lowercase().contains(&q))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // ── Toolbar: kind filter + search + mark-all-read ──
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("notif_kind_filter")
-                            .selected_text(match self.notif_kind_filter {
+                            .selected_text(match s.kind_filter {
                                 None => "All kinds".to_string(),
                                 Some(k) => k.label().to_string(),
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.notif_kind_filter, None, "All kinds");
+                                ui.selectable_value(&mut s.kind_filter, None, "All kinds");
                                 for k in crate::models::NotificationKind::ALL {
                                     ui.selectable_value(
-                                        &mut self.notif_kind_filter,
+                                        &mut s.kind_filter,
                                         Some(k),
                                         format!("{} {}", k.icon(), k.label()),
                                     );
                                 }
                             });
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.notif_search)
+                            egui::TextEdit::singleline(&mut s.search)
                                 .hint_text("Filter…")
                                 .desired_width(180.0),
                         );
-                        if !self.notif_search.is_empty()
+                        if !s.search.is_empty()
                             && ui.button("✕").on_hover_text("Clear filter").clicked()
                         {
-                            self.notif_search.clear();
+                            s.search.clear();
                         }
-                        ui.checkbox(&mut self.notif_bgcolor, "Row colors").on_hover_text(
-                            "Paint each row in its kind's colour (live purple, finished                              blue, error red, …) so the feed can be skimmed by colour.                              Off = plain rows; the coloured icons and dots still carry                              the kind.",
+                        ui.checkbox(&mut s.bgcolor, "Row colors").on_hover_text(
+                            "Paint each row in its kind's colour (live purple, finished \
+                             blue, error red, …) so the feed can be skimmed by colour. \
+                             Off = plain rows; the coloured icons and dots still carry \
+                             the kind.",
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✔ Mark all read").clicked() {
-                                act = Some(Act::MarkAllRead);
+                                s.act = Some(NotifAct::MarkAllRead);
                             }
                         });
                     });
                     ui.separator();
 
-                    if self.notifications.is_empty() {
+                    if s.rows.is_empty() {
                         ui.add_space(24.0);
                         ui.vertical_centered(|ui| ui.weak("No notifications yet."));
                         return;
@@ -1771,7 +1820,7 @@ impl StreamArchiverApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for &i in &visible {
-                                let r = &self.notifications[i];
+                                let r = &s.rows[i];
                                 let kind = crate::models::NotificationKind::from_id(&r.kind);
                                 let icon = kind.map(|k| k.icon()).unwrap_or("•");
                                 // Row tint by severity/kind; read rows keep the
@@ -1779,14 +1828,14 @@ impl StreamArchiverApp {
                                 // a list rather than a wall of paint.
                                 let (rgb, accent) = notif_colors(kind, &r.severity);
                                 let alpha = if r.read { 22 } else { 70 };
-                                let tint = if self.notif_bgcolor {
+                                let tint = if s.bgcolor {
                                     egui::Color32::from_rgba_unmultiplied(
                                         rgb.0, rgb.1, rgb.2, alpha,
                                     )
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
-                                let (avatar, name_color) = match ident.get(&r.id) {
+                                let (avatar, name_color) = match s.ident.get(&r.id) {
                                     Some((a, (base, adjust))) => (
                                         a.as_ref(),
                                         Some(if *adjust {
@@ -1868,8 +1917,8 @@ impl StreamArchiverApp {
                                                         ))
                                                         .clicked()
                                                     {
-                                                        act =
-                                                            Some(Act::OpenUrl(r.action_url.clone()));
+                                                        s.act =
+                                                            Some(NotifAct::OpenUrl(r.action_url.clone()));
                                                     }
                                                 }
                                                 if kind
@@ -1886,7 +1935,7 @@ impl StreamArchiverApp {
                                                         )
                                                         .clicked()
                                                 {
-                                                    act = Some(Act::ViewPost(pid));
+                                                    s.act = Some(NotifAct::ViewPost(pid));
                                                 }
                                                 if kind
                                                     == Some(
@@ -1895,15 +1944,18 @@ impl StreamArchiverApp {
                                                     && ui
                                                         .button("🚨 Details")
                                                         .on_hover_text(
-                                                            "Open the 🚨 Capture warnings                                                              window — the full view of this                                                              alert (explanation, matched log                                                              line, Ack / Log actions).",
+                                                            "Open the 🚨 Capture warnings \
+                                                             window — the full view of this \
+                                                             alert (explanation, matched log \
+                                                             line, Ack / Log actions).",
                                                         )
                                                         .clicked()
                                                 {
-                                                    act = Some(Act::OpenWarnings);
+                                                    s.act = Some(NotifAct::OpenWarnings);
                                                 }
-                                                if have_player
+                                                if s.have_player
                                                     && notif_is_live_stream(kind)
-                                                    && let Some(&mid) = live_mids.get(&r.id)
+                                                    && let Some(&mid) = s.live_mids.get(&r.id)
                                                     && ui
                                                         .button("Watch in player")
                                                         .on_hover_text(
@@ -1915,7 +1967,7 @@ impl StreamArchiverApp {
                                                         )
                                                         .clicked()
                                                 {
-                                                    act = Some(Act::WatchInPlayer(mid));
+                                                    s.act = Some(NotifAct::WatchInPlayer(mid));
                                                 }
                                             },
                                         );
@@ -1931,25 +1983,40 @@ impl StreamArchiverApp {
             },
         );
 
-        if bg_before != self.notif_bgcolor {
+        // Filter fields are remembered across a close/reopen (mirrors the
+        // pre-migration code, which read them straight off `self` every
+        // frame); `bgcolor` also persists to settings on change.
+        let (search, kind_filter, bgcolor, closed, act) = {
+            let mut s = popup_state.lock().unwrap();
+            (s.search.clone(), s.kind_filter, s.bgcolor, s.closed, s.act.take())
+        };
+        self.notif_search = search;
+        self.notif_kind_filter = kind_filter;
+        if bgcolor != self.notif_bgcolor {
+            self.notif_bgcolor = bgcolor;
             let _ = self
                 .core
                 .store
-                .set_setting(K_NOTIF_BGCOLOR, if self.notif_bgcolor { "1" } else { "0" });
+                .set_setting(K_NOTIF_BGCOLOR, if bgcolor { "1" } else { "0" });
         }
-        if !open {
+        if closed {
             self.show_notifications = false;
+            self.notifications_popup = None;
         }
         match act {
-            Some(Act::OpenUrl(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
-            Some(Act::MarkAllRead) => {
+            Some(NotifAct::OpenUrl(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Some(NotifAct::MarkAllRead) => {
+                let now = crate::models::now_unix();
                 let _ = self.core.store.mark_notifications_read_before(now);
                 self.notif_unread = 0;
                 for r in &mut self.notifications {
                     r.read = true;
                 }
+                for r in &mut popup_state.lock().unwrap().rows {
+                    r.read = true;
+                }
             }
-            Some(Act::ViewPost(post_id)) => {
+            Some(NotifAct::ViewPost(post_id)) => {
                 // Focus overrides the feed's own filters (see `posts_focus_post`)
                 // so the post can't be hidden by whatever the Posts window was
                 // last filtered to.
@@ -1958,7 +2025,7 @@ impl StreamArchiverApp {
                 self.posts_refreshed = None; // pick up a just-ingested post
                 self.show_posts_window = true;
             }
-            Some(Act::WatchInPlayer(mid)) => {
+            Some(NotifAct::WatchInPlayer(mid)) => {
                 let player = self.settings.media_player_path.trim().to_string();
                 match self.rows.iter().find(|r| r.monitor.id == mid) {
                     Some(row) => {
@@ -1980,7 +2047,7 @@ impl StreamArchiverApp {
                     }
                 }
             }
-            Some(Act::OpenWarnings) => {
+            Some(NotifAct::OpenWarnings) => {
                 self.show_warnings = true;
                 // The window is often ALREADY open — just buried under the
                 // notifications window that hosts this button — and setting

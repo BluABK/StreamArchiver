@@ -572,6 +572,7 @@ impl StreamArchiverApp {
             posts_unread: 0,
             notif_search: String::new(),
             notif_kind_filter: None,
+            notifications_popup: None,
             show_warnings: false,
             warnings_rows: Vec::new(),
             rec_alert_badges: std::collections::HashMap::new(),

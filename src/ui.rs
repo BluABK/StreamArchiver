@@ -1448,6 +1448,9 @@ pub struct StreamArchiverApp {
     posts_unread: i64,
     notif_search: String,
     notif_kind_filter: Option<crate::models::NotificationKind>,
+    /// Deferred-viewport state while the Notifications window is open (None =
+    /// closed) — see [`issues::NotificationsPopupState`].
+    notifications_popup: Option<Arc<Mutex<issues::NotificationsPopupState>>>,
     /// The 🚨 Warnings window (capture alerts scraped from tool logs): open
     /// flag, last-loaded rows, refresh throttle, cached unacked badge counts
     /// `(errors, warnings)`, and session-only text/severity filters.
