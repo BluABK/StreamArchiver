@@ -2182,7 +2182,7 @@ pub struct StreamArchiverApp {
     debug_test_title: String,
     debug_test_game: String,
     /// Format Designer: an interactive template preview/editor window.
-    format_designer: Option<FormatDesignerState>,
+    format_designer: Option<Arc<Mutex<FormatDesignerState>>>,
     /// Pending "Stop recordings & quit" confirmation (triggered by the tray
     /// item or the top-bar StreamArchiver ▾ menu).
     confirm_quit_stop: Option<Arc<Mutex<ConfirmDialogState<()>>>>,

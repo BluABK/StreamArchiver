@@ -90,6 +90,11 @@ pub(super) struct FormatDesignerState {
     /// In-flight background load of recordings for the selected monitor. Drained
     /// each frame in `format_designer_window`; avoids blocking the UI thread.
     pub(super) recordings_load: Option<std::sync::mpsc::Receiver<(Vec<Recording>, usize)>>,
+    /// Set by the deferred closure's button clicks; read back by
+    /// `format_designer_window` next call.
+    pub(super) close: bool,
+    pub(super) apply: bool,
+    pub(super) fd_save_preset: bool,
 }
 
 impl FormatDesignerState {
@@ -101,6 +106,9 @@ impl FormatDesignerState {
             selected_recording_idx: 0,
             target,
             recordings_load: None,
+            close: false,
+            apply: false,
+            fd_save_preset: false,
         }
     }
 }
@@ -1743,16 +1751,16 @@ impl StreamArchiverApp {
                 .ok();
             state.recordings_load = Some(rx);
         }
-        self.format_designer = Some(state);
+        self.format_designer = Some(Arc::new(Mutex::new(state)));
     }
 
     /// The floating Format Designer window: token reference, live preview, and
     /// optional write-back to the field that opened it.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn format_designer_window(&mut self, ctx: &egui::Context) {
-        if self.format_designer.is_none() {
+        let Some(state) = self.format_designer.clone() else {
             return;
-        }
+        };
 
         // Token catalogue: (category label, &[(token, tooltip)])
         const TOKENS: &[(&str, &[(&str, &str)])] = &[
@@ -1801,7 +1809,8 @@ impl StreamArchiverApp {
         // When a load is in-flight, schedule a repaint so we check again next
         // frame even if there is no user input — otherwise the data sits in the
         // channel until the user moves the mouse.
-        let still_loading = if let Some(fd) = self.format_designer.as_mut() {
+        let still_loading = {
+            let mut fd = state.lock().unwrap();
             if let Some(rx) = &fd.recordings_load {
                 match rx.try_recv() {
                     Ok((recs, default_idx)) => {
@@ -1819,19 +1828,25 @@ impl StreamArchiverApp {
             } else {
                 false
             }
-        } else {
-            false
         };
         if still_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
 
-        // ── Snapshot state before closure (avoids borrow conflicts) ──────────
-        let template = self.format_designer.as_ref().unwrap().template.clone();
-        let selected_monitor_idx = self.format_designer.as_ref().unwrap().selected_monitor_idx;
-        let selected_recording_idx = self.format_designer.as_ref().unwrap().selected_recording_idx;
-        let recordings = self.format_designer.as_ref().unwrap().recordings.clone();
-        let target = self.format_designer.as_ref().unwrap().target.clone();
+        // ── Snapshot state before the call (only needed for the preview —
+        // still computed once per frame, not live inside the deferred
+        // closure, so typing stays "stale by one frame" exactly as before
+        // the migration) ───────────────────────────────────────────────────
+        let (template, selected_monitor_idx, selected_recording_idx, recordings, target) = {
+            let fd = state.lock().unwrap();
+            (
+                fd.template.clone(),
+                fd.selected_monitor_idx,
+                fd.selected_recording_idx,
+                fd.recordings.clone(),
+                fd.target.clone(),
+            )
+        };
 
         // Channels with the same name across platforms are otherwise
         // indistinguishable in the dropdown — tag each with its platform.
@@ -1846,24 +1861,30 @@ impl StreamArchiverApp {
             .map(|m| build_preview_filename(&self.core.store, m, selected_recording.as_ref(), &template))
             .unwrap_or_default();
 
-        // ── Mutable locals for the closure to write into ─────────────────────
-        let mut new_template = template.clone();
-        let mut new_monitor_idx = selected_monitor_idx;
-        let mut new_recording_idx = selected_recording_idx;
-        let mut close = false;
-        let mut apply = false;
-        let mut fd_save_preset = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        let target_for_closure = target.clone();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("format_designer_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Format Designer")
                 .with_inner_size([820.0, 600.0])
                 .with_resizable(true),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            move |ctx, fd, _shared| {
+                let target = &target_for_closure;
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    close = true;
+                    fd.close = true;
                 }
+                // Locals the closure body below (unchanged from before the
+                // migration) writes into; folded back into `fd` at the end.
+                let mut new_template = fd.template.clone();
+                let mut new_monitor_idx = fd.selected_monitor_idx;
+                let mut new_recording_idx = fd.selected_recording_idx;
+                let mut close = fd.close;
+                let mut apply = false;
+                let mut fd_save_preset = false;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(2.0);
                     ui.label("Listing of all possible {formatter} options — highlighted when in use in the template below.");
@@ -2003,15 +2024,33 @@ impl StreamArchiverApp {
                         }
                     });
                 });
+                // Fold the locals this (unchanged) closure body wrote into
+                // back into the shared state.
+                fd.template = new_template;
+                fd.selected_monitor_idx = new_monitor_idx;
+                fd.selected_recording_idx = new_recording_idx;
+                fd.close = close;
+                fd.apply = apply;
+                fd.fd_save_preset = fd_save_preset;
             },
         );
 
         // ── Apply closure results back to state ──────────────────────────────
+        let (new_monitor_idx, new_recording_idx, close, apply, fd_save_preset, new_template) = {
+            let fd = state.lock().unwrap();
+            (
+                fd.selected_monitor_idx,
+                fd.selected_recording_idx,
+                fd.close,
+                fd.apply,
+                fd.fd_save_preset,
+                fd.template.clone(),
+            )
+        };
         let monitor_changed = new_monitor_idx != selected_monitor_idx;
 
-        if let Some(fd) = self.format_designer.as_mut() {
-            fd.template = new_template.clone();
-            fd.selected_monitor_idx = new_monitor_idx;
+        {
+            let mut fd = state.lock().unwrap();
             if monitor_changed {
                 // Load recordings for the newly selected monitor off the UI thread.
                 if let Some(m) = self.rows.get(new_monitor_idx) {
