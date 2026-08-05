@@ -94,6 +94,7 @@ impl StreamArchiverApp {
         let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
         let mut open_asset_history = false;
         let mut open_about = false;
+        let mut open_change_history = false;
 
         self.instance_scope_drafts
             .entry(m.id)
@@ -128,7 +129,7 @@ impl StreamArchiverApp {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
 
                 // ── Monitor (instance) ───────────────────────────────────
-                Self::instance_props_monitor_section(ui, m, row.recording_count);
+                Self::instance_props_monitor_section(ui, m, row.recording_count, &mut open_change_history);
 
                 // ── Assets (this instance's account) ─────────────────────
                 // The same data the channel Properties window shows, filtered
@@ -172,6 +173,7 @@ impl StreamArchiverApp {
             open_emote_viewer,
             open_asset_history,
             open_about,
+            open_change_history,
         );
 
         !open
@@ -294,7 +296,12 @@ impl StreamArchiverApp {
     }
 
     /// "Monitor (instance)" section — the read-only monitor-config grid.
-    fn instance_props_monitor_section(ui: &mut egui::Ui, m: &Monitor, recording_count: i64) {
+    fn instance_props_monitor_section(
+        ui: &mut egui::Ui,
+        m: &Monitor,
+        recording_count: i64,
+        open_change_history: &mut bool,
+    ) {
         egui::CollapsingHeader::new(egui::RichText::new("Monitor (instance)").strong())
             .id_salt("inst_props_sec_monitor")
             .default_open(true)
@@ -348,6 +355,17 @@ impl StreamArchiverApp {
                 ui.label(prop_bool(m.fetch_chat_assets));
                 ui.end_row();
             });
+            ui.add_space(4.0);
+            if ui
+                .button("📝 Title/category/tags history")
+                .on_hover_text(
+                    "Every title/category/tags change ever seen for this instance — \
+                     while recording or not.",
+                )
+                .clicked()
+            {
+                *open_change_history = true;
+            }
             });
     }
 
@@ -681,6 +699,7 @@ impl StreamArchiverApp {
         open_emote_viewer: Option<(EmoteProvider, AssetAccount)>,
         open_asset_history: bool,
         open_about: bool,
+        open_change_history: bool,
     ) {
         if scope_dirty {
             if let Some(scope) = self.instance_scope_drafts.get(&mid) {
@@ -748,6 +767,11 @@ impl StreamArchiverApp {
         // ℹ About — the archived About-page viewer for this account.
         if open_about && let Some(acc) = inst_account {
             self.open_about_view(cid, &ch.name, acc);
+        }
+        // 📝 Title/category/tags history — same popup the Streams grid's
+        // context menu opens, reused as-is.
+        if open_change_history && !self.history_popups.contains(&mid) {
+            self.history_popups.push(mid);
         }
     }
 
@@ -1024,6 +1048,7 @@ impl StreamArchiverApp {
         let mut open_asset_history = false;
         let mut open_about_account: Option<AssetAccount> = None;
         let mut refetch_monitor_ids: Vec<i64> = Vec::new();
+        let mut open_change_history = false;
 
         if !self.channel_cfg_drafts.contains_key(&ch.id) {
             self.channel_cfg_drafts
@@ -1094,7 +1119,7 @@ impl StreamArchiverApp {
                 );
 
                 // ── Channel ─────────────────────────────────────────────
-                Self::channel_props_channel_section(ui, &ch);
+                Self::channel_props_channel_section(ui, &ch, &mut open_change_history);
 
                 // ── Trigger words (per-channel) ──────────────────────────
                 self.channel_props_triggers_section(ui, cid, &mut trigger_dirty, &mut block_dirty);
@@ -1129,6 +1154,7 @@ impl StreamArchiverApp {
             scope_dirty,
             trigger_dirty,
             block_dirty,
+            open_change_history,
         );
 
         // Draft/texture cleanup for a closed window happens in the caller
@@ -1592,7 +1618,11 @@ impl StreamArchiverApp {
     }
 
     /// "Channel" section — the read-only channel-identity grid.
-    fn channel_props_channel_section(ui: &mut egui::Ui, ch: &Channel) {
+    fn channel_props_channel_section(
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        open_change_history: &mut bool,
+    ) {
         egui::CollapsingHeader::new(egui::RichText::new("Channel").strong())
             .id_salt("ch_props_sec_channel")
             .default_open(true)
@@ -1626,6 +1656,18 @@ impl StreamArchiverApp {
                     ui.end_row();
                 }
             });
+            ui.add_space(4.0);
+            if ui
+                .button("📝 Title/category/tags history")
+                .on_hover_text(
+                    "Every title/category/tags change ever seen across this channel's \
+                     instance(s) — while recording or not. Opens one window per instance \
+                     when the channel has more than one.",
+                )
+                .clicked()
+            {
+                *open_change_history = true;
+            }
             });
     }
 
@@ -1854,6 +1896,7 @@ impl StreamArchiverApp {
         scope_dirty: bool,
         trigger_dirty: bool,
         block_dirty: bool,
+        open_change_history: bool,
     ) {
         // The Refetch buttons (header = every account, per-row = one account)
         // dispatch outside the viewport closure.
@@ -1936,6 +1979,17 @@ impl StreamArchiverApp {
             && let Err(e) = crate::triggers::save_channel_block_scope(&self.core.store, cid, scope)
         {
             self.status = format!("Error saving blacklist triggers: {e}");
+        }
+        // 📝 Title/category/tags history — the popup is per-monitor (there's
+        // no channel-wide rollup query), so a multi-instance channel opens
+        // one window per instance; the common single-instance case behaves
+        // exactly like the instance-Properties button.
+        if open_change_history {
+            for mid in self.rows.iter().filter(|r| r.channel.id == cid).map(|r| r.monitor.id) {
+                if !self.history_popups.contains(&mid) {
+                    self.history_popups.push(mid);
+                }
+            }
         }
     }
 

@@ -706,7 +706,7 @@ pub(super) const STREAM_COLUMNS: [GridCol; 24] = [
     GridCol { id: "duration",    title: "Duration",   tooltip: "How long we've recorded (ticks while live).",                                               min_width: 56.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "ad_free",     title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts. A channel row shows one 🛡 per ad-free instance.", min_width: 54.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
-    GridCol { id: "tags",        title: "Tags",       tooltip: "The live stream's tags (Twitch; Kick when set). Hover for the full list; changes are archived — see 📝 Title/category history.", min_width: 0.0, initial: 120.0, sortable: true, stretch: false },
+    GridCol { id: "tags",        title: "Tags",       tooltip: "The stream's tags (Twitch; Kick when set) — persists through offline as the channel's usual tags, same as language/category id. Hover for the full list; changes are archived — see 📝 Title/category/tags history.", min_width: 0.0, initial: 120.0, sortable: true, stretch: false },
 ];
 
 /// Total Streams columns, including the non-sortable Actions slot.

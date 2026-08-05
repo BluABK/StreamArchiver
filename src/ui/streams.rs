@@ -4688,9 +4688,9 @@ impl StreamArchiverApp {
                 }
                 ui.separator();
                 if ui
-                    .button("📝  Title/category history")
+                    .button("📝  Title/category/tags history")
                     .on_hover_text(
-                        "Every title/category change ever seen for this instance — \
+                        "Every title/category/tags change ever seen for this instance — \
                          while recording or not.",
                     )
                     .clicked()

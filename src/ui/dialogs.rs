@@ -1038,25 +1038,43 @@ impl StreamArchiverApp {
         }
     }
 
-    /// One "channel history" window (all-time title/category changes for a
-    /// monitor, independent of any recording); returns true on close.
+    /// One "channel history" window (all-time title/category/tags changes for
+    /// a monitor, independent of any recording); returns true on close.
     #[allow(deprecated)]
     pub(super) fn history_popup_window(&mut self, ctx: &egui::Context, monitor_id: i64) -> bool {
         self.ensure_history_cached(monitor_id);
         let changes = self.history_change_cache.get(&monitor_id).cloned().unwrap_or_default();
-        let channel_name = self
-            .core
-            .store
-            .get_monitor_with_channel(monitor_id)
-            .ok()
-            .flatten()
-            .map(|r| r.channel.name)
-            .unwrap_or_default();
+        let row = self.core.store.get_monitor_with_channel(monitor_id).ok().flatten();
+        let channel_name = row.as_ref().map(|r| r.channel.name.clone()).unwrap_or_default();
+        // Include the platform (and URL, when this channel has more than one
+        // instance on the SAME platform) so opening history for several of a
+        // channel's instances at once — e.g. from the channel Properties
+        // window's rollup button — doesn't show several identically-titled
+        // windows with no way to tell them apart.
+        let title = match &row {
+            Some(r) => {
+                let siblings = self
+                    .rows
+                    .iter()
+                    .filter(|o| o.channel.id == r.channel.id && o.monitor.platform() == r.monitor.platform())
+                    .count();
+                if siblings > 1 {
+                    format!(
+                        "{channel_name} ({}, {}) — title/category/tags history",
+                        r.monitor.platform().tag(),
+                        instance_label(&r.monitor.url),
+                    )
+                } else {
+                    format!("{channel_name} ({}) — title/category/tags history", r.monitor.platform().tag())
+                }
+            }
+            None => format!("{channel_name} — title/category/tags history"),
+        };
         let mut open = true;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of(("channel_history_vp", monitor_id)),
             egui::ViewportBuilder::default()
-                .with_title(format!("{channel_name} — title & category history"))
+                .with_title(title)
                 .with_inner_size([480.0, 320.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -1065,11 +1083,11 @@ impl StreamArchiverApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let lines = monitor_change_lines(&changes);
                     if lines.is_empty() {
-                        ui.label("No title or category changes recorded yet.");
+                        ui.label("No title, category, or tags changes recorded yet.");
                         return;
                     }
                     ui.label(format!(
-                        "{} change(s), newest first — every title/category transition \
+                        "{} change(s), newest first — every title/category/tags transition \
                          ever observed for this instance, whether or not it was being \
                          recorded.",
                         lines.len(),

@@ -2462,15 +2462,23 @@ polling during a recording, so this runs as a dedicated per-recording poller.)
 
 The categories played can also be folded into the filename — see `{games}` below.
 
-**All-time title/category history, independent of recording.** The change log
-above only exists for a take that's actually being recorded. Separately,
-StreamArchiver keeps a **continuous** title/category history per instance —
-fed by the normal live poll whenever a channel is live but not recording (Auto
-off, or Enabled-but-idle) and by the same in-recording poller while it is —
-so a channel's full history survives regardless of Auto/Enabled state. Open it
-from a stream row's right-click menu → **📝 Title/category history**: a
+**All-time title/category/tags history, independent of recording.** The change
+log above only exists for a take that's actually being recorded. Separately,
+StreamArchiver keeps a **continuous** title/category/tags history per
+instance — fed by the normal live poll whenever a channel is live but not
+recording (Auto off, or Enabled-but-idle) and by the same in-recording poller
+while it is — so a channel's full history survives regardless of Auto/Enabled
+state. Open it from a stream row's right-click menu → **📝
+Title/category/tags history**, or from the same button in the instance/
+channel Properties windows (**Monitor (instance)** section for one instance;
+**Channel** section for every instance the channel has — opens one window
+per instance when there's more than one, each titled with its platform/URL
+so simultaneous windows for the same channel stay distinguishable): a
 scrollable, copyable, newest-first log with real dates/times (not
-take-relative offsets).
+take-relative offsets). Unlike title/category (which clear to blank while a
+channel is offline, the same way the live Streams grid does), **tags persist
+through offline** as "the channel's usual tags" — the same behavior the grid's
+Tags column and Language field already have.
 
 ### Stream Together collabs 🤝
 
