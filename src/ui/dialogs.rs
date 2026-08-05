@@ -274,6 +274,41 @@ pub(super) struct SavePresetDraft {
     pub(super) closed: bool,
 }
 
+/// Deferred-viewport state for `processes_window`. `rows` is refreshed by the
+/// wrapper every call from `self.processes` (cheap — already just an
+/// in-memory `Vec`, the actual list-processes work happens off-thread and
+/// lands in `self.processes` on its own throttle). `entries` mirrors
+/// `self.processes_grid.entries` (synced back after every call, same as
+/// every other column-choosable table); `reorder_columns` is set by the
+/// header's column-chooser context menu inside the closure (it can't reach
+/// `self.reorder_columns` directly) and relayed into the real field by the
+/// wrapper next call, mirroring `IssuesPopupState::reorder_columns`. Actions
+/// key on `pid` rather than a `Vec` index — the deferred closure that set
+/// `act` may have run on a stale snapshot of `self.processes` by the time
+/// the wrapper applies it, so a `usize` index could point at the wrong row.
+pub(super) struct ProcessesPopupState {
+    pub(super) rows: Vec<crate::app_core::ProcInfo>,
+    pub(super) entries: Vec<ColumnEntry>,
+    /// Mirrors `GridState::last_order`/`widths` — kept here instead since
+    /// the deferred closure can't reach `self.processes_grid`. Both are
+    /// deliberately session-only even in `GridState` itself (see
+    /// `WidthMemory`'s doc), so living only in this popup and never syncing
+    /// back to `self` changes nothing observable.
+    pub(super) last_order: Option<Vec<usize>>,
+    pub(super) widths: grid_columns::WidthMemory,
+    pub(super) reorder_columns: Option<Arc<Mutex<ReorderColumnsState>>>,
+    pub(super) act: Option<ProcessesAct>,
+    pub(super) closed: bool,
+}
+
+pub(super) enum ProcessesAct {
+    Refresh,
+    Stop(u32),
+    Kill(u32),
+    RevealLog(u32),
+    RevealDir(u32),
+}
+
 impl StreamArchiverApp {
     /// Modal confirmation for deleting a monitor (the only destructive action).
     pub(super) fn confirm_delete_window(&mut self, ctx: &egui::Context) {
@@ -2879,10 +2914,8 @@ impl StreamArchiverApp {
     }
     /// its PID, status, and uptime, plus per-process Stop (graceful) / Kill (force)
     /// and reveal-log/folder actions. Doubles as a live list of spawned processes.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn processes_window(&mut self, ctx: &egui::Context) {
-        use crate::models::{ContentType, DetachedKind};
-        use egui_extras::{Column, TableBuilder};
         use std::time::{Duration, Instant};
         // Drain a completed background load first.
         if let Some(rx) = &self.processes_load {
@@ -2932,59 +2965,77 @@ impl StreamArchiverApp {
         }
 
         if !self.show_processes {
+            self.processes_popup = None;
             return;
         }
 
-        let now = now_unix();
-        // Latest per-process I/O sample, keyed by PID — O(1) fetch (unlike
-        // `iomon::history()`, which clones the whole ~30 min ring). The
-        // sampler ticks every 1s regardless of this window, so this is
-        // always fresh to within a second.
-        let io_by_pid: std::collections::HashMap<u32, crate::iomon::ProcSample> =
-            crate::iomon::latest()
-                .map(|s| s.procs.into_iter().map(|p| (p.pid, p)).collect())
-                .unwrap_or_default();
-        let mut open = true;
-        enum Act {
-            Refresh,
-            Stop(usize),
-            Kill(usize),
-            RevealLog(usize),
-            RevealDir(usize),
+        // Ensure a popup instance exists, seeded from the persisted column
+        // draft (remembered across a close/reopen, same as before).
+        if self.processes_popup.is_none() {
+            self.processes_popup = Some(Arc::new(Mutex::new(ProcessesPopupState {
+                rows: Vec::new(),
+                entries: self.processes_grid.entries.clone(),
+                last_order: None,
+                widths: grid_columns::WidthMemory::default(),
+                reorder_columns: None,
+                act: None,
+                closed: false,
+            })));
         }
-        let mut act: Option<Act> = None;
-        // Persisted column order/visibility, taken as a local copy (mutated by
-        // the header's column-chooser context menu, written back + persisted
-        // once after the viewport closure below).
-        let mut processes_entries = self.processes_grid.entries.clone();
-        let processes_order = grid_columns::effective_order(&PROCESSES_COLUMNS, &processes_entries, |_| true);
-        let processes_reset = self.processes_grid.note_order(&processes_order);
+        let popup_state = self.processes_popup.clone().unwrap();
+        // Cheap — already just an in-memory Vec; the actual list-processes
+        // work happened off-thread above, on its own throttle.
+        popup_state.lock().unwrap().rows = self.processes.clone();
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("processes_vp"),
             egui::ViewportBuilder::default()
                 .with_title("🖥 Processes")
                 .with_inner_size([800.0, 440.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
+                use crate::models::{ContentType, DetachedKind};
+                use egui_extras::{Column, TableBuilder};
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
+                let now = now_unix();
+                // Latest per-process I/O sample, keyed by PID — O(1) fetch (unlike
+                // `iomon::history()`, which clones the whole ~30 min ring). The
+                // sampler ticks every 1s regardless of this window, so this is
+                // always fresh to within a second.
+                let io_by_pid: std::collections::HashMap<u32, crate::iomon::ProcSample> =
+                    crate::iomon::latest()
+                        .map(|smp| smp.procs.into_iter().map(|p| (p.pid, p)).collect())
+                        .unwrap_or_default();
+                let processes_order =
+                    grid_columns::effective_order(&PROCESSES_COLUMNS, &s.entries, |_| true);
+                // Mirrors `GridState::note_order` — can't call it directly
+                // since it needs `&mut self.processes_grid`, unreachable from
+                // in here; `last_order`/`widths` live on `s` instead (both
+                // deliberately session-only anyway, same as `GridState`'s).
+                let processes_reset =
+                    s.last_order.as_deref().is_some_and(|prev| prev != processes_order);
+                s.last_order = Some(processes_order.clone());
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} spawned process(es)", self.processes.len()));
+                        ui.label(format!("{} spawned process(es)", s.rows.len()));
                         // Child-viewport instrumentation: proves registration +
-                        // highlight painting inside an immediate viewport.
+                        // highlight painting inside a deferred viewport.
                         if ui
                             .button("⟳ Refresh")
                             .inspect("Processes: Refresh button", &[])
                             .clicked()
                         {
-                            act = Some(Act::Refresh);
+                            s.act = Some(ProcessesAct::Refresh);
                         }
                         ui.weak("Stop = graceful (file finalized) · Kill = force-terminate the tree");
                     });
                     ui.separator();
-                    if self.processes.is_empty() {
+                    if s.rows.is_empty() {
                         ui.weak("No download tool processes are running.");
                         return;
                     }
@@ -3001,7 +3052,7 @@ impl StreamArchiverApp {
                         // A hide/show/reorder-forced reset restores each column to
                         // its last remembered width instead of snapping back to the
                         // declared default — see `WidthMemory` (`grid_columns.rs`).
-                        let seed = self.processes_grid.widths.get(c.id);
+                        let seed = s.widths.get(c.id);
                         let col = if c.stretch {
                             Column::remainder().at_least(c.min_width).clip(true)
                         } else if processes_reset && let Some(w) = seed {
@@ -3015,20 +3066,20 @@ impl StreamArchiverApp {
                         for &i in &processes_order {
                             let c = &PROCESSES_COLUMNS[i];
                             let (rect, _) = h.col(|ui| {
-                                if grid_header_cell_plain(ui, GridTableId::Processes, c, &mut processes_entries, &PROCESSES_COLUMNS) {
-                                    self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
+                                if grid_header_cell_plain(ui, GridTableId::Processes, c, &mut s.entries, &PROCESSES_COLUMNS) {
+                                    s.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
                                         table: GridTableId::Processes,
-                                        draft: processes_entries.clone(),
+                                        draft: s.entries.clone(),
                                         apply: false,
                                         cancel: false,
                                     })));
                                 }
                             });
-                            self.processes_grid.widths.note(c.id, rect.width());
+                            s.widths.note(c.id, rect.width());
                         }
                     })
                     .body(|mut body| {
-                        for (i, p) in self.processes.iter().enumerate() {
+                        for p in &s.rows {
                             body.row(22.0, |mut row| {
                                 for &ci in &processes_order {
                                     row.col(|ui| match PROCESSES_COLUMNS[ci].id {
@@ -3072,11 +3123,11 @@ impl StreamArchiverApp {
                                         }
                                         "io" => {
                                             match io_by_pid.get(&p.pid) {
-                                                Some(s) => {
-                                                    let tree = if s.tree.is_empty() {
-                                                        s.tool.clone()
+                                                Some(smp) => {
+                                                    let tree = if smp.tree.is_empty() {
+                                                        smp.tool.clone()
                                                     } else {
-                                                        s.tree.clone()
+                                                        smp.tree.clone()
                                                     };
                                                     // Fixed-width monospace so the column doesn't
                                                     // visibly resize every refresh as the rate
@@ -3084,18 +3135,18 @@ impl StreamArchiverApp {
                                                     // vs "1.0 MB/s").
                                                     ui.monospace(format!(
                                                         "↓{:>8}/s ↑{:>8}/s",
-                                                        fmt_bytes(s.read_bps as i64),
-                                                        fmt_bytes(s.write_bps as i64),
+                                                        fmt_bytes(smp.read_bps as i64),
+                                                        fmt_bytes(smp.write_bps as i64),
                                                     ))
                                                     .on_hover_text(format!(
                                                         "{tree}\nTotal since start: ↓{} read, ↑{} written\
                                                          {}",
-                                                        fmt_bytes(s.total_read as i64),
-                                                        fmt_bytes(s.total_write as i64),
-                                                        if s.descendants > 0 {
+                                                        fmt_bytes(smp.total_read as i64),
+                                                        fmt_bytes(smp.total_write as i64),
+                                                        if smp.descendants > 0 {
                                                             format!(
                                                                 "\n{} live descendant process(es) rolled in",
-                                                                s.descendants
+                                                                smp.descendants
                                                             )
                                                         } else {
                                                             String::new()
@@ -3162,7 +3213,7 @@ impl StreamArchiverApp {
                                                 )
                                                 .clicked()
                                             {
-                                                act = Some(Act::Stop(i));
+                                                s.act = Some(ProcessesAct::Stop(p.pid));
                                             }
                                             if ui
                                                 .small_button("Kill")
@@ -3172,7 +3223,7 @@ impl StreamArchiverApp {
                                                 )
                                                 .clicked()
                                             {
-                                                act = Some(Act::Kill(i));
+                                                s.act = Some(ProcessesAct::Kill(p.pid));
                                             }
                                             // Some re-attached ffmpeg jobs (chapters/thumbnail embed
                                             // etc. from before this feature tracked a real progress
@@ -3187,10 +3238,10 @@ impl StreamArchiverApp {
                                                 log_btn.on_disabled_hover_text("No log file for this job")
                                             };
                                             if log_btn.clicked() {
-                                                act = Some(Act::RevealLog(i));
+                                                s.act = Some(ProcessesAct::RevealLog(p.pid));
                                             }
                                             if ui.small_button("Folder").clicked() {
-                                                act = Some(Act::RevealDir(i));
+                                                s.act = Some(ProcessesAct::RevealDir(p.pid));
                                             }
                                         }
                                         "filename" => {
@@ -3205,37 +3256,46 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if processes_entries != self.processes_grid.entries {
-            self.processes_grid.entries = processes_entries;
+
+        let (entries, reorder_columns, closed, act) = {
+            let mut s = popup_state.lock().unwrap();
+            (s.entries.clone(), s.reorder_columns.take(), s.closed, s.act.take())
+        };
+        if entries != self.processes_grid.entries {
+            self.processes_grid.entries = entries;
             grid_columns::save_columns(&self.core.store, GridTableId::Processes, &self.processes_grid.entries);
         }
+        if let Some(rc) = reorder_columns {
+            self.reorder_columns = Some(rc);
+        }
 
-        if !open {
+        if closed {
             self.show_processes = false;
+            self.processes_popup = None;
         }
         match act {
-            Some(Act::Refresh) => self.processes_refreshed = None,
-            Some(Act::Stop(i)) => {
-                if let Some(p) = self.processes.get(i) {
+            Some(ProcessesAct::Refresh) => self.processes_refreshed = None,
+            Some(ProcessesAct::Stop(pid)) => {
+                if let Some(p) = self.processes.iter().find(|p| p.pid == pid) {
                     self.core.stop_process(p);
                     self.status = format!("Stopping pid {} ({})…", p.pid, p.name);
                     self.processes_refreshed = None;
                 }
             }
-            Some(Act::Kill(i)) => {
-                if let Some(p) = self.processes.get(i) {
+            Some(ProcessesAct::Kill(pid)) => {
+                if let Some(p) = self.processes.iter().find(|p| p.pid == pid) {
                     self.core.force_kill(p.pid, &p.job_name);
                     self.status = format!("Killed pid {} ({}).", p.pid, p.name);
                     self.processes_refreshed = None;
                 }
             }
-            Some(Act::RevealLog(i)) => {
-                if let Some(p) = self.processes.get(i) {
+            Some(ProcessesAct::RevealLog(pid)) => {
+                if let Some(p) = self.processes.iter().find(|p| p.pid == pid) {
                     crate::platform::open_path(std::path::Path::new(&p.log_path));
                 }
             }
-            Some(Act::RevealDir(i)) => {
-                if let Some(p) = self.processes.get(i) {
+            Some(ProcessesAct::RevealDir(pid)) => {
+                if let Some(p) = self.processes.iter().find(|p| p.pid == pid) {
                     if let Some(dir) = std::path::Path::new(&p.capture_path).parent() {
                         crate::platform::open_path(dir);
                     }

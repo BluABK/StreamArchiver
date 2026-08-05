@@ -1381,6 +1381,9 @@ pub struct StreamArchiverApp {
     /// In-flight background load of the process list (spawned off the UI thread
     /// to avoid blocking on the store mutex during `list_processes()`).
     processes_load: Option<std::sync::mpsc::Receiver<Vec<crate::app_core::ProcInfo>>>,
+    /// Deferred-viewport state while the Processes window is open (None =
+    /// closed) — see [`dialogs::ProcessesPopupState`].
+    processes_popup: Option<Arc<Mutex<dialogs::ProcessesPopupState>>>,
     /// The issues panel: whether it's open, its last snapshot of recordings
     /// that still have a `.ts` path, and when that snapshot was taken.
     show_issues: bool,

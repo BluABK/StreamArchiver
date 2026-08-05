@@ -46,6 +46,7 @@ pub async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
 /// taken from the persistent detached-process registry (which holds a row for
 /// every live recording / on-demand video / chat sidecar) and enriched with its
 /// channel/video name and tool.
+#[derive(Clone)]
 pub struct ProcInfo {
     pub kind: crate::models::DetachedKind,
     pub ref_id: i64,

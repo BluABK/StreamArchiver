@@ -546,6 +546,7 @@ impl StreamArchiverApp {
             processes: Vec::new(),
             processes_refreshed: None,
             processes_load: None,
+            processes_popup: None,
             show_issues: false,
             issues_recs: Vec::new(),
             issues_missing: Vec::new(),
