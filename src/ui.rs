@@ -1612,6 +1612,8 @@ pub struct StreamArchiverApp {
     settings_search: String,
     /// Shared state of the async "List formats" probe (Videos tab).
     format_probe: Arc<Mutex<FormatProbe>>,
+    /// Deferred-viewport state for `format_probe_window` (None = closed).
+    format_probe_popup: Option<Arc<Mutex<videos::FormatProbePopupState>>>,
     /// Backing state for the "Recover VOD" dialog (`None` = closed).
     recover_form: Option<Arc<Mutex<RecoverVodForm>>>,
     /// Shared state of the async Recover-VOD CDN probe.

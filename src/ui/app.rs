@@ -618,6 +618,7 @@ impl StreamArchiverApp {
             settings_tab,
             settings_search: String::new(),
             format_probe: Arc::new(Mutex::new(FormatProbe::Idle)),
+            format_probe_popup: None,
             recover_form: None,
             recover_probe: Arc::new(Mutex::new(RecoverProbe::Idle)),
             recover_scrape: Arc::new(Mutex::new(RecoverScrape::Idle)),

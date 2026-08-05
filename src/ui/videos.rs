@@ -11,6 +11,16 @@ pub(super) enum FormatProbe {
     Failed(String),
 }
 
+/// Deferred-viewport content for `format_probe_window`, derived fresh from
+/// `self.format_probe` every wrapper call (cheap — a small string clone,
+/// same cost as before the migration).
+pub(super) struct FormatProbePopupState {
+    pub(super) title: &'static str,
+    pub(super) body: String,
+    pub(super) done: bool,
+    pub(super) closed: bool,
+}
+
 /// A self-mutating action picked from a video row's context menu (open/copy are
 /// handled inline; these need deferred access to `self`).
 pub(super) enum VideoMenuChoice {
@@ -1213,39 +1223,63 @@ impl StreamArchiverApp {
     pub(super) fn format_probe_window(&mut self, ctx: &egui::Context) {
         let probe = self.format_probe.lock().unwrap().clone();
         let (title, body, done) = match &probe {
-            FormatProbe::Idle => return,
+            FormatProbe::Idle => {
+                self.format_probe_popup = None;
+                return;
+            }
             FormatProbe::Running => ("Listing formats…", "Running…".to_string(), false),
             FormatProbe::Done(s) => ("Available formats", s.clone(), true),
             FormatProbe::Failed(e) => ("Format probe failed", e.clone(), true),
         };
-        let mut open = true;
-        ctx.show_viewport_immediate(
+
+        if self.format_probe_popup.is_none() {
+            self.format_probe_popup = Some(Arc::new(Mutex::new(FormatProbePopupState {
+                title,
+                body: body.clone(),
+                done,
+                closed: false,
+            })));
+        }
+        let popup_state = self.format_probe_popup.clone().unwrap();
+        {
+            let mut s = popup_state.lock().unwrap();
+            s.title = title;
+            s.body = body;
+            s.done = done;
+        }
+
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("format_probe_vp"),
             egui::ViewportBuilder::default()
                 .with_title(title.to_string())
                 .with_inner_size([680.0, 460.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if done && ui.button("📋  Copy").clicked() {
-                        ui.ctx().copy_text(body.clone());
+                    if s.done && ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(s.body.clone());
                     }
                     ui.add_space(4.0);
                     egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&body).monospace())
+                                egui::Label::new(egui::RichText::new(&s.body).monospace())
                                     .selectable(true),
                             );
                         });
                 });
             },
         );
-        if !open {
+        if popup_state.lock().unwrap().closed {
             *self.format_probe.lock().unwrap() = FormatProbe::Idle;
+            self.format_probe_popup = None;
         }
     }
 
