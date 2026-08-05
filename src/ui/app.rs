@@ -623,7 +623,7 @@ impl StreamArchiverApp {
             issues_refreshed: None,
             issues_dirty: false,
             issues_confirm_clear: false,
-            issues_error_view: None,
+            issues_popup: None,
             show_notifications: false,
             notifications: Vec::new(),
             show_pot_server_log: false,
