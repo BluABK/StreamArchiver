@@ -3,6 +3,40 @@
 
 use super::*;
 
+/// Deferred-viewport content for `ad_popup_window` — derived once per
+/// recording id.
+pub(super) struct AdPopupContent {
+    pub(super) total: i64,
+    pub(super) lines: Vec<String>,
+    pub(super) closed: bool,
+}
+
+/// Deferred-viewport content for `history_popup_window` — derived once per
+/// monitor id (see [`PopupRegistry`]).
+pub(super) struct HistoryPopupContent {
+    pub(super) title: String,
+    pub(super) lines: Vec<String>,
+    pub(super) closed: bool,
+}
+
+/// Deferred-viewport content for `chapters_popup_window` — derived once per
+/// recording id.
+pub(super) struct ChaptersPopupContent {
+    pub(super) channel_name: String,
+    pub(super) output_path: String,
+    pub(super) lines: Vec<String>,
+    pub(super) closed: bool,
+}
+
+/// Deferred-viewport content shared by `vod_info_popup_window` and
+/// `remux_info_popup_window` — both just display a channel name + the whole
+/// `Recording` the caller already had at click time, no store read needed.
+pub(super) struct VodInfoContent {
+    pub(super) channel_name: String,
+    pub(super) rec: crate::models::Recording,
+    pub(super) closed: bool,
+}
+
 /// What the metadata-change popup shows.
 #[derive(Clone)]
 pub(super) enum MetaPopup {
@@ -910,11 +944,13 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.ad_popups.retain(|r| !closed.contains(r));
         }
+        self.ad_popup_registry.retain(&self.ad_popups);
     }
 
-    /// Window listing where ad breaks cause hard cuts in a take's finished file.
-    /// Opened by double-clicking an Ads / Ad time cell. Returns true on close.
-    #[allow(deprecated)]
+    /// Window listing where ad breaks cause hard cuts in a take's finished
+    /// file. Opened by double-clicking an Ads / Ad time cell. Returns true
+    /// once closed.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn ad_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
         // Reuse the cached cut list (cleared on reload) rather than re-querying
         // every frame the popup is open.
@@ -926,46 +962,55 @@ impl StreamArchiverApp {
                 .unwrap_or_default();
             self.ad_break_cache.insert(rid, v);
         }
-        let breaks = self.ad_break_cache.get(&rid).cloned().unwrap_or_default();
-        let total: i64 = breaks.iter().map(|b| b.duration_secs).sum();
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let state = self.ad_popup_registry.get_or_init(rid, || {
+            let breaks = self.ad_break_cache.get(&rid).cloned().unwrap_or_default();
+            let total: i64 = breaks.iter().map(|b| b.duration_secs).sum();
+            let lines = ad_cut_lines(&breaks);
+            AdPopupContent { total, lines, closed: false }
+        });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("ad_breaks_vp", rid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Ad breaks — cut points (take #{rid})"))
                 .with_inner_size([360.0, 260.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if breaks.is_empty() {
+                    if content.lines.is_empty() {
                         ui.label("No ad breaks recorded for this take.");
                         return;
                     }
                     ui.label(format!(
                         "{} ad break(s), {} total. Each is a hard cut in the recorded file \
                          (streamlink filters ad segments out).",
-                        breaks.len(),
-                        fmt_duration(total),
+                        content.lines.len(),
+                        fmt_duration(content.total),
                     ));
                     ui.add_space(6.0);
-                    let lines = ad_cut_lines(&breaks);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for line in &lines {
+                            for line in &content.lines {
                                 ui.label(egui::RichText::new(line).monospace());
                             }
                         });
                     ui.add_space(6.0);
                     if ui.button("📋  Copy").clicked() {
-                        ui.ctx().copy_text(lines.join("\n"));
+                        ui.ctx().copy_text(content.lines.join("\n"));
                     }
                 });
             },
         );
-        !open
+        false
     }
 
     /// Load a recording's metadata-change rows into the cache if absent.
@@ -1004,53 +1049,72 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.history_popups.retain(|m| !closed.contains(m));
         }
+        self.history_popup_registry.retain(&self.history_popups);
     }
 
     /// One "channel history" window (all-time title/category/tags changes for
-    /// a monitor, independent of any recording); returns true on close.
-    #[allow(deprecated)]
+    /// a monitor, independent of any recording); returns true once the user
+    /// has closed it (checked at the START of the next call, one frame after
+    /// the deferred closure itself set the flag — the window is destroyed by
+    /// the OS asynchronously, and this app-state cleanup doesn't need to be
+    /// any more synchronous than that). Content is derived once per monitor
+    /// id when first opened (matches the pre-migration behavior, which only
+    /// ever populated `history_change_cache` once too via
+    /// `ensure_history_cached`'s "if absent" guard — never live-refreshed
+    /// while open).
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn history_popup_window(&mut self, ctx: &egui::Context, monitor_id: i64) -> bool {
         self.ensure_history_cached(monitor_id);
-        let changes = self.history_change_cache.get(&monitor_id).cloned().unwrap_or_default();
-        let row = self.core.store.get_monitor_with_channel(monitor_id).ok().flatten();
-        let channel_name = row.as_ref().map(|r| r.channel.name.clone()).unwrap_or_default();
-        // Include the platform (and URL, when this channel has more than one
-        // instance on the SAME platform) so opening history for several of a
-        // channel's instances at once — e.g. from the channel Properties
-        // window's rollup button — doesn't show several identically-titled
-        // windows with no way to tell them apart.
-        let title = match &row {
-            Some(r) => {
-                let siblings = self
-                    .rows
-                    .iter()
-                    .filter(|o| o.channel.id == r.channel.id && o.monitor.platform() == r.monitor.platform())
-                    .count();
-                if siblings > 1 {
-                    format!(
-                        "{channel_name} ({}, {}) — title/category/tags history",
-                        r.monitor.platform().tag(),
-                        instance_label(&r.monitor.url),
-                    )
-                } else {
-                    format!("{channel_name} ({}) — title/category/tags history", r.monitor.platform().tag())
+        let state = self.history_popup_registry.get_or_init(monitor_id, || {
+            let changes = self.history_change_cache.get(&monitor_id).cloned().unwrap_or_default();
+            let row = self.core.store.get_monitor_with_channel(monitor_id).ok().flatten();
+            let channel_name = row.as_ref().map(|r| r.channel.name.clone()).unwrap_or_default();
+            // Include the platform (and URL, when this channel has more than
+            // one instance on the SAME platform) so opening history for
+            // several of a channel's instances at once — e.g. from the
+            // channel Properties window's rollup button — doesn't show
+            // several identically-titled windows with no way to tell them
+            // apart.
+            let title = match &row {
+                Some(r) => {
+                    let siblings = self
+                        .rows
+                        .iter()
+                        .filter(|o| o.channel.id == r.channel.id && o.monitor.platform() == r.monitor.platform())
+                        .count();
+                    if siblings > 1 {
+                        format!(
+                            "{channel_name} ({}, {}) — title/category/tags history",
+                            r.monitor.platform().tag(),
+                            instance_label(&r.monitor.url),
+                        )
+                    } else {
+                        format!("{channel_name} ({}) — title/category/tags history", r.monitor.platform().tag())
+                    }
                 }
-            }
-            None => format!("{channel_name} — title/category/tags history"),
-        };
-        let mut open = true;
-        ctx.show_viewport_immediate(
+                None => format!("{channel_name} — title/category/tags history"),
+            };
+            HistoryPopupContent { title, lines: monitor_change_lines(&changes), closed: false }
+        });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        let title = state.lock().unwrap().title.clone();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("channel_history_vp", monitor_id)),
             egui::ViewportBuilder::default()
                 .with_title(title)
                 .with_inner_size([480.0, 320.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let lines = monitor_change_lines(&changes);
-                    if lines.is_empty() {
+                    if content.lines.is_empty() {
                         ui.label("No title, category, or tags changes recorded yet.");
                         return;
                     }
@@ -1058,24 +1122,24 @@ impl StreamArchiverApp {
                         "{} change(s), newest first — every title/category/tags transition \
                          ever observed for this instance, whether or not it was being \
                          recorded.",
-                        lines.len(),
+                        content.lines.len(),
                     ));
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for line in &lines {
+                            for line in &content.lines {
                                 ui.label(egui::RichText::new(line).monospace());
                             }
                         });
                     ui.add_space(6.0);
                     if ui.button("📋  Copy").clicked() {
-                        ui.ctx().copy_text(lines.join("\n"));
+                        ui.ctx().copy_text(content.lines.join("\n"));
                     }
                 });
             },
         );
-        !open
+        false
     }
 
     /// Load one recording's (channel name, file path, parsed chapter list)
@@ -1112,63 +1176,76 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.chapters_popups.retain(|r| !closed.contains(r));
         }
+        self.chapters_popup_registry.retain(&self.chapters_popups);
     }
 
     /// Window showing which stream, which file, and the embedded chapter
-    /// list (title + timestamp) for one recording; returns true on close.
-    #[allow(deprecated)]
+    /// list (title + timestamp) for one recording; returns true once closed
+    /// (see `history_popup_window`'s doc comment for the async-close shape).
+    /// Content derived once per recording id, matching the pre-migration
+    /// `chapters_popup_cache`'s own "if absent" load-once behavior.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn chapters_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
         self.ensure_chapters_popup_cached(rid);
-        let (channel_name, output_path, chapters) =
-            self.chapters_popup_cache.get(&rid).cloned().unwrap_or_default();
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let state = self.chapters_popup_registry.get_or_init(rid, || {
+            let (channel_name, output_path, chapters) =
+                self.chapters_popup_cache.get(&rid).cloned().unwrap_or_default();
+            let lines: Vec<String> = chapters
+                .iter()
+                .map(|c| format!("{}  {}", fmt_duration(c.at_secs.round() as i64), c.title))
+                .collect();
+            ChaptersPopupContent { channel_name, output_path, lines, closed: false }
+        });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("chapters_detail_vp", rid)),
             egui::ViewportBuilder::default()
-                .with_title(format!("{channel_name} — chapters (take #{rid})"))
+                .with_title(format!("{} — chapters (take #{rid})", state.lock().unwrap().channel_name))
                 .with_inner_size([460.0, 320.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(egui::RichText::new(&channel_name).strong());
+                    ui.label(egui::RichText::new(&content.channel_name).strong());
                     ui.horizontal(|ui| {
                         ui.label("File:");
-                        ui.label(egui::RichText::new(&output_path).monospace().small());
+                        ui.label(egui::RichText::new(&content.output_path).monospace().small());
                         if ui.small_button("📋").on_hover_text("Copy file path").clicked() {
-                            ui.ctx().copy_text(output_path.clone());
+                            ui.ctx().copy_text(content.output_path.clone());
                         }
                     });
                     ui.add_space(6.0);
-                    if chapters.is_empty() {
+                    if content.lines.is_empty() {
                         ui.label(
                             "No chapters recorded for this take yet (embedding may still be \
                              in progress, or none of the enabled kinds found anything to mark).",
                         );
                         return;
                     }
-                    ui.label(format!("{} chapter(s):", chapters.len()));
+                    ui.label(format!("{} chapter(s):", content.lines.len()));
                     ui.add_space(4.0);
-                    let lines: Vec<String> = chapters
-                        .iter()
-                        .map(|c| format!("{}  {}", fmt_duration(c.at_secs.round() as i64), c.title))
-                        .collect();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for line in &lines {
+                            for line in &content.lines {
                                 ui.label(egui::RichText::new(line).monospace());
                             }
                         });
                     ui.add_space(6.0);
                     if ui.button("📋  Copy").clicked() {
-                        ui.ctx().copy_text(lines.join("\n"));
+                        ui.ctx().copy_text(content.lines.join("\n"));
                     }
                 });
             },
         );
-        !open
+        false
     }
 
     /// Render every open VOD-status popup — Stream History's ℹ VOD button.
@@ -1183,28 +1260,40 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.vod_info_popups.retain(|r| !closed.contains(r));
         }
+        self.vod_info_popup_registry.retain(&self.vod_info_popups);
     }
 
     /// Window showing one take's VOD/recovery/archive-download status;
-    /// returns true on close. No store read needed — the caller already had
-    /// the full `Recording` at click time (see `history::stream_history_view`).
-    #[allow(deprecated)]
+    /// returns true once closed. No store read needed — the caller already
+    /// had the full `Recording` at click time (see
+    /// `history::stream_history_view`).
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn vod_info_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
         let Some((channel_name, rec)) = self.vod_info_popup_cache.get(&rid).cloned() else {
             return true;
         };
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let state = self
+            .vod_info_popup_registry
+            .get_or_init(rid, || VodInfoContent { channel_name, rec, closed: false });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("vod_info_vp", rid)),
             egui::ViewportBuilder::default()
-                .with_title(format!("{channel_name} — VOD status (take #{rid})"))
+                .with_title(format!("{} — VOD status (take #{rid})", state.lock().unwrap().channel_name))
                 .with_inner_size([420.0, 280.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
+                let rec = &content.rec;
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(egui::RichText::new(&channel_name).strong());
+                    ui.label(egui::RichText::new(&content.channel_name).strong());
                     ui.add_space(6.0);
                     egui::Grid::new("vod_info_grid").num_columns(2).spacing([8.0, 4.0]).show(
                         ui,
@@ -1257,7 +1346,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        !open
+        false
     }
 
     /// Render every open remux-status popup — Stream History's ℹ Remux button.
@@ -1272,26 +1361,37 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.remux_info_popups.retain(|r| !closed.contains(r));
         }
+        self.remux_info_popup_registry.retain(&self.remux_info_popups);
     }
 
-    /// Window showing one take's remux/promote status; returns true on close.
-    #[allow(deprecated)]
+    /// Window showing one take's remux/promote status; returns true once closed.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn remux_info_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
         let Some((channel_name, rec)) = self.remux_info_popup_cache.get(&rid).cloned() else {
             return true;
         };
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let state = self
+            .remux_info_popup_registry
+            .get_or_init(rid, || VodInfoContent { channel_name, rec, closed: false });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("remux_info_vp", rid)),
             egui::ViewportBuilder::default()
-                .with_title(format!("{channel_name} — remux status (take #{rid})"))
+                .with_title(format!("{} — remux status (take #{rid})", state.lock().unwrap().channel_name))
                 .with_inner_size([460.0, 220.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
+                let rec = &content.rec;
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(egui::RichText::new(&channel_name).strong());
+                    ui.label(egui::RichText::new(&content.channel_name).strong());
                     ui.horizontal(|ui| {
                         ui.label("File:");
                         ui.label(egui::RichText::new(&rec.output_path).monospace().small());
@@ -1300,7 +1400,7 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.add_space(6.0);
-                    if is_remux_pending(&rec) {
+                    if is_remux_pending(rec) {
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 140, 30),
                             "⚠ Still a .ts capture in the cache dir — the automatic remux to \
@@ -1309,7 +1409,7 @@ impl StreamArchiverApp {
                         ui.label(
                             "Right-click the take in Streams → \"🔄 Re-remux to MKV\" to retry.",
                         );
-                    } else if is_stuck_in_cache(&rec) {
+                    } else if is_stuck_in_cache(rec) {
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 140, 30),
                             "⚠ Capture completed but the promote-to-output-dir move never \
@@ -1321,7 +1421,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        !open
+        false
     }
 
     // (collab history helpers below; state struct + line formatter at the

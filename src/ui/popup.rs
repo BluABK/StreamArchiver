@@ -91,6 +91,36 @@ pub(super) fn show_deferred_popup<T: Send + 'static>(
     });
 }
 
+/// Per-key `Arc<Mutex<T>>` state for popups shaped like "`Vec<K>` of open
+/// ids + derive each one's content once from a cache/store lookup" — channel
+/// history, chapters, VOD/remux info, ad breaks, upcoming-schedule popups,
+/// etc. `T` is created lazily via `get_or_init` the first time a key is seen,
+/// and dropped once the caller's own open-id list stops naming it (call
+/// `retain` with that same list each frame, mirroring the existing
+/// `self.xxx_popups.retain(...)` cleanup every one of these windows already
+/// does — see e.g. `history_popup_windows`).
+pub(super) struct PopupRegistry<K, T> {
+    states: HashMap<K, Arc<Mutex<T>>>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone, T> Default for PopupRegistry<K, T> {
+    fn default() -> Self {
+        PopupRegistry { states: HashMap::new() }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone, T> PopupRegistry<K, T> {
+    pub(super) fn get_or_init(&mut self, key: K, init: impl FnOnce() -> T) -> Arc<Mutex<T>> {
+        self.states.entry(key).or_insert_with(|| Arc::new(Mutex::new(init()))).clone()
+    }
+
+    /// Drop state for any key no longer in `keep` — call alongside the
+    /// caller's own open-id-list `.retain(...)`.
+    pub(super) fn retain(&mut self, keep: &[K]) {
+        self.states.retain(|k, _| keep.contains(k));
+    }
+}
+
 /// Backing state for the generic "are you sure?" confirm dialog
 /// ([`confirm_dialog_deferred`]). `payload` is whatever the dialog needs to
 /// render its message (an id, a name, a list of items to delete, ...) —

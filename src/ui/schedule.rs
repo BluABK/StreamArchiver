@@ -3,6 +3,13 @@
 
 use super::*;
 
+/// Deferred-viewport content for `schedule_popup_window` — derived once per
+/// monitor id.
+pub(super) struct SchedulePopupContent {
+    pub(super) lines: Vec<String>,
+    pub(super) closed: bool,
+}
+
 /// The Schedule tab's calendar granularity.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ScheduleMode {
@@ -265,11 +272,12 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.schedule_popups.retain(|m| !closed.contains(m));
         }
+        self.schedule_popup_registry.retain(&self.schedule_popups);
     }
 
     /// Window listing a monitor's upcoming scheduled streams (datetime — title).
-    /// Opened by double-clicking a Next stream cell. Returns true on close.
-    #[allow(deprecated)]
+    /// Opened by double-clicking a Next stream cell. Returns true once closed.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn schedule_popup_window(&mut self, ctx: &egui::Context, mid: i64) -> bool {
         if !self.schedule_cache.contains_key(&mid) {
             let v = self
@@ -279,50 +287,59 @@ impl StreamArchiverApp {
                 .unwrap_or_default();
             self.schedule_cache.insert(mid, v);
         }
-        let segs = self.schedule_cache.get(&mid).cloned().unwrap_or_default();
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let state = self.schedule_popup_registry.get_or_init(mid, || {
+            let segs = self.schedule_cache.get(&mid).cloned().unwrap_or_default();
+            let lines: Vec<String> = segs
+                .iter()
+                .map(|s| {
+                    let when = fmt_datetime_short(s.start_time);
+                    if s.category.is_empty() {
+                        format!("{when}  —  {}", s.title)
+                    } else {
+                        format!("{when}  —  {}  ({})", s.title, s.category)
+                    }
+                })
+                .collect();
+            SchedulePopupContent { lines, closed: false }
+        });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("upcoming_streams_vp", mid)),
             egui::ViewportBuilder::default()
                 .with_title("Upcoming streams")
                 .with_inner_size([460.0, 280.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if segs.is_empty() {
+                    if content.lines.is_empty() {
                         ui.label("No upcoming scheduled streams.");
                         return;
                     }
-                    ui.label(format!("{} upcoming scheduled stream(s).", segs.len()));
+                    ui.label(format!("{} upcoming scheduled stream(s).", content.lines.len()));
                     ui.add_space(6.0);
-                    let lines: Vec<String> = segs
-                        .iter()
-                        .map(|s| {
-                            let when = fmt_datetime_short(s.start_time);
-                            if s.category.is_empty() {
-                                format!("{when}  —  {}", s.title)
-                            } else {
-                                format!("{when}  —  {}  ({})", s.title, s.category)
-                            }
-                        })
-                        .collect();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for l in &lines {
+                            for l in &content.lines {
                                 ui.label(egui::RichText::new(l).monospace());
                             }
                         });
                     ui.add_space(6.0);
                     if ui.button("📋  Copy").clicked() {
-                        ui.ctx().copy_text(lines.join("\n"));
+                        ui.ctx().copy_text(content.lines.join("\n"));
                     }
                 });
             },
         );
-        !open
+        false
     }
 
     /// Load the persisted source order into the draft and open the dialog.

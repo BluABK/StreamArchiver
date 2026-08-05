@@ -1706,6 +1706,8 @@ pub struct StreamArchiverApp {
     ad_break_cache: HashMap<i64, Vec<AdBreak>>,
     /// Recording id whose ad-break cut list is shown in a popup (None = closed).
     ad_popups: Vec<i64>,
+    /// Deferred-viewport content for each open `ad_popups` entry.
+    ad_popup_registry: PopupRegistry<i64, AdPopupContent>,
     /// Lazy per-recording title/category change log, keyed by recording id;
     /// cleared on reload. Same caching role as `ad_break_cache`.
     meta_change_cache: HashMap<i64, Vec<StreamMetaChange>>,
@@ -1718,6 +1720,10 @@ pub struct StreamArchiverApp {
     history_change_cache: HashMap<i64, Vec<MonitorStreamChange>>,
     /// Monitor id whose all-time change history is shown in a popup.
     history_popups: Vec<i64>,
+    /// Deferred-viewport content for each open `history_popups` entry —
+    /// created once per monitor id, dropped once its id leaves
+    /// `history_popups` (see `history_popup_window`).
+    history_popup_registry: PopupRegistry<i64, HistoryPopupContent>,
     /// Recording id whose embedded chapter list (stream, file path, chapter
     /// timestamps) is shown in a popup — the Background view's ℹ button on a
     /// Chapters task row.
@@ -1725,6 +1731,8 @@ pub struct StreamArchiverApp {
     /// Lazy per-recording (channel name, file path, parsed chapter list) for
     /// the chapters detail popup, keyed by recording id; cleared on reload.
     chapters_popup_cache: HashMap<i64, (String, String, Vec<crate::chapters::Chapter>)>,
+    /// Deferred-viewport content for each open `chapters_popups` entry.
+    chapters_popup_registry: PopupRegistry<i64, ChaptersPopupContent>,
     /// All-monitor recording history, newest-first, capped at
     /// `history_load_limit` — shared by the Backlog and Stream History
     /// views. Loaded lazily on first visit to either; see
@@ -1793,15 +1801,21 @@ pub struct StreamArchiverApp {
     /// `trash::trash_view` each frame, same shape as `trash_action_done`.
     trash_import_done: Arc<Mutex<Option<crate::disposal_backfill::BackfillReport>>>,
     vod_info_popup_cache: HashMap<i64, (String, Recording)>,
+    /// Deferred-viewport content for each open `vod_info_popups` entry.
+    vod_info_popup_registry: PopupRegistry<i64, VodInfoContent>,
     /// Recording id whose remux-status popup is open, same caching shape as
     /// `vod_info_popup_cache`.
     remux_info_popups: Vec<i64>,
     remux_info_popup_cache: HashMap<i64, (String, Recording)>,
+    /// Deferred-viewport content for each open `remux_info_popups` entry.
+    remux_info_popup_registry: PopupRegistry<i64, VodInfoContent>,
     /// Lazy per-monitor upcoming-schedule detail, keyed by monitor id; cleared on
     /// reload. Backs the Next stream popup.
     schedule_cache: HashMap<i64, Vec<ScheduleSegment>>,
     /// Monitor id whose upcoming schedule is shown in a popup (None = closed).
     schedule_popups: Vec<i64>,
+    /// Deferred-viewport content for each open `schedule_popups` entry.
+    schedule_popup_registry: PopupRegistry<i64, SchedulePopupContent>,
     /// All upcoming scheduled streams (across every monitor), backing the Schedule
     /// calendar. Loaded lazily on first view + on refresh; see [`Self::spawn_reload_schedule`].
     schedule_all: Vec<UpcomingStream>,
