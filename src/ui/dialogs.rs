@@ -41,6 +41,38 @@ pub(super) struct VodInfoContent {
 /// per-field `hype_mark_channel`/`hype_mark_abs` + a plain `show_hype_mark:
 /// bool`; the deferred closure mutates this directly instead of the old
 /// copy-out/copy-back-in dance a `show_viewport_immediate` closure needed.
+/// Backing state for the "Move instance to another channel" dialog.
+pub(super) struct MoveInstanceState {
+    pub(super) mid: i64,
+    /// The ComboBox selection — lives here (not a per-frame local) so it
+    /// persists across frames/calls.
+    pub(super) dest: Option<i64>,
+    pub(super) do_move: bool,
+    pub(super) closed: bool,
+}
+
+/// Backing state for the "Merge channel into another" dialog.
+pub(super) struct MergeChannelState {
+    pub(super) src: i64,
+    /// The ComboBox selection — lives here (not a per-frame local) so it
+    /// persists across frames/calls.
+    pub(super) dest: Option<i64>,
+    pub(super) do_merge: bool,
+    pub(super) closed: bool,
+}
+
+/// Backing state for the "Rename recording" dialog.
+pub(super) struct RenameDialogState {
+    pub(super) rec_id: i64,
+    pub(super) draft: String,
+    pub(super) preview: String,
+    /// Set by the deferred closure on OK; read back by `rename_dialog_window`
+    /// next call.
+    pub(super) do_rename: bool,
+    /// Set by the deferred closure on Cancel/close.
+    pub(super) closed: bool,
+}
+
 pub(super) struct HypeMarkDraft {
     pub(super) channel: i64,
     pub(super) mins_ago: i64,
@@ -695,11 +727,12 @@ impl StreamArchiverApp {
     /// (recordings, schedule, stats, chat) moves implicitly; posts/about
     /// history is re-keyed by the store call. See
     /// [`crate::store::Store::move_monitor_to_channel`].
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn move_instance_window(&mut self, ctx: &egui::Context) {
-        let Some((mid, mut dest)) = self.move_instance_dialog else {
+        let Some(popup_state) = self.move_instance_dialog.clone() else {
             return;
         };
+        let mid = popup_state.lock().unwrap().mid;
         let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid) else {
             self.move_instance_dialog = None; // instance deleted meanwhile
             return;
@@ -715,25 +748,31 @@ impl StreamArchiverApp {
             .filter(|c| c.id != src_cid)
             .map(|c| (c.id, c.name.clone()))
             .collect();
+        // Cloned again for the closure specifically — `dests`/`inst` are
+        // also needed after `show_deferred_popup` returns (post-processing).
+        let dests_for_closure = dests.clone();
+        let inst_for_closure = inst.clone();
 
-        let mut open = true;
-        let mut do_move = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("move_instance_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Move instance")
                 .with_inner_size([440.0, 190.0])
                 .with_resizable(false),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            move |ctx, s, _shared| {
+                let dests = &dests_for_closure;
+                let inst = &inst_for_closure;
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label(format!("Move “{src_name}”'s {inst} instance into:"));
                     ui.add_space(4.0);
-                    let sel_name = dest
+                    let sel_name = s.dest
                         .and_then(|d| dests.iter().find(|(id, _)| *id == d))
                         .map(|(_, n)| n.clone())
                         .unwrap_or_else(|| "Select a channel…".into());
@@ -741,8 +780,8 @@ impl StreamArchiverApp {
                         .width(260.0)
                         .selected_text(sel_name)
                         .show_ui(ui, |ui| {
-                            for (id, name) in &dests {
-                                ui.selectable_value(&mut dest, Some(*id), name);
+                            for (id, name) in dests {
+                                ui.selectable_value(&mut s.dest, Some(*id), name);
                             }
                         });
                     if dests.is_empty() {
@@ -757,18 +796,26 @@ impl StreamArchiverApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(dest.is_some(), egui::Button::new("Move"))
+                            .add_enabled(s.dest.is_some(), egui::Button::new("Move"))
                             .clicked()
                         {
-                            do_move = true;
+                            s.do_move = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                            s.closed = true;
                         }
                     });
                 });
             },
         );
+
+        let (dest, do_move, closed) = {
+            let mut s = popup_state.lock().unwrap();
+            let result = (s.dest, s.do_move, s.closed);
+            s.do_move = false;
+            s.closed = false;
+            result
+        };
 
         if do_move && let Some(d) = dest {
             let dest_name = dests
@@ -787,21 +834,23 @@ impl StreamArchiverApp {
             }
             self.move_instance_dialog = None;
             self.reload_rows();
-        } else if do_cancel || !open {
+        } else if closed {
             self.move_instance_dialog = None;
-        } else {
-            self.move_instance_dialog = Some((mid, dest)); // keep the selection
         }
+        // Still open, no action: `popup_state` already sits in
+        // `self.move_instance_dialog` unchanged — the selection lives on the
+        // SAME `Arc<Mutex<>>`, no write-back needed.
     }
 
     /// "Merge channel into another" dialog: move ALL of the source channel's
     /// instances to a destination channel, then delete the (now empty) source.
     /// See [`crate::store::Store::merge_channel_into`].
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn merge_channel_window(&mut self, ctx: &egui::Context) {
-        let Some((src, mut dest)) = self.merge_channel_dialog else {
+        let Some(popup_state) = self.merge_channel_dialog.clone() else {
             return;
         };
+        let src = popup_state.lock().unwrap().src;
         let Some(src_name) = self
             .channels
             .iter()
@@ -818,20 +867,26 @@ impl StreamArchiverApp {
             .filter(|c| c.id != src)
             .map(|c| (c.id, c.name.clone()))
             .collect();
+        // Cloned again for the closure specifically — `dests`/`src_name` are
+        // also needed after `show_deferred_popup` returns (post-processing).
+        let dests_for_closure = dests.clone();
+        let src_name_for_closure = src_name.clone();
 
-        let mut open = true;
-        let mut do_merge = false;
-        let mut do_cancel = false;
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("merge_channel_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Merge channel")
                 .with_inner_size([460.0, 210.0])
                 .with_resizable(false),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            move |ctx, s, _shared| {
+                let dests = &dests_for_closure;
+                let src_name = &src_name_for_closure;
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label(format!(
@@ -839,7 +894,7 @@ impl StreamArchiverApp {
                         if ninst == 1 { "" } else { "s" }
                     ));
                     ui.add_space(4.0);
-                    let sel_name = dest
+                    let sel_name = s.dest
                         .and_then(|d| dests.iter().find(|(id, _)| *id == d))
                         .map(|(_, n)| n.clone())
                         .unwrap_or_else(|| "Select a channel…".into());
@@ -847,8 +902,8 @@ impl StreamArchiverApp {
                         .width(260.0)
                         .selected_text(sel_name)
                         .show_ui(ui, |ui| {
-                            for (id, name) in &dests {
-                                ui.selectable_value(&mut dest, Some(*id), name);
+                            for (id, name) in dests {
+                                ui.selectable_value(&mut s.dest, Some(*id), name);
                             }
                         });
                     if dests.is_empty() {
@@ -865,18 +920,26 @@ impl StreamArchiverApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(dest.is_some(), egui::Button::new("Merge"))
+                            .add_enabled(s.dest.is_some(), egui::Button::new("Merge"))
                             .clicked()
                         {
-                            do_merge = true;
+                            s.do_merge = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                            s.closed = true;
                         }
                     });
                 });
             },
         );
+
+        let (dest, do_merge, closed) = {
+            let mut s = popup_state.lock().unwrap();
+            let result = (s.dest, s.do_merge, s.closed);
+            s.do_merge = false;
+            s.closed = false;
+            result
+        };
 
         if do_merge && let Some(d) = dest {
             let dest_name = dests
@@ -900,10 +963,8 @@ impl StreamArchiverApp {
             }
             self.merge_channel_dialog = None;
             self.reload_rows();
-        } else if do_cancel || !open {
+        } else if closed {
             self.merge_channel_dialog = None;
-        } else {
-            self.merge_channel_dialog = Some((src, dest)); // keep the selection
         }
     }
 
@@ -1523,27 +1584,36 @@ impl StreamArchiverApp {
             .find(|c| c.id == channel_id)
             .map(|c| c.name.clone())
             .unwrap_or_default();
-        self.collab_history = Some(CollabHistoryState { channel_name, sessions });
+        self.collab_history =
+            Some(Arc::new(Mutex::new(CollabHistoryState { channel_name, sessions, closed: false })));
     }
 
     /// The "🤝 Collab history" window: one line per stored "Stream Together"
     /// session (newest first) — when, how long, with whom, who hosted, and
     /// whether it came from Shared Chat or a title @mention.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn collab_history_window(&mut self, ctx: &egui::Context) {
-        let Some(state) = &self.collab_history else { return };
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let Some(state) = self.collab_history.clone() else { return };
+        if state.lock().unwrap().closed {
+            self.collab_history = None;
+            return;
+        }
+        let channel_name = state.lock().unwrap().channel_name.clone();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("collab_history_vp"),
             egui::ViewportBuilder::default()
-                .with_title(format!("{} — collab history", state.channel_name))
+                .with_title(format!("{channel_name} — collab history"))
                 .with_inner_size([560.0, 360.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if state.sessions.is_empty() {
+                    if s.sessions.is_empty() {
                         ui.label(
                             "No collabs recorded yet. Sessions appear here once a live \
                              Twitch instance is seen in a \"Stream Together\" shared \
@@ -1555,10 +1625,10 @@ impl StreamArchiverApp {
                         "{} session(s), newest first. 💬 = Shared Chat (confirmed), \
                          @ = title mention (heuristic); a duration ending in \"+\" is \
                          still ongoing.",
-                        state.sessions.len()
+                        s.sessions.len()
                     ));
                     ui.add_space(6.0);
-                    let lines = collab_session_lines(&state.sessions);
+                    let lines = collab_session_lines(&s.sessions);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
@@ -1577,39 +1647,47 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.collab_history = None;
-        }
     }
 
     /// Open the "which streams was this collab in" drill-down for `partner`
     /// (the display name from the aggregate Collabs table's Sessions count).
     pub(super) fn open_partner_sessions(&mut self, partner: &str) {
         let rows = self.core.store.collab_sessions_for_partner(partner).unwrap_or_default();
-        self.partner_sessions =
-            Some(PartnerSessionsState { partner: partner.to_string(), rows });
+        self.partner_sessions = Some(Arc::new(Mutex::new(PartnerSessionsState {
+            partner: partner.to_string(),
+            rows,
+            closed: false,
+            jump: None,
+        })));
     }
 
     /// The "🤝 {partner} — sessions" window: every stored collab session that
     /// partner appeared in, across all monitored channels — the drill-down
     /// from the App Stats Collabs table's Sessions count. Each row can jump
     /// straight to that channel's Streams row.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn partner_sessions_window(&mut self, ctx: &egui::Context) {
-        let Some(state) = &self.partner_sessions else { return };
-        let mut open = true;
-        let mut jump: Option<i64> = None;
-        ctx.show_viewport_immediate(
+        let Some(state) = self.partner_sessions.clone() else { return };
+        if state.lock().unwrap().closed {
+            self.partner_sessions = None;
+            return;
+        }
+        let partner = state.lock().unwrap().partner.clone();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("partner_sessions_vp"),
             egui::ViewportBuilder::default()
-                .with_title(format!("🤝 {} — sessions", state.partner))
+                .with_title(format!("🤝 {partner} — sessions"))
                 .with_inner_size([560.0, 360.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if state.rows.is_empty() {
+                    if s.rows.is_empty() {
                         ui.label("No sessions found for this partner.");
                         return;
                     }
@@ -1617,7 +1695,7 @@ impl StreamArchiverApp {
                         "{} session(s), newest first. 💬 = Shared Chat (confirmed), \
                          @ = title mention (heuristic); a duration ending in \"+\" is \
                          still ongoing.",
-                        state.rows.len()
+                        s.rows.len()
                     ));
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
@@ -1632,27 +1710,27 @@ impl StreamArchiverApp {
                                 ui.strong("With");
                                 ui.label("");
                                 ui.end_row();
-                                for s in &state.rows {
-                                    ui.label(&s.channel_name).on_hover_text(format!(
+                                for r in s.rows.clone() {
+                                    ui.label(&r.channel_name).on_hover_text(format!(
                                         "Broadcast (stream id): {}",
-                                        if s.stream_id.is_empty() { "unknown" } else { &s.stream_id }
+                                        if r.stream_id.is_empty() { "unknown" } else { &r.stream_id }
                                     ));
-                                    ui.label(fmt_datetime_short(s.first_seen_at));
-                                    let span = match s.ended_at {
-                                        Some(end) => fmt_duration((end - s.first_seen_at).max(0)),
+                                    ui.label(fmt_datetime_short(r.first_seen_at));
+                                    let span = match r.ended_at {
+                                        Some(end) => fmt_duration((end - r.first_seen_at).max(0)),
                                         None => format!(
                                             "{}+",
                                             fmt_duration(
-                                                (s.last_seen_at - s.first_seen_at).max(0)
+                                                (r.last_seen_at - r.first_seen_at).max(0)
                                             )
                                         ),
                                     };
                                     ui.label(span);
-                                    let marker = if s.source == "shared_chat" { "💬" } else { "@" };
-                                    let with = if s.co_partners.is_empty() {
+                                    let marker = if r.source == "shared_chat" { "💬" } else { "@" };
+                                    let with = if r.co_partners.is_empty() {
                                         marker.to_string()
                                     } else {
-                                        format!("{marker} {}", s.co_partners.join(", "))
+                                        format!("{marker} {}", r.co_partners.join(", "))
                                     };
                                     ui.label(with);
                                     if ui
@@ -1662,7 +1740,7 @@ impl StreamArchiverApp {
                                         )
                                         .clicked()
                                     {
-                                        jump = Some(s.monitor_id);
+                                        s.jump = Some(r.monitor_id);
                                     }
                                     ui.end_row();
                                 }
@@ -1671,9 +1749,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.partner_sessions = None;
-        }
+        let jump = state.lock().unwrap().jump.take();
         if let Some(mid) = jump {
             self.switch_view(View::Streams);
             self.selected_monitor = Some(mid);
@@ -2359,55 +2435,82 @@ impl StreamArchiverApp {
     /// Rename-recording dialog: shows a text-edit for the new file stem, a live
     /// preview of the final filename, and OK / Cancel buttons.
     #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn rename_dialog_window(&mut self, ctx: &egui::Context) {
         if !self.show_rename_dialog {
+            self.rename_dialog_popup = None;
             return;
         }
         let rec_id = match self.rename_rec_id {
             Some(id) => id,
-            None => { self.show_rename_dialog = false; return; }
+            None => {
+                self.show_rename_dialog = false;
+                return;
+            }
         };
 
-        let mut open = true;
-        let mut do_rename = false;
-        // These are local vars captured mutably by the closure.
-        let mut new_draft = self.rename_draft.clone();
-        let preview = self.rename_preview.clone();
+        if self.rename_dialog_popup.is_none() {
+            self.rename_dialog_popup = Some(Arc::new(Mutex::new(RenameDialogState {
+                rec_id,
+                draft: self.rename_draft.clone(),
+                preview: self.rename_preview.clone(),
+                do_rename: false,
+                closed: false,
+            })));
+        }
+        let popup_state = self.rename_dialog_popup.clone().unwrap();
+        {
+            let mut s = popup_state.lock().unwrap();
+            s.rec_id = rec_id;
+            s.preview = self.rename_preview.clone();
+        }
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("rename_recording_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Rename recording")
                 .with_inner_size([500.0, 160.0])
                 .with_resizable(false),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.label("New file name (without extension):");
                     ui.add_space(4.0);
                     ui.add(
-                        egui::TextEdit::singleline(&mut new_draft)
+                        egui::TextEdit::singleline(&mut s.draft)
                             .desired_width(ui.available_width())
                             .hint_text("new stem"),
                     );
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new(format!("→ {preview}.mkv"))
+                    ui.label(egui::RichText::new(format!("→ {}.mkv", s.preview))
                         .color(egui::Color32::from_rgb(0xa0, 0xa0, 0xa0)));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("✔  OK").clicked() {
-                            do_rename = true;
+                            s.do_rename = true;
                         }
                         if ui.button("✖  Cancel").clicked() {
-                            open = false;
+                            s.closed = true;
                         }
                     });
                 });
             },
         );
+
+        let (new_draft, do_rename, closed) = {
+            let mut s = popup_state.lock().unwrap();
+            let result = (s.draft.clone(), s.do_rename, s.closed);
+            s.do_rename = false;
+            s.closed = false;
+            result
+        };
 
         // Update draft and recompute preview outside the closure (borrow is released).
         if new_draft != self.rename_draft {
@@ -2429,9 +2532,11 @@ impl StreamArchiverApp {
             self.core.manual(ManualCommand::RenameRecording { rec_id, new_stem: stem });
             self.show_rename_dialog = false;
             self.rename_rec_id = None;
-        } else if !open {
+            self.rename_dialog_popup = None;
+        } else if closed {
             self.show_rename_dialog = false;
             self.rename_rec_id = None;
+            self.rename_dialog_popup = None;
         }
     }
 
@@ -3937,6 +4042,8 @@ impl StreamArchiverApp {
 pub(super) struct CollabHistoryState {
     pub(super) channel_name: String,
     pub(super) sessions: Vec<crate::models::CollabSessionRow>,
+    /// Set by the deferred closure on close; read back next call.
+    pub(super) closed: bool,
 }
 
 /// Backing state for the "🤝 {partner} — sessions" drill-down window (one at
@@ -3944,6 +4051,11 @@ pub(super) struct CollabHistoryState {
 pub(super) struct PartnerSessionsState {
     pub(super) partner: String,
     pub(super) rows: Vec<crate::store::PartnerSessionRow>,
+    /// Set by the deferred closure on close; read back next call.
+    pub(super) closed: bool,
+    /// Set by the deferred closure when "Jump" is clicked; applied by the
+    /// wrapper (switches view + selects the monitor).
+    pub(super) jump: Option<i64>,
 }
 
 /// One line per stored collab session: start, duration (or "ongoing"), source

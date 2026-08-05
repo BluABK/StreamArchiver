@@ -885,6 +885,7 @@ impl StreamArchiverApp {
             rename_rec_id: None,
             rename_draft: String::new(),
             rename_preview: String::new(),
+            rename_dialog_popup: None,
         };
         app.reload_rows();
         app.reload_videos();

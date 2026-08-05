@@ -1626,10 +1626,10 @@ pub struct StreamArchiverApp {
     /// "Move instance to another channel" dialog: `(monitor id, chosen
     /// destination channel id)`. The destination lives here (not a per-frame
     /// local) so the ComboBox selection persists across frames.
-    move_instance_dialog: Option<(i64, Option<i64>)>,
+    move_instance_dialog: Option<Arc<Mutex<dialogs::MoveInstanceState>>>,
     /// "Merge channel into another" dialog: `(source channel id, chosen
     /// destination channel id)`.
-    merge_channel_dialog: Option<(i64, Option<i64>)>,
+    merge_channel_dialog: Option<Arc<Mutex<dialogs::MergeChannelState>>>,
     /// Pending schedule-segment-delete confirmation: segment id.
     confirm_delete_segment: Option<Arc<Mutex<ConfirmDialogState<i64>>>>,
     /// Backing state for the create/rename-channel dialog.
@@ -2174,11 +2174,11 @@ pub struct StreamArchiverApp {
     /// collab a past broadcast was without per-frame DB queries.
     collab_by_stream: HashMap<(i64, String), String>,
     /// Open "🤝 Collab history" popup: the channel id + its loaded sessions.
-    collab_history: Option<CollabHistoryState>,
+    collab_history: Option<Arc<Mutex<CollabHistoryState>>>,
     /// Open "which streams was this collab in" drill-down: the partner name
     /// and every session they appeared in, across all channels. Opened by
     /// clicking a partner's Sessions count in the App Stats Collabs table.
-    partner_sessions: Option<PartnerSessionsState>,
+    partner_sessions: Option<Arc<Mutex<PartnerSessionsState>>>,
     /// Whether Streams rows show a status background tint (recording / ad / error).
     /// Toggled from the top bar; persisted under [`K_STATUS_BGCOLOR`]. Keyboard
     /// row selection is still highlighted regardless.
@@ -2356,6 +2356,9 @@ pub struct StreamArchiverApp {
     rename_draft: String,
     /// Rename dialog: live-expanded preview of `rename_draft`.
     rename_preview: String,
+    /// Deferred-viewport state while the Rename dialog is open (None =
+    /// closed) — see [`dialogs::RenameDialogState`].
+    rename_dialog_popup: Option<Arc<Mutex<dialogs::RenameDialogState>>>,
 }
 /// Handle to the background thread loading a channel Properties window's per-open data.
 /// Polled each frame the window is open until the [`PropsLoaded`] bundle arrives. See

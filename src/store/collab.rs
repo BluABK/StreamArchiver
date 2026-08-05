@@ -13,6 +13,7 @@ use crate::models::{CollabPartner, CollabSessionRow, collab_partner_names};
 
 /// One collab session a specific partner appeared in, across every monitored
 /// channel — see [`Store::collab_sessions_for_partner`].
+#[derive(Clone)]
 pub struct PartnerSessionRow {
     /// The monitor whose channel this session was recorded on — resolves to
     /// the Streams row a "Jump" action selects.

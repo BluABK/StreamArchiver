@@ -2377,7 +2377,12 @@ impl StreamArchiverApp {
             ))));
         }
         if let Some(mid) = acts.move_instance {
-            self.move_instance_dialog = Some((mid, None));
+            self.move_instance_dialog = Some(Arc::new(Mutex::new(MoveInstanceState {
+                mid,
+                dest: None,
+                do_move: false,
+                closed: false,
+            })));
         }
         if let Some(id) = acts.select {
             self.selected_monitor = Some(id);
@@ -2477,7 +2482,12 @@ impl StreamArchiverApp {
             self.confirm_delete_channel = Some(ConfirmDialogState::open((cid, name)));
         }
         if let Some(cid) = merge_channel {
-            self.merge_channel_dialog = Some((cid, None));
+            self.merge_channel_dialog = Some(Arc::new(Mutex::new(MergeChannelState {
+                src: cid,
+                dest: None,
+                do_merge: false,
+                closed: false,
+            })));
         }
         if let Some(cid) = clear_channel_err {
             if let Err(e) = self.core.store.clear_channel_errors(cid) {
