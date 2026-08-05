@@ -1714,6 +1714,9 @@ pub struct StreamArchiverApp {
     /// What the metadata-change popup shows (None = closed): a single take or a
     /// whole stream's aggregated takes.
     meta_popups: Vec<MetaPopup>,
+    /// Deferred-viewport content for each open `meta_popups` entry, keyed by
+    /// [`MetaPopup::key`].
+    meta_popup_registry: PopupRegistry<i64, MetaPopupContent>,
     /// Lazy per-monitor all-time title/category change ledger, keyed by
     /// monitor id; cleared on reload. Independent of any recording — see
     /// [`crate::models::MonitorStreamChange`].
@@ -2245,22 +2248,17 @@ pub struct StreamArchiverApp {
     /// widgets (auto-tune also rewrites the stored blob in the background —
     /// the section's ⟳ reloads).
     hype_tuning: crate::hype::HypeTuning,
-    /// "🚂 Mark hype train" dialog visibility.
-    show_hype_mark: bool,
-    /// Mark dialog: preselected channel id (0 = pick).
-    hype_mark_channel: i64,
-    /// Mark dialog: "minutes ago" start shortcut (used when the absolute
-    /// field below is empty).
+    /// "🚂 Mark hype train" dialog — `None` = closed. See [`HypeMarkDraft`].
+    show_hype_mark: Option<Arc<Mutex<HypeMarkDraft>>>,
+    /// Mark dialog: "minutes ago" start shortcut, remembered across opens
+    /// (used to seed a fresh [`HypeMarkDraft`] — the channel and absolute
+    /// time are NOT remembered, only these two "usually the same" values).
     hype_mark_mins_ago: i64,
-    /// Mark dialog: absolute local start time `YYYY-MM-DD HH:MM` (optional;
-    /// wins over "minutes ago" when parseable).
-    hype_mark_abs: String,
-    /// Mark dialog: train duration in minutes (0 = unknown).
+    /// Mark dialog: train duration in minutes, remembered across opens.
     hype_mark_dur: i64,
-    /// "⚙ Hype sensitivity" per-channel override editor: open for this
-    /// channel id (`None` = closed) + its draft values.
-    hype_override_for: Option<i64>,
-    hype_override_draft: crate::hype::HypeOverride,
+    /// "⚙ Hype sensitivity" per-channel override editor (`None` = closed).
+    /// See [`HypeOverrideState`].
+    hype_override_for: Option<Arc<Mutex<HypeOverrideState>>>,
     /// Recent raw viewer samples per monitor for the 👁 column sparklines
     /// (last hour), refreshed at most once per minute while Streams renders.
     spark_data: std::collections::HashMap<i64, Vec<(i64, i64)>>,

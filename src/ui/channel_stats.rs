@@ -357,9 +357,14 @@ impl StreamArchiverApp {
                     )
                     .clicked()
                 {
-                    self.hype_mark_channel = self.chstats_channel.unwrap_or(0);
-                    self.hype_mark_abs.clear();
-                    self.show_hype_mark = true;
+                    self.show_hype_mark = Some(Arc::new(Mutex::new(HypeMarkDraft {
+                        channel: self.chstats_channel.unwrap_or(0),
+                        mins_ago: self.hype_mark_mins_ago,
+                        abs: String::new(),
+                        dur: self.hype_mark_dur,
+                        do_mark: false,
+                        closed: false,
+                    })));
                 }
                 if let Some(cid) = self.chstats_channel
                     && ui
@@ -372,11 +377,25 @@ impl StreamArchiverApp {
                         )
                         .clicked()
                 {
-                    self.hype_override_draft = crate::hype::load_overrides(&self.core.store)
+                    let draft = crate::hype::load_overrides(&self.core.store)
                         .get(&cid)
                         .copied()
                         .unwrap_or_default();
-                    self.hype_override_for = Some(cid);
+                    let name = self
+                        .channels
+                        .iter()
+                        .find(|c| c.id == cid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| format!("channel {cid}"));
+                    let global = crate::hype::load_tuning(&self.core.store);
+                    self.hype_override_for = Some(Arc::new(Mutex::new(HypeOverrideState {
+                        channel_id: cid,
+                        name,
+                        global,
+                        draft,
+                        do_save: false,
+                        closed: false,
+                    })));
                 }
             });
             // Auto refresh: invalidate the cache once a minute and keep a
@@ -857,11 +876,17 @@ impl StreamArchiverApp {
             self.open_channel_properties(cid);
         }
         if let Some(at) = out.mark_at {
-            self.hype_mark_channel = channel_id;
-            self.hype_mark_abs = chrono::DateTime::from_timestamp(at, 0)
+            let abs = chrono::DateTime::from_timestamp(at, 0)
                 .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
-            self.show_hype_mark = true;
+            self.show_hype_mark = Some(Arc::new(Mutex::new(HypeMarkDraft {
+                channel: channel_id,
+                mins_ago: self.hype_mark_mins_ago,
+                abs,
+                dur: self.hype_mark_dur,
+                do_mark: false,
+                closed: false,
+            })));
         }
         if let Some((event_id, tighten, monitor_id, at)) = out.delete {
             if tighten {

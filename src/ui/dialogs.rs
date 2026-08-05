@@ -37,6 +37,39 @@ pub(super) struct VodInfoContent {
     pub(super) closed: bool,
 }
 
+/// Backing draft for the "Mark hype train" dialog — replaces the old
+/// per-field `hype_mark_channel`/`hype_mark_abs` + a plain `show_hype_mark:
+/// bool`; the deferred closure mutates this directly instead of the old
+/// copy-out/copy-back-in dance a `show_viewport_immediate` closure needed.
+pub(super) struct HypeMarkDraft {
+    pub(super) channel: i64,
+    pub(super) mins_ago: i64,
+    pub(super) abs: String,
+    pub(super) dur: i64,
+    pub(super) do_mark: bool,
+    pub(super) closed: bool,
+}
+
+/// Backing state for the "⚙ Sensitivity" per-channel hype-train override
+/// editor — replaces the old `hype_override_for: Option<i64>` +
+/// `hype_override_draft` pair.
+pub(super) struct HypeOverrideState {
+    pub(super) channel_id: i64,
+    pub(super) name: String,
+    pub(super) global: crate::hype::HypeTuning,
+    pub(super) draft: crate::hype::HypeOverride,
+    pub(super) do_save: bool,
+    pub(super) closed: bool,
+}
+
+/// Deferred-viewport content for `meta_popup_window` — derived once per
+/// popup key ([`MetaPopup::key`]).
+pub(super) struct MetaPopupContent {
+    pub(super) lines: Vec<String>,
+    pub(super) scope: &'static str,
+    pub(super) closed: bool,
+}
+
 /// What the metadata-change popup shows.
 #[derive(Clone)]
 pub(super) enum MetaPopup {
@@ -1612,75 +1645,94 @@ impl StreamArchiverApp {
         if !closed.is_empty() {
             self.meta_popups.retain(|p| !closed.contains(&p.key()));
         }
+        let keys: Vec<i64> = self.meta_popups.iter().map(MetaPopup::key).collect();
+        self.meta_popup_registry.retain(&keys);
     }
 
-    /// One title/category-changes window; returns true on close.
-    #[allow(deprecated)]
+    /// One title/category-changes window; returns true once closed. Content
+    /// derived once per popup key (the aggregated change list doesn't change
+    /// while the window's open, matching every other popup in this file).
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn meta_popup_window(&mut self, ctx: &egui::Context, popup: MetaPopup) -> bool {
+        let key = popup.key();
         // Build the change list: one take directly, or a stream's takes merged
         // chronologically with the per-take re-baselines dropped.
-        let (changes, multi) = match &popup {
-            MetaPopup::Take(rid) => {
-                self.ensure_meta_cached(*rid);
-                (self.meta_change_cache.get(rid).cloned().unwrap_or_default(), false)
-            }
+        match &popup {
+            MetaPopup::Take(rid) => self.ensure_meta_cached(*rid),
             MetaPopup::Stream(takes) => {
                 for (rid, _) in takes {
                     self.ensure_meta_cached(*rid);
                 }
-                let loaded: Vec<(i64, Vec<StreamMetaChange>)> = takes
-                    .iter()
-                    .map(|(rid, started)| {
-                        (*started, self.meta_change_cache.get(rid).cloned().unwrap_or_default())
-                    })
-                    .collect();
-                (aggregate_stream_changes(&loaded), takes.len() > 1)
             }
-        };
-        let mut open = true;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of(("title_changes_vp", popup.key())),
+        }
+        let state = self.meta_popup_registry.get_or_init(key, || {
+            let (changes, multi) = match &popup {
+                MetaPopup::Take(rid) => {
+                    (self.meta_change_cache.get(rid).cloned().unwrap_or_default(), false)
+                }
+                MetaPopup::Stream(takes) => {
+                    let loaded: Vec<(i64, Vec<StreamMetaChange>)> = takes
+                        .iter()
+                        .map(|(rid, started)| {
+                            (*started, self.meta_change_cache.get(rid).cloned().unwrap_or_default())
+                        })
+                        .collect();
+                    (aggregate_stream_changes(&loaded), takes.len() > 1)
+                }
+            };
+            // Only actual changes (the initial value of each field is the
+            // starting state, not a change); shown as `old → new`.
+            let lines = meta_change_lines(&changes);
+            let scope = if multi {
+                "across this stream's takes"
+            } else {
+                "during this recording"
+            };
+            MetaPopupContent { lines, scope, closed: false }
+        });
+        if state.lock().unwrap().closed {
+            return true;
+        }
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
+            egui::ViewportId::from_hash_of(("title_changes_vp", key)),
             egui::ViewportBuilder::default()
                 .with_title("Title & category changes")
                 .with_inner_size([460.0, 280.0]),
-            |ctx, _class| {
+            state,
+            shared,
+            |ctx, content, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    content.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    // Only actual changes (the initial value of each field is the
-                    // starting state, not a change); shown as `old → new`.
-                    let lines = meta_change_lines(&changes);
-                    if lines.is_empty() {
+                    if content.lines.is_empty() {
                         ui.label("No title or category changes recorded.");
                         return;
                     }
-                    let scope = if multi {
-                        "across this stream's takes"
-                    } else {
-                        "during this recording"
-                    };
                     ui.label(format!(
-                        "{} change(s) {scope} (offset from the start; each shows the \
+                        "{} change(s) {} (offset from the start; each shows the \
                          value before → after).",
-                        lines.len(),
+                        content.lines.len(),
+                        content.scope,
                     ));
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for line in &lines {
+                            for line in &content.lines {
                                 ui.label(egui::RichText::new(line).monospace());
                             }
                         });
                     ui.add_space(6.0);
                     if ui.button("📋  Copy").clicked() {
-                        ui.ctx().copy_text(lines.join("\n"));
+                        ui.ctx().copy_text(content.lines.join("\n"));
                     }
                 });
             },
         );
-        !open
+        false
     }
 
     /// Render every open recording-properties window (one per take).
@@ -2339,42 +2391,38 @@ impl StreamArchiverApp {
     /// the stored contributions right before the start so the inference can
     /// be loosened toward what it should have caught (the auto-tune's
     /// manual-label path).
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn hype_mark_window(&mut self, ctx: &egui::Context) {
-        if !self.show_hype_mark {
+        let Some(state) = self.show_hype_mark.clone() else {
             return;
-        }
-        let mut open = true;
-        let mut do_mark = false;
-        let mut channel = self.hype_mark_channel;
-        let mut mins_ago = self.hype_mark_mins_ago;
-        let mut abs = self.hype_mark_abs.clone();
-        let mut dur = self.hype_mark_dur;
+        };
         let mut channels: Vec<(i64, String)> =
             self.channels.iter().map(|c| (c.id, c.name.clone())).collect();
         channels.sort_by_key(|(_, n)| n.to_lowercase());
-
-        // Absolute local time wins when parseable; else "minutes ago".
-        let parse_abs = |s: &str| -> Option<i64> {
-            let dt = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M").ok()?;
-            use chrono::offset::LocalResult;
-            match dt.and_local_timezone(chrono::Local) {
-                LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.timestamp()),
-                LocalResult::None => None,
-            }
-        };
-        let abs_ts = parse_abs(&abs);
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("hype_mark_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Mark hype train")
                 .with_inner_size([460.0, 240.0])
                 .with_resizable(false),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            move |ctx, draft, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    draft.closed = true;
                 }
+                // Absolute local time wins when parseable; else "minutes ago".
+                let parse_abs = |s: &str| -> Option<i64> {
+                    let dt = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M").ok()?;
+                    use chrono::offset::LocalResult;
+                    match dt.and_local_timezone(chrono::Local) {
+                        LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.timestamp()),
+                        LocalResult::None => None,
+                    }
+                };
+                let abs_ts = parse_abs(&draft.abs);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.label(
@@ -2387,15 +2435,15 @@ impl StreamArchiverApp {
                         ui.label("Channel:");
                         let sel = channels
                             .iter()
-                            .find(|(id, _)| *id == channel)
+                            .find(|(id, _)| *id == draft.channel)
                             .map(|(_, n)| n.clone())
                             .unwrap_or_else(|| "— pick —".into());
                         egui::ComboBox::from_id_salt("hype_mark_channel")
                             .selected_text(sel)
                             .show_ui(ui, |ui| {
                                 for (cid, name) in &channels {
-                                    if ui.selectable_label(channel == *cid, name).clicked() {
-                                        channel = *cid;
+                                    if ui.selectable_label(draft.channel == *cid, name).clicked() {
+                                        draft.channel = *cid;
                                     }
                                 }
                             });
@@ -2403,7 +2451,7 @@ impl StreamArchiverApp {
                     ui.horizontal(|ui| {
                         ui.label("Started:");
                         ui.add(
-                            egui::DragValue::new(&mut mins_ago).range(0..=1440).suffix(" min ago"),
+                            egui::DragValue::new(&mut draft.mins_ago).range(0..=1440).suffix(" min ago"),
                         )
                         .on_hover_text(
                             "How long ago the train kicked off — used when no \
@@ -2411,7 +2459,7 @@ impl StreamArchiverApp {
                         );
                         ui.label("or at");
                         let resp = ui.add(
-                            egui::TextEdit::singleline(&mut abs)
+                            egui::TextEdit::singleline(&mut draft.abs)
                                 .desired_width(130.0)
                                 .hint_text("YYYY-MM-DD HH:MM"),
                         );
@@ -2419,7 +2467,7 @@ impl StreamArchiverApp {
                             "Absolute local start time — wins over 'minutes ago' \
                              when filled in and parseable.",
                         );
-                        if !abs.trim().is_empty() && abs_ts.is_none() {
+                        if !draft.abs.trim().is_empty() && abs_ts.is_none() {
                             ui.colored_label(
                                 egui::Color32::from_rgb(0xe0, 0xb0, 0x6c),
                                 "⚠ format",
@@ -2428,7 +2476,7 @@ impl StreamArchiverApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Duration:");
-                        ui.add(egui::DragValue::new(&mut dur).range(0..=240).suffix(" min"))
+                        ui.add(egui::DragValue::new(&mut draft.dur).range(0..=240).suffix(" min"))
                             .on_hover_text(
                                 "Optional — how long the train ran (0 = unknown). \
                                  Recorded in the event's detail only.",
@@ -2436,7 +2484,7 @@ impl StreamArchiverApp {
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let ok = ui.add_enabled(channel != 0, egui::Button::new("✔  Mark"));
+                        let ok = ui.add_enabled(draft.channel != 0, egui::Button::new("✔  Mark"));
                         if ok
                             .on_hover_text(
                                 "Insert the train into the channel's event history \
@@ -2445,27 +2493,39 @@ impl StreamArchiverApp {
                             )
                             .clicked()
                         {
-                            do_mark = true;
+                            draft.do_mark = true;
                         }
                         if ui.button("✖  Cancel").clicked() {
-                            open = false;
+                            draft.closed = true;
                         }
                     });
                 });
             },
         );
 
-        self.hype_mark_channel = channel;
+        let (closed, do_mark, channel, mins_ago, abs, dur) = {
+            let d = state.lock().unwrap();
+            (d.closed, d.do_mark, d.channel, d.mins_ago, d.abs.clone(), d.dur)
+        };
+        // Remembered across the next open, same as the pre-migration code's
+        // unconditional per-frame sync back to `self`.
         self.hype_mark_mins_ago = mins_ago;
-        self.hype_mark_abs = abs;
         self.hype_mark_dur = dur;
 
         if do_mark && channel != 0 {
-            let start = abs_ts.unwrap_or_else(|| now_unix() - mins_ago.max(0) * 60);
+            let parse_abs = |s: &str| -> Option<i64> {
+                let dt = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M").ok()?;
+                use chrono::offset::LocalResult;
+                match dt.and_local_timezone(chrono::Local) {
+                    LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.timestamp()),
+                    LocalResult::None => None,
+                }
+            };
+            let start = parse_abs(&abs).unwrap_or_else(|| now_unix() - mins_ago.max(0) * 60);
             self.record_manual_hype_train(channel, start, dur);
-            self.show_hype_mark = false;
-        } else if !open {
-            self.show_hype_mark = false;
+            self.show_hype_mark = None;
+        } else if closed {
+            self.show_hype_mark = None;
         }
     }
 
@@ -2532,17 +2592,7 @@ impl StreamArchiverApp {
     /// the Channel Stats controls row; `hype_override_for` = channel id).
     #[allow(deprecated)]
     pub(super) fn hype_override_window(&mut self, ctx: &egui::Context) {
-        let Some(channel_id) = self.hype_override_for else { return };
-        let name = self
-            .channels
-            .iter()
-            .find(|c| c.id == channel_id)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| format!("channel {channel_id}"));
-        let global = crate::hype::load_tuning(&self.core.store);
-        let mut draft = self.hype_override_draft;
-        let mut open = true;
-        let mut do_save = false;
+        let Some(state) = self.hype_override_for.clone() else { return };
 
         // One row per gate: a "use global" checkbox + a DragValue that only
         // exists while overridden.
@@ -2576,16 +2626,22 @@ impl StreamArchiverApp {
             ui.end_row();
         }
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("hype_override_vp"),
             egui::ViewportBuilder::default()
-                .with_title(format!("{name} — hype sensitivity"))
+                .with_title(format!("{} — hype sensitivity", state.lock().unwrap().name))
                 .with_inner_size([420.0, 210.0])
                 .with_resizable(false),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
+                let global = s.global.clone();
+                let draft = &mut s.draft;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.label(
@@ -2639,21 +2695,24 @@ impl StreamArchiverApp {
                             )
                             .clicked()
                         {
-                            do_save = true;
+                            s.do_save = true;
                         }
                         if ui.button("✖  Cancel").clicked() {
-                            open = false;
+                            s.closed = true;
                         }
                     });
                 });
             },
         );
 
-        self.hype_override_draft = draft;
+        let (do_save, closed, channel_id, draft) = {
+            let s = state.lock().unwrap();
+            (s.do_save, s.closed, s.channel_id, s.draft)
+        };
         if do_save {
             crate::hype::save_override(&self.core.store, channel_id, draft);
             self.hype_override_for = None;
-        } else if !open {
+        } else if closed {
             self.hype_override_for = None;
         }
     }
