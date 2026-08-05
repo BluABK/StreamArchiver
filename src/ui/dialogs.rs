@@ -2587,8 +2587,8 @@ impl StreamArchiverApp {
             }
         }
         self.chstats_data = None;
-        if let Some(p) = &mut self.viewer_stats_popup {
-            p.data = None;
+        if let Some(p) = &self.viewer_stats_popup {
+            p.lock().unwrap().data = None;
         }
         self.status = "Hype train marked".into();
     }

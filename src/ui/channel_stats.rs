@@ -46,6 +46,12 @@ pub(super) struct ViewerStatsPopup {
     pub(super) data: Option<StatsRange>,
     /// Events-list filter text (window-local).
     filter: String,
+    /// Set by the deferred closure on close; read back by
+    /// `viewer_stats_window` next call.
+    closed: bool,
+    /// Row actions clicked in the events table this pass — drained and
+    /// applied by `viewer_stats_window` via `apply_events_table_out`.
+    ev_out: EventsTableOut,
 }
 
 /// Marker color per event kind (legend + points on the graphs).
@@ -908,8 +914,8 @@ impl StreamArchiverApp {
             }
             let _ = self.core.store.delete_stream_event(event_id);
             self.chstats_data = None;
-            if let Some(p) = &mut self.viewer_stats_popup {
-                p.data = None;
+            if let Some(p) = &self.viewer_stats_popup {
+                p.lock().unwrap().data = None;
             }
         }
     }
@@ -922,14 +928,16 @@ impl StreamArchiverApp {
             .find(|c| c.id == channel_id)
             .map(|c| c.name.clone())
             .unwrap_or_else(|| format!("channel {channel_id}"));
-        self.viewer_stats_popup = Some(ViewerStatsPopup {
+        self.viewer_stats_popup = Some(Arc::new(Mutex::new(ViewerStatsPopup {
             channel_id,
             title: name,
             range: None,
             span: super::PollSpan::Day,
             data: None,
             filter: String::new(),
-        });
+            closed: false,
+            ev_out: EventsTableOut::default(),
+        })));
     }
 
     /// Open the 📈 popup clamped to one broadcast (`since..until`; pass
@@ -944,59 +952,66 @@ impl StreamArchiverApp {
         // Pad the window a little so the raid-out after the end and the pre-
         // stream baseline are visible.
         let until = if until > 0 { until } else { now_unix() };
-        self.viewer_stats_popup = Some(ViewerStatsPopup {
+        self.viewer_stats_popup = Some(Arc::new(Mutex::new(ViewerStatsPopup {
             channel_id,
             title: label.to_string(),
             range: Some((since - 900, until + 900)),
             span: super::PollSpan::Day,
             data: None,
             filter: String::new(),
-        });
+            closed: false,
+            ev_out: EventsTableOut::default(),
+        })));
     }
 
     /// Render the 📈 popup viewport (registered at the end of `ui()`).
     pub(super) fn viewer_stats_window(&mut self, ctx: &egui::Context) {
-        if self.viewer_stats_popup.is_none() {
+        let Some(state) = self.viewer_stats_popup.clone() else {
             return;
-        }
-        // Computed up front (needs `&mut self`) — `popup` below borrows
-        // `self.viewer_stats_popup` for the rest of this call.
+        };
+        // Computed up front (needs `&mut self`) — plain owned data handed
+        // into the deferred closure, which can't reach `self`.
         let name_colors = self.tracked_name_colors();
-        let popup = self.viewer_stats_popup.as_mut().unwrap();
-        // (Re)load lazily for the current span/range.
-        if popup.data.is_none() {
-            let (since, until, bucket) = match popup.range {
-                Some((s, u)) => {
-                    // Aim for ~200 points across the fixed range.
-                    let b = ((u - s) / 200).max(60);
-                    (s, u, b)
-                }
-                None => (now_unix() - popup.span.secs(), i64::MAX, popup.span.bucket_secs()),
-            };
-            let store = &self.core.store;
-            popup.data = Some((
-                store
-                    .viewer_history_range(popup.channel_id, since, until, bucket)
-                    .unwrap_or_default(),
-                store.stream_events_range(popup.channel_id, since, until).unwrap_or_default(),
-                store.monitor_changes_range(popup.channel_id, since, until).unwrap_or_default(),
-            ));
+        // (Re)load lazily for the current span/range — still needs
+        // `&self.core.store`, done here before the closure like before.
+        {
+            let mut popup = state.lock().unwrap();
+            if popup.data.is_none() {
+                let (since, until, bucket) = match popup.range {
+                    Some((s, u)) => {
+                        // Aim for ~200 points across the fixed range.
+                        let b = ((u - s) / 200).max(60);
+                        (s, u, b)
+                    }
+                    None => (now_unix() - popup.span.secs(), i64::MAX, popup.span.bucket_secs()),
+                };
+                let store = &self.core.store;
+                popup.data = Some((
+                    store
+                        .viewer_history_range(popup.channel_id, since, until, bucket)
+                        .unwrap_or_default(),
+                    store.stream_events_range(popup.channel_id, since, until).unwrap_or_default(),
+                    store.monitor_changes_range(popup.channel_id, since, until).unwrap_or_default(),
+                ));
+            }
         }
-        let popup_channel = popup.channel_id;
+        let popup_channel = state.lock().unwrap().channel_id;
         let labels = self.monitor_labels(popup_channel);
-        let popup = self.viewer_stats_popup.as_mut().unwrap();
-        let mut open = true;
-        let mut new_span: Option<super::PollSpan> = None;
-        let mut ev_out = EventsTableOut::default();
-        ctx.show_viewport_immediate(
+        let title = state.lock().unwrap().title.clone();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("viewer_stats_vp"),
             egui::ViewportBuilder::default()
-                .with_title(format!("{} — viewer stats", popup.title))
+                .with_title(format!("{title} — viewer stats"))
                 .with_inner_size([720.0, 480.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            move |ctx, popup, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    popup.closed = true;
                 }
+                let mut new_span: Option<super::PollSpan> = None;
                 // Same pattern as every other viewport window here (a
                 // viewport hands us a Context, not a Ui).
                 #[allow(deprecated)]
@@ -1042,7 +1057,7 @@ impl StreamArchiverApp {
                             bucket,
                         );
                         ui.add_space(8.0);
-                        ev_out = events_table_ui(
+                        popup.ev_out = events_table_ui(
                             ui,
                             "viewer_stats_popup_events",
                             events,
@@ -1052,13 +1067,17 @@ impl StreamArchiverApp {
                         );
                     });
                 });
+                if let Some(s) = new_span {
+                    popup.span = s;
+                    popup.data = None;
+                }
             },
         );
-        if let Some(s) = new_span {
-            popup.span = s;
-            popup.data = None;
-        }
-        if !open {
+        let (closed, ev_out) = {
+            let mut popup = state.lock().unwrap();
+            (popup.closed, std::mem::take(&mut popup.ev_out))
+        };
+        if closed {
             self.viewer_stats_popup = None;
         }
         self.apply_events_table_out(popup_channel, ev_out);

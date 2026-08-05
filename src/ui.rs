@@ -2240,7 +2240,7 @@ pub struct StreamArchiverApp {
     /// Events-list filter text in the Channel Stats view (session-only).
     chstats_event_filter: String,
     /// 📈 viewer-stats popup window (single-instance, like collab history).
-    viewer_stats_popup: Option<channel_stats::ViewerStatsPopup>,
+    viewer_stats_popup: Option<Arc<Mutex<channel_stats::ViewerStatsPopup>>>,
     /// Confirm hype trains via anonymous Twitch GQL polling. Persisted as
     /// `hype_gql` ([`crate::hype::K_HYPE_GQL`]); default on.
     hype_gql: bool,
