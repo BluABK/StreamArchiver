@@ -228,12 +228,15 @@ pub(super) struct AssetHistoryView {
     /// reloaded in place when a background asset refetch lands while it's open.
     pub(super) accounts: Vec<AssetAccount>,
     pub(super) lines: Vec<String>,
+    /// Set by the deferred closure on close; read back by
+    /// `asset_history_window` next call.
+    pub(super) closed: bool,
 }
 
 impl AssetHistoryView {
     pub(super) fn new(channel_name: String, accounts: &[AssetAccount]) -> AssetHistoryView {
         let lines = load_asset_history_lines(&channel_name, accounts);
-        AssetHistoryView { channel_name, accounts: accounts.to_vec(), lines }
+        AssetHistoryView { channel_name, accounts: accounts.to_vec(), lines, closed: false }
     }
 
     /// Re-read the change logs from disk (newest first), keeping the window open.
@@ -267,6 +270,9 @@ pub(super) struct AboutView {
     /// `post_img_cache` — the posts feed's 200-entry cap would evict panel
     /// textures mid-frame.
     pub(super) img_cache: PostImageCache,
+    /// Set by the deferred closure on close; read back by `about_window`
+    /// next call.
+    pub(super) closed: bool,
 }
 
 impl AboutView {
@@ -290,6 +296,7 @@ impl AboutView {
             links: Vec::new(),
             md_cache: egui_commonmark::CommonMarkCache::default(),
             img_cache: HashMap::new(),
+            closed: false,
         };
         view.reload(store);
         view

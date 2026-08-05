@@ -2076,10 +2076,10 @@ pub struct StreamArchiverApp {
     emote_viewers: Vec<EmoteViewer>,
     /// Open asset change-history popup (None = closed). Holds the channel's
     /// `asset_changes.jsonl` parsed + formatted once on open (newest first).
-    asset_histories: Vec<AssetHistoryView>,
+    asset_histories: Vec<Arc<Mutex<AssetHistoryView>>>,
     /// Open About-page viewers (one per channel + platform + account): the
     /// account's archived about versions with a picker + rendered content.
-    about_views: Vec<AboutView>,
+    about_views: Vec<Arc<Mutex<AboutView>>>,
     /// Channel Properties "About pages" rows: latest snapshot + version count
     /// per (platform, account), loaded off-thread with the props bundle.
     channel_about_latest: HashMap<i64, Vec<(crate::store::AboutSnapshotRow, i64)>>,

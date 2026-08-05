@@ -1371,7 +1371,8 @@ impl StreamArchiverApp {
                             // The asset-history view reads the change logs once on
                             // open; if it's showing this channel, reload it in place
                             // so freshly-recorded changes appear without a reopen.
-                            for h in &mut self.asset_histories {
+                            for h in &self.asset_histories {
+                                let mut h = h.lock().unwrap();
                                 if h.channel_name == task.label {
                                     h.reload();
                                 }
@@ -1379,7 +1380,8 @@ impl StreamArchiverApp {
                             // Same for open About viewers: re-query the snapshots
                             // (a new version may have landed) and drop their panel
                             // textures so changed images re-decode from disk.
-                            for v in &mut self.about_views {
+                            for v in &self.about_views {
+                                let mut v = v.lock().unwrap();
                                 if v.channel_name == task.label {
                                     v.reload(&self.core.store);
                                     v.img_cache.clear();

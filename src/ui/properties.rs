@@ -758,10 +758,10 @@ impl StreamArchiverApp {
             match self
                 .asset_histories
                 .iter_mut()
-                .find(|h| h.channel_name == ch.name)
+                .find(|h| h.lock().unwrap().channel_name == ch.name)
             {
-                Some(slot) => *slot = fresh,
-                None => self.asset_histories.push(fresh),
+                Some(slot) => *slot.lock().unwrap() = fresh,
+                None => self.asset_histories.push(Arc::new(Mutex::new(fresh))),
             }
         }
         // ℹ About — the archived About-page viewer for this account.
@@ -1941,10 +1941,10 @@ impl StreamArchiverApp {
             match self
                 .asset_histories
                 .iter_mut()
-                .find(|h| h.channel_name == ch.name)
+                .find(|h| h.lock().unwrap().channel_name == ch.name)
             {
-                Some(slot) => *slot = fresh,
-                None => self.asset_histories.push(fresh),
+                Some(slot) => *slot.lock().unwrap() = fresh,
+                None => self.asset_histories.push(Arc::new(Mutex::new(fresh))),
             }
         }
         // ℹ — open the archived About-page viewer for one of the accounts.
@@ -2307,29 +2307,42 @@ impl StreamArchiverApp {
     pub(super) fn asset_history_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<String> = Vec::new();
         for i in 0..self.asset_histories.len() {
-            let name = self.asset_histories[i].channel_name.clone();
+            let name = self.asset_histories[i].lock().unwrap().channel_name.clone();
             if self.asset_history_window(ctx, i) {
                 closed.push(name);
             }
         }
         if !closed.is_empty() {
-            self.asset_histories.retain(|h| !closed.contains(&h.channel_name));
+            self.asset_histories
+                .retain(|h| !closed.contains(&h.lock().unwrap().channel_name));
         }
     }
 
-    /// One asset-history window; returns true when it should close.
-    #[allow(deprecated)]
+    /// One asset-history window; returns true when it should close. `view`
+    /// is a live-shared `Arc<Mutex<>>` — a background asset-refetch landing
+    /// while this is open mutates the SAME instance in place (see the
+    /// `for h in &self.asset_histories` reload loop in `app.rs`), so the
+    /// deferred closure picks up fresh lines without a reopen, exactly like
+    /// before the migration.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn asset_history_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
-        let view = &self.asset_histories[idx];
-        let mut open = true;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of(("asset_history_vp", &view.channel_name)),
+        let view = self.asset_histories[idx].clone();
+        if view.lock().unwrap().closed {
+            return true;
+        }
+        let channel_name = view.lock().unwrap().channel_name.clone();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
+            egui::ViewportId::from_hash_of(("asset_history_vp", &channel_name)),
             egui::ViewportBuilder::default()
-                .with_title(format!("Asset history — {}", view.channel_name))
+                .with_title(format!("Asset history — {channel_name}"))
                 .with_inner_size([560.0, 440.0]),
-            |ctx, _class| {
+            view,
+            shared,
+            |ctx, view, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    view.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if view.lines.is_empty() {
@@ -2358,7 +2371,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        !open
+        false
     }
 
     /// Open (or refresh in place) the About-page viewer for one account.
@@ -2372,10 +2385,11 @@ impl StreamArchiverApp {
             acc.label.clone(),
         );
         match self.about_views.iter_mut().find(|v| {
+            let v = v.lock().unwrap();
             v.channel_id == channel_id && v.platform == acc.platform && v.account == acc.account
         }) {
-            Some(slot) => *slot = fresh,
-            None => self.about_views.push(fresh),
+            Some(slot) => *slot.lock().unwrap() = fresh,
+            None => self.about_views.push(Arc::new(Mutex::new(fresh))),
         }
     }
 
@@ -2395,27 +2409,37 @@ impl StreamArchiverApp {
     /// One About-page viewer window; returns true when it should close.
     /// Version picker (newest first) + the selected version's description
     /// (markdown), panel cards (image / title / markdown body / link), and
-    /// external links. Mirrors [`Self::asset_history_window`]'s lifecycle.
-    #[allow(deprecated)]
+    /// external links. Mirrors [`Self::asset_history_window`]'s lifecycle —
+    /// `view` is a live-shared `Arc<Mutex<>>`, so a background refetch
+    /// landing while this is open (see the `about_views` reload loop in
+    /// `app.rs`) updates the SAME instance the popup is reading.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn about_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
-        let view = &mut self.about_views[idx];
-        let mut open = true;
-        let mut open_url: Option<String> = None;
-        let mut select: Option<usize> = None;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of((
-                "about_vp",
-                view.channel_id,
-                view.platform.as_str(),
-                &view.account,
-            )),
+        let view = self.about_views[idx].clone();
+        if view.lock().unwrap().closed {
+            return true;
+        }
+        let (vp_key, title) = {
+            let v = view.lock().unwrap();
+            (
+                (v.channel_id, v.platform.as_str().to_string(), v.account.clone()),
+                format!("About — {} · {}", v.channel_name, v.label),
+            )
+        };
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
+            egui::ViewportId::from_hash_of(("about_vp", vp_key.0, &vp_key.1, &vp_key.2)),
             egui::ViewportBuilder::default()
-                .with_title(format!("About — {} · {}", view.channel_name, view.label))
+                .with_title(title)
                 .with_inner_size([560.0, 640.0]),
-            |ctx, _class| {
+            view,
+            shared,
+            |ctx, view, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    view.closed = true;
                 }
+                let mut open_url: Option<String> = None;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if view.snapshots.is_empty() {
                         ui.label(
@@ -2427,6 +2451,7 @@ impl StreamArchiverApp {
                     let snap = view.snapshots[view.selected].clone();
                     ui.horizontal(|ui| {
                         ui.label("Version:");
+                        let mut select: Option<usize> = None;
                         egui::ComboBox::from_id_salt("about_ver")
                             .selected_text(about_version_label(&view.snapshots, view.selected))
                             .show_ui(ui, |ui| {
@@ -2442,6 +2467,9 @@ impl StreamArchiverApp {
                                     }
                                 }
                             });
+                        if let Some(i) = select {
+                            view.select(i);
+                        }
                         ui.weak(format!(
                             "last checked {}",
                             fmt_datetime_short(snap.last_checked_at)
@@ -2502,14 +2530,11 @@ impl StreamArchiverApp {
                     });
                 });
                 draw_alt_image_preview(ctx);
+                if let Some(url) = open_url {
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                }
             },
         );
-        if let Some(i) = select {
-            self.about_views[idx].select(i);
-        }
-        if let Some(url) = open_url {
-            ctx.open_url(egui::OpenUrl::new_tab(url));
-        }
-        !open
+        false
     }
 }
