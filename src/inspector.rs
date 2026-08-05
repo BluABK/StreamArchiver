@@ -9,16 +9,18 @@
 //! frame's snapshot (double-buffered, as immediate-mode requires).
 //!
 //! The highlight rect is painted *at registration time* via `response.ctx`:
-//! every child window is an immediate viewport with its own pass, and by the
-//! time the snapshot is drained those passes have ended, so post-hoc painting
-//! would land on the wrong viewport. Painting inside `.inspect()` is always
-//! the correct viewport and the current rect, at the cost of a uniform
-//! one-frame lag on which widget is targeted (standard for immediate mode).
+//! every child window is its own pass, and by the time the snapshot is
+//! drained those passes have ended, so post-hoc painting would land on the
+//! wrong viewport. Painting inside `.inspect()` is always the correct
+//! viewport and the current rect, at the cost of a uniform one-frame lag on
+//! which widget is targeted (standard for immediate mode).
 //!
-//! Thread-local caveat: all of the app's child windows are
-//! `show_viewport_immediate` (same thread). If a *deferred* viewport (own
-//! thread) is ever added, its registrations would be silently lost — switch
-//! the registry to a `Mutex<Vec<_>>` then.
+//! Thread-local safety: the app's child windows are a mix of
+//! `show_viewport_immediate` and `show_viewport_deferred`, but eframe's
+//! native backends run every viewport's callback on the same OS thread as
+//! the root — deferred viewports get their own *repaint cadence*, not their
+//! own *thread* — so the `thread_local!` registry below sees every
+//! `.inspect()` call regardless of which viewport kind registered it.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -205,6 +207,8 @@ pub struct InspectorState {
     /// Set while drawing the Elements list; a hovered row wins over the
     /// selection as the highlight target.
     hovered_row: Option<egui::Id>,
+    /// Set by the deferred inspector window on Close/OS close button.
+    pub closed: bool,
 }
 
 impl InspectorState {

@@ -600,7 +600,7 @@ impl StreamArchiverApp {
             posts_focus_post: None,
             post_img_cache: Arc::new(Mutex::new(HashMap::new())),
             show_inspector: false,
-            inspector: crate::inspector::InspectorState::default(),
+            inspector: Arc::new(Mutex::new(crate::inspector::InspectorState::default())),
             quitting: false,
             heartbeat,
             startup_window_size_checked: false,

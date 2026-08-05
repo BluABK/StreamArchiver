@@ -1570,7 +1570,7 @@ pub struct StreamArchiverApp {
     /// The widget inspector (F12): whether the window is open (session-only,
     /// like the other window flags) and its tab/selection/snapshot state.
     show_inspector: bool,
-    inspector: crate::inspector::InspectorState,
+    inspector: Arc<Mutex<crate::inspector::InspectorState>>,
     quitting: bool,
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
@@ -3491,6 +3491,6 @@ impl eframe::App for StreamArchiverApp {
         // Must remain the FINAL statement of ui(): the child-viewport windows
         // above register their widgets after the root CentralPanel, so an
         // earlier drain would split one frame's widgets across two snapshots.
-        self.inspector.end_frame(self.show_inspector);
+        self.inspector.lock().unwrap().end_frame(self.show_inspector);
     }
 }

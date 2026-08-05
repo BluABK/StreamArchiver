@@ -210,21 +210,33 @@ impl StreamArchiverApp {
         if !self.show_inspector {
             return;
         }
-        let mut open = true;
-        ctx.show_viewport_immediate(
+        let state = self.inspector.clone();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("inspector_vp"),
             egui::ViewportBuilder::default()
                 .with_title("🔍 Inspector")
                 .with_inner_size([520.0, 600.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
+                // Keep repainting at the root's cadence: the snapshot this
+                // window shows is refreshed by `end_frame` at the tail of
+                // every root `ui()` call, not by anything targeting this
+                // viewport directly (hovering/clicking happens in the root
+                // window being inspected).
+                ctx.request_repaint();
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    crate::inspector::ui_contents(ui, &mut self.inspector);
+                    crate::inspector::ui_contents(ui, s);
                 });
             },
         );
-        self.show_inspector = open;
+        if state.lock().unwrap().closed {
+            self.show_inspector = false;
+        }
     }
 }
