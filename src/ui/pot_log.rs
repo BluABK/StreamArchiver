@@ -46,13 +46,21 @@ fn read_pot_log_tail() -> String {
     text
 }
 
+/// Deferred-viewport state for `pot_server_log_window`. `text` is refreshed
+/// by the wrapper on the same 1s throttle as before the migration.
+pub(super) struct PotLogPopupState {
+    pub(super) text: String,
+    pub(super) closed: bool,
+}
+
 impl StreamArchiverApp {
     /// Separate-viewport live tail of the PO token server log. Mirrors the
     /// `notifications_window` pattern: gated on its `show_*` bool, refreshed
     /// on a throttle while open, closed via the OS close button.
-    #[allow(deprecated)] // CentralPanel::show inside a viewport (matches notifications_window)
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn pot_server_log_window(&mut self, ctx: &egui::Context) {
         if !self.show_pot_server_log {
+            self.pot_log_popup = None;
             return;
         }
         let stale = self
@@ -63,15 +71,30 @@ impl StreamArchiverApp {
             self.pot_log_text = read_pot_log_tail();
             self.pot_log_refreshed = Some(std::time::Instant::now());
         }
-        let mut open = true;
-        ctx.show_viewport_immediate(
+
+        if self.pot_log_popup.is_none() {
+            self.pot_log_popup = Some(Arc::new(Mutex::new(PotLogPopupState {
+                text: self.pot_log_text.clone(),
+                closed: false,
+            })));
+        }
+        let popup_state = self.pot_log_popup.clone().unwrap();
+        if stale {
+            popup_state.lock().unwrap().text = self.pot_log_text.clone();
+        }
+
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("pot_server_log_vp"),
             egui::ViewportBuilder::default()
                 .with_title("🎫 GVS PO token server log")
                 .with_inner_size([760.0, 480.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 // Keep tailing while open (repaint drives the 1s refresh above).
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -105,7 +128,7 @@ impl StreamArchiverApp {
                         .show(ui, |ui| {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(&self.pot_log_text).monospace(),
+                                    egui::RichText::new(&s.text).monospace(),
                                 )
                                 .wrap_mode(egui::TextWrapMode::Extend),
                             );
@@ -113,8 +136,9 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
+        if popup_state.lock().unwrap().closed {
             self.show_pot_server_log = false;
+            self.pot_log_popup = None;
         }
     }
 }

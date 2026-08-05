@@ -39,6 +39,17 @@ pub(super) enum SchedRecsAct {
     AddNew(i64),
 }
 
+/// Deferred-viewport state for `schedule_sources_window`. `draft` IS the
+/// domain data (no separate `self` copy — this window is the only reader/
+/// writer of the source order in the whole codebase), edited live by the
+/// closure; `dirty` tells the wrapper a change needs persisting.
+pub(super) struct ScheduleSourcesPopupState {
+    pub(super) draft: Vec<SourceEntry>,
+    pub(super) selected: Option<String>,
+    pub(super) dirty: bool,
+    pub(super) closed: bool,
+}
+
 /// The Schedule tab's calendar granularity.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ScheduleMode {
@@ -371,64 +382,78 @@ impl StreamArchiverApp {
         false
     }
 
-    /// Load the persisted source order into the draft and open the dialog.
+    /// Open the dialog — its popup state is (re)created fresh from the
+    /// persisted source order the first time `schedule_sources_window` sees
+    /// `show_schedule_sources` go true (see there).
     pub(super) fn open_schedule_sources(&mut self) {
-        self.schedule_sources_draft = load_source_order(&self.core.store);
-        self.schedule_sources_selected = None;
+        self.schedule_sources_popup = None; // force a fresh load, not a stale draft
         self.show_schedule_sources = true;
     }
 
     /// The "Schedule sources" dialog: two columns (Available / Enabled) with →/←
     /// transfer and ▲/▼ priority reordering, mirroring the user's mockup. Every
     /// change persists the order and asks the refresher to re-walk the sources.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn schedule_sources_window(&mut self, ctx: &egui::Context) {
         if !self.show_schedule_sources {
+            self.schedule_sources_popup = None;
             return;
         }
-        let mut open = true;
-        // Actions collected during the (borrowing) render, applied afterwards.
-        let mut enable_id: Option<String> = None;
-        let mut disable_id: Option<String> = None;
-        let mut move_up_id: Option<String> = None;
-        let mut move_down_id: Option<String> = None;
-        let mut select_id: Option<String> = None;
+        if self.schedule_sources_popup.is_none() {
+            self.schedule_sources_popup = Some(Arc::new(Mutex::new(ScheduleSourcesPopupState {
+                draft: load_source_order(&self.core.store),
+                selected: None,
+                dirty: false,
+                closed: false,
+            })));
+        }
+        let popup_state = self.schedule_sources_popup.clone().unwrap();
 
-        // Filtered, draft-ordered views of the two columns: (draft index, kind).
-        let enabled: Vec<(usize, ScheduleSourceKind)> = self
-            .schedule_sources_draft
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.enabled)
-            .filter_map(|(i, e)| e.kind().map(|k| (i, k)))
-            .collect();
-        let available: Vec<(usize, ScheduleSourceKind)> = self
-            .schedule_sources_draft
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| !e.enabled)
-            .filter_map(|(i, e)| e.kind().map(|k| (i, k)))
-            .collect();
-        let selected = self.schedule_sources_selected.clone();
-        let sel_in_enabled = enabled
-            .iter()
-            .any(|(i, _)| Some(&self.schedule_sources_draft[*i].id) == selected.as_ref());
-        let sel_in_available = available
-            .iter()
-            .any(|(i, _)| Some(&self.schedule_sources_draft[*i].id) == selected.as_ref());
-        let sel_pos = enabled
-            .iter()
-            .position(|(i, _)| Some(&self.schedule_sources_draft[*i].id) == selected.as_ref());
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("schedule_sources_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Schedule sources")
                 .with_inner_size([600.0, 440.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
+                // Filtered, draft-ordered views of the two columns: (draft index, kind).
+                let enabled: Vec<(usize, ScheduleSourceKind)> = s
+                    .draft
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.enabled)
+                    .filter_map(|(i, e)| e.kind().map(|k| (i, k)))
+                    .collect();
+                let available: Vec<(usize, ScheduleSourceKind)> = s
+                    .draft
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| !e.enabled)
+                    .filter_map(|(i, e)| e.kind().map(|k| (i, k)))
+                    .collect();
+                let selected = s.selected.clone();
+                let sel_in_enabled =
+                    enabled.iter().any(|(i, _)| Some(&s.draft[*i].id) == selected.as_ref());
+                let sel_in_available =
+                    available.iter().any(|(i, _)| Some(&s.draft[*i].id) == selected.as_ref());
+                let sel_pos =
+                    enabled.iter().position(|(i, _)| Some(&s.draft[*i].id) == selected.as_ref());
+
+                // Actions collected during the (borrowing) render, applied below —
+                // same shape as before the migration, just against `s` instead of
+                // `self`.
+                let mut enable_id: Option<String> = None;
+                let mut disable_id: Option<String> = None;
+                let mut move_up_id: Option<String> = None;
+                let mut move_down_id: Option<String> = None;
+                let mut select_id: Option<String> = None;
+
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label(
                         "Sources are tried top-to-bottom per channel; the first one to resolve \
@@ -449,7 +474,7 @@ impl StreamArchiverApp {
                                     ui.weak("(all sources enabled)");
                                 }
                                 for (i, kind) in &available {
-                                    let id = &self.schedule_sources_draft[*i].id;
+                                    let id = &s.draft[*i].id;
                                     let resp = source_row(ui, *kind, selected.as_deref() == Some(id));
                                     if resp.clicked() {
                                         select_id = Some(id.clone());
@@ -512,7 +537,7 @@ impl StreamArchiverApp {
                                     ui.weak("(no sources enabled — schedules won't update)");
                                 }
                                 for (rank, (i, kind)) in enabled.iter().enumerate() {
-                                    let id = &self.schedule_sources_draft[*i].id;
+                                    let id = &s.draft[*i].id;
                                     let resp = source_row_ranked(
                                         ui,
                                         rank + 1,
@@ -547,56 +572,64 @@ impl StreamArchiverApp {
 
                     ui.add_space(8.0);
                     if ui.button("Close").clicked() {
-                        open = false;
+                        s.closed = true;
                     }
                 });
+
+                // ── Apply collected actions (mutating the draft). ──
+                if let Some(id) = &select_id {
+                    s.selected = Some(id.clone());
+                }
+                if let Some(id) = &enable_id {
+                    if let Some(e) = s.draft.iter_mut().find(|e| &e.id == id) {
+                        e.enabled = true;
+                        s.dirty = true;
+                    }
+                    s.selected = Some(id.clone());
+                }
+                if let Some(id) = &disable_id {
+                    if let Some(e) = s.draft.iter_mut().find(|e| &e.id == id) {
+                        e.enabled = false;
+                        s.dirty = true;
+                    }
+                    s.selected = Some(id.clone());
+                }
+                // Reorder swaps the selected enabled entry with its enabled neighbour, by
+                // swapping their draft slots (disabled entries in between are unaffected).
+                if let (Some(id), Some(p)) = (&move_up_id, sel_pos) {
+                    if p > 0 {
+                        s.draft.swap(enabled[p].0, enabled[p - 1].0);
+                        s.dirty = true;
+                    }
+                    s.selected = Some(id.clone());
+                }
+                if let (Some(id), Some(p)) = (&move_down_id, sel_pos) {
+                    if p + 1 < enabled.len() {
+                        s.draft.swap(enabled[p].0, enabled[p + 1].0);
+                        s.dirty = true;
+                    }
+                    s.selected = Some(id.clone());
+                }
             },
         );
 
-        // ── Apply collected actions (mutating the draft). ──
-        let mut changed = false;
-        if let Some(id) = &select_id {
-            self.schedule_sources_selected = Some(id.clone());
-        }
-        if let Some(id) = &enable_id {
-            if let Some(e) = self.schedule_sources_draft.iter_mut().find(|e| &e.id == id) {
-                e.enabled = true;
-                changed = true;
-            }
-            self.schedule_sources_selected = Some(id.clone());
-        }
-        if let Some(id) = &disable_id {
-            if let Some(e) = self.schedule_sources_draft.iter_mut().find(|e| &e.id == id) {
-                e.enabled = false;
-                changed = true;
-            }
-            self.schedule_sources_selected = Some(id.clone());
-        }
-        // Reorder swaps the selected enabled entry with its enabled neighbour, by
-        // swapping their draft slots (disabled entries in between are unaffected).
-        if let (Some(id), Some(p)) = (&move_up_id, sel_pos) {
-            if p > 0 {
-                self.schedule_sources_draft.swap(enabled[p].0, enabled[p - 1].0);
-                changed = true;
-            }
-            self.schedule_sources_selected = Some(id.clone());
-        }
-        if let (Some(id), Some(p)) = (&move_down_id, sel_pos) {
-            if p + 1 < enabled.len() {
-                self.schedule_sources_draft.swap(enabled[p].0, enabled[p + 1].0);
-                changed = true;
-            }
-            self.schedule_sources_selected = Some(id.clone());
-        }
-        if changed {
-            if let Err(e) = save_source_order(&self.core.store, &self.schedule_sources_draft) {
+        let (dirty, closed) = {
+            let mut s = popup_state.lock().unwrap();
+            let result = (s.dirty, s.closed);
+            s.dirty = false;
+            result
+        };
+        if dirty {
+            let draft = popup_state.lock().unwrap().draft.clone();
+            if let Err(e) = save_source_order(&self.core.store, &draft) {
                 self.status = format!("Error saving schedule sources: {e}");
             } else {
                 self.core.request_schedule_refresh();
             }
         }
-        if !open {
+        if closed {
             self.show_schedule_sources = false;
+            self.schedule_sources_popup = None;
         }
     }
 

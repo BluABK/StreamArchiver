@@ -1488,6 +1488,9 @@ pub struct StreamArchiverApp {
     show_pot_server_log: bool,
     pot_log_text: String,
     pot_log_refreshed: Option<std::time::Instant>,
+    /// Deferred-viewport state while the PO token server log window is open
+    /// (None = closed) — see [`pot_log::PotLogPopupState`].
+    pot_log_popup: Option<Arc<Mutex<pot_log::PotLogPopupState>>>,
     notif_refreshed: Option<std::time::Instant>,
     notif_unread: i64,
     /// Unread `youtube_post`-kind notifications — the 📣 Posts tab badge.
@@ -1956,11 +1959,9 @@ pub struct StreamArchiverApp {
     schedule_day_popup: Option<Arc<Mutex<ScheduleDayState>>>,
     /// Whether the "Schedule sources" dialog is open.
     show_schedule_sources: bool,
-    /// Editable draft of the ordered source list, shown in the dialog. Loaded from
-    /// settings when the dialog opens; saved (+ refresh requested) on every change.
-    schedule_sources_draft: Vec<SourceEntry>,
-    /// The source id selected in the dialog (drives the →/← / ▲/▼ buttons).
-    schedule_sources_selected: Option<String>,
+    /// Deferred-viewport state for the "Schedule sources" dialog (None = closed
+    /// or not yet loaded).
+    schedule_sources_popup: Option<Arc<Mutex<schedule::ScheduleSourcesPopupState>>>,
     /// Editable per-channel schedule-source configs shown in the Properties
     /// windows — one draft per open window, keyed by channel id.
     channel_cfg_drafts: HashMap<i64, crate::schedule_source::ChannelSourceConfig>,
