@@ -2309,7 +2309,7 @@ impl StreamArchiverApp {
                     r.monitor.id,
                 );
                 mf.allow_delete = crate::manual_delete::monitor_gate_on(&self.core.store, r.monitor.id);
-                self.form = Some(mf);
+                self.form = Some(Arc::new(Mutex::new(mf)));
             }
         }
         if let Some(mid) = acts.properties {
@@ -2332,11 +2332,11 @@ impl StreamArchiverApp {
             // Look up the container in `channels` (not `rows`) so this also works
             // for an empty container that has no instances yet.
             if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
-                self.form = Some(MonitorForm::add_instance(
+                self.form = Some(Arc::new(Mutex::new(MonitorForm::add_instance(
                     c,
                     &self.monitor_defaults,
                     &self.settings.default_output_dir,
-                ));
+                ))));
             }
         }
         if let Some(p) = acts.add_collab_instance {
@@ -2344,12 +2344,12 @@ impl StreamArchiverApp {
             // (Name-cell suffix or 🤝 Collab column) → open the Add-stream
             // form pre-filled with their Twitch login/display name, same as
             // a manual "Add stream" but without retyping the URL.
-            self.form = Some(MonitorForm::from_collab_partner(
+            self.form = Some(Arc::new(Mutex::new(MonitorForm::from_collab_partner(
                 &p.login,
                 &p.name,
                 &self.monitor_defaults,
                 &self.settings.default_output_dir,
-            ));
+            ))));
         }
         if let Some(mid) = acts.move_instance {
             self.move_instance_dialog = Some((mid, None));

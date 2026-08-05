@@ -3304,20 +3304,21 @@ impl StreamArchiverApp {
             None => {}
         }
     }
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn form_window(&mut self, ctx: &egui::Context) {
-        if self.form.is_none() {
+        let Some(form_arc) = self.form.clone() else {
             return;
+        };
+        // Re-resolved every call — the deferred closure can't reach `self` to
+        // pick up a live Settings/monitor-defaults/preset-list change itself.
+        {
+            let mut f = form_arc.lock().unwrap();
+            f.monitor_defaults = self.monitor_defaults.clone();
+            f.default_output_dir = self.settings.default_output_dir.clone();
+            f.custom_presets = self.custom_presets.clone();
         }
-        let mut open = true;
-        let mut do_save = false;
-        let mut do_cancel = false;
-        let mut open_format_designer = false;
-        let mut browse_req: Option<PendingBrowse> = None;
-        let mut form_preset_delete: Option<i64> = None;
-        let mut form_preset_save_tmpl: Option<String> = None;
 
-        let f = self.form.as_ref().unwrap();
+        let f = form_arc.lock().unwrap();
         let title = if f.monitor_id.is_some() {
             "Edit instance"
         } else if f.channel_id.is_some() {
@@ -3325,44 +3326,49 @@ impl StreamArchiverApp {
         } else {
             "Add stream (new channel)"
         };
+        let title = title.to_string();
+        drop(f);
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("monitor_form_vp"),
             egui::ViewportBuilder::default()
-                .with_title(title.to_string())
+                .with_title(title)
                 .with_inner_size([820.0, 760.0]),
-            |ctx, _class| {
+            form_arc.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::TopBottomPanel::bottom("monitor_form_bottom_bar").show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
-                            do_save = true;
+                            s.do_save = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                            s.closed = true;
                         }
                     });
                     ui.add_space(4.0);
                 });
                 egui::CentralPanel::default().show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let form = self.form.as_mut().unwrap();
-                let platform = Platform::detect(&form.url);
+                let platform = Platform::detect(&s.url);
                 // When the URL's platform changes, re-apply that platform's
                 // defaults (tool, detection, container, quality, poll interval,
                 // filename template, output dir). User overrides afterwards stick.
-                if form.last_platform != Some(platform) {
-                    let md = &self.monitor_defaults;
-                    form.tool = md.resolve_tool(platform);
-                    form.detection_method = md.resolve_detection(platform);
-                    form.container = md.resolve_container(platform);
-                    form.quality = md.resolve_quality(platform);
-                    form.poll_interval_secs = md.resolve_poll_interval(platform);
-                    form.filename_template = md.resolve_filename_template(platform);
-                    form.last_platform = Some(platform);
+                if s.last_platform != Some(platform) {
+                    let md = &s.monitor_defaults;
+                    s.tool = md.resolve_tool(platform);
+                    s.detection_method = md.resolve_detection(platform);
+                    s.container = md.resolve_container(platform);
+                    s.quality = md.resolve_quality(platform);
+                    s.poll_interval_secs = md.resolve_poll_interval(platform);
+                    s.filename_template = md.resolve_filename_template(platform);
+                    s.last_platform = Some(platform);
                 }
                 // Output dir depends on the channel name too (via a possible
                 // `{name}` token — see `expand_dir_template`), which isn't
@@ -3371,20 +3377,20 @@ impl StreamArchiverApp {
                 // platform, so the folder catches up once the name lands —
                 // tracked separately from `last_platform` above since this is
                 // the only field with a second trigger.
-                if form.output_dir_platform != Some(platform) || form.output_dir_name != form.name {
-                    form.output_dir = self.monitor_defaults.resolve_output_dir(
+                if s.output_dir_platform != Some(platform) || s.output_dir_name != s.name {
+                    s.output_dir = s.monitor_defaults.resolve_output_dir(
                         platform,
-                        &form.name,
-                        &self.settings.default_output_dir,
+                        &s.name,
+                        &s.default_output_dir,
                     );
-                    form.output_dir_platform = Some(platform);
-                    form.output_dir_name = form.name.clone();
+                    s.output_dir_platform = Some(platform);
+                    s.output_dir_name = s.name.clone();
                 }
                 // The name belongs to the channel container; it's editable only
                 // when creating a new channel. For an instance it's the container's
                 // (rename via the channel row's ✏). The URL is per-instance and
                 // always editable.
-                let name_editable = form.channel_id.is_none();
+                let name_editable = s.channel_id.is_none();
 
                 egui::Grid::new("form_grid")
                     .num_columns(2)
@@ -3392,7 +3398,7 @@ impl StreamArchiverApp {
                     .show(ui, |ui| {
                         ui.label("Name");
                         let name_resp =
-                            ui.add_enabled(name_editable, egui::TextEdit::singleline(&mut form.name));
+                            ui.add_enabled(name_editable, egui::TextEdit::singleline(&mut s.name));
                         if !name_editable {
                             name_resp.on_hover_text(
                                 "The channel name — rename it from the channel row's ✏.",
@@ -3401,7 +3407,7 @@ impl StreamArchiverApp {
                         ui.end_row();
 
                         ui.label("URL");
-                        ui.add(egui::TextEdit::singleline(&mut form.url).desired_width(320.0))
+                        ui.add(egui::TextEdit::singleline(&mut s.url).desired_width(320.0))
                             .on_hover_text("This instance's source URL (platform auto-detected).");
                         ui.end_row();
 
@@ -3409,53 +3415,53 @@ impl StreamArchiverApp {
                         ui.label(platform.label());
                         ui.end_row();
 
-                        ui.label("Tool").on_hover_text(form.tool.tooltip());
+                        ui.label("Tool").on_hover_text(s.tool.tooltip());
                         egui::ComboBox::from_id_salt("tool_cb")
-                            .selected_text(form.tool.label())
+                            .selected_text(s.tool.label())
                             .show_ui(ui, |ui| {
                                 for t in Tool::ALL {
-                                    ui.selectable_value(&mut form.tool, t, t.label())
+                                    ui.selectable_value(&mut s.tool, t, t.label())
                                         .on_hover_text(t.tooltip());
                                 }
                             });
                         ui.end_row();
 
                         ui.label("Detection")
-                            .on_hover_text(form.detection_method.tooltip());
+                            .on_hover_text(s.detection_method.tooltip());
                         let methods = platform.detection_methods();
-                        if !methods.contains(&form.detection_method) {
-                            form.detection_method = platform.default_detection();
+                        if !methods.contains(&s.detection_method) {
+                            s.detection_method = platform.default_detection();
                         }
                         egui::ComboBox::from_id_salt("method_cb")
-                            .selected_text(form.detection_method.label())
+                            .selected_text(s.detection_method.label())
                             .show_ui(ui, |ui| {
                                 for &dm in methods {
-                                    ui.selectable_value(&mut form.detection_method, dm, dm.label())
+                                    ui.selectable_value(&mut s.detection_method, dm, dm.label())
                                         .on_hover_text(dm.tooltip());
                                 }
                             });
                         ui.end_row();
 
                         ui.label("Poll interval (s)");
-                        ui.add(egui::DragValue::new(&mut form.poll_interval_secs).range(5..=86400));
+                        ui.add(egui::DragValue::new(&mut s.poll_interval_secs).range(5..=86400));
                         ui.end_row();
 
                         ui.label("Quality");
-                        ui.text_edit_singleline(&mut form.quality);
+                        ui.text_edit_singleline(&mut s.quality);
                         ui.end_row();
 
                         ui.label("Container");
                         egui::ComboBox::from_id_salt("container_cb")
-                            .selected_text(form.container.label())
+                            .selected_text(s.container.label())
                             .show_ui(ui, |ui| {
                                 for c in Container::ALL {
-                                    ui.selectable_value(&mut form.container, c, c.label());
+                                    ui.selectable_value(&mut s.container, c, c.label());
                                 }
                             });
                         ui.end_row();
 
                         ui.label("Audio tracks");
-                        ui.text_edit_singleline(&mut form.audio_tracks).on_hover_text(
+                        ui.text_edit_singleline(&mut s.audio_tracks).on_hover_text(
                             "Audio tracks to capture (streamlink --hls-audio-select). \
                              Empty = the tool's default single track; 'all' (or '*') = \
                              every track; or a comma-separated list of language \
@@ -3464,7 +3470,7 @@ impl StreamArchiverApp {
                         ui.end_row();
 
                         ui.label("Subtitle tracks");
-                        ui.text_edit_singleline(&mut form.subtitle_tracks).on_hover_text(
+                        ui.text_edit_singleline(&mut s.subtitle_tracks).on_hover_text(
                             "Subtitle tracks to capture (yt-dlp --sub-langs, written as \
                              sidecar files next to the recording). Empty = none; 'all' \
                              (or '*') = every subtitle; or a comma-separated list of \
@@ -3489,7 +3495,7 @@ impl StreamArchiverApp {
                             .spacing([12.0, 8.0])
                             .show(ui, |ui| {
                                 ui.label("Log chat");
-                                ui.checkbox(&mut form.chat_log, "").on_hover_text(
+                                ui.checkbox(&mut s.chat_log, "").on_hover_text(
                                     "Save chat alongside the recording. Twitch: a built-in \
                                      anonymous chat logger writes a .chat.jsonl sidecar. YouTube \
                                      (yt-dlp tool): yt-dlp's live_chat writes a .live_chat.json \
@@ -3502,7 +3508,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Fetch thumbnail");
-                                ui.checkbox(&mut form.fetch_thumbnail, "").on_hover_text(
+                                ui.checkbox(&mut s.fetch_thumbnail, "").on_hover_text(
                                     "Download the stream thumbnail alongside the recording \
                                      ({stem}.thumbnail.jpg). For yt-dlp, passes --write-thumbnail; \
                                      for Twitch/Kick/YouTube, fetches the URL from detection metadata.",
@@ -3511,8 +3517,8 @@ impl StreamArchiverApp {
 
                                 ui.label("Thumbnail in notification");
                                 ui.add_enabled(
-                                    form.fetch_thumbnail,
-                                    egui::Checkbox::new(&mut form.thumbnail_in_toast, ""),
+                                    s.fetch_thumbnail,
+                                    egui::Checkbox::new(&mut s.thumbnail_in_toast, ""),
                                 ).on_hover_text(
                                     "Use the stream thumbnail as the hero image in the \
                                      recording-started notification (instead of the channel's \
@@ -3522,7 +3528,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Fetch chat assets");
-                                ui.checkbox(&mut form.fetch_chat_assets, "").on_hover_text(
+                                ui.checkbox(&mut s.fetch_chat_assets, "").on_hover_text(
                                     "Download channel icon, offline banner, Twitch badges, and \
                                      emotes (including BTTV, FFZ, 7TV) into channel_assets/ \
                                      alongside recordings. Needed for full offline chat replay. \
@@ -3531,14 +3537,14 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Capture from start");
-                                ui.checkbox(&mut form.capture_from_start, "").on_hover_text(
+                                ui.checkbox(&mut s.capture_from_start, "").on_hover_text(
                                     "yt-dlp --live-from-start / streamlink --hls-live-restart",
                                 );
                                 ui.end_row();
 
-                                if Platform::detect(&form.url) == Platform::YouTube {
+                                if Platform::detect(&s.url) == Platform::YouTube {
                                     ui.label("Dual capture (SABR + DASH)");
-                                    ui.checkbox(&mut form.dual_capture, "").on_hover_text(
+                                    ui.checkbox(&mut s.dual_capture, "").on_hover_text(
                                         "YouTube only: also run a second concurrent DASH capture \
                                          (system yt-dlp, live edge) when wanted formats span both SABR \
                                          and DASH. Produces a second recording in the same take. \
@@ -3548,11 +3554,11 @@ impl StreamArchiverApp {
 
                                     ui.label("Video codec / quality");
                                     egui::ComboBox::from_id_salt("form_sabr_codec_pref")
-                                        .selected_text(form.sabr_codec_pref.label())
+                                        .selected_text(s.sabr_codec_pref.label())
                                         .show_ui(ui, |ui| {
                                             for &p in &SabrCodecPref::ALL {
                                                 ui.selectable_value(
-                                                    &mut form.sabr_codec_pref,
+                                                    &mut s.sabr_codec_pref,
                                                     p,
                                                     p.label(),
                                                 );
@@ -3565,10 +3571,10 @@ impl StreamArchiverApp {
                                              lower-bitrate VP9/AV1 rendition of the same resolution.",
                                         );
                                     ui.end_row();
-                                    if form.sabr_codec_pref == SabrCodecPref::Custom {
+                                    if s.sabr_codec_pref == SabrCodecPref::Custom {
                                         ui.label("Custom -S sort");
                                         ui.add(
-                                            egui::TextEdit::singleline(&mut form.sabr_codec_custom)
+                                            egui::TextEdit::singleline(&mut s.sabr_codec_custom)
                                                 .hint_text("res,fps,vcodec:h264")
                                                 .desired_width(180.0),
                                         )
@@ -3581,7 +3587,7 @@ impl StreamArchiverApp {
                                 }
 
                                 ui.label("Ad-free");
-                                ui.checkbox(&mut form.ad_free, "").on_hover_text(
+                                ui.checkbox(&mut s.ad_free, "").on_hover_text(
                                     "Mark this instance ad-free for your account (YouTube \
                                      membership/Premium, Twitch Turbo/sub) so captures won't have \
                                      ad-break hard cuts. For Twitch with a connected account, sub \
@@ -3590,7 +3596,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Pin as preferred platform");
-                                ui.checkbox(&mut form.primary_pin, "").on_hover_text(
+                                ui.checkbox(&mut s.primary_pin, "").on_hover_text(
                                     "Always show THIS instance's info on the channel row while it's \
                                      live, even if a sibling instance (another platform) went live \
                                      earlier or the channel/global preference points elsewhere — the \
@@ -3599,7 +3605,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Enabled");
-                                ui.checkbox(&mut form.automation_enabled, "")
+                                ui.checkbox(&mut s.automation_enabled, "")
                                     .on_hover_text(
                                         "Master switch (same as the Enabled column). Off = fully \
                                          dormant: no detection, recording, or asset/about/posts/schedule \
@@ -3609,7 +3615,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Auto");
-                                ui.checkbox(&mut form.enabled, "")
+                                ui.checkbox(&mut s.enabled, "")
                                     .on_hover_text(
                                         "Auto-record: automatically record to disk when this channel \
                                          goes live (a disk-space control; same as the Auto column). It \
@@ -3628,7 +3634,7 @@ impl StreamArchiverApp {
                             .spacing([12.0, 8.0])
                             .show(ui, |ui| {
                                 ui.label("Download VOD after end");
-                                tristate_combo(ui, "form_vod_download", &mut form.vod_download)
+                                tristate_combo(ui, "form_vod_download", &mut s.vod_download)
                                     .on_hover_text(
                                         "Download the platform's published VOD after this instance's \
                                          stream ends. Inherit follows the channel, then the global default.",
@@ -3636,7 +3642,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Replace with VOD");
-                                tristate_combo(ui, "form_vod_replace", &mut form.vod_replace)
+                                tristate_combo(ui, "form_vod_replace", &mut s.vod_replace)
                                     .on_hover_text(
                                         "Replace the live recording with the downloaded VOD when it \
                                          succeeds (never for a muted Twitch VOD). Inherit follows the \
@@ -3645,7 +3651,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Fetch new head backfill on new take");
-                                tristate_combo(ui, "form_head_backfill_fetch", &mut form.head_backfill_fetch)
+                                tristate_combo(ui, "form_head_backfill_fetch", &mut s.head_backfill_fetch)
                                     .on_hover_text(
                                         "Capture-from-start only: fetch a fresh head backfill for a retake \
                                          (reconnect mid-broadcast), not just the stream's first take. \
@@ -3654,7 +3660,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Replace old head (if new is undamaged)");
-                                tristate_combo(ui, "form_head_backfill_replace", &mut form.head_backfill_replace)
+                                tristate_combo(ui, "form_head_backfill_replace", &mut s.head_backfill_replace)
                                     .on_hover_text(
                                         "Once a fresh head backfill passes its integrity checks, delete \
                                          older takes' now-redundant head files for the same stream. Only \
@@ -3664,7 +3670,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("After full.mkv join");
-                                join_cleanup_combo(ui, "form_join_cleanup", &mut form.join_cleanup)
+                                join_cleanup_combo(ui, "form_join_cleanup", &mut s.join_cleanup)
                                     .on_hover_text(
                                         "Once a verified full.mkv (head + live capture joined) lands for \
                                          a take of this instance: keep both parts (safe, doubles the \
@@ -3676,7 +3682,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Automatic deletes go to");
-                                disposal_method_combo(ui, "form_disposal_method", &mut form.disposal_method)
+                                disposal_method_combo(ui, "form_disposal_method", &mut s.disposal_method)
                                     .on_hover_text(
                                         "How automatic media deletions for this instance are executed \
                                          (post-join cleanup, superseded heads, a live capture replaced \
@@ -3690,7 +3696,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Embed chapters");
-                                tristate_combo(ui, "form_chapters_enabled", &mut form.chapters_enabled)
+                                tristate_combo(ui, "form_chapters_enabled", &mut s.chapters_enabled)
                                     .on_hover_text(
                                         "Embed chapter markers (title/category changes, raids, \
                                          recovered/muted gap-splice segments) into finalized recordings \
@@ -3701,7 +3707,7 @@ impl StreamArchiverApp {
 
                                 ui.label("Title/game coalesce window (s)");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut form.chapters_coalesce_secs)
+                                    egui::TextEdit::singleline(&mut s.chapters_coalesce_secs)
                                         .desired_width(80.0)
                                         .hint_text("Inherit"),
                                 )
@@ -3714,7 +3720,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Auto-record my raids");
-                                tristate_combo(ui, "form_follow_my_raids", &mut form.follow_my_raids)
+                                tristate_combo(ui, "form_follow_my_raids", &mut s.follow_my_raids)
                                     .on_hover_text(
                                         "When this instance raids out to another Twitch channel, \
                                          auto-record the target (Settings → Follow raid). Inherit \
@@ -3724,7 +3730,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Auto-play my raids");
-                                tristate_combo(ui, "form_follow_my_raids_play", &mut form.follow_my_raids_play)
+                                tristate_combo(ui, "form_follow_my_raids_play", &mut s.follow_my_raids_play)
                                     .on_hover_text(
                                         "When this instance raids out to another Twitch channel, \
                                          auto-open the target at the live edge in your media player — no \
@@ -3739,7 +3745,7 @@ impl StreamArchiverApp {
                                 tristate_combo(
                                     ui,
                                     "form_raid_target_record",
-                                    &mut form.record_me_as_raid_target,
+                                    &mut s.record_me_as_raid_target,
                                 )
                                 .on_hover_text(
                                     "Whether Follow raid may auto-RECORD this instance when a followed \
@@ -3755,7 +3761,7 @@ impl StreamArchiverApp {
                                 tristate_combo(
                                     ui,
                                     "form_raid_play_exclude",
-                                    &mut form.exclude_from_auto_play,
+                                    &mut s.exclude_from_auto_play,
                                 )
                                 .on_hover_text(
                                     "Set to Always to make sure this instance never gets an auto-opened \
@@ -3767,7 +3773,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Allow deleting files");
-                                ui.checkbox(&mut form.allow_delete, "")
+                                ui.checkbox(&mut s.allow_delete, "")
                                     .on_hover_text(
                                         "Half of the gate for this instance's take rows' \
                                          \"🗑🔥 Delete file from disk\" action — the OTHER half \
@@ -3789,30 +3795,30 @@ impl StreamArchiverApp {
                     .show(ui, |ui| {
                         ui.label("Auth");
                         egui::ComboBox::from_id_salt("auth_cb")
-                            .selected_text(form.auth_kind.label())
+                            .selected_text(s.auth_kind.label())
                             .show_ui(ui, |ui| {
                                 for k in AuthKind::ALL {
-                                    ui.selectable_value(&mut form.auth_kind, k, k.label());
+                                    ui.selectable_value(&mut s.auth_kind, k, k.label());
                                 }
                             });
                         ui.end_row();
 
                         // Value field depends on the chosen auth kind.
-                        match form.auth_kind {
+                        match s.auth_kind {
                             AuthKind::CookiesBrowser => {
                                 ui.label("Browser");
-                                ui.text_edit_singleline(&mut form.auth_value)
+                                ui.text_edit_singleline(&mut s.auth_value)
                                     .on_hover_text("Browser, or browser:profile — e.g. firefox:dmrf6eed.YouTube (blank = global)");
                                 ui.end_row();
                             }
                             AuthKind::CookiesFile => {
                                 ui.label("Cookies file");
                                 ui.horizontal(|ui| {
-                                    ui.text_edit_singleline(&mut form.auth_value);
+                                    ui.text_edit_singleline(&mut s.auth_value);
                                     if ui.button("Browse…").clicked() {
-                                        browse_req = Some(spawn_browse_file(
-                                            &form.auth_value,
-                                            |app, p| { if let Some(f) = &mut app.form { f.auth_value = p; } },
+                                        s.browse_req = Some(spawn_browse_file(
+                                            &s.auth_value,
+                                            |app, p| { if let Some(f) = &app.form { f.lock().unwrap().auth_value = p; } },
                                         ));
                                     }
                                 });
@@ -3821,7 +3827,7 @@ impl StreamArchiverApp {
                             AuthKind::Token => {
                                 ui.label("Auth token");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut form.auth_value).password(true),
+                                    egui::TextEdit::singleline(&mut s.auth_value).password(true),
                                 )
                                 .on_hover_text("Twitch OAuth token (streamlink)");
                                 ui.end_row();
@@ -3836,11 +3842,11 @@ impl StreamArchiverApp {
                              folder than accept the default's.",
                         );
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut form.output_dir);
+                            ui.text_edit_singleline(&mut s.output_dir);
                             if ui.button("Browse…").clicked() {
-                                browse_req = Some(spawn_browse_folder(
-                                    &form.output_dir,
-                                    |app, p| { if let Some(f) = &mut app.form { f.output_dir = p; } },
+                                s.browse_req = Some(spawn_browse_folder(
+                                    &s.output_dir,
+                                    |app, p| { if let Some(f) = &app.form { f.lock().unwrap().output_dir = p; } },
                                 ));
                             }
                         });
@@ -3849,24 +3855,24 @@ impl StreamArchiverApp {
                         let fn_tmpl_hint = "{name} {channel} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {platform_short} {went_live_date} {went_live_time} {timestamp}";
                         ui.label("Filename template").on_hover_text(fn_tmpl_hint);
                         ui.horizontal(|ui| {
-                            let custom_presets = self.custom_presets.as_slice();
+                            let custom_presets = s.custom_presets.as_slice();
                             let (del, save) = filename_preset_combo(
                                 ui,
                                 "monitor_form_tmpl",
-                                &mut form.filename_template,
+                                &mut s.filename_template,
                                 custom_presets,
                             );
-                            if del.is_some() { form_preset_delete = del; }
-                            if save { form_preset_save_tmpl = Some(form.filename_template.clone()); }
-                            ui.text_edit_singleline(&mut form.filename_template).on_hover_text(fn_tmpl_hint);
+                            if del.is_some() { s.preset_delete = del; }
+                            if save { s.preset_save_tmpl = Some(s.filename_template.clone()); }
+                            ui.text_edit_singleline(&mut s.filename_template).on_hover_text(fn_tmpl_hint);
                             if ui.button("Design…").on_hover_text("Open the Format Designer to preview and compose the template").clicked() {
-                                open_format_designer = true;
+                                s.open_format_designer = true;
                             }
                         });
                         ui.end_row();
 
                         ui.label("Extra args");
-                        ui.text_edit_singleline(&mut form.extra_args);
+                        ui.text_edit_singleline(&mut s.extra_args);
                         ui.end_row();
                     });
                 });
@@ -3874,28 +3880,40 @@ impl StreamArchiverApp {
             },
         );
 
+        let (do_save, closed, open_format_designer, browse_req, preset_delete, preset_save_tmpl) = {
+            let mut f = form_arc.lock().unwrap();
+            (
+                f.do_save,
+                f.closed,
+                f.open_format_designer,
+                f.browse_req.take(),
+                f.preset_delete.take(),
+                f.preset_save_tmpl.take(),
+            )
+        };
+
         if let Some(br) = browse_req {
             self.pending_browse = Some(br);
         }
 
         if do_save {
             self.save_form();
-        } else if do_cancel || !open {
+        } else if closed {
             self.form = None;
         }
 
         if open_format_designer {
-            let tmpl = self.form.as_ref().map(|f| f.filename_template.clone()).unwrap_or_default();
+            let tmpl = self.form.as_ref().map(|f| f.lock().unwrap().filename_template.clone()).unwrap_or_default();
             self.open_format_designer(tmpl, Some(FormatDesignerTarget::MonitorForm));
         }
-        if let Some(id) = form_preset_delete {
+        if let Some(id) = preset_delete {
             if let Err(e) = self.core.store.delete_filename_preset(id) {
                 self.status = format!("Error deleting preset: {e:#}");
             } else {
                 self.custom_presets = self.core.store.get_filename_presets().unwrap_or_default();
             }
         }
-        if let Some(tmpl) = form_preset_save_tmpl {
+        if let Some(tmpl) = preset_save_tmpl {
             self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
                 template: tmpl,
                 name: String::new(),

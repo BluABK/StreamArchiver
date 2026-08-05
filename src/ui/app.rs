@@ -1398,9 +1398,10 @@ impl StreamArchiverApp {
     }
 
     pub(super) fn save_form(&mut self) {
-        let Some(form) = self.form.as_ref() else {
+        let Some(form_arc) = self.form.clone() else {
             return;
         };
+        let form = form_arc.lock().unwrap();
         // Validate before closing the form.
         if form.url.trim().is_empty() {
             self.status = "An instance URL is required.".into();
@@ -2166,10 +2167,10 @@ impl StreamArchiverApp {
 
         if ctx.input_mut(|i| i.consume_shortcut(&ADD)) {
             self.switch_view(View::Streams);
-            self.form = Some(MonitorForm::new_channel(
+            self.form = Some(Arc::new(Mutex::new(MonitorForm::new_channel(
                 &self.monitor_defaults,
                 &self.settings.default_output_dir,
-            ));
+            ))));
         }
         if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
             self.switch_view(View::Settings);
@@ -2247,7 +2248,7 @@ impl StreamArchiverApp {
                             crate::raid_follow::K_MONITOR_RAID_TARGET_SCOPE,
                             self.rows[idx].monitor.id,
                         );
-                        self.form = Some(mf);
+                        self.form = Some(Arc::new(Mutex::new(mf)));
                     }
                 }
             }

@@ -622,6 +622,23 @@ struct MonitorForm {
     /// an inherit chain: off by default. The channel-level half lives on
     /// `ChannelForm::allow_delete`.
     allow_delete: bool,
+    /// Set by the deferred closure on Save/Enter; read back by
+    /// `form_window` next call.
+    do_save: bool,
+    /// Set by the deferred closure on Cancel/close.
+    closed: bool,
+    open_format_designer: bool,
+    browse_req: Option<PendingBrowse>,
+    preset_delete: Option<i64>,
+    preset_save_tmpl: Option<String>,
+    /// Snapshot of `self.monitor_defaults`/`self.settings.default_output_dir`,
+    /// refreshed by `form_window` every call — the deferred closure can't
+    /// reach `self` to re-resolve platform defaults live as the URL/name
+    /// change.
+    monitor_defaults: MonitorDefaults,
+    default_output_dir: String,
+    /// Snapshot of `self.custom_presets`, refreshed every call.
+    custom_presets: Vec<(i64, String, String)>,
 }
 
 impl MonitorForm {
@@ -681,6 +698,15 @@ impl MonitorForm {
             follow_my_raids_play: None,
             exclude_from_auto_play: None,
             allow_delete: false,
+            do_save: false,
+            closed: false,
+            open_format_designer: false,
+            browse_req: None,
+            preset_delete: None,
+            preset_save_tmpl: None,
+            monitor_defaults: defaults.clone(),
+            default_output_dir: default_output_dir.to_string(),
+            custom_presets: Vec::new(),
         }
     }
 
@@ -736,6 +762,16 @@ impl MonitorForm {
             follow_my_raids_play: None,
             exclude_from_auto_play: None,
             allow_delete: false,
+            do_save: false,
+            closed: false,
+            open_format_designer: false,
+            browse_req: None,
+            preset_delete: None,
+            preset_save_tmpl: None,
+            // Refreshed by `form_window` before the very first render.
+            monitor_defaults: MonitorDefaults::default(),
+            default_output_dir: String::new(),
+            custom_presets: Vec::new(),
         }
     }
 
@@ -790,6 +826,15 @@ impl MonitorForm {
             follow_my_raids_play: None,
             exclude_from_auto_play: None,
             allow_delete: false,
+            do_save: false,
+            closed: false,
+            open_format_designer: false,
+            browse_req: None,
+            preset_delete: None,
+            preset_save_tmpl: None,
+            monitor_defaults: defaults.clone(),
+            default_output_dir: default_output_dir.to_string(),
+            custom_presets: Vec::new(),
         }
     }
 
@@ -1548,7 +1593,7 @@ pub struct StreamArchiverApp {
     /// header/filter. Reloaded in `reload_rows` and after any group CRUD.
     channel_groups: Vec<crate::models::ChannelGroup>,
     videos: Vec<Video>,
-    form: Option<MonitorForm>,
+    form: Option<Arc<Mutex<MonitorForm>>>,
     video_form: VideoForm,
     /// Per-platform download defaults editable on the Videos tab (persisted JSON).
     download_defaults: DownloadDefaults,
@@ -2330,7 +2375,10 @@ struct PendingBrowse {
     rx: std::sync::mpsc::Receiver<Option<String>>,
     /// Called on the UI thread once the picker returns a path. Receives `&mut App`
     /// and the selected path; skipped when the user cancels (dialog returns `None`).
-    apply: Box<dyn FnOnce(&mut StreamArchiverApp, String)>,
+    /// `+ Send`: a `MonitorForm` can hold a `PendingBrowse` (`browse_req`) and
+    /// `MonitorForm` itself needs `Send` to live behind `form_window`'s
+    /// deferred-viewport `Arc<Mutex<>>`.
+    apply: Box<dyn FnOnce(&mut StreamArchiverApp, String) + Send>,
 }
 
 /// Loaded rows returned by a background save-form thread; installed by
@@ -2364,7 +2412,7 @@ struct PendingSave {
 /// on the UI thread once the user confirms a selection.
 fn spawn_browse_folder(
     current: &str,
-    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + Send + 'static,
 ) -> PendingBrowse {
     let (tx, rx) = std::sync::mpsc::channel();
     let current = current.to_string();
@@ -2384,7 +2432,7 @@ fn spawn_browse_folder(
 /// Same as [`spawn_browse_folder`] but opens a file picker instead.
 fn spawn_browse_file(
     current: &str,
-    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + Send + 'static,
 ) -> PendingBrowse {
     spawn_browse_file_impl(current, None, apply)
 }
@@ -2395,7 +2443,7 @@ fn spawn_browse_file(
 fn spawn_browse_file_filtered(
     current: &str,
     filter: (&'static str, &'static [&'static str]),
-    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + Send + 'static,
 ) -> PendingBrowse {
     spawn_browse_file_impl(current, Some(filter), apply)
 }
@@ -2403,7 +2451,7 @@ fn spawn_browse_file_filtered(
 fn spawn_browse_file_impl(
     current: &str,
     filter: Option<(&'static str, &'static [&'static str])>,
-    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + Send + 'static,
 ) -> PendingBrowse {
     let (tx, rx) = std::sync::mpsc::channel();
     let current = current.to_string();
@@ -3014,10 +3062,10 @@ impl eframe::App for StreamArchiverApp {
                         )
                         .clicked()
                     {
-                        self.form = Some(MonitorForm::new_channel(
+                        self.form = Some(Arc::new(Mutex::new(MonitorForm::new_channel(
                             &self.monitor_defaults,
                             &self.settings.default_output_dir,
-                        ));
+                        ))));
                     }
                     if ui
                         .button("➕ Channel")
@@ -3311,10 +3359,10 @@ impl eframe::App for StreamArchiverApp {
             }
         });
         if ctx_add_stream {
-            self.form = Some(MonitorForm::new_channel(
+            self.form = Some(Arc::new(Mutex::new(MonitorForm::new_channel(
                 &self.monitor_defaults,
                 &self.settings.default_output_dir,
-            ));
+            ))));
         }
         if ctx_add_channel {
             self.channel_form = Some(ChannelForm {

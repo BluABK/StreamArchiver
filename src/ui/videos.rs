@@ -2089,8 +2089,8 @@ impl StreamArchiverApp {
         if apply {
             match &target {
                 Some(FormatDesignerTarget::MonitorForm) => {
-                    if let Some(form) = self.form.as_mut() {
-                        form.filename_template = new_template.clone();
+                    if let Some(form) = self.form.as_ref() {
+                        form.lock().unwrap().filename_template = new_template.clone();
                     }
                 }
                 Some(FormatDesignerTarget::VideoForm) => {
