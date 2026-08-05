@@ -179,6 +179,16 @@ pub(super) struct ImportDialog {
     pub(super) quality_override: String,
     /// Batch output-directory override. Empty = per-platform default output dir.
     pub(super) out_dir_override: String,
+    /// Existing channels this import can target instead of creating a new
+    /// one — snapshot of `self.rows`, refreshed by the wrapper every call
+    /// (the deferred closure can't reach `self` to read it directly).
+    pub(super) existing_channels: Vec<(i64, String)>,
+    /// "Import N selected" clicked — applied by the wrapper.
+    pub(super) do_import: bool,
+    /// "🔗 Guess existing channels" clicked — applied by the wrapper.
+    pub(super) do_guess: bool,
+    /// Close/Cancel clicked, or the OS close button.
+    pub(super) closed: bool,
 }
 
 /// Self-mutating actions collected while rendering the Streams grid (whose
@@ -5943,7 +5953,7 @@ impl StreamArchiverApp {
             _ => "Import channels",
         }
         .to_string();
-        self.import_dialog = Some(ImportDialog {
+        self.import_dialog = Some(Arc::new(Mutex::new(ImportDialog {
             title,
             load,
             rows: Vec::new(),
@@ -5953,25 +5963,29 @@ impl StreamArchiverApp {
             status: String::new(),
             quality_override: String::new(),
             out_dir_override: String::new(),
-        });
+            existing_channels: Vec::new(),
+            do_import: false,
+            do_guess: false,
+            closed: false,
+        })));
     }
 
     #[allow(deprecated)]
     pub(super) fn import_window(&mut self, ctx: &egui::Context) {
-        if self.import_dialog.is_none() {
+        let Some(state) = self.import_dialog.clone() else {
             return;
-        }
+        };
         // Promote a completed background fetch into editable rows once — this needs
-        // `self.rows` to mark channels already added, so it happens before the
-        // viewport closure borrows the dialog.
+        // `self.rows` to mark channels already added, so it happens here in the
+        // wrapper (the deferred closure can't reach `self`).
         let promote = {
-            let d = self.import_dialog.as_ref().unwrap();
+            let d = state.lock().unwrap();
             !d.loaded && matches!(&*d.load.lock().unwrap(), ImportLoadState::Loaded { .. })
         };
         if promote {
             // Take the guard once (a second .lock() on the same thread would deadlock).
             let (cands, resolved) = {
-                let d = self.import_dialog.as_ref().unwrap();
+                let d = state.lock().unwrap();
                 let mut g = d.load.lock().unwrap();
                 match std::mem::replace(&mut *g, ImportLoadState::Loading) {
                     ImportLoadState::Loaded { cands, resolved } => (cands, resolved),
@@ -6002,7 +6016,7 @@ impl StreamArchiverApp {
             // whose page scrape failed).
             let existing_names: HashSet<String> =
                 self.rows.iter().map(|r| r.channel.name.to_lowercase()).collect();
-            let d = self.import_dialog.as_mut().unwrap();
+            let mut d = state.lock().unwrap();
             d.rows = cands
                 .into_iter()
                 .map(|c| {
@@ -6025,9 +6039,8 @@ impl StreamArchiverApp {
         }
 
         // Existing channels this import can target instead of creating a new
-        // one — computed here (not inside the viewport closure, which only
-        // captures `dialog`, not `self`) so it's a plain owned local the
-        // closure can read freely.
+        // one — refreshed every call (the deferred closure can't reach `self`
+        // to read `self.rows` directly).
         let mut existing_channels: Vec<(i64, String)> = self
             .rows
             .iter()
@@ -6036,24 +6049,23 @@ impl StreamArchiverApp {
             .into_iter()
             .collect();
         existing_channels.sort_by(|a, b| a.1.cmp(&b.1));
+        state.lock().unwrap().existing_channels = existing_channels.clone();
 
-        let Some(dialog) = &mut self.import_dialog else {
-            return;
-        };
-        let mut open = true;
-        let mut do_import = false;
-        let mut do_close = false;
-        let mut do_guess = false;
-
-        ctx.show_viewport_immediate(
+        let title = state.lock().unwrap().title.clone();
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("import_vp"),
             egui::ViewportBuilder::default()
-                .with_title(dialog.title.clone())
+                .with_title(title)
                 .with_inner_size([620.0, 560.0]),
-            |ctx, _class| {
+            state.clone(),
+            shared,
+            |ctx, dialog, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    dialog.closed = true;
                 }
+                let existing_channels = dialog.existing_channels.clone();
 
                 if !dialog.loaded {
                     egui::CentralPanel::default().show(ctx, |ui| {
@@ -6078,7 +6090,7 @@ impl StreamArchiverApp {
                         }
                         ui.add_space(8.0);
                         if ui.button("Close").clicked() {
-                            do_close = true;
+                            dialog.closed = true;
                         }
                     });
                     return;
@@ -6111,10 +6123,10 @@ impl StreamArchiverApp {
                             .add_enabled(n > 0, egui::Button::new(format!("Import {n} selected")))
                             .clicked()
                         {
-                            do_import = true;
+                            dialog.do_import = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_close = true;
+                            dialog.closed = true;
                         }
                         if pending > 0 {
                             ui.weak(format!(
@@ -6205,7 +6217,7 @@ impl StreamArchiverApp {
                             )
                             .clicked()
                         {
-                            do_guess = true;
+                            dialog.do_guess = true;
                         }
                     });
                     egui::CollapsingHeader::new("Overrides for this import")
@@ -6384,10 +6396,20 @@ impl StreamArchiverApp {
             },
         );
 
+        let (do_import, do_guess, closed) = {
+            let mut d = state.lock().unwrap();
+            let result = (d.do_import, d.do_guess, d.closed);
+            d.do_import = false;
+            d.do_guess = false;
+            result
+        };
+
         // Collect the chosen rows before the dialog borrow ends (the create + reload
         // below need `&mut self`).
         let to_create: Vec<(String, String, bool, bool, Option<i64>)> = if do_import {
-            dialog
+            state
+                .lock()
+                .unwrap()
                 .rows
                 .iter()
                 .filter(|r| r.selected && !r.already && !r.guess_pending)
@@ -6398,9 +6420,10 @@ impl StreamArchiverApp {
         } else {
             Vec::new()
         };
-        let quality_override = dialog.quality_override.clone();
-        let out_dir_override = dialog.out_dir_override.clone();
-        let close = do_close || !open;
+        let (quality_override, out_dir_override) = {
+            let d = state.lock().unwrap();
+            (d.quality_override.clone(), d.out_dir_override.clone())
+        };
 
         if do_guess {
             // Off the render path (button-triggered, not per-frame): one
@@ -6420,8 +6443,8 @@ impl StreamArchiverApp {
                     (*id, links)
                 })
                 .collect();
-            let dialog = self.import_dialog.as_mut().unwrap();
-            for row in &mut dialog.rows {
+            let mut d = state.lock().unwrap();
+            for row in &mut d.rows {
                 if row.already || row.target_channel.is_some() {
                     continue;
                 }
@@ -6473,7 +6496,7 @@ impl StreamArchiverApp {
                 )
             };
             self.import_dialog = None;
-        } else if close {
+        } else if closed {
             self.import_dialog = None;
         }
     }

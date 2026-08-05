@@ -2169,7 +2169,7 @@ pub struct StreamArchiverApp {
     /// Shared state of the interactive "Connect YouTube" (Google) device-code flow.
     google_flow: Arc<Mutex<AuthFlow>>,
     /// Open "Import followed/subscriptions" confirmation dialog, if any.
-    import_dialog: Option<ImportDialog>,
+    import_dialog: Option<Arc<Mutex<ImportDialog>>>,
     /// Stored collab history keyed by `(monitor_id, stream_id)` → partner
     /// names, preloaded on row reload — lets stream/take rows show which
     /// collab a past broadcast was without per-frame DB queries.
