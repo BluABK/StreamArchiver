@@ -417,13 +417,17 @@ Each object has these fields:\n\
     )
 }
 
-/// Run the LLM CLI for one image+model using `--output-format json`.
-/// Returns `(result_text, stats)` on success, `None` on any failure.
-/// If the output isn't a recognisable JSON envelope (older CLI), falls back to
-/// treating stdout as raw text with zeroed stats so the parse step still runs.
-async fn run_cli(command: &str, model: &str, dir: &str, prompt: &str, opts: &OcrOpts) -> Option<(String, OcrCallStats)> {
-    let timeout = Duration::from_secs(if opts.timeout_secs > 0 { opts.timeout_secs } else { DEFAULT_TIMEOUT_SECS });
-    let mut cmd = tokio::process::Command::new(command);
+/// Builds the `claude --model ... --add-dir ... -p ...` command against a
+/// given executable (bare name or resolved absolute path) — shared so the
+/// PATH-fallback retry in [`run_cli`] doesn't have to duplicate flag setup.
+fn build_ocr_command(
+    exe: impl AsRef<std::ffi::OsStr>,
+    model: &str,
+    dir: &str,
+    prompt: &str,
+    opts: &OcrOpts,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
     cmd.args(["--model", model, "--add-dir", dir, "-p", prompt, "--output-format", "json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -438,17 +442,62 @@ async fn run_cli(command: &str, model: &str, dir: &str, prompt: &str, opts: &Ocr
     }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
 
+/// A bare command name (`command` has no path component) is resolved against
+/// the *current process's* inherited `PATH` — for a long-running GUI app that
+/// can lag well behind a PATH edit made after the app was last launched (the
+/// standard Claude Code installer drops the CLI at `%USERPROFILE%\.local\bin`,
+/// which is exactly the kind of freshly-added PATH entry an already-running
+/// process won't see). Probe that well-known install location directly before
+/// giving up, so a stale-PATH GUI process doesn't need a manual restart to
+/// pick up a CLI installed after it launched.
+fn windows_command_fallback(command: &str) -> Option<std::path::PathBuf> {
+    if command.contains('/') || command.contains('\\') {
+        return None;
+    }
+    let home = std::env::var_os("USERPROFILE")?;
+    let candidate = std::path::PathBuf::from(home).join(".local").join("bin").join(format!("{command}.exe"));
+    crate::iomon::fs::is_file_sync(crate::iomon::Cat::Detector, &candidate).then_some(candidate)
+}
+
+/// Run the LLM CLI for one image+model using `--output-format json`.
+/// Returns `(result_text, stats)` on success, `None` on any failure.
+/// If the output isn't a recognisable JSON envelope (older CLI), falls back to
+/// treating stdout as raw text with zeroed stats so the parse step still runs.
+async fn run_cli(command: &str, model: &str, dir: &str, prompt: &str, opts: &OcrOpts) -> Option<(String, OcrCallStats)> {
+    let timeout = Duration::from_secs(if opts.timeout_secs > 0 { opts.timeout_secs } else { DEFAULT_TIMEOUT_SECS });
+    let mut cmd = build_ocr_command(command, model, dir, prompt, opts);
+
+    let budget = opts.max_budget_usd.trim();
+    let effort = opts.effort.trim();
     let mut log_flags = format!("--model {model}");
     if !budget.is_empty() { log_flags.push_str(&format!(" --max-budget-usd {budget}")); }
     if !effort.is_empty() { log_flags.push_str(&format!(" --effort {effort}")); }
     info!("OCR: invoking '{command}' {log_flags} (timeout {timeout:?}, dir {dir})");
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            warn!("OCR: failed to spawn '{command}': {e} (is the CLI installed/on PATH?)");
-            return None;
-        }
+        Err(e) => match windows_command_fallback(command) {
+            Some(path) => {
+                info!(
+                    "OCR: '{command}' not found via inherited PATH ({e}); retrying at {}",
+                    path.display()
+                );
+                let mut retry_cmd = build_ocr_command(&path, model, dir, prompt, opts);
+                match retry_cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        warn!("OCR: fallback spawn at {} also failed: {e2}", path.display());
+                        return None;
+                    }
+                }
+            }
+            None => {
+                warn!("OCR: failed to spawn '{command}': {e} (is the CLI installed/on PATH?)");
+                return None;
+            }
+        },
     };
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
@@ -625,6 +674,14 @@ mod tests {
             timeout_secs: 0,
             effort: String::new(),
         }
+    }
+
+    #[test]
+    fn windows_command_fallback_rejects_paths() {
+        // A command that's already a path (user set an explicit absolute path
+        // in Settings) must never be reinterpreted as a bare-name lookup.
+        assert!(windows_command_fallback("C:/tools/claude").is_none());
+        assert!(windows_command_fallback(r"C:\tools\claude.exe").is_none());
     }
 
     #[test]

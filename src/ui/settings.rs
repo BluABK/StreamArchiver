@@ -874,7 +874,11 @@ impl StreamArchiverApp {
                     )
                     .on_hover_text(
                         "Executable to shell out to for image OCR. Must be on PATH (or an absolute \
-                         path) and accept `--model <m> --add-dir <dir> -p <prompt>`. Default: claude.",
+                         path) and accept `--model <m> --add-dir <dir> -p <prompt>`. Default: claude. \
+                         If a bare name isn't found (e.g. this app was already running when the CLI \
+                         was installed, so it never saw the updated PATH), the default install \
+                         location %USERPROFILE%\\.local\\bin\\<name>.exe is tried as a fallback before \
+                         the call is marked failed.",
                     );
                     ui.end_row();
                     ui.label("Model");

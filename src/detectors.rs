@@ -517,6 +517,52 @@ pub(crate) fn fnv64(data: &[u8]) -> u64 {
     h
 }
 
+/// File (or grow) a warning alert so a schedule-OCR CLI that can't be spawned
+/// at all surfaces in the 🚨 Warnings window / 🔔 feed instead of only living
+/// as a background-task row that scrolls away — this repeats on every image
+/// until fixed, so it's easy to miss otherwise. Never touches recording.
+fn file_ocr_cli_failed_alert(
+    store: &crate::store::Store,
+    events: &EventTx,
+    monitor_id: i64,
+    channel_name: &str,
+    command: &str,
+) {
+    let alert = crate::store::NewCaptureAlert {
+        kind: "ocr_cli_failed".to_string(),
+        severity: "warning".to_string(),
+        source: "schedule_ocr".to_string(),
+        take_key: format!("ocr_cli:{monitor_id}"),
+        monitor_id: Some(monitor_id),
+        recording_id: None,
+        video_id: None,
+        channel: channel_name.to_string(),
+        count: 1,
+        lost_segments: 0,
+        last_line: format!(
+            "Schedule OCR couldn't run '{command}' — is it installed and on PATH? Set an \
+             absolute path in Settings → Schedule → Image OCR if it's installed but not \
+             visible to this app (e.g. PATH was updated after this app was launched)."
+        ),
+    };
+    match store.upsert_capture_alert(&alert) {
+        Ok((id, was_new)) => {
+            if was_new {
+                let _ = events.send(crate::events::AppEvent::CaptureAlert {
+                    severity: alert.severity.clone(),
+                    title: format!("Schedule OCR CLI failed — {channel_name}"),
+                    body: alert.last_line.clone(),
+                    monitor_id: Some(monitor_id),
+                    channel: channel_name.to_string(),
+                    recording_id: None,
+                    ref_key: format!("capalert:{id}"),
+                });
+            }
+        }
+        Err(e) => warn!("OCR: failed to file CLI-failed alert: {e:#}"),
+    }
+}
+
 impl DetectContext {
     pub fn new(store: Arc<Store>, events: EventTx) -> DetectContext {
         let browser = store
@@ -2104,7 +2150,7 @@ impl DetectContext {
             .unwrap_or(source_id);
         let detail = format!("{source_label} · {}", opts.model);
         let result = self
-            .ocr_one_with_events(channel_name, detail, path, &opts)
+            .ocr_one_with_events(monitor_id, channel_name, detail, path, &opts)
             .await;
 
         let segs = result.segments?;
@@ -2120,6 +2166,7 @@ impl DetectContext {
     /// single-image cache path and the multi-post community walk.
     async fn ocr_one_with_events(
         &self,
+        monitor_id: i64,
         channel_name: &str,
         detail: String,
         path: &Path,
@@ -2157,6 +2204,13 @@ impl DetectContext {
             }
             None => {
                 if result.cli_failures > 0 && result.cli_calls.is_empty() {
+                    file_ocr_cli_failed_alert(
+                        self.store.as_ref(),
+                        &self.events,
+                        monitor_id,
+                        channel_name,
+                        &opts.command,
+                    );
                     crate::events::TaskOutcome::Failed(format!(
                         "CLI failed — is '{}' on PATH?",
                         opts.command
@@ -2357,7 +2411,7 @@ impl DetectContext {
                 )
             };
             let result = self
-                .ocr_one_with_events(&row.channel.name, detail, path, &opts)
+                .ocr_one_with_events(row.monitor.id, &row.channel.name, detail, path, &opts)
                 .await;
 
             // Persist the decode (empty included) so an unchanged image is never
