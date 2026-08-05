@@ -1655,6 +1655,9 @@ pub struct StreamArchiverApp {
     scheduled_recordings: Vec<crate::models::ScheduledRecordingWithNames>,
     scheduled_recording_form: Option<ScheduledRecordingForm>,
     confirm_delete_scheduled_recording: Option<Arc<Mutex<ConfirmDialogState<(i64, String)>>>>,
+    /// Deferred-viewport state while the Scheduled recordings window is open
+    /// (None = closed) — see [`schedule::SchedRecsPopupState`].
+    scheduled_recordings_popup: Option<Arc<Mutex<schedule::SchedRecsPopupState>>>,
     /// Scheduled recordings window: the "+ Add new" instance-picker
     /// dropdown's selection (session-only, not persisted to the DB). Must
     /// live on `self`, not a per-frame local — a local re-initialized to

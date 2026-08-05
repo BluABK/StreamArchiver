@@ -19,6 +19,26 @@ pub(super) struct ScheduleDayState {
     pub(super) closed: bool,
 }
 
+/// Deferred-viewport state for `scheduled_recordings_window`. `rows`/
+/// `scheduled_recordings` are refreshed by the wrapper every call (cheap —
+/// both were already plain `self` reads every frame pre-migration);
+/// `add_monitor` mirrors `self.sched_rec_add_monitor` (synced back after
+/// every call, same as `hype_mark_mins_ago`-style session state elsewhere).
+pub(super) struct SchedRecsPopupState {
+    pub(super) rows: Vec<MonitorWithChannel>,
+    pub(super) scheduled_recordings: Vec<ScheduledRecordingWithNames>,
+    pub(super) add_monitor: i64,
+    pub(super) act: Option<SchedRecsAct>,
+    pub(super) closed: bool,
+}
+
+pub(super) enum SchedRecsAct {
+    Edit(i64),
+    Delete(i64, String),
+    ToggleEnabled(i64, bool),
+    AddNew(i64),
+}
+
 /// The Schedule tab's calendar granularity.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ScheduleMode {
@@ -3813,18 +3833,12 @@ impl StreamArchiverApp {
     /// Recurrence/Next run/Duration/Enabled) with Edit/Delete row actions and
     /// an "+ Add new" picker over every known instance.
     #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn scheduled_recordings_window(&mut self, ctx: &egui::Context) {
         if !self.show_scheduled_recordings {
+            self.scheduled_recordings_popup = None;
             return;
         }
-        let mut open = true;
-        enum Act {
-            Edit(i64),
-            Delete(i64, String),
-            ToggleEnabled(i64, bool),
-            AddNew(i64),
-        }
-        let mut act: Option<Act> = None;
         // "+ Add new" instance picker selection lives on `self` (see field
         // doc) — reconcile it once per frame: fall back to the first row
         // when unset, or when the previous selection's instance is gone.
@@ -3832,41 +3846,64 @@ impl StreamArchiverApp {
             self.sched_rec_add_monitor = self.rows.first().map(|r| r.monitor.id).unwrap_or(0);
         }
 
-        ctx.show_viewport_immediate(
+        if self.scheduled_recordings_popup.is_none() {
+            self.scheduled_recordings_popup = Some(Arc::new(Mutex::new(SchedRecsPopupState {
+                rows: Vec::new(),
+                scheduled_recordings: Vec::new(),
+                add_monitor: self.sched_rec_add_monitor,
+                act: None,
+                closed: false,
+            })));
+        }
+        let popup_state = self.scheduled_recordings_popup.clone().unwrap();
+        // Refreshed every call — both were already plain `self` reads every
+        // frame pre-migration, so this is no new cost.
+        {
+            let mut s = popup_state.lock().unwrap();
+            s.rows = self.rows.clone();
+            s.scheduled_recordings = self.scheduled_recordings.clone();
+            s.add_monitor = self.sched_rec_add_monitor;
+        }
+
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("sched_recs_vp"),
             egui::ViewportBuilder::default()
                 .with_title("📅 Scheduled recordings")
                 .with_inner_size([720.0, 420.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} scheduled recording(s)", self.scheduled_recordings.len()));
+                        ui.label(format!("{} scheduled recording(s)", s.scheduled_recordings.len()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             egui::ComboBox::from_id_salt("sched_rec_add_monitor")
                                 .selected_text(
-                                    self.rows
+                                    s.rows
                                         .iter()
-                                        .find(|r| r.monitor.id == self.sched_rec_add_monitor)
+                                        .find(|r| r.monitor.id == s.add_monitor)
                                         .map(|r| format!("{} — {}", r.channel.name, r.monitor.url))
                                         .unwrap_or_else(|| "(no instances yet)".to_string()),
                                 )
                                 .show_ui(ui, |ui| {
-                                    for r in &self.rows {
+                                    for r in &s.rows.clone() {
                                         ui.selectable_value(
-                                            &mut self.sched_rec_add_monitor,
+                                            &mut s.add_monitor,
                                             r.monitor.id,
                                             format!("{} — {}", r.channel.name, r.monitor.url),
                                         );
                                     }
                                 });
                             if ui
-                                .add_enabled(!self.rows.is_empty(), egui::Button::new("➕ Add new"))
+                                .add_enabled(!s.rows.is_empty(), egui::Button::new("➕ Add new"))
                                 .clicked()
                             {
-                                act = Some(Act::AddNew(self.sched_rec_add_monitor));
+                                s.act = Some(SchedRecsAct::AddNew(s.add_monitor));
                             }
                         });
                     });
@@ -3884,7 +3921,7 @@ impl StreamArchiverApp {
                                 ui.strong("Duration");
                                 ui.strong("");
                                 ui.end_row();
-                                for row in &self.scheduled_recordings {
+                                for row in &s.scheduled_recordings {
                                     let r = &row.rec;
                                     ui.label(&row.channel_name);
                                     ui.label(&row.monitor_url);
@@ -3900,13 +3937,13 @@ impl StreamArchiverApp {
                                     ui.horizontal(|ui| {
                                         let mut enabled = r.enabled;
                                         if ui.checkbox(&mut enabled, "").changed() {
-                                            act = Some(Act::ToggleEnabled(r.id, enabled));
+                                            s.act = Some(SchedRecsAct::ToggleEnabled(r.id, enabled));
                                         }
                                         if ui.button("✏").on_hover_text("Edit").clicked() {
-                                            act = Some(Act::Edit(r.id));
+                                            s.act = Some(SchedRecsAct::Edit(r.id));
                                         }
                                         if ui.button("🗑").on_hover_text("Delete").clicked() {
-                                            act = Some(Act::Delete(
+                                            s.act = Some(SchedRecsAct::Delete(
                                                 r.id,
                                                 format!("{} — {}", row.channel_name, row.monitor_url),
                                             ));
@@ -3920,8 +3957,18 @@ impl StreamArchiverApp {
             },
         );
 
+        let (add_monitor, closed, act) = {
+            let mut s = popup_state.lock().unwrap();
+            (s.add_monitor, s.closed, s.act.take())
+        };
+        self.sched_rec_add_monitor = add_monitor;
+        if closed {
+            self.show_scheduled_recordings = false;
+            self.scheduled_recordings_popup = None;
+        }
+
         match act {
-            Some(Act::AddNew(monitor_id)) => {
+            Some(SchedRecsAct::AddNew(monitor_id)) => {
                 if let Some(row) = self.rows.iter().find(|r| r.monitor.id == monitor_id) {
                     self.scheduled_recording_form = Some(ScheduledRecordingForm::new_for_monitor(
                         monitor_id,
@@ -3930,15 +3977,15 @@ impl StreamArchiverApp {
                     ));
                 }
             }
-            Some(Act::Edit(id)) => {
+            Some(SchedRecsAct::Edit(id)) => {
                 if let Some(row) = self.scheduled_recordings.iter().find(|r| r.rec.id == id) {
                     self.scheduled_recording_form = Some(ScheduledRecordingForm::from_existing(row));
                 }
             }
-            Some(Act::Delete(id, name)) => {
+            Some(SchedRecsAct::Delete(id, name)) => {
                 self.confirm_delete_scheduled_recording = Some(ConfirmDialogState::open((id, name)));
             }
-            Some(Act::ToggleEnabled(id, enabled)) => {
+            Some(SchedRecsAct::ToggleEnabled(id, enabled)) => {
                 let next_run_at = if enabled {
                     self.scheduled_recordings
                         .iter()
@@ -3953,10 +4000,6 @@ impl StreamArchiverApp {
                 }
             }
             None => {}
-        }
-
-        if !open {
-            self.show_scheduled_recordings = false;
         }
     }
 
