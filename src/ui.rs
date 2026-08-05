@@ -1607,7 +1607,7 @@ pub struct StreamArchiverApp {
     /// Shared state of the async "List formats" probe (Videos tab).
     format_probe: Arc<Mutex<FormatProbe>>,
     /// Backing state for the "Recover VOD" dialog (`None` = closed).
-    recover_form: Option<RecoverVodForm>,
+    recover_form: Option<Arc<Mutex<RecoverVodForm>>>,
     /// Shared state of the async Recover-VOD CDN probe.
     recover_probe: Arc<Mutex<RecoverProbe>>,
     /// Shared state of the async "Parse URL" start-time scrape.

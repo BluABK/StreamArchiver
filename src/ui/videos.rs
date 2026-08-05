@@ -39,6 +39,14 @@ pub(super) struct RecoverVodForm {
     pub(super) deleted: bool,
     /// The `/videos/<id>` archive id when known (enables the GQL fast-path).
     pub(super) vod_id: Option<String>,
+    /// Set by the deferred closure; drained by `recover_vod_window` next
+    /// call (and reset, same as `form_window`'s `do_save`/`closed` — see
+    /// commit 1f7a7a0).
+    pub(super) do_parse: bool,
+    pub(super) do_probe: bool,
+    pub(super) do_recover: bool,
+    pub(super) do_cancel: bool,
+    pub(super) closed: bool,
 }
 
 /// State of the async Recover-VOD CDN probe (the dry-run before downloading).
@@ -1289,7 +1297,7 @@ impl StreamArchiverApp {
         }
         *self.recover_probe.lock().unwrap() = RecoverProbe::Idle;
         *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
-        self.recover_form = Some(RecoverVodForm {
+        self.recover_form = Some(Arc::new(Mutex::new(RecoverVodForm {
             login,
             broadcast_id: seed.stream_id,
             start_utc: Self::fmt_utc(seed.start_epoch),
@@ -1300,7 +1308,12 @@ impl StreamArchiverApp {
             output_dir: String::new(),
             deleted: seed.deleted,
             vod_id: seed.vod_id,
-        });
+            do_parse: false,
+            do_probe: false,
+            do_recover: false,
+            do_cancel: false,
+            closed: false,
+        })));
     }
 
     /// Open a blank Recover-VOD dialog for a VOD the app never tracked (the result
@@ -1308,7 +1321,7 @@ impl StreamArchiverApp {
     pub(super) fn open_recover_vod_manual(&mut self) {
         *self.recover_probe.lock().unwrap() = RecoverProbe::Idle;
         *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
-        self.recover_form = Some(RecoverVodForm {
+        self.recover_form = Some(Arc::new(Mutex::new(RecoverVodForm {
             login: String::new(),
             broadcast_id: String::new(),
             start_utc: String::new(),
@@ -1325,13 +1338,19 @@ impl StreamArchiverApp {
             ),
             deleted: true,
             vod_id: None,
-        });
+            do_parse: false,
+            do_probe: false,
+            do_recover: false,
+            do_cancel: false,
+            closed: false,
+        })));
     }
 
     /// Kick off the async CDN probe (dry-run): locate the live playlist, list the
     /// available qualities, and count present/muted/missing segments.
     pub(super) fn start_recover_probe(&mut self, ctx: egui::Context) {
-        let Some(f) = self.recover_form.as_ref() else { return };
+        let Some(form_arc) = self.recover_form.clone() else { return };
+        let f = form_arc.lock().unwrap();
         let Some(start_epoch) = Self::parse_utc(&f.start_utc) else {
             self.status = "Start time must be YYYY-MM-DD HH:MM:SS (UTC).".into();
             return;
@@ -1396,12 +1415,13 @@ impl StreamArchiverApp {
         let url = self
             .recover_form
             .as_ref()
-            .map(|f| f.url_paste.trim().to_string())
+            .map(|f| f.lock().unwrap().url_paste.trim().to_string())
             .unwrap_or_default();
 
         // Twitch VOD URL → GQL (exact folder, works for muted-but-online VODs).
         if let Some(vid) = crate::recovery::scrape::twitch_vod_id(&url) {
-            if let Some(f) = self.recover_form.as_mut() {
+            if let Some(f) = self.recover_form.as_ref() {
+                let mut f = f.lock().unwrap();
                 f.vod_id = Some(vid.clone());
                 f.deleted = false; // a resolvable /videos/ id means it's still online
             }
@@ -1425,7 +1445,8 @@ impl StreamArchiverApp {
         }
 
         // Third-party tracker URL → parse ids from the path + scrape the start time.
-        let Some(f) = self.recover_form.as_mut() else { return };
+        let Some(form_arc) = self.recover_form.clone() else { return };
+        let mut f = form_arc.lock().unwrap();
         let Some(parsed) = crate::recovery::scrape::parse_vod_url(&url) else {
             self.status =
                 "Unrecognized URL — paste a twitch.tv/videos/<id> or a TwitchTracker/StreamsCharts/SullyGnome /streams/<id> link."
@@ -1457,26 +1478,25 @@ impl StreamArchiverApp {
 
     /// The Recover-VOD dialog window.
     #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn recover_vod_window(&mut self, ctx: &egui::Context) {
-        if self.recover_form.is_none() {
+        let Some(form_arc) = self.recover_form.clone() else {
             return;
-        }
+        };
         // Apply an async "Parse URL" result into the form.
         let scrape = self.recover_scrape.lock().unwrap().clone();
         match scrape {
             RecoverScrape::Filled(epoch) => {
-                if let Some(f) = self.recover_form.as_mut() {
-                    f.start_utc = Self::fmt_utc(epoch);
-                }
+                form_arc.lock().unwrap().start_utc = Self::fmt_utc(epoch);
                 *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
             }
             RecoverScrape::FilledFull { login, broadcast_id, start_epoch } => {
-                if let Some(f) = self.recover_form.as_mut() {
-                    f.login = login;
-                    f.broadcast_id = broadcast_id;
-                    f.start_utc = Self::fmt_utc(start_epoch);
-                    f.went_live_approx = false;
-                }
+                let mut f = form_arc.lock().unwrap();
+                f.login = login;
+                f.broadcast_id = broadcast_id;
+                f.start_utc = Self::fmt_utc(start_epoch);
+                f.went_live_approx = false;
+                drop(f);
                 *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
             }
             _ => {}
@@ -1488,23 +1508,18 @@ impl StreamArchiverApp {
         };
         let probe = self.recover_probe.lock().unwrap().clone();
 
-        let mut open = true;
-        let mut do_probe = false;
-        let mut do_parse = false;
-        let mut do_recover = false;
-        let mut do_cancel = false;
-
-        // Snapshot form fields for editing (written back after the closure).
-        let mut f = self.recover_form.take().unwrap();
-
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("recover_vod_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Recover Twitch VOD")
                 .with_inner_size([560.0, 480.0]),
-            |ctx, _class| {
+            form_arc.clone(),
+            shared,
+            move |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label(
@@ -1523,30 +1538,30 @@ impl StreamArchiverApp {
                             ui.label("Paste URL");
                             ui.horizontal(|ui| {
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut f.url_paste)
+                                    egui::TextEdit::singleline(&mut s.url_paste)
                                         .hint_text("twitch.tv/videos/<id> or twitchtracker.com/<login>/streams/<id>")
                                         .desired_width(280.0),
                                 );
                                 if ui.button("Parse").clicked() {
-                                    do_parse = true;
+                                    s.do_parse = true;
                                 }
                             });
                             ui.end_row();
 
                             ui.label("Streamer login");
-                            ui.text_edit_singleline(&mut f.login);
+                            ui.text_edit_singleline(&mut s.login);
                             ui.end_row();
 
                             ui.label("Broadcast id");
                             ui.add(
-                                egui::TextEdit::singleline(&mut f.broadcast_id)
+                                egui::TextEdit::singleline(&mut s.broadcast_id)
                                     .hint_text("the /streams/<id> number, not /videos/<id>"),
                             );
                             ui.end_row();
 
                             ui.label("Start (UTC)");
                             ui.add(
-                                egui::TextEdit::singleline(&mut f.start_utc)
+                                egui::TextEdit::singleline(&mut s.start_utc)
                                     .hint_text("YYYY-MM-DD HH:MM:SS"),
                             );
                             ui.end_row();
@@ -1558,20 +1573,20 @@ impl StreamArchiverApp {
                             };
                             if quals.is_empty() {
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut f.quality)
+                                    egui::TextEdit::singleline(&mut s.quality)
                                         .hint_text("auto / source (probe to list)"),
                                 );
                             } else {
                                 egui::ComboBox::from_id_salt("recover_quality")
-                                    .selected_text(if f.quality.is_empty() {
+                                    .selected_text(if s.quality.is_empty() {
                                         "auto (source)".to_string()
                                     } else {
-                                        f.quality.clone()
+                                        s.quality.clone()
                                     })
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut f.quality, String::new(), "auto (source)");
+                                        ui.selectable_value(&mut s.quality, String::new(), "auto (source)");
                                         for q in &quals {
-                                            ui.selectable_value(&mut f.quality, q.clone(), q);
+                                            ui.selectable_value(&mut s.quality, q.clone(), q);
                                         }
                                     });
                             }
@@ -1580,7 +1595,7 @@ impl StreamArchiverApp {
                             ui.label("Options");
                             ui.vertical(|ui| {
                                 ui.checkbox(
-                                    &mut f.deleted,
+                                    &mut s.deleted,
                                     "Deleted VOD (validate every segment)",
                                 )
                                 .on_hover_text(
@@ -1589,7 +1604,7 @@ impl StreamArchiverApp {
                                      VOD that still exists but is muted.",
                                 );
                                 ui.checkbox(
-                                    &mut f.went_live_approx,
+                                    &mut s.went_live_approx,
                                     "Start time is approximate (widen search)",
                                 );
                             });
@@ -1656,7 +1671,7 @@ impl StreamArchiverApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("🔎  Probe").clicked() {
-                            do_probe = true;
+                            s.do_probe = true;
                         }
                         let found = matches!(probe, RecoverProbe::Found { .. });
                         if ui
@@ -1664,18 +1679,27 @@ impl StreamArchiverApp {
                             .on_hover_text("Download & mux the surviving segments into an MKV")
                             .clicked()
                         {
-                            do_recover = true;
+                            s.do_recover = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                            s.do_cancel = true;
                         }
                     });
                 });
             },
         );
 
-        // Write the (possibly edited) form back.
-        self.recover_form = Some(f);
+        let (do_parse, do_probe, do_recover, do_cancel, mut closed) = {
+            let mut s = form_arc.lock().unwrap();
+            let result = (s.do_parse, s.do_probe, s.do_recover, s.do_cancel, s.closed);
+            // Consume — see commit 1f7a7a0.
+            s.do_parse = false;
+            s.do_probe = false;
+            s.do_recover = false;
+            s.do_cancel = false;
+            s.closed = false;
+            result
+        };
 
         if do_parse {
             self.parse_recover_url(ctx.clone());
@@ -1685,12 +1709,12 @@ impl StreamArchiverApp {
         }
         if do_recover {
             self.submit_recover_vod();
-            open = false;
+            closed = true;
         }
         if do_cancel {
-            open = false;
+            closed = true;
         }
-        if !open {
+        if closed {
             self.recover_form = None;
             *self.recover_probe.lock().unwrap() = RecoverProbe::Idle;
             *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
@@ -1699,7 +1723,8 @@ impl StreamArchiverApp {
 
     /// Fire the recovery download for the current form and close the dialog.
     pub(super) fn submit_recover_vod(&mut self) {
-        let Some(f) = self.recover_form.as_ref() else { return };
+        let Some(form_arc) = self.recover_form.clone() else { return };
+        let f = form_arc.lock().unwrap();
         let Some(start_epoch) = Self::parse_utc(&f.start_utc) else {
             self.status = "Start time must be YYYY-MM-DD HH:MM:SS (UTC).".into();
             return;
