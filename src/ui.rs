@@ -1473,6 +1473,9 @@ pub struct StreamArchiverApp {
     /// on); off = plain rows, the accent-coloured icons/titles still carry
     /// the state.
     warn_bgcolor: bool,
+    /// Deferred-viewport state while the Warnings window is open (None =
+    /// closed) — see [`issues::WarningsPopupState`].
+    warnings_popup: Option<Arc<Mutex<issues::WarningsPopupState>>>,
     /// 🔔 Notifications window: paint rows in their per-kind colours.
     /// Persisted (`notif_row_bgcolor`, default on) — same idea as the
     /// Warnings toggle above.

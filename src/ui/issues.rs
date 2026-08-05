@@ -2,6 +2,35 @@
 
 use super::*;
 
+/// Deferred-viewport state for `warnings_window`. `search`/`sev_filter`/
+/// `hide_acked`/`bgcolor` mirror `self.warn_*` (seeded from them at open,
+/// synced back after every call — same "remembered across opens" shape as
+/// `hype_mark_mins_ago`/`hype_mark_dur`); `rows`/`ident` are refreshed by the
+/// wrapper on the same throttle as the DB reload, not every frame (they're
+/// cloned in, and `CaptureAlertRow` × up to 500 rows isn't free to copy at
+/// 60fps for no reason). `act` is the one action the user picked this pass,
+/// applied by the wrapper next call.
+pub(super) struct WarningsPopupState {
+    pub(super) search: String,
+    pub(super) sev_filter: Option<bool>,
+    pub(super) hide_acked: bool,
+    pub(super) bgcolor: bool,
+    pub(super) rows: Vec<crate::store::CaptureAlertRow>,
+    pub(super) ident: HashMap<i64, (Option<egui::TextureHandle>, (egui::Color32, bool))>,
+    pub(super) act: Option<WarningsAct>,
+    pub(super) closed: bool,
+}
+
+pub(super) enum WarningsAct {
+    Ack(i64),
+    AckAll,
+    /// Batch-ack every alert of one category ("Ack all disk full").
+    AckGroup(Vec<i64>),
+    OpenLog(String),
+    /// Open the folder holding a recording's recovered patch files.
+    OpenPatches(i64),
+}
+
 /// Human-readable byte size (B / KB / MB / GB).
 /// Everything the background Issues scan computes off the UI thread — every
 /// `path.exists()`/`read_dir`/ffprobe in here can block for seconds against
@@ -749,7 +778,7 @@ impl StreamArchiverApp {
     /// errors, yellow rows warnings; acknowledging clears the header badge but
     /// keeps the row — new occurrences un-acknowledge automatically. The badge
     /// counts refresh on the same open/closed throttle as the bell.
-    #[allow(deprecated)] // CentralPanel::show(ctx) inside a viewport
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn warnings_window(&mut self, ctx: &egui::Context) {
         use std::time::{Duration, Instant};
         let interval = if self.show_warnings {
@@ -772,96 +801,108 @@ impl StreamArchiverApp {
             self.warn_refreshed = Some(Instant::now());
         }
         if !self.show_warnings {
+            self.warnings_popup = None;
             return;
         }
 
-        // Per-row channel identity (avatar + name colour), via the resolver
-        // shared with the 🔔 Notifications window.
-        let keys: Vec<(i64, Option<i64>, String)> = self
-            .warnings_rows
-            .iter()
-            .map(|r| (r.id, r.monitor_id, r.channel.clone()))
-            .collect();
-        let ident = self.feed_identities(ctx, &keys);
-        let bg_before = self.warn_bgcolor;
-
-        let mut open = true;
-        // Deferred actions (applied after the viewport closure releases &self).
-        enum Act {
-            Ack(i64),
-            AckAll,
-            /// Batch-ack every alert of one category ("Ack all disk full").
-            AckGroup(Vec<i64>),
-            OpenLog(String),
-            /// Open the folder holding a recording's recovered patch files.
-            OpenPatches(i64),
+        // Ensure a popup instance exists, seeded from the persisted filter
+        // fields (remembered across a close/reopen, same as before).
+        if self.warnings_popup.is_none() {
+            self.warnings_popup = Some(Arc::new(Mutex::new(WarningsPopupState {
+                search: self.warn_search.clone(),
+                sev_filter: self.warn_sev_filter,
+                hide_acked: self.warn_hide_acked,
+                bgcolor: self.warn_bgcolor,
+                rows: Vec::new(),
+                ident: HashMap::new(),
+                act: None,
+                closed: false,
+            })));
         }
-        let mut act: Option<Act> = None;
+        let popup_state = self.warnings_popup.clone().unwrap();
 
-        let q = self.warn_search.trim().to_lowercase();
-        let sev = self.warn_sev_filter;
-        let visible: Vec<usize> = self
-            .warnings_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| {
-                let cat = crate::downloader::alert_category(&r.kind, &r.last_line).1;
-                (!self.warn_hide_acked || !r.acked)
-                    && sev.map(|errs_only| (r.severity == "error") == errs_only).unwrap_or(true)
-                    && (q.is_empty()
-                        || r.channel.to_lowercase().contains(&q)
-                        || r.kind.to_lowercase().contains(&q)
-                        || cat.to_lowercase().contains(&q)
-                        || r.last_line.to_lowercase().contains(&q)
-                        || r.take_key.to_lowercase().contains(&q))
-            })
-            .map(|(i, _)| i)
-            .collect();
-        // Unacked alerts grouped by category, for the "Ack group" menu —
-        // plus a state-based "Fixed" group covering every green row (fully
-        // recovered or superseded), so healed history clears in one click.
-        let mut ack_groups: std::collections::BTreeMap<(&str, &str), Vec<i64>> =
-            std::collections::BTreeMap::new();
-        let mut fixed_ids: Vec<i64> = Vec::new();
-        for r in &self.warnings_rows {
-            if !r.acked {
-                let cat = crate::downloader::alert_category(&r.kind, &r.last_line);
-                ack_groups.entry(cat).or_default().push(r.id);
-                // Mirrors the row-tint logic below: healed (every lost range
-                // re-fetched) or superseded (a later completed take covers
-                // the dead one).
-                let healed = r.ranges_total > 0 && r.recovered == r.ranges_total;
-                let superseded = !healed
-                    && r.severity == "error"
-                    && r.superseded
-                    && r.ranges_total == 0;
-                if healed || superseded {
-                    fixed_ids.push(r.id);
-                }
-            }
+        // Refresh rows/channel-identity into the popup on the same throttle
+        // as the DB reload above — not every frame (up to 500 rows isn't
+        // free to clone at 60fps for no reason).
+        if stale {
+            let keys: Vec<(i64, Option<i64>, String)> = self
+                .warnings_rows
+                .iter()
+                .map(|r| (r.id, r.monitor_id, r.channel.clone()))
+                .collect();
+            let ident = self.feed_identities(ctx, &keys);
+            let mut s = popup_state.lock().unwrap();
+            s.rows = self.warnings_rows.clone();
+            s.ident = ident;
         }
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("warnings_vp"),
             egui::ViewportBuilder::default()
                 .with_title("🚨 Capture warnings")
                 .with_inner_size([860.0, 520.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            |ctx, s, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
+                }
+                let q = s.search.trim().to_lowercase();
+                let sev = s.sev_filter;
+                let visible: Vec<usize> = s
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| {
+                        let cat = crate::downloader::alert_category(&r.kind, &r.last_line).1;
+                        (!s.hide_acked || !r.acked)
+                            && sev.map(|errs_only| (r.severity == "error") == errs_only).unwrap_or(true)
+                            && (q.is_empty()
+                                || r.channel.to_lowercase().contains(&q)
+                                || r.kind.to_lowercase().contains(&q)
+                                || cat.to_lowercase().contains(&q)
+                                || r.last_line.to_lowercase().contains(&q)
+                                || r.take_key.to_lowercase().contains(&q))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                // Unacked alerts grouped by category, for the "Ack group" menu —
+                // plus a state-based "Fixed" group covering every green row (fully
+                // recovered or superseded), so healed history clears in one click.
+                let mut ack_groups: std::collections::BTreeMap<(&str, &str), Vec<i64>> =
+                    std::collections::BTreeMap::new();
+                let mut fixed_ids: Vec<i64> = Vec::new();
+                for r in &s.rows {
+                    if !r.acked {
+                        let cat = crate::downloader::alert_category(&r.kind, &r.last_line);
+                        ack_groups.entry(cat).or_default().push(r.id);
+                        // Mirrors the row-tint logic below: healed (every lost range
+                        // re-fetched) or superseded (a later completed take covers
+                        // the dead one).
+                        let healed = r.ranges_total > 0 && r.recovered == r.ranges_total;
+                        let superseded = !healed
+                            && r.severity == "error"
+                            && r.superseded
+                            && r.ranges_total == 0;
+                        if healed || superseded {
+                            fixed_ids.push(r.id);
+                        }
+                    }
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("warn_sev_filter")
-                            .selected_text(match self.warn_sev_filter {
+                            .selected_text(match s.sev_filter {
                                 None => "All severities",
                                 Some(true) => "Errors only",
                                 Some(false) => "Warnings only",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.warn_sev_filter, None, "All severities");
-                                ui.selectable_value(&mut self.warn_sev_filter, Some(true), "Errors only");
-                                ui.selectable_value(&mut self.warn_sev_filter, Some(false), "Warnings only");
+                                ui.selectable_value(&mut s.sev_filter, None, "All severities");
+                                ui.selectable_value(&mut s.sev_filter, Some(true), "Errors only");
+                                ui.selectable_value(&mut s.sev_filter, Some(false), "Warnings only");
                             })
                             .response
                             .on_hover_text(
@@ -870,22 +911,22 @@ impl StreamArchiverApp {
                                  complaints.",
                             );
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.warn_search)
+                            egui::TextEdit::singleline(&mut s.search)
                                 .hint_text("Filter…")
                                 .desired_width(180.0),
                         )
                         .on_hover_text("Matches channel, kind, file path, and the last log line.");
-                        if !self.warn_search.is_empty()
+                        if !s.search.is_empty()
                             && ui.button("✕").on_hover_text("Clear filter").clicked()
                         {
-                            self.warn_search.clear();
+                            s.search.clear();
                         }
-                        ui.checkbox(&mut self.warn_hide_acked, "Hide acknowledged").on_hover_text(
+                        ui.checkbox(&mut s.hide_acked, "Hide acknowledged").on_hover_text(
                             "Only show alerts that still need attention — acknowledged rows \
                              (including healed/superseded ones you've cleared) drop out of \
                              the list until new damage un-acknowledges them again.",
                         );
-                        ui.checkbox(&mut self.warn_bgcolor, "Row colors").on_hover_text(
+                        ui.checkbox(&mut s.bgcolor, "Row colors").on_hover_text(
                             "Paint each row in its state colour — red = data missing, \
                              yellow = warning, green = recovered/superseded; dimmed once \
                              acknowledged. Off = plain rows; the coloured icon and title \
@@ -901,7 +942,7 @@ impl StreamArchiverApp {
                                 )
                                 .clicked()
                             {
-                                act = Some(Act::AckAll);
+                                s.act = Some(WarningsAct::AckAll);
                             }
                             ui.menu_button("✔ Ack group…", |ui| {
                                 if ack_groups.is_empty() {
@@ -919,7 +960,7 @@ impl StreamArchiverApp {
                                         )
                                         .clicked()
                                     {
-                                        act = Some(Act::AckGroup(fixed_ids.clone()));
+                                        s.act = Some(WarningsAct::AckGroup(fixed_ids.clone()));
                                         ui.close();
                                     }
                                     ui.separator();
@@ -934,7 +975,7 @@ impl StreamArchiverApp {
                                         ))
                                         .clicked()
                                     {
-                                        act = Some(Act::AckGroup(ids.clone()));
+                                        s.act = Some(WarningsAct::AckGroup(ids.clone()));
                                         ui.close();
                                     }
                                 }
@@ -948,7 +989,7 @@ impl StreamArchiverApp {
                     });
                     ui.separator();
 
-                    if self.warnings_rows.is_empty() {
+                    if s.rows.is_empty() {
                         ui.add_space(24.0);
                         ui.vertical_centered(|ui| {
                             ui.weak("No capture warnings — the tools' logs are clean.")
@@ -963,7 +1004,7 @@ impl StreamArchiverApp {
 
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         for &i in &visible {
-                            let r = &self.warnings_rows[i];
+                            let r = &s.rows[i];
                             let error = r.severity == "error";
                             // Fully healed: every lost range was re-fetched
                             // from the VOD — the row flips green so recovered
@@ -985,14 +1026,14 @@ impl StreamArchiverApp {
                                 ((120, 95, 10), egui::Color32::from_rgb(220, 175, 60))
                             };
                             let alpha = if r.acked { 25 } else { 70 };
-                            let tint = if self.warn_bgcolor {
+                            let tint = if s.bgcolor {
                                 egui::Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha)
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
                             // Channel identity: avatar + the channel's own name
                             // colour (same as the Streams grid / 🔔 feed).
-                            let (avatar, name_color) = match ident.get(&r.id) {
+                            let (avatar, name_color) = match s.ident.get(&r.id) {
                                 Some((a, (base, adjust))) => (
                                     a.as_ref(),
                                     Some(if *adjust { readable_color(*base, tint) } else { *base }),
@@ -1183,7 +1224,7 @@ impl StreamArchiverApp {
                                                     )
                                                     .clicked()
                                             {
-                                                act = Some(Act::Ack(r.id));
+                                                s.act = Some(WarningsAct::Ack(r.id));
                                             }
                                             if ui
                                                 .button("📂 Log")
@@ -1193,7 +1234,7 @@ impl StreamArchiverApp {
                                                 )
                                                 .clicked()
                                             {
-                                                act = Some(Act::OpenLog(r.take_key.clone()));
+                                                s.act = Some(WarningsAct::OpenLog(r.take_key.clone()));
                                             }
                                             if r.recovered > 0
                                                 && let Some(rec_id) = r.recording_id
@@ -1206,7 +1247,7 @@ impl StreamArchiverApp {
                                                     )
                                                     .clicked()
                                             {
-                                                act = Some(Act::OpenPatches(rec_id));
+                                                s.act = Some(WarningsAct::OpenPatches(rec_id));
                                             }
                                         },
                                     );
@@ -1222,43 +1263,73 @@ impl StreamArchiverApp {
             },
         );
 
-        if bg_before != self.warn_bgcolor {
+        // Filter fields are remembered across a close/reopen (mirrors the
+        // pre-migration code, which read them straight off `self` every
+        // frame); `bgcolor` also persists to settings on change.
+        let (search, sev_filter, hide_acked, bgcolor, closed, act) = {
+            let mut s = popup_state.lock().unwrap();
+            (
+                s.search.clone(),
+                s.sev_filter,
+                s.hide_acked,
+                s.bgcolor,
+                s.closed,
+                s.act.take(),
+            )
+        };
+        self.warn_search = search;
+        self.warn_sev_filter = sev_filter;
+        self.warn_hide_acked = hide_acked;
+        if bgcolor != self.warn_bgcolor {
+            self.warn_bgcolor = bgcolor;
             let _ = self
                 .core
                 .store
-                .set_setting(K_WARN_BGCOLOR, if self.warn_bgcolor { "1" } else { "0" });
+                .set_setting(K_WARN_BGCOLOR, if bgcolor { "1" } else { "0" });
         }
-        if !open {
+        if closed {
             self.show_warnings = false;
+            self.warnings_popup = None;
         }
         match act {
-            Some(Act::Ack(id)) => {
+            Some(WarningsAct::Ack(id)) => {
                 let _ = self.core.store.ack_capture_alert(id);
                 if let Some(r) = self.warnings_rows.iter_mut().find(|r| r.id == id) {
                     r.acked = true;
                 }
+                if let Some(r) = popup_state.lock().unwrap().rows.iter_mut().find(|r| r.id == id) {
+                    r.acked = true;
+                }
                 self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
             }
-            Some(Act::AckAll) => {
+            Some(WarningsAct::AckAll) => {
                 let _ = self.core.store.ack_all_capture_alerts();
                 for r in &mut self.warnings_rows {
                     r.acked = true;
                 }
+                for r in &mut popup_state.lock().unwrap().rows {
+                    r.acked = true;
+                }
                 self.warn_badge = (0, 0);
             }
-            Some(Act::AckGroup(ids)) => {
+            Some(WarningsAct::AckGroup(ids)) => {
                 let _ = self.core.store.ack_capture_alerts(&ids);
                 for r in &mut self.warnings_rows {
                     if ids.contains(&r.id) {
                         r.acked = true;
                     }
                 }
+                for r in &mut popup_state.lock().unwrap().rows {
+                    if ids.contains(&r.id) {
+                        r.acked = true;
+                    }
+                }
                 self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
             }
-            Some(Act::OpenLog(path)) => {
+            Some(WarningsAct::OpenLog(path)) => {
                 crate::platform::open_path(std::path::Path::new(&path));
             }
-            Some(Act::OpenPatches(rec_id)) => {
+            Some(WarningsAct::OpenPatches(rec_id)) => {
                 // The patch files sit next to the recording; take the first
                 // done range's out_path and open its folder.
                 let dir = self

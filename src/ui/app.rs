@@ -644,6 +644,7 @@ impl StreamArchiverApp {
             warn_sev_filter: None,
             warn_hide_acked: false,
             warn_bgcolor,
+            warnings_popup: None,
             notif_bgcolor,
             show_posts_window: false,
             show_posts_excluded: false,
