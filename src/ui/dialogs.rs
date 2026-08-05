@@ -127,6 +127,11 @@ impl MetaPopup {
 pub(super) struct RecPropsPopup {
     pub(super) rec_id: i64,
     pub(super) notes: String,
+    /// Set by the deferred closure when `notes` changes; the wrapper persists
+    /// it (DB + in-memory cache) and resets this next call.
+    pub(super) notes_dirty: bool,
+    /// Set by the deferred closure on close; read back next call.
+    pub(super) closed: bool,
 }
 
 /// One open "Schedule event properties" window + its rescan draft (model +
@@ -136,6 +141,10 @@ pub(super) struct EventPropsPopup {
     pub(super) segment_id: i64,
     pub(super) rescan_model: String,
     pub(super) rescan_effort: String,
+    /// Set by the deferred closure on close; read back by
+    /// `event_properties_window` next call.
+    pub(super) closed: bool,
+    pub(super) rescan_clicked: bool,
 }
 
 /// Draft state for the "Edit schedule item" dialog. Times are edited as local
@@ -1864,22 +1873,23 @@ impl StreamArchiverApp {
     pub(super) fn recording_properties_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
         for i in 0..self.rec_props_popups.len() {
-            let rid = self.rec_props_popups[i].rec_id;
+            let rid = self.rec_props_popups[i].lock().unwrap().rec_id;
             if self.recording_properties_window(ctx, i) {
                 closed.push(rid);
             }
         }
         if !closed.is_empty() {
-            self.rec_props_popups.retain(|p| !closed.contains(&p.rec_id));
+            self.rec_props_popups.retain(|p| !closed.contains(&p.lock().unwrap().rec_id));
         }
     }
 
     /// Properties dialog for a single recording take.
     /// Opened via right-click → Properties on a history-tree take row.
     /// Returns true when the window should close.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn recording_properties_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
-        let rid = self.rec_props_popups[idx].rec_id;
+        let popup_state = self.rec_props_popups[idx].clone();
+        let rid = popup_state.lock().unwrap().rec_id;
         // Pull the recording out of the cache; close if the take was deleted.
         let Some(rec) = self
             .rec_cache
@@ -1902,21 +1912,19 @@ impl StreamArchiverApp {
             .get(&rec.monitor_id)
             .and_then(|v| find_take_stats(v, &rec))
             .cloned();
-        let mut open = true;
-        // Collect inter-frame actions so the closure doesn't borrow `self`.
-        let mut copy_path: Option<String> = None;
-        let mut notes_changed: Option<String> = None;
-        // Snapshot the draft so the TextEdit can borrow it inside the closure.
-        let mut notes_draft = self.rec_props_popups[idx].notes.clone();
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("recording_props_vp", rid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Recording properties — take #{rid}"))
                 .with_inner_size([500.0, 540.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            move |ctx, popup, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    popup.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1941,7 +1949,7 @@ impl StreamArchiverApp {
                                             .on_hover_text("Copy path")
                                             .clicked()
                                     {
-                                        copy_path = Some(rec.output_path.clone());
+                                        ui.ctx().copy_text(rec.output_path.clone());
                                     }
                                 });
                                 ui.end_row();
@@ -2197,23 +2205,25 @@ impl StreamArchiverApp {
                         ui.add_space(8.0);
                         ui.strong("Notes");
                         let resp = ui.add(
-                            egui::TextEdit::multiline(&mut notes_draft)
+                            egui::TextEdit::multiline(&mut popup.notes)
                                 .hint_text("Add notes for this take…")
                                 .desired_rows(4)
                                 .desired_width(f32::INFINITY),
                         );
                         if resp.changed() {
-                            notes_changed = Some(notes_draft.clone());
+                            popup.notes_dirty = true;
                         }
                     });
                 });
             },
         );
-        if let Some(path) = copy_path {
-            ctx.copy_text(path);
-        }
-        if let Some(notes) = notes_changed {
-            self.rec_props_popups[idx].notes = notes.clone();
+        let (notes, notes_dirty) = {
+            let mut p = popup_state.lock().unwrap();
+            let result = (p.notes.clone(), p.notes_dirty);
+            p.notes_dirty = false;
+            result
+        };
+        if notes_dirty {
             // Update in-memory cache so the draft stays in sync if the dialog
             // is closed and reopened without a full reload.
             for recs in self.rec_cache.values_mut() {
@@ -2225,19 +2235,19 @@ impl StreamArchiverApp {
             }
             let _ = self.core.store.set_recording_notes(rid, &notes);
         }
-        !open
+        popup_state.lock().unwrap().closed
     }
 
     pub(super) fn event_properties_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
         for i in 0..self.event_props_popups.len() {
-            let sid = self.event_props_popups[i].segment_id;
+            let sid = self.event_props_popups[i].lock().unwrap().segment_id;
             if self.event_properties_window(ctx, i) {
                 closed.push(sid);
             }
         }
         if !closed.is_empty() {
-            self.event_props_popups.retain(|p| !closed.contains(&p.segment_id));
+            self.event_props_popups.retain(|p| !closed.contains(&p.lock().unwrap().segment_id));
         }
     }
 
@@ -2250,9 +2260,10 @@ impl StreamArchiverApp {
     /// `schedule_all` — covers both manual deletion AND a successful rescan
     /// (which necessarily replaces the whole source's segment ids, see
     /// [`crate::downloader::supervisor::Supervisor::cmd_rescan_schedule_event`]).
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn event_properties_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
-        let sid = self.event_props_popups[idx].segment_id;
+        let popup_state = self.event_props_popups[idx].clone();
+        let sid = popup_state.lock().unwrap().segment_id;
         let Some(s) = self.schedule_all.iter().find(|s| s.segment_id == sid).cloned() else {
             return true;
         };
@@ -2261,19 +2272,19 @@ impl StreamArchiverApp {
             matches!(t.kind, crate::events::BackgroundTaskKind::OcrRescan(id) if id == sid)
         });
         let hidden = self.schedule_hidden_segments.contains(&sid);
-        let mut open = true;
-        let mut rescan_clicked = false;
-        let mut model_draft = self.event_props_popups[idx].rescan_model.clone();
-        let mut effort_draft = self.event_props_popups[idx].rescan_effort.clone();
 
-        ctx.show_viewport_immediate(
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of(("schedule_event_props_vp", sid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Schedule event properties — {}", s.title))
                 .with_inner_size([460.0, 460.0]),
-            |ctx, _class| {
+            popup_state.clone(),
+            shared,
+            move |ctx, popup, _shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    popup.closed = true;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2364,11 +2375,11 @@ impl StreamArchiverApp {
                                 .show(ui, |ui| {
                                     ui.label("Model");
                                     egui::ComboBox::from_id_salt(("evp_model_combo", sid))
-                                        .selected_text(&model_draft)
+                                        .selected_text(&popup.rescan_model)
                                         .width(120.0)
                                         .show_ui(ui, |ui| {
                                             for m in ["haiku", "sonnet", "opus"] {
-                                                ui.selectable_value(&mut model_draft, m.to_string(), m);
+                                                ui.selectable_value(&mut popup.rescan_model, m.to_string(), m);
                                             }
                                         })
                                         .response
@@ -2378,16 +2389,16 @@ impl StreamArchiverApp {
                                     ui.end_row();
                                     ui.label("Effort");
                                     egui::ComboBox::from_id_salt(("evp_effort_combo", sid))
-                                        .selected_text(if effort_draft.is_empty() {
+                                        .selected_text(if popup.rescan_effort.is_empty() {
                                             "default"
                                         } else {
-                                            &effort_draft
+                                            &popup.rescan_effort
                                         })
                                         .width(120.0)
                                         .show_ui(ui, |ui| {
                                             for level in ["", "low", "medium", "high", "xhigh", "max"] {
                                                 let label = if level.is_empty() { "default" } else { level };
-                                                ui.selectable_value(&mut effort_draft, level.to_string(), label);
+                                                ui.selectable_value(&mut popup.rescan_effort, level.to_string(), label);
                                             }
                                         })
                                         .response
@@ -2410,7 +2421,7 @@ impl StreamArchiverApp {
                                 )
                             };
                             if btn.clicked() {
-                                rescan_clicked = true;
+                                popup.rescan_clicked = true;
                             }
                         }
                     });
@@ -2418,16 +2429,20 @@ impl StreamArchiverApp {
             },
         );
 
-        self.event_props_popups[idx].rescan_model = model_draft.clone();
-        self.event_props_popups[idx].rescan_effort = effort_draft.clone();
+        let (model, effort, rescan_clicked, closed) = {
+            let mut p = popup_state.lock().unwrap();
+            let result = (p.rescan_model.clone(), p.rescan_effort.clone(), p.rescan_clicked, p.closed);
+            p.rescan_clicked = false;
+            result
+        };
         if rescan_clicked {
             self.core.manual(ManualCommand::RescanScheduleEvent {
                 segment_id: sid,
-                model: model_draft,
-                effort: effort_draft,
+                model,
+                effort,
             });
         }
-        !open
+        closed
     }
 
     /// The "Edit schedule item" dialog (None = closed). Lets the user correct an

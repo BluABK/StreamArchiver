@@ -2704,7 +2704,7 @@ impl StreamArchiverApp {
                 MetaPopup::Take(id) => *id != rid,
                 MetaPopup::Stream(takes) => !takes.iter().any(|(id, _)| *id == rid),
             });
-            self.rec_props_popups.retain(|p| p.rec_id != rid);
+            self.rec_props_popups.retain(|p| p.lock().unwrap().rec_id != rid);
             self.reload_rows();
         }
         if let Some(rid) = delete_recording_file {
@@ -2786,7 +2786,7 @@ impl StreamArchiverApp {
             }
         }
         if let Some(rid) = open_recording_props
-            && !self.rec_props_popups.iter().any(|p| p.rec_id == rid)
+            && !self.rec_props_popups.iter().any(|p| p.lock().unwrap().rec_id == rid)
         {
             // Seed the notes draft from the cached recording (already loaded).
             let notes = self
@@ -2796,7 +2796,12 @@ impl StreamArchiverApp {
                 .find(|r| r.id == rid)
                 .map(|r| r.notes.clone())
                 .unwrap_or_default();
-            self.rec_props_popups.push(RecPropsPopup { rec_id: rid, notes });
+            self.rec_props_popups.push(Arc::new(Mutex::new(RecPropsPopup {
+                rec_id: rid,
+                notes,
+                notes_dirty: false,
+                closed: false,
+            })));
         }
     }
 

@@ -3051,14 +3051,16 @@ impl StreamArchiverApp {
     /// event. The window itself resolves the live row fresh each frame (see
     /// [`Self::event_properties_window`]) — this just registers the popup.
     pub(super) fn open_event_properties(&mut self, segment_id: i64) {
-        if self.event_props_popups.iter().any(|p| p.segment_id == segment_id) {
+        if self.event_props_popups.iter().any(|p| p.lock().unwrap().segment_id == segment_id) {
             return;
         }
-        self.event_props_popups.push(EventPropsPopup {
+        self.event_props_popups.push(Arc::new(Mutex::new(EventPropsPopup {
             segment_id,
             rescan_model: crate::schedule_ocr::DEFAULT_MODEL.to_string(),
             rescan_effort: String::new(),
-        });
+            closed: false,
+            rescan_clicked: false,
+        })));
     }
 
     pub(super) fn open_edit_schedule(&mut self, segment_id: i64) {
