@@ -354,17 +354,22 @@ async fn tick(
         // Auto-record flag, so the grid can show a live channel's title/game/
         // viewers without a recording. Cleared (empty + -1) when offline/errored
         // or when the platform omits a field.
-        let (title, game, thumb, viewers, tags) = if o.live && !o.error {
+        let (title, game, thumb, viewers) = if o.live && !o.error {
             (
                 o.stream_title.as_deref().unwrap_or(""),
                 o.stream_game.as_deref().unwrap_or(""),
                 o.thumbnail_url.as_deref().unwrap_or(""),
                 o.stream_viewers.unwrap_or(-1),
-                o.stream_tags.as_deref().unwrap_or(""),
             )
         } else {
-            ("", "", "", -1, "")
+            ("", "", "", -1)
         };
+        // Tags read as "the channel's usual tags" rather than clearing
+        // offline — same rationale/pattern as `last_language`/`last_game_id`
+        // below (`set_monitor_stream_extras`): a live poll that positively
+        // carries tags always wins, but going offline (or a source that
+        // never reports tags at all) must not blank a previously-seen value.
+        let tags = o.stream_tags.as_deref().unwrap_or("");
         // Archive a title/category change to the continuous per-monitor
         // history the moment this poll observes it — independent of whether
         // anything is being recorded. Only while genuinely live: an
@@ -442,6 +447,11 @@ async fn tick(
         {
             warn!("scheduler: failed to persist stream extras for {}: {e:#}", o.monitor_id);
         }
+        if o.stream_tags.is_some()
+            && let Err(e) = ctx.store.set_monitor_tags(o.monitor_id, tags)
+        {
+            warn!("scheduler: failed to persist tags for {}: {e:#}", o.monitor_id);
+        }
         if let Err(e) = ctx.store.set_monitor_live_meta(
             o.monitor_id,
             title,
@@ -450,7 +460,6 @@ async fn tick(
             viewers,
             live_since,
             live_since_approx,
-            tags,
         ) {
             warn!(
                 "scheduler: failed to persist live meta for {}: {e:#}",

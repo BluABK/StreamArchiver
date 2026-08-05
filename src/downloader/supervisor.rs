@@ -1970,8 +1970,10 @@ progress_info: None,
                 };
                 let _ = self.store.set_monitor_live_meta(
                     monitor_id, "", "", "", stream_viewers.unwrap_or(-1), live_since, live_since_approx,
-                    stream_tags.as_deref().unwrap_or(""),
                 );
+                if let Some(t) = stream_tags.as_deref() {
+                    let _ = self.store.set_monitor_tags(monitor_id, t);
+                }
                 return false;
             }
         }
@@ -2003,8 +2005,10 @@ progress_info: None,
                 stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
-                stream_tags.as_deref().unwrap_or(""),
             );
+            if let Some(t) = stream_tags.as_deref() {
+                let _ = self.store.set_monitor_tags(monitor_id, t);
+            }
             // Log + notify once per broadcast — try_begin re-runs on every
             // poll while the stream stays live.
             let key = stream_id
@@ -2060,8 +2064,10 @@ progress_info: None,
                 stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
-                stream_tags.as_deref().unwrap_or(""),
             );
+            if let Some(t) = stream_tags.as_deref() {
+                let _ = self.store.set_monitor_tags(monitor_id, t);
+            }
             // Not recording, but the broadcast still happened — track it as a
             // take-shaped row with no capture behind it (see
             // `insert_not_recorded_session`'s doc comment), so it shows up in
@@ -2141,8 +2147,10 @@ progress_info: None,
                 stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
-                stream_tags.as_deref().unwrap_or(""),
             );
+            if let Some(t) = stream_tags.as_deref() {
+                let _ = self.store.set_monitor_tags(monitor_id, t);
+            }
             return false;
         }
         let trigger_info = trigger_hit.as_ref().map(|h| h.describe()).unwrap_or_default();
@@ -2284,8 +2292,10 @@ progress_info: None,
                     outcome.stream_viewers.unwrap_or(-1),
                     live_since,
                     live_since_approx,
-                    outcome.stream_tags.as_deref().unwrap_or(""),
                 );
+                if let Some(t) = outcome.stream_tags.as_deref() {
+                    let _ = self.store.set_monitor_tags(monitor_id, t);
+                }
             }
         } else if user_initiated {
             let message = if outcome.error && !outcome.detail.is_empty() {

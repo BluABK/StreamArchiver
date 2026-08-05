@@ -361,7 +361,11 @@ impl Store {
     /// Went Live/Started On/Duration — without a recording. Empty strings +
     /// `viewers = -1` clear stale info when a channel goes offline; `live_since
     /// = None` likewise clears the go-live time (a fresh value is stamped again
-    /// the next time it's seen live).
+    /// the next time it's seen live). Deliberately does NOT touch `last_tags` —
+    /// unlike title/game/thumbnail/viewers, tags read as "the channel's usual
+    /// tags" and must survive going offline; see [`Self::set_monitor_tags`],
+    /// called separately (and only when the poll actually carries tags), same
+    /// split as [`Self::set_monitor_stream_extras`] for language/game id.
     #[allow(clippy::too_many_arguments)]
     pub fn set_monitor_live_meta(
         &self,
@@ -372,14 +376,12 @@ impl Store {
         viewers: i64,
         live_since: Option<i64>,
         live_since_approx: bool,
-        tags: &str,
     ) -> Result<()> {
         let conn = self.db();
         conn.execute(
             "UPDATE monitor SET last_title = ?2, last_game = ?3,
                  last_thumbnail_url = ?4, last_viewers = ?5,
-                 last_live_since = ?6, last_live_since_approx = ?7,
-                 last_tags = ?8 WHERE id = ?1",
+                 last_live_since = ?6, last_live_since_approx = ?7 WHERE id = ?1",
             params![
                 id,
                 title,
@@ -388,7 +390,6 @@ impl Store {
                 viewers,
                 live_since,
                 live_since_approx as i64,
-                tags
             ],
         )?;
         Ok(())
@@ -414,8 +415,14 @@ impl Store {
         Ok(())
     }
 
-    /// Narrow tags-only setter for the in-recording refresh (`meta_watcher`)
-    /// — mirrors [`Store::set_monitor_viewers`]'s single-column rationale.
+    /// Narrow tags-only setter, called wherever a live poll positively
+    /// carries tags — the scheduler's own tick and the in-recording refresh
+    /// (`meta_watcher`) alike. Deliberately separate from
+    /// [`Self::set_monitor_live_meta`] (mirrors [`Store::set_monitor_viewers`]'s
+    /// single-column rationale) so tags never get clobbered to empty just
+    /// because THAT call's other fields are being cleared for an offline poll —
+    /// tags should read as "the channel's usual tags," surviving offline, the
+    /// same as [`Self::set_monitor_stream_extras`]'s language/game id.
     pub fn set_monitor_tags(&self, id: i64, tags: &str) -> Result<()> {
         let conn = self.db();
         conn.execute("UPDATE monitor SET last_tags = ?2 WHERE id = ?1", params![id, tags])?;
@@ -825,14 +832,15 @@ mod tests {
         store
             .set_monitor_live_meta(
                 mid, "Ranked grind", "VALORANT", "https://t/x.jpg", 1234, Some(1_000_000), true,
-                "Vtuber, English",
             )
             .unwrap();
+        store.set_monitor_tags(mid, "Vtuber, English").unwrap();
         let r = row(&store);
         assert_eq!(r.last_title, "Ranked grind");
         assert_eq!(r.last_game, "VALORANT");
         assert_eq!(r.last_thumbnail_url, "https://t/x.jpg");
         assert_eq!(r.last_viewers, 1234);
+        assert_eq!(r.last_tags, "Vtuber, English");
         assert_eq!(r.monitor.last_live_since, Some(1_000_000));
         assert!(r.monitor.last_live_since_approx);
 
@@ -847,12 +855,18 @@ mod tests {
         assert_eq!(r.monitor.last_live_since, Some(1_000_000), "left alone");
 
         store
-            .set_monitor_live_meta(mid, "", "", "", -1, None, false, "")
+            .set_monitor_live_meta(mid, "", "", "", -1, None, false)
             .unwrap();
         let r = row(&store);
         assert_eq!(r.last_title, "");
         assert_eq!(r.last_viewers, -1);
         assert_eq!(r.monitor.last_live_since, None, "cleared on offline");
+        // Unlike title/viewers/go-live time, tags are deliberately a SEPARATE
+        // setter (`set_monitor_tags`) not touched by `set_monitor_live_meta` at
+        // all — so they must survive the very same "went offline" write above
+        // untouched, reading as "the channel's usual tags" (matches
+        // last_language/last_game_id's already-established behavior).
+        assert_eq!(r.last_tags, "Vtuber, English", "tags survive offline unlike title/viewers");
     }
     #[test]
     fn create_container_with_flags_seeds_channel_switches() {
