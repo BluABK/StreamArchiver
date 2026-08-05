@@ -1630,7 +1630,7 @@ pub struct StreamArchiverApp {
     /// Pending schedule-segment-delete confirmation: segment id.
     confirm_delete_segment: Option<Arc<Mutex<ConfirmDialogState<i64>>>>,
     /// Backing state for the create/rename-channel dialog.
-    channel_form: Option<ChannelForm>,
+    channel_form: Option<Arc<Mutex<ChannelForm>>>,
     /// "Manage groups" dialog: open flag, new-group name draft, and an
     /// in-progress inline rename (group id + draft text; `None` = not
     /// renaming any row).
@@ -3075,7 +3075,7 @@ impl eframe::App for StreamArchiverApp {
                         )
                         .clicked()
                     {
-                        self.channel_form = Some(ChannelForm {
+                        self.channel_form = Some(Arc::new(Mutex::new(ChannelForm {
                             id: None,
                             name: String::new(),
                             color: String::new(),
@@ -3095,7 +3095,10 @@ impl eframe::App for StreamArchiverApp {
                             allow_delete: false,
                             primary_group: None,
                             groups: Default::default(),
-                        });
+                            do_save: false,
+                            closed: false,
+                            channel_groups: Vec::new(),
+                        })));
                     }
                     if ui
                         .button("🏷 Groups")
@@ -3365,7 +3368,7 @@ impl eframe::App for StreamArchiverApp {
             ))));
         }
         if ctx_add_channel {
-            self.channel_form = Some(ChannelForm {
+            self.channel_form = Some(Arc::new(Mutex::new(ChannelForm {
                 id: None,
                 name: String::new(),
                 color: String::new(),
@@ -3385,7 +3388,10 @@ impl eframe::App for StreamArchiverApp {
                 allow_delete: false,
                 primary_group: None,
                 groups: Default::default(),
-            });
+                do_save: false,
+                closed: false,
+                channel_groups: Vec::new(),
+            })));
         }
         if ctx_refresh_schedule {
             self.core.request_schedule_refresh();

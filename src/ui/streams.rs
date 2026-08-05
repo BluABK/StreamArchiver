@@ -105,6 +105,14 @@ pub(super) struct ChannelForm {
     /// Every group this channel belongs to (primary included). Diffed
     /// against the DB's current membership on save.
     pub(super) groups: std::collections::HashSet<i64>,
+    /// Set by the deferred closure on Save; read back by
+    /// `channel_form_window` next call.
+    pub(super) do_save: bool,
+    /// Set by the deferred closure on Cancel/close.
+    pub(super) closed: bool,
+    /// Snapshot of `self.channel_groups`, refreshed every wrapper call — the
+    /// deferred closure can't reach `self` to read it directly.
+    pub(super) channel_groups: Vec<crate::models::ChannelGroup>,
 }
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
@@ -380,57 +388,64 @@ fn period_open(default_open: bool, toggles: &HashSet<String>, key: &str) -> bool
 
 impl StreamArchiverApp {
     /// Modal for creating a new channel container or renaming an existing one.
-    #[allow(deprecated)]
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     pub(super) fn channel_form_window(&mut self, ctx: &egui::Context) {
-        if self.channel_form.is_none() {
+        let Some(form_arc) = self.channel_form.clone() else {
             return;
-        }
-        let renaming = self.channel_form.as_ref().unwrap().id.is_some();
-        let title = if renaming { "Rename channel" } else { "Add channel" };
-        let mut open = true;
-        let mut do_save = false;
-        let mut do_cancel = false;
+        };
+        // Re-snapshotted every call — the deferred closure can't reach
+        // `self.channel_groups` itself.
+        form_arc.lock().unwrap().channel_groups = self.channel_groups.clone();
 
-        ctx.show_viewport_immediate(
+        let f = form_arc.lock().unwrap();
+        let renaming = f.id.is_some();
+        let title = if renaming { "Rename channel" } else { "Add channel" }.to_string();
+        drop(f);
+
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
             egui::ViewportId::from_hash_of("channel_form_vp"),
             egui::ViewportBuilder::default()
-                .with_title(title.to_string())
+                .with_title(title)
                 .with_inner_size([420.0, 480.0]),
-            |ctx, _class| {
+            form_arc.clone(),
+            shared,
+            |ctx, s, _shared| {
+                let renaming = s.id.is_some();
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    open = false;
+                    s.closed = true;
                 }
                 egui::TopBottomPanel::bottom("channel_form_bottom_bar").show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
-                            do_save = true;
+                            s.do_save = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            do_cancel = true;
+                            s.closed = true;
                         }
                     });
                     ui.add_space(4.0);
                 });
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        let f = self.channel_form.as_mut().unwrap();
-                        let channel_groups = &self.channel_groups;
+                        let channel_groups = s.channel_groups.clone();
                         egui::Grid::new("channel_form_grid")
                             .num_columns(2)
                             .spacing([8.0, 6.0])
                             .show(ui, |ui| {
                                 ui.label("Name");
-                                ui.text_edit_singleline(&mut f.name);
+                                ui.text_edit_singleline(&mut s.name);
                                 ui.end_row();
 
                                 ui.label("Color");
                                 ui.horizontal(|ui| {
                                     // Colored swatch preview
-                                    let swatch_color = if f.color.is_empty() {
+                                    let swatch_color = if s.color.is_empty() {
                                         egui::Color32::from_gray(0x60)
                                     } else {
-                                        parse_hex_color(&f.color)
+                                        parse_hex_color(&s.color)
                                             .unwrap_or(egui::Color32::from_gray(0x60))
                                     };
                                     let (rect, _) = ui.allocate_exact_size(
@@ -445,18 +460,18 @@ impl StreamArchiverApp {
                                         egui::StrokeKind::Inside,
                                     );
                                     ui.add(
-                                        egui::TextEdit::singleline(&mut f.color)
+                                        egui::TextEdit::singleline(&mut s.color)
                                             .hint_text("#rrggbb")
                                             .desired_width(80.0),
                                     );
-                                    if !f.color.is_empty() && ui.small_button("✕").clicked() {
-                                        f.color.clear();
+                                    if !s.color.is_empty() && ui.small_button("✕").clicked() {
+                                        s.color.clear();
                                     }
                                 });
                                 ui.end_row();
 
                                 ui.label("Download VOD after end");
-                                tristate_combo(ui, "chform_vod_download", &mut f.vod_download)
+                                tristate_combo(ui, "chform_vod_download", &mut s.vod_download)
                                     .on_hover_text(
                                         "Post-stream VOD download for every instance in this channel. \
                                          Inherit follows the global default (Settings).",
@@ -464,7 +479,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Replace with VOD");
-                                tristate_combo(ui, "chform_vod_replace", &mut f.vod_replace)
+                                tristate_combo(ui, "chform_vod_replace", &mut s.vod_replace)
                                     .on_hover_text(
                                         "Replace the live recording with the VOD on success (never for \
                                          a muted Twitch VOD). Inherit follows the global default.",
@@ -472,7 +487,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Fetch new head backfill on new take");
-                                tristate_combo(ui, "chform_head_backfill_fetch", &mut f.head_backfill_fetch)
+                                tristate_combo(ui, "chform_head_backfill_fetch", &mut s.head_backfill_fetch)
                                     .on_hover_text(
                                         "Capture-from-start only: fetch a fresh head backfill for a \
                                          retake (reconnect mid-broadcast), not just the stream's first \
@@ -481,7 +496,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Replace old head (if new is undamaged)");
-                                tristate_combo(ui, "chform_head_backfill_replace", &mut f.head_backfill_replace)
+                                tristate_combo(ui, "chform_head_backfill_replace", &mut s.head_backfill_replace)
                                     .on_hover_text(
                                         "Once a fresh head backfill passes its integrity checks, delete \
                                          older takes' now-redundant head files for the same stream. Only \
@@ -491,7 +506,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("After full.mkv join");
-                                join_cleanup_combo(ui, "chform_join_cleanup", &mut f.join_cleanup)
+                                join_cleanup_combo(ui, "chform_join_cleanup", &mut s.join_cleanup)
                                     .on_hover_text(
                                         "Once a verified full.mkv (head + live capture joined) lands \
                                          for a take in this channel: keep both parts (safe, doubles \
@@ -503,7 +518,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Automatic deletes go to");
-                                disposal_method_combo(ui, "chform_disposal_method", &mut f.disposal_method)
+                                disposal_method_combo(ui, "chform_disposal_method", &mut s.disposal_method)
                                     .on_hover_text(
                                         "How automatic media deletions for this channel are executed \
                                          (post-join cleanup, superseded heads, a live capture \
@@ -517,7 +532,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Preferred platform when multiple live");
-                                platform_pref_combo(ui, "chform_platform_pref", &mut f.primary_platform_pref)
+                                platform_pref_combo(ui, "chform_platform_pref", &mut s.primary_platform_pref)
                                     .on_hover_text(
                                         "When this channel has more than one instance simultaneously \
                                          live, show this platform's info on the channel row instead of \
@@ -528,7 +543,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Embed chapters");
-                                tristate_combo(ui, "chform_chapters_enabled", &mut f.chapters_enabled)
+                                tristate_combo(ui, "chform_chapters_enabled", &mut s.chapters_enabled)
                                     .on_hover_text(
                                         "Embed chapter markers (title/category changes, raids, \
                                          recovered/muted gap-splice segments) into finalized \
@@ -540,7 +555,7 @@ impl StreamArchiverApp {
 
                                 ui.label("Title/game coalesce window (s)");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut f.chapters_coalesce_secs)
+                                    egui::TextEdit::singleline(&mut s.chapters_coalesce_secs)
                                         .desired_width(80.0)
                                         .hint_text("Inherit"),
                                 )
@@ -553,7 +568,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Auto-record my raids");
-                                tristate_combo(ui, "chform_follow_my_raids", &mut f.follow_my_raids)
+                                tristate_combo(ui, "chform_follow_my_raids", &mut s.follow_my_raids)
                                     .on_hover_text(
                                         "When any instance in this channel raids out to another \
                                          Twitch channel, auto-record the target (Settings → \
@@ -564,7 +579,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Auto-play my raids");
-                                tristate_combo(ui, "chform_follow_my_raids_play", &mut f.follow_my_raids_play)
+                                tristate_combo(ui, "chform_follow_my_raids_play", &mut s.follow_my_raids_play)
                                     .on_hover_text(
                                         "When any instance in this channel raids out to another \
                                          Twitch channel, auto-open the target at the live edge in \
@@ -579,7 +594,7 @@ impl StreamArchiverApp {
                                 tristate_combo(
                                     ui,
                                     "chform_raid_target_record",
-                                    &mut f.record_me_as_raid_target,
+                                    &mut s.record_me_as_raid_target,
                                 )
                                 .on_hover_text(
                                     "Whether Follow raid may auto-RECORD this channel when a \
@@ -595,7 +610,7 @@ impl StreamArchiverApp {
                                 tristate_combo(
                                     ui,
                                     "chform_raid_play_exclude",
-                                    &mut f.exclude_from_auto_play,
+                                    &mut s.exclude_from_auto_play,
                                 )
                                 .on_hover_text(
                                     "Set to Always to make sure this channel never gets an \
@@ -607,7 +622,7 @@ impl StreamArchiverApp {
                                 ui.end_row();
 
                                 ui.label("Allow deleting files");
-                                ui.checkbox(&mut f.allow_delete, "")
+                                ui.checkbox(&mut s.allow_delete, "")
                                     .on_hover_text(
                                         "Half of the gate for this channel's take rows' \
                                          \"🗑🔥 Delete file from disk\" action — the OTHER half \
@@ -622,19 +637,19 @@ impl StreamArchiverApp {
                                 ui.label("Primary group");
                                 egui::ComboBox::from_id_salt("chform_primary_group")
                                     .selected_text(
-                                        f.primary_group
+                                        s.primary_group
                                             .and_then(|gid| channel_groups.iter().find(|g| g.id == gid))
                                             .map(|g| g.name.as_str())
                                             .unwrap_or("(ungrouped)"),
                                     )
                                     .show_ui(ui, |ui| {
-                                        if ui.selectable_label(f.primary_group.is_none(), "(ungrouped)").clicked() {
-                                            f.primary_group = None;
+                                        if ui.selectable_label(s.primary_group.is_none(), "(ungrouped)").clicked() {
+                                            s.primary_group = None;
                                         }
-                                        for g in channel_groups {
-                                            if ui.selectable_label(f.primary_group == Some(g.id), &g.name).clicked() {
-                                                f.primary_group = Some(g.id);
-                                                f.groups.insert(g.id);
+                                        for g in &channel_groups {
+                                            if ui.selectable_label(s.primary_group == Some(g.id), &g.name).clicked() {
+                                                s.primary_group = Some(g.id);
+                                                s.groups.insert(g.id);
                                             }
                                         }
                                     })
@@ -652,9 +667,9 @@ impl StreamArchiverApp {
                                     if channel_groups.is_empty() {
                                         ui.weak("No groups yet — create one from the Streams toolbar.");
                                     }
-                                    for g in channel_groups {
-                                        let mut member = f.groups.contains(&g.id);
-                                        let is_primary = f.primary_group == Some(g.id);
+                                    for g in &channel_groups {
+                                        let mut member = s.groups.contains(&g.id);
+                                        let is_primary = s.primary_group == Some(g.id);
                                         ui.add_enabled_ui(!is_primary, |ui| {
                                             let resp = ui.checkbox(&mut member, &g.name);
                                             if is_primary {
@@ -663,9 +678,9 @@ impl StreamArchiverApp {
                                         });
                                         if !is_primary {
                                             if member {
-                                                f.groups.insert(g.id);
+                                                s.groups.insert(g.id);
                                             } else {
-                                                f.groups.remove(&g.id);
+                                                s.groups.remove(&g.id);
                                             }
                                         }
                                     }
@@ -692,8 +707,18 @@ impl StreamArchiverApp {
             },
         );
 
+        let (do_save, closed) = {
+            let mut f = form_arc.lock().unwrap();
+            let result = (f.do_save, f.closed);
+            // Consume: a failed-validation Save (name empty) must not keep
+            // re-triggering every subsequent call, and must not permanently
+            // block Cancel from ever taking effect.
+            f.do_save = false;
+            result
+        };
+
         if do_save {
-            let f = self.channel_form.as_ref().unwrap();
+            let f = form_arc.lock().unwrap();
             let name = f.name.trim().to_string();
             if name.is_empty() {
                 self.status = "Name is required.".into();
@@ -851,7 +876,7 @@ impl StreamArchiverApp {
                     Err(e) => self.status = format!("Error: {e}"),
                 }
             }
-        } else if do_cancel || !open {
+        } else if closed {
             self.channel_form = None;
         }
     }
@@ -2422,7 +2447,7 @@ impl StreamArchiverApp {
                     .unwrap_or_default()
                     .into_iter()
                     .collect();
-                self.channel_form = Some(ChannelForm {
+                self.channel_form = Some(Arc::new(Mutex::new(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
                     color: c.color.clone(),
@@ -2442,7 +2467,10 @@ impl StreamArchiverApp {
                     allow_delete,
                     primary_group,
                     groups,
-                });
+                    do_save: false,
+                    closed: false,
+                    channel_groups: Vec::new(),
+                })));
             }
         }
         if let Some((cid, name)) = delete_channel {

@@ -3882,14 +3882,21 @@ impl StreamArchiverApp {
 
         let (do_save, closed, open_format_designer, browse_req, preset_delete, preset_save_tmpl) = {
             let mut f = form_arc.lock().unwrap();
-            (
+            let result = (
                 f.do_save,
                 f.closed,
                 f.open_format_designer,
                 f.browse_req.take(),
                 f.preset_delete.take(),
                 f.preset_save_tmpl.take(),
-            )
+            );
+            // Consume: a failed-validation Save (empty name/URL) must not
+            // keep re-triggering every subsequent call, permanently block
+            // Cancel, or keep re-opening the Format Designer.
+            f.do_save = false;
+            f.closed = false;
+            f.open_format_designer = false;
+            result
         };
 
         if let Some(br) = browse_req {
