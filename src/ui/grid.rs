@@ -1868,6 +1868,24 @@ pub(super) fn instance_label(url: &str) -> String {
     if s.is_empty() { "(no URL)".to_string() } else { s.to_string() }
 }
 
+/// Just the channel/user name, for places with no room for a URL — currently
+/// the Custom layout editor's chips, where the other angles are collab
+/// partners shown by their platform display name and this has to match.
+///
+/// [`instance_label`] can't be used there: it is deliberately a URL path
+/// (`twitch.tv/camizolecorzette`) because the Name cell has to tell several
+/// instances of one channel apart, which is more text than a chip can hold.
+/// Falls back to the URL's last path segment for a container with no name of
+/// its own.
+pub(super) fn channel_only_label(row: &MonitorWithChannel) -> String {
+    let name = row.channel.name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    let url = instance_label(&row.monitor.url);
+    url.rsplit('/').find(|s| !s.is_empty()).unwrap_or(url.as_str()).to_string()
+}
+
 /// The platform shared by all of a channel's instances, or `None` if they differ
 /// (or there are none) — drives the container row's badge.
 pub(super) fn channel_platform(monitors: &[&MonitorWithChannel]) -> Option<Platform> {
@@ -2500,7 +2518,7 @@ pub(super) fn render_instance_row(
             let live_plays: Vec<&(crate::models::CollabPartner, Option<StreamTarget>, Option<i64>)> =
                 collab_plays.iter().filter(|(p, _, _)| p.is_live != Some(false)).collect();
             let this_angle = || LayoutAngle {
-                label: instance_label(&m.url),
+                label: channel_only_label(row),
                 avatar: avatar.cloned(),
             };
             // "All angles, current downloads": this instance plus every collab
@@ -3797,5 +3815,28 @@ mod tests {
         assert_eq!(streams_col_min_width(name), name.min_width, "non-datetime column untouched");
 
         set_short_ts(false); // restore default for other tests
+    }
+
+    #[test]
+    fn channel_only_label_is_a_name_never_a_url() {
+        let mut row = test_row(1, "idle", None, None, None, false);
+        row.channel.name = "Camizole".into();
+        row.monitor.url = "https://twitch.tv/camizolecorzette".into();
+        // The Name cell's own label stays the disambiguating URL path...
+        assert_eq!(instance_label(&row.monitor.url), "twitch.tv/camizolecorzette");
+        // ...but a layout chip only ever gets the channel name.
+        assert_eq!(channel_only_label(&row), "Camizole");
+
+        // Unnamed container: fall back to the URL's last path segment, not
+        // the whole path (a trailing slash must not win).
+        row.channel.name = "   ".into();
+        row.monitor.url = "https://twitch.tv/camizolecorzette/".into();
+        assert_eq!(channel_only_label(&row), "camizolecorzette");
+        row.monitor.url = "https://youtube.com/@somehandle".into();
+        assert_eq!(channel_only_label(&row), "@somehandle");
+
+        // Degenerate: no URL at all still yields something printable.
+        row.monitor.url = String::new();
+        assert_eq!(channel_only_label(&row), "(no URL)");
     }
 }
