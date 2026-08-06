@@ -227,7 +227,7 @@ impl StreamArchiverApp {
             }
         });
         let Some(scan_ptr) = self.files_scan.as_ref() else {
-            ui.spinner();
+            throttled_spinner(ui);
             ui.weak("Scanning drives and recording locations…");
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
             return;

@@ -371,8 +371,10 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("del_monitor_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete monitor")
-                .with_inner_size([380.0, 130.0])
-                .with_resizable(false),
+                // Resizable: the message embeds a channel name, which has no
+                // length bound and wraps the buttons downward.
+                .with_inner_size([420.0, 180.0])
+                .with_min_inner_size([320.0, 140.0]),
             &state,
             |ui, (_, name), result| {
                 ui.label(format!("Delete this capture instance for “{name}”?"));
@@ -425,8 +427,9 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("del_channel_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete channel")
-                .with_inner_size([400.0, 130.0])
-                .with_resizable(false),
+                // Resizable for the same reason as "Delete monitor" above.
+                .with_inner_size([440.0, 180.0])
+                .with_min_inner_size([320.0, 140.0]),
             &state,
             |ui, (_, name), result| {
                 ui.label(format!("Delete the channel “{name}” and all its instances?"));
@@ -486,8 +489,13 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("del_recfile_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete file from disk")
-                .with_inner_size([460.0, 170.0])
-                .with_resizable(false),
+                // Sized for, and resizable because of, the two unbounded
+                // strings below: a take label is a full stream title (easily
+                // 150+ chars) and the path is absolute. At the old fixed
+                // 460×170 those wrapped far enough to push Delete/Cancel off
+                // the bottom of a window that couldn't be resized.
+                .with_inner_size([620.0, 400.0])
+                .with_min_inner_size([420.0, 220.0]),
             &state,
             |ui, cdf, result| {
                 ui.label(format!("Delete the captured file for “{}”?", cdf.label));
@@ -625,8 +633,10 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("del_streamfiles_vp"),
             egui::ViewportBuilder::default()
                 .with_title("Delete all take files")
-                .with_inner_size([460.0, 220.0])
-                .with_resizable(false),
+                // Same unbounded-label reasoning as "Delete file from disk",
+                // plus a per-disposal-method line for each distinct method.
+                .with_inner_size([620.0, 400.0])
+                .with_min_inner_size([420.0, 220.0]),
             &state,
             |ui, cdsf, result| {
                 let total_bytes: i64 = cdsf.items.iter().map(|(_, _, b, _)| *b).sum();

@@ -6144,10 +6144,12 @@ impl StreamArchiverApp {
                         match &*dialog.load.lock().unwrap() {
                             ImportLoadState::Loading => {
                                 ui.horizontal(|ui| {
-                                    ui.spinner();
+                                    // The spinner's own throttled repaint is
+                                    // what re-polls this state; a zero-delay
+                                    // request here would free-run the viewport.
+                                    throttled_spinner(ui);
                                     ui.label("Loading…");
                                 });
-                                ctx.request_repaint();
                             }
                             ImportLoadState::Error(e) => {
                                 ui.add_space(8.0);

@@ -177,7 +177,7 @@ impl StreamArchiverApp {
                 self.spawn_trash_import(&ctx);
             }
             if self.trash_import_running {
-                ui.spinner();
+                throttled_spinner(ui);
             }
             ui.separator();
             let n_selected = self.trash_selected.len();
@@ -453,7 +453,7 @@ impl StreamArchiverApp {
                                     crate::platform::open_path(dir);
                                 }
                                 if pending {
-                                    ui.spinner();
+                                    throttled_spinner(ui);
                                 }
                             }
                             "when" => ts_label(ui, row.disposed_at),

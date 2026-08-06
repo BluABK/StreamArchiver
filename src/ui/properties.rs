@@ -1732,7 +1732,7 @@ impl StreamArchiverApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(220.0);
-                        ui.spinner();
+                        throttled_spinner(ui);
                         ui.add_space(8.0);
                         ui.label(&s.label);
                     });

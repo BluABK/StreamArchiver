@@ -1668,7 +1668,7 @@ impl StreamArchiverApp {
                         }
                         RecoverProbe::Running => {
                             ui.horizontal(|ui| {
-                                ui.spinner();
+                                throttled_spinner(ui);
                                 ui.label("Probing Twitch CDN…");
                             });
                         }

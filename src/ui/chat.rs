@@ -1385,6 +1385,7 @@ pub(super) fn draw_cached_emote(
 }
 
 /// Floor on how often an animated emote may ask its viewport to repaint (30 fps).
+/// Same hazard, and the same reasoning, as [`throttled_spinner`].
 ///
 /// `emote_anim::MIN_DELAY` lets a frame's `remaining` come back as low
 /// as 20 ms, and a popup asking for ~20 ms repaints saturates eframe's event
@@ -3771,10 +3772,12 @@ impl StreamArchiverApp {
                     match &mut *guard {
                         ChatLoadState::Loading => {
                             ui.horizontal(|ui| {
-                                ui.spinner();
+                                // Drives the repaints that poll the load too —
+                                // an extra zero-delay `request_repaint` here
+                                // would just free-run the viewport.
+                                throttled_spinner(ui);
                                 ui.label("Loading chat…");
                             });
-                            ctx.request_repaint();
                         }
                         ChatLoadState::NoFile => {
                             ui.add_space(8.0);
@@ -3829,7 +3832,7 @@ impl StreamArchiverApp {
                             ui.horizontal(|ui| {
                                 ui.weak(format!("{count} messages"));
                                 if log.loading_older {
-                                    ui.spinner();
+                                    throttled_spinner(ui);
                                     ui.weak("loading older messages…");
                                 }
                             });

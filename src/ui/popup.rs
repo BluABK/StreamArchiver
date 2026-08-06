@@ -85,6 +85,54 @@ pub(super) fn show_deferred_popup<T: Send + 'static>(
     });
 }
 
+/// How often a [`throttled_spinner`] asks its viewport to repaint. ~16 fps —
+/// smooth enough for a loading indicator, slow enough to leave the event loop
+/// alone.
+const SPINNER_TICK: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// A loading spinner that does **not** free-run its viewport. Use this instead
+/// of [`egui::Ui::spinner`] anywhere inside a deferred popup.
+///
+/// `egui::Spinner::paint_at` calls `ui.request_repaint()` — a *zero-delay*
+/// request — every pass it is visible. In a deferred viewport that saturates
+/// eframe's event loop: the popup free-runs at ~165 passes/s and the **root**
+/// viewport drops to **zero** passes per second (measured; reproduce with
+/// `cargo run --example vp_repaint_probe`, `PROBE_CHILD_MS=0`). Since
+/// `App::logic` only runs on a root pass, everything the root drives stops
+/// too — message pumping, the drains, the UI-freeze watchdog's heartbeat, and
+/// every wrapper that polls a background job.
+///
+/// That last one bites hardest here: a "Loading…" spinner in a popup stalls
+/// the very load it is waiting for. The Properties window's off-thread load
+/// finished in ~100 ms yet sat on its spinner for as long as the main window
+/// stayed idle, because nothing was left to run its `try_recv`. At this
+/// module's 60 ms tick the same test has the root at ~30 passes/s.
+///
+/// Same paint as `egui::Spinner` (arc of `n_points` along a time-driven
+/// sweep), minus the repaint request.
+pub(super) fn throttled_spinner(ui: &mut egui::Ui) -> egui::Response {
+    let size = ui.style().spacing.interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.ctx().request_repaint_after(SPINNER_TICK);
+        let color = ui.visuals().strong_text_color();
+        let radius = (rect.height().min(rect.width()) / 2.0) - 2.0;
+        let n_points = (radius.round() as u32).clamp(8, 128);
+        let time = ui.input(|i| i.time);
+        let start_angle = time * std::f64::consts::TAU;
+        let end_angle = start_angle + 240f64.to_radians() * time.sin();
+        let points: Vec<egui::Pos2> = (0..n_points)
+            .map(|i| {
+                let angle = egui::lerp(start_angle..=end_angle, i as f64 / n_points as f64);
+                let (sin, cos) = angle.sin_cos();
+                rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
+    }
+    response
+}
+
 /// Per-key `Arc<Mutex<T>>` state for popups shaped like "`Vec<K>` of open
 /// ids + derive each one's content once from a cache/store lookup" — channel
 /// history, chapters, VOD/remux info, ad breaks, upcoming-schedule popups,
@@ -176,7 +224,16 @@ pub(super) fn confirm_dialog_deferred<T: Send + 'static>(
             s.open = false;
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            body(ui, &s.payload, &mut s.result);
+            // Scrollable because a confirm dialog's message embeds user data —
+            // a take's full title, an absolute path — whose height nobody can
+            // predict when picking `with_inner_size`. Every caller draws its
+            // buttons at the end of `body`, so without this an over-long
+            // message pushes them past the bottom edge of a fixed-size,
+            // non-resizable window and the dialog becomes impossible to
+            // answer (reported for "Delete file from disk").
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                body(ui, &s.payload, &mut s.result);
+            });
         });
     });
     None
