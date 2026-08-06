@@ -4,17 +4,28 @@
 //! each collab angle exactly where it should land before playing (and,
 //! optionally, saving the arrangement as a reusable named preset via
 //! `crate::layout`).
+//!
+//! Each angle is a chip carrying that channel's name and avatar (see
+//! [`super::grid::LayoutAngle`], built alongside the target list itself so
+//! chip *i* is the window that gets slot *i*). Drag to move — across display
+//! boundaries too — drag the bottom-right corner to resize, double-click to
+//! fill the display the chip is on, double-click again to restore.
 
 use super::*;
 
-/// One collab angle's placement on the canvas — `label` is display-only
-/// (see `grid::generic_layout_labels`), `monitor_index`/`rect_frac` are
-/// exactly a `crate::layout::LayoutSlot`'s fields, kept apart here only so
-/// the label can travel alongside them while the user drags.
+/// One collab angle's placement on the canvas. `angle` is display-only (which
+/// channel this chip is, plus its avatar); `monitor_index`/`rect_frac` are
+/// exactly a [`crate::layout::LayoutSlot`]'s fields, kept apart here only so
+/// the identity can travel alongside them while the user drags.
 pub(super) struct LayoutEntry {
-    pub(super) label: String,
+    pub(super) angle: super::grid::LayoutAngle,
     pub(super) monitor_index: usize,
     pub(super) rect_frac: (f32, f32, f32, f32),
+    /// Where this chip sat before a double-click maximized it to fill its
+    /// display — `Some` exactly while it is maximized, so the next
+    /// double-click can put it back. Cleared by any drag/resize, which is the
+    /// user placing it deliberately (there is no "previous" to return to).
+    pub(super) restore_frac: Option<(f32, f32, f32, f32)>,
 }
 
 pub(super) struct LayoutEditorPopupState {
@@ -44,6 +55,62 @@ const CHIP_COLORS: [egui::Color32; 6] = [
 fn entry_pixel_rect(entry: &LayoutEntry, monitors: &[crate::display::PhysicalMonitor]) -> crate::display::PixelRect {
     let m = crate::display::resolve_monitor(monitors, entry.monitor_index);
     crate::layout::frac_to_pixels(m.work_rect, entry.rect_frac)
+}
+
+/// Paint one chip's contents: the channel's avatar (square, scaled to the
+/// chip's height so it grows/shrinks with the window the chip represents) and
+/// its name, wrapped into whatever width is left beside the avatar.
+///
+/// Both are skipped rather than clipped when the chip is too small to hold
+/// them — a chip dragged down to the 80×60 px minimum is a placement handle,
+/// not a label, and a half-drawn face there reads as a rendering glitch.
+fn draw_chip_face(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    chip: egui::Rect,
+    angle: &super::grid::LayoutAngle,
+) {
+    const PAD: f32 = 4.0;
+    let inner = chip.shrink(PAD);
+    if inner.width() < 12.0 || inner.height() < 12.0 {
+        return;
+    }
+    // Scale by height, but never let the face eat more than half the chip —
+    // otherwise a wide-and-short chip's avatar squeezes the name out entirely.
+    let mut text_rect = inner;
+    if let Some(tex) = &angle.avatar {
+        let side = inner.height().min(inner.width() * 0.5);
+        if side >= 12.0 {
+            let img = egui::Rect::from_min_size(
+                egui::pos2(inner.min.x, inner.center().y - side / 2.0),
+                egui::vec2(side, side),
+            );
+            painter.image(
+                tex.id(),
+                img,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            text_rect = egui::Rect::from_min_max(
+                egui::pos2(img.max.x + PAD, inner.min.y),
+                inner.max,
+            );
+        }
+    }
+    if text_rect.width() < 24.0 {
+        return;
+    }
+    let galley = painter.layout(
+        angle.label.clone(),
+        egui::FontId::proportional(13.0),
+        ui.visuals().text_color(),
+        text_rect.width(),
+    );
+    painter.galley(
+        text_rect.center() - galley.size() / 2.0,
+        galley,
+        ui.visuals().text_color(),
+    );
 }
 
 /// Draw every monitor + every entry chip, handling drag (move) and a
@@ -103,15 +170,29 @@ fn render_canvas(ui: &mut egui::Ui, s: &mut LayoutEditorPopupState) {
         let move_resp = ui.interact(chip_rect, move_id, egui::Sense::click_and_drag());
         painter.rect_filled(chip_rect, 3.0, color.linear_multiply(0.35));
         painter.rect_stroke(chip_rect, 3.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Inside);
-        painter.text(
-            chip_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            &s.entries[i].label,
-            egui::FontId::proportional(13.0),
-            ui.visuals().text_color(),
-        );
+        draw_chip_face(&painter, ui, chip_rect, &s.entries[i].angle);
+        move_resp.clone().on_hover_text(format!(
+            "{}\nDouble-click to fill {}; double-click again to restore.",
+            s.entries[i].angle.label,
+            crate::display::resolve_monitor(&s.monitors, s.entries[i].monitor_index).name,
+        ));
 
-        if move_resp.dragged() {
+        // Double-click = maximize onto the display the chip currently sits on
+        // (its whole work area, so a maximized window still clears the
+        // taskbar), and again = back to where it was.
+        // `else if` on purpose: a double-click that drifts a pixel can report
+        // both, and letting the drag arm run would immediately clear the
+        // `restore_frac` the maximize just recorded.
+        if move_resp.double_clicked() {
+            match s.entries[i].restore_frac.take() {
+                Some(prev) => s.entries[i].rect_frac = prev,
+                None => {
+                    s.entries[i].restore_frac = Some(s.entries[i].rect_frac);
+                    s.entries[i].rect_frac = (0.0, 0.0, 1.0, 1.0);
+                }
+            }
+        } else if move_resp.dragged() {
+            s.entries[i].restore_frac = None;
             let delta = move_resp.drag_delta() / scale;
             let new_x = abs.x + delta.x.round() as i32;
             let new_y = abs.y + delta.y.round() as i32;
@@ -141,6 +222,7 @@ fn render_canvas(ui: &mut egui::Ui, s: &mut LayoutEditorPopupState) {
         let resize_resp = ui.interact(handle_rect, resize_id, egui::Sense::drag());
         painter.rect_filled(handle_rect, 1.0, ui.visuals().strong_text_color());
         if resize_resp.dragged() {
+            s.entries[i].restore_frac = None;
             let delta = resize_resp.drag_delta() / scale;
             let home = crate::display::resolve_monitor(&s.monitors, s.entries[i].monitor_index);
             let min_frac_w = (80.0 / home.work_rect.w.max(1) as f32).min(1.0);
@@ -155,24 +237,25 @@ fn render_canvas(ui: &mut egui::Ui, s: &mut LayoutEditorPopupState) {
 
 impl StreamArchiverApp {
     /// Seed a fresh Custom layout editor from a menu click — one entry per
-    /// label, initially arranged via [`crate::layout::BuiltinPreset::TileEqually`]
+    /// collab angle, initially arranged via [`crate::layout::BuiltinPreset::TileEqually`]
     /// on the primary monitor as a reasonable drag-from-here starting point.
     pub(super) fn open_layout_editor(
         &mut self,
-        labels: Vec<String>,
+        angles: Vec<super::grid::LayoutAngle>,
         targets: super::grid::LayoutEditorTargets,
     ) {
         let monitors = crate::display::enumerate_monitors();
         let primary = crate::display::primary_or_fallback(&monitors);
         let seed_rects =
-            crate::layout::resolve_builtin(crate::layout::BuiltinPreset::TileEqually, &primary, labels.len());
-        let entries = labels
+            crate::layout::resolve_builtin(crate::layout::BuiltinPreset::TileEqually, &primary, angles.len());
+        let entries = angles
             .into_iter()
             .zip(seed_rects)
-            .map(|(label, rect)| LayoutEntry {
-                label,
+            .map(|(angle, rect)| LayoutEntry {
+                angle,
                 monitor_index: primary.index,
                 rect_frac: crate::layout::pixels_to_frac(primary.work_rect, rect),
+                restore_frac: None,
             })
             .collect();
         self.layout_editor = Some(Arc::new(Mutex::new(LayoutEditorPopupState {
@@ -220,7 +303,8 @@ impl StreamArchiverApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label(
                         "Drag a chip to move it (across displays too); drag its bottom-right \
-                         corner to resize.",
+                         corner to resize; double-click it to fill its display (and again to \
+                         restore).",
                     );
                     render_canvas(ui, s);
                     ui.separator();

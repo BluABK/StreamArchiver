@@ -2563,16 +2563,33 @@ live, and archived:
   one — a title mention is just a guess, not confirmation that's really
   their handle. Note that "confirmed via Shared Chat" only means their chat
   is merged in, not that they're currently broadcasting — Twitch allows a
-  Shared Chat member to stay merged after their own stream ends, so a synthetic
-  instance can open to nothing playing (the player just quietly finds no live
-  stream, same as pointing "▷ Play stream (live edge)" at any other offline
-  channel). The **💤** marker described above is the heads-up for exactly
-  this — a partner already showing it is likely to open to nothing, though
-  the button always still tries (the 💤 check can itself be stale by the
-  time you click). For just one specific angle instead of all of them, the
-  **"👥 Play collab instance…"** submenu lists each partner with its own
-  Current download / Live edge pair, the same locally-tracked-vs-synthetic
-  distinction applying to that Live edge button too.
+  Shared Chat member to stay merged after their own stream ends. Both bulk
+  actions therefore **skip any partner already known to be offline** (the
+  ones carrying the **💤** marker described above): there's no live edge to
+  tune into, and their "current download" would be a finished take from an
+  earlier stream rather than this collab. A partner whose state is simply
+  *unknown* is still included — unknown isn't offline. To try an offline
+  partner anyway, open it from its own row's right-click menu; for just one
+  specific angle in general, the **"👥 Play collab instance…"** submenu lists
+  each partner with its own Current download / Live edge pair, unfiltered,
+  the same locally-tracked-vs-synthetic distinction applying to that Live
+  edge button too.
+
+  Both bulk actions are **Layout** submenus rather than plain buttons —
+  Windows' own tiling isn't much help for lining several player windows up,
+  so the app places them itself. Pick one of the built-in presets (**Tile
+  Equally**, **Main + Tiled Rest**, **Main + Row**), any layout you've saved,
+  or **🖌 Custom…**. The custom editor draws every connected display to scale
+  in its real arrangement, with one chip per angle showing that channel's
+  name and avatar: drag a chip to move it (across displays too), drag its
+  bottom-right corner to resize, or **double-click it to fill the display
+  it's on** — double-click again to put it back where it was. **Apply now**
+  plays with that arrangement; **Save as preset…** also stores it under a
+  name, which then appears in both Layout submenus (with a **×** to delete
+  it). Saved layouts are stored as fractions of each display's work area, so
+  they survive a resolution change, and fall back to the primary display if
+  the display they named is gone. Placement uses mpv's own `--geometry` when
+  mpv is the configured player, and a Win32 move-after-launch otherwise.
   Two Settings → Defaults options tune this: **Mute collab instances**
   (default on) silences every OTHER angle opened by the bulk "Play all
   collab instances (live edge)" action — the instance you actually

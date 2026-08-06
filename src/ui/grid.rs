@@ -2281,7 +2281,7 @@ pub(super) struct RowActions {
     /// collab instances" Layout submenu) — a label per entry (display only)
     /// plus what to actually play once the editor's "Apply now"/"Save as
     /// preset…" fires.
-    pub(super) open_layout_editor: Option<(Vec<String>, LayoutEditorTargets)>,
+    pub(super) open_layout_editor: Option<(Vec<LayoutAngle>, LayoutEditorTargets)>,
     /// Name of a saved layout to delete (set by the "×" next to it in either
     /// Layout submenu's saved-layouts list).
     pub(super) delete_saved_layout: Option<String>,
@@ -2296,15 +2296,17 @@ pub(super) enum LayoutEditorTargets {
     LiveEdge(i64, Vec<i64>, Vec<UntrackedCollabPartner>),
 }
 
-/// Generic per-entry labels for the Custom layout editor's canvas chips —
-/// "which collab angle is which" is nice to have but not worth threading
-/// exact channel names through every filter/collapse step that built the
-/// target list by the time "Custom…" is clicked; the first entry is always
-/// the clicked-on instance itself.
-fn generic_layout_labels(n: usize) -> Vec<String> {
-    (0..n)
-        .map(|i| if i == 0 { "This instance".to_string() } else { format!("Collab angle {i}") })
-        .collect()
+/// Who one Custom-layout-editor chip stands for. Built alongside the target
+/// list itself (index `i` here is the angle that gets slot `i`), so the canvas
+/// can show the actual channel and its avatar instead of "Collab angle 2".
+/// The first entry is always the clicked-on instance.
+#[derive(Clone)]
+pub(super) struct LayoutAngle {
+    pub(super) label: String,
+    /// That channel's account avatar, when one has been fetched — the same
+    /// texture the Name cell draws. `None` for an untracked collab partner
+    /// (no local instance, so no cached avatar) or one not fetched yet.
+    pub(super) avatar: Option<egui::TextureHandle>,
 }
 
 /// A collab partner confirmed via Twitch Shared Chat (`from_title == false`)
@@ -2342,6 +2344,10 @@ pub(super) fn render_instance_row(
     media_player: &str,
     // This instance's own account avatar for the Name cell (None until fetched).
     avatar: Option<&egui::TextureHandle>,
+    // Every tracked instance's account avatar, by monitor id — only used to
+    // put a face on each collab angle's chip in the Custom layout editor
+    // (`LayoutAngle`), which needs the *partners'* avatars, not just this row's.
+    instance_avatars: &HashMap<i64, egui::TextureHandle>,
     // The most recently started recording for this monitor, if any — the
     // target of the "Backfill head" manual action.
     latest_rec_id: Option<i64>,
@@ -2483,22 +2489,50 @@ pub(super) fn render_instance_row(
             }
         }
         if row.live_collab.is_some() {
+            // Every "play ALL angles" path below skips partners the platform
+            // says are offline: there is no live edge to tune into, and their
+            // "current download" would be a finished take from an earlier
+            // stream rather than this collab. `is_live == None` means unknown,
+            // not offline (same reading as `CollabPartner::display`'s 💤), so
+            // those stay in. The per-partner "Play collab instance…" submenu
+            // below is deliberately NOT filtered — trying an offline partner
+            // by hand from their own row stays possible.
+            let live_plays: Vec<&(crate::models::CollabPartner, Option<StreamTarget>, Option<i64>)> =
+                collab_plays.iter().filter(|(p, _, _)| p.is_live != Some(false)).collect();
+            let this_angle = || LayoutAngle {
+                label: instance_label(&m.url),
+                avatar: avatar.cloned(),
+            };
             // "All angles, current downloads": this instance plus every collab
             // partner that resolves to a locally-tracked monitor WITH a
             // currently-downloading capture — one player window per angle.
             // Partners that aren't locally tracked have no local file to play
             // at all, so they're silently skipped here regardless of
-            // verification (unlike the live-edge variant below).
-            let all_current: Vec<StreamTarget> = stream_target
-                .cloned()
-                .into_iter()
-                .chain(collab_plays.iter().filter_map(|(_, t, _)| t.clone()))
-                // Same playability gate as the single-target "Stream in
-                // player" button — an unplayable SplitAv target (SABR mid-
-                // download under a non-mpv player) would otherwise still get
-                // handed a built mpv-flavored command.
-                .filter(|t| playable_with(t, media_player))
-                .collect();
+            // verification (unlike the live-edge variant below). Angles are
+            // collected with their labels attached so the Custom editor can
+            // name each chip; the play path only needs the targets.
+            //
+            // Same playability gate as the single-target "Stream in player"
+            // button — an unplayable SplitAv target (SABR mid-download under a
+            // non-mpv player) would otherwise still get handed a built
+            // mpv-flavored command.
+            let mut current_angles: Vec<(StreamTarget, LayoutAngle)> = Vec::new();
+            if let Some(t) = stream_target.cloned().filter(|t| playable_with(t, media_player)) {
+                current_angles.push((t, this_angle()));
+            }
+            for (partner, target, pmid) in &live_plays {
+                if let Some(t) = target.clone().filter(|t| playable_with(t, media_player)) {
+                    current_angles.push((
+                        t,
+                        LayoutAngle {
+                            label: partner.name.clone(),
+                            avatar: pmid.and_then(|mid| instance_avatars.get(&mid)).cloned(),
+                        },
+                    ));
+                }
+            }
+            let all_current: Vec<StreamTarget> =
+                current_angles.iter().map(|(t, _)| t.clone()).collect();
             // "All angles, live edge": this instance, every collab partner
             // that resolves to a locally-tracked monitor, AND every verified
             // (Shared-Chat-confirmed, not a title-mention guess) partner that
@@ -2507,14 +2541,34 @@ pub(super) fn render_instance_row(
             // `m.id` (the clicked-on instance) is threaded separately from the
             // partner mids so only the partners get muted, never this one.
             let tracked_partner_mids: Vec<i64> =
-                collab_plays.iter().filter_map(|(_, _, mid)| *mid).collect();
-            let untracked_live_edge: Vec<UntrackedCollabPartner> = collab_plays
+                live_plays.iter().filter_map(|(_, _, mid)| *mid).collect();
+            let untracked_live_edge: Vec<UntrackedCollabPartner> = live_plays
                 .iter()
                 .filter(|(partner, _, pmid)| pmid.is_none() && !partner.from_title)
                 .map(|(partner, _, _)| UntrackedCollabPartner {
                     login: partner.login.clone(),
                     name: partner.name.clone(),
                 })
+                .collect();
+            // Same three groups in the same order `dispatch_play_collab_live_edge`
+            // spawns them (source, tracked partners, untracked) so chip N is
+            // the window that lands in slot N.
+            let live_edge_angles: Vec<LayoutAngle> = std::iter::once(this_angle())
+                .chain(live_plays.iter().filter(|(_, _, mid)| mid.is_some()).map(
+                    |(partner, _, pmid)| LayoutAngle {
+                        label: partner.name.clone(),
+                        avatar: pmid.and_then(|mid| instance_avatars.get(&mid)).cloned(),
+                    },
+                ))
+                .chain(
+                    live_plays
+                        .iter()
+                        .filter(|(partner, _, pmid)| pmid.is_none() && !partner.from_title)
+                        .map(|(partner, _, _)| LayoutAngle {
+                            label: partner.name.clone(),
+                            avatar: None,
+                        }),
+                )
                 .collect();
             ui.add_enabled_ui(!media_player.is_empty() && !all_current.is_empty(), |ui| {
                 ui.menu_button("👥⏵  Play all collab instances (current downloads) ▸ Layout", |ui| {
@@ -2547,9 +2601,10 @@ pub(super) fn render_instance_row(
                     }
                     ui.separator();
                     if ui.button("🖌  Custom…").clicked() {
-                        let labels = generic_layout_labels(all_current.len());
+                        let angles: Vec<LayoutAngle> =
+                            current_angles.iter().map(|(_, a)| a.clone()).collect();
                         a.open_layout_editor =
-                            Some((labels, LayoutEditorTargets::Current(all_current.clone())));
+                            Some((angles, LayoutEditorTargets::Current(all_current.clone())));
                         ui.close();
                     }
                 })
@@ -2595,10 +2650,8 @@ pub(super) fn render_instance_row(
                     }
                     ui.separator();
                     if ui.button("🖌  Custom…").clicked() {
-                        let n = 1 + tracked_partner_mids.len() + untracked_live_edge.len();
-                        let labels = generic_layout_labels(n);
                         a.open_layout_editor = Some((
-                            labels,
+                            live_edge_angles.clone(),
                             LayoutEditorTargets::LiveEdge(
                                 m.id,
                                 tracked_partner_mids.clone(),

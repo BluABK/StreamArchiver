@@ -3933,6 +3933,7 @@ impl StreamArchiverApp {
             inst_needs_remux,
             inst_stream_target.as_ref(), &media_player,
             instance_avatars.get(&mid),
+            instance_avatars,
             inst_latest_rec_id,
             scheduled_recordings,
             stop_hold_desc,
