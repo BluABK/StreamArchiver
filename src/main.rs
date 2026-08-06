@@ -53,6 +53,7 @@ mod version;
 mod vod_archive;
 mod watchdog;
 mod websub;
+mod window_placement;
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};

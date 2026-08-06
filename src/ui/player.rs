@@ -571,11 +571,17 @@ pub(crate) fn monitor_watched_recently(monitor_id: i64, within_secs: i64) -> boo
 /// returning a status-bar error message on spawn failure. `watch_monitor`
 /// registers the spawned process in [`OPEN_PLAYERS`] as an open player for
 /// that instance (a reaper thread notes the close) — pass it for live
-/// tune-ins of a tracked row, `None` for everything else.
+/// tune-ins of a tracked row, `None` for everything else. `tile_rect`, if
+/// set, moves/resizes the spawned window (or a descendant's — see
+/// [`crate::window_placement::place_window_for_pid_tree`]) to that rect once
+/// it appears; pass `None` when no tiling was requested, or when the command
+/// already got mpv `--geometry` flags baked in via [`apply_tile_or_geometry`]
+/// (no Win32 fallback needed in that case).
 pub(super) fn spawn_logged(
     mut cmd: std::process::Command,
     what: &str,
     watch_monitor: Option<i64>,
+    tile_rect: Option<crate::display::PixelRect>,
 ) -> Option<String> {
     let line = format!(
         "{} {}",
@@ -585,6 +591,13 @@ pub(super) fn spawn_logged(
     tracing::info!(%line, "play-new-instance: spawning {what}");
     match cmd.spawn() {
         Ok(mut child) => {
+            if let Some(rect) = tile_rect {
+                crate::window_placement::place_window_for_pid_tree(
+                    child.id(),
+                    rect,
+                    crate::window_placement::PLACEMENT_TIMEOUT,
+                );
+            }
             if let Some(mid) = watch_monitor.filter(|&m| m > 0) {
                 note_player_opened(mid);
                 // The streamlink path's child is streamlink itself, which
@@ -601,6 +614,24 @@ pub(super) fn spawn_logged(
             warn!(%line, "play-new-instance: failed to spawn {what}: {e}");
             Some(format!("Failed to launch {what}: {e}"))
         }
+    }
+}
+
+/// Resolve a requested tile rect against the player: mpv gets the rect baked
+/// in as `--geometry` flags at command-build time (no window-matching race),
+/// everything else gets the rect back so the caller can pass it through to
+/// [`spawn_logged`]'s Win32 poll-and-move fallback instead.
+pub(super) fn apply_tile_or_geometry(
+    cmd: &mut std::process::Command,
+    player: &str,
+    rect: Option<crate::display::PixelRect>,
+) -> Option<crate::display::PixelRect> {
+    let rect = rect?;
+    if player_is_mpv(player) {
+        cmd.args(crate::window_placement::mpv_geometry_args(rect));
+        None
+    } else {
+        Some(rect)
     }
 }
 
@@ -1563,7 +1594,7 @@ pub(super) fn spawn_play_new_instance(
             // Streamlink spawns mpv itself here, so its stderr is the only
             // window into BOTH processes for the Twitch path.
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
-            let status = spawn_logged(cmd, "streamlink", Some(m.id));
+            let status = spawn_logged(cmd, "streamlink", Some(m.id), None);
             // Both updaters start only if Streamlink actually started —
             // otherwise one would sit on a pipe that can never appear and log
             // a spurious warning a minute later.
@@ -1641,7 +1672,7 @@ pub(super) fn spawn_play_new_instance(
                     if mute && player_is_mpv(player) {
                         cmd.arg("--mute");
                     }
-                    spawn_logged(cmd, "media player", Some(m.id))
+                    spawn_logged(cmd, "media player", Some(m.id), None)
                 }
                 Err(e) => {
                     warn!(%line, "play-new-instance: failed to spawn yt-dlp: {e}");
@@ -1661,7 +1692,7 @@ pub(super) fn spawn_play_new_instance(
                 cmd.arg("--mute");
             }
             cmd.arg(&m.url);
-            spawn_logged(cmd, "media player", Some(m.id))
+            spawn_logged(cmd, "media player", Some(m.id), None)
         }
     }
 }
