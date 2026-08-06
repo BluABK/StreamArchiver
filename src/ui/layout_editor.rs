@@ -267,6 +267,9 @@ impl StreamArchiverApp {
                 crate::layout::CustomLayout { name: name.clone(), slots: slots.clone() },
             );
             self.status = format!("Layout \"{name}\" saved.");
+            // The Layout ▸ submenu reads its saved-layout list from
+            // `saved_layouts_cache`, which is keyed on this rev.
+            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
             let targets = state.lock().unwrap().targets.clone();
             self.dispatch_layout_editor_targets(targets, crate::layout::LayoutChoice::Custom(slots));
             self.layout_editor = None;

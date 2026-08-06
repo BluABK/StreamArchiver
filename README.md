@@ -61,6 +61,13 @@ lifetime). Launching the app again while it's already running — including
 minimized — un-minimizes and focuses the existing window instead of opening a
 second copy or silently doing nothing.
 
+Pop-out windows (chat, properties, Warnings, Posts, the widget inspector — every
+window the app opens beside the main one) are **independent OS windows**: they
+stay open, in place, and keep updating when the main window is minimized or
+closed to the tray, and they are not dragged along when it is. Minimizing the
+main window used to destroy them and re-open them at a default position on
+restore; it no longer does.
+
 The window has three tabs: **Streams** (monitor channels for live broadcasts),
 **Videos** (on-demand downloads), and **Settings**.
 

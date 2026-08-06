@@ -1682,7 +1682,34 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 86)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 86);
+        if version < 87 {
+            // Two indexes for queries the Streams grid runs on the UI thread,
+            // both of which were full table scans and measured (on a real
+            // 183 MB library) as the app's two worst main-thread DB stalls:
+            //
+            // * `latest_raid_outs_all` ("Follow raid" button state) —
+            //   `WHERE kind = 'raid_out'` over 113k `stream_event` rows, twice
+            //   (once for the row fetch, once for the `MAX(id) GROUP BY` list
+            //   subquery): ~90 ms cold, 100 ms average *with the lock held*
+            //   across 35k calls in one day. With `(kind, monitor_id, id)` the
+            //   subquery becomes a covering index scan of just the 562
+            //   `raid_out` rows: 87 ms → 0.3 ms.
+            // * `ALERT_SUPERSEDED_SQL` (the take/stream alert badges) — its
+            //   `EXISTS(... WHERE r2.monitor_id = ? AND r2.stream_id = ?)`
+            //   re-scanned the whole `recording` table per alert row:
+            //   193 ms → 3.7 ms with `(monitor_id, stream_id, status)`.
+            //
+            // Both are pure read-path indexes: no column/table changes, so an
+            // older build opening this DB keeps working unchanged.
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_stream_event_kind
+                     ON stream_event(kind, monitor_id, id);
+                 CREATE INDEX IF NOT EXISTS idx_recording_stream
+                     ON recording(monitor_id, stream_id, status);",
+            )?;
+            conn.pragma_update(None, "user_version", 87)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 87);
         Ok(())
     }
 }

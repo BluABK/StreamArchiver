@@ -732,6 +732,8 @@ impl StreamArchiverApp {
             schedule_large_avatar,
             schedule_month_icons,
             deep_filter_texts: None,
+            raid_out_cache: None,
+            saved_layouts_cache: None,
             schedule_day_popup: None,
             show_schedule_sources: false,
             schedule_sources_popup: None,

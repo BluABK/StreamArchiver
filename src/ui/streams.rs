@@ -1610,7 +1610,23 @@ impl StreamArchiverApp {
                 }
             }
 
-            let latest_raid_out = self.core.store.latest_raid_outs_all().unwrap_or_default();
+            // Keyed on `streams_cache_rev`, NOT the per-second stamp — same
+            // reasoning as `deep_filter_texts` below, but this one mattered
+            // most: `latest_raid_outs_all` was ~100 ms *with the DB lock held*
+            // on a real library (see migration 87, which brings that down to
+            // sub-millisecond), and re-running it every second during a
+            // capture stalled the UI thread and every background thread
+            // waiting on the same lock. A raid can only appear via EventSub,
+            // which reloads the grid and bumps the rev.
+            if self.raid_out_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
+                let fresh = self.core.store.latest_raid_outs_all().unwrap_or_default();
+                self.raid_out_cache = Some((self.streams_cache_rev, fresh));
+            }
+            let latest_raid_out = self
+                .raid_out_cache
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
 
             // Per-recording ad-break detail (offsets) for the cut-list tooltips on
             // expanded history rows. Cached (cleared on reload) so we issue the SELECT
@@ -1980,10 +1996,21 @@ impl StreamArchiverApp {
                         cancel: false,
                     })));
                 }
-                // Computed once per frame (not per row) — the Layout submenu's
-                // saved-layouts list, cheap but no reason to re-read the
-                // setting for every visible instance row.
-                let saved_layouts = crate::layout::list_layouts(&self.core.store);
+                // The Layout submenu's saved-layouts list. Read once per grid
+                // rebuild (keyed on `streams_cache_rev`, same shape as
+                // `raid_out_cache`), not once per frame: the render path
+                // should never take the DB lock at mouse-move repaint rates,
+                // however cheap the individual query looks.
+                let layouts_rev = self.saved_layouts_cache.as_ref().map(|(rev, _)| *rev);
+                if layouts_rev != Some(self.streams_cache_rev) {
+                    let fresh = crate::layout::list_layouts(&self.core.store);
+                    self.saved_layouts_cache = Some((self.streams_cache_rev, fresh));
+                }
+                let saved_layouts = self
+                    .saved_layouts_cache
+                    .as_ref()
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
                 table.body(|body| {
                     // Virtualized: only the rows in view are laid out — the old
                     // per-row loop rebuilt every widget of every row each frame.
@@ -2718,6 +2745,8 @@ impl StreamArchiverApp {
         if let Some(name) = acts.delete_saved_layout.take() {
             crate::layout::delete_layout(&self.core.store, &name);
             self.status = format!("Layout \"{name}\" deleted.");
+            // Invalidate `saved_layouts_cache` (keyed on this rev).
+            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
         }
         if let Some(mid) = acts.follow_raid.take() {
             let player = self.settings.media_player_path.trim().to_string();

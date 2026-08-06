@@ -10,8 +10,19 @@
 //! default position) whenever the root is restored. Confirmed empirically
 //! with a minimal eframe repro before this module was written, not guessed.
 //!
-//! `show_viewport_deferred` repaints independently of the root and doesn't
-//! need to be re-declared every frame to survive, but its callback must be
+//! **Deferred is only half the fix**: a deferred viewport still has to be
+//! re-declared during every pass of its parent or egui's end-of-pass GC
+//! destroys it just the same. eframe skips `App::ui` (but not `App::logic`)
+//! whenever the root viewport reports itself invisible, and
+//! `ViewportInfo::visible()` derives that from `minimized`/`occluded` — so a
+//! merely minimized main window meant no `ui()`, no re-declaration, and every
+//! popup's native window destroyed. That is why
+//! `StreamArchiverApp::popup_windows` is called from `logic()` — see its docs, and
+//! `examples/vp_minimize_probe.rs` for the probe that pins both halves down.
+//!
+//! `show_viewport_deferred` repaints independently of the root — the popup's
+//! own UI no longer runs as a side effect of the root's frame — but its
+//! callback must be
 //! `Fn(...) + Send + Sync + 'static` — it cannot hold `&mut self`. Popup
 //! state therefore has to live in `Arc<Mutex<T>>`. In practice every one of
 //! the ~68 popups converted to this module found a way to avoid needing

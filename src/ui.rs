@@ -1956,6 +1956,18 @@ pub struct StreamArchiverApp {
     /// changes when the grid data reloads, while the streams cache itself also
     /// rebuilds every second during an active capture.
     deep_filter_texts: Option<(u64, DeepFilterTexts)>,
+    /// Each monitor's most recent `raid_out` event, cached against the
+    /// `streams_cache_rev` it was fetched at — same reasoning (and same shape)
+    /// as [`Self::deep_filter_texts`]: raids only arrive via EventSub, which
+    /// reloads the grid (and bumps the rev), so re-running the query on the
+    /// streams cache's *per-second* stamp was pure waste. It was also the
+    /// single most expensive thing the UI thread did — see migration 87.
+    raid_out_cache: Option<(u64, HashMap<i64, crate::models::StreamEventRow>)>,
+    /// Saved custom window layouts for the collab-play "Layout ▸" submenu,
+    /// cached against `streams_cache_rev` — read once per grid rebuild instead
+    /// of once per frame (it is a settings-table read, not a hot query, but
+    /// the render path should hold no DB lock it doesn't have to).
+    saved_layouts_cache: Option<(u64, Vec<crate::layout::CustomLayout>)>,
     /// The day whose full stream list is shown in a popup (None = closed).
     schedule_day_popup: Option<Arc<Mutex<ScheduleDayState>>>,
     /// Whether the "Schedule sources" dialog is open.
@@ -2493,6 +2505,93 @@ fn spawn_browse_file_impl(
         .ok();
     PendingBrowse { rx, apply: Box::new(apply) }
 }
+
+impl StreamArchiverApp {
+    /// Declare/update every popup window for this frame.
+    ///
+    /// **This must be called from [`eframe::App::logic`], never from
+    /// [`eframe::App::ui`].** A `show_viewport_deferred` child only survives
+    /// egui's end-of-pass viewport GC if it was re-declared during that pass
+    /// (`ViewportImpl::used`), and eframe *skips `App::ui` entirely* whenever
+    /// the root viewport reports itself invisible — which
+    /// [`egui::ViewportInfo::visible`] derives from `minimized`/`occluded`, so
+    /// it is `Some(false)` for a merely **minimized** window. `App::logic`
+    /// keeps being called there, `App::ui` does not.
+    ///
+    /// Declaring these from `ui()` was therefore why every open popup's native
+    /// window was destroyed the moment the main window was minimized, and
+    /// reappeared with a fresh HWND (and default position) on restore — the
+    /// exact symptom the deferred-viewport migration was supposed to fix, just
+    /// moved one level up. Verified with a standalone eframe probe: declared
+    /// from `ui()`, the child HWND vanishes from `EnumWindows` while the root
+    /// is minimized; declared from `logic()`, the *same* HWND survives both a
+    /// minimize and a hide-to-tray (`ViewportCommand::Visible(false)`).
+    ///
+    /// Side effect of the move: popups now open one frame after the click that
+    /// requested them (this runs before `ui()` within the same pass, so it
+    /// sees last frame's flags). Imperceptible, and they render on their own
+    /// viewport schedule anyway.
+    fn popup_windows(&mut self, ctx: &egui::Context) {
+        self.form_window(ctx);
+        self.channel_form_window(ctx);
+        self.group_manager_window(ctx);
+        self.add_to_recording_group_window(ctx);
+        self.confirm_delete_window(ctx);
+        self.confirm_delete_channel_window(ctx);
+        self.drain_manual_delete_results();
+        self.confirm_delete_file_window(ctx);
+        self.confirm_delete_stream_files_window(ctx);
+        self.move_instance_window(ctx);
+        self.merge_channel_window(ctx);
+        self.confirm_delete_segment_window(ctx);
+        self.merge_preview_window(ctx);
+        self.confirm_delete_segments_window(ctx);
+        self.save_preset_window(ctx);
+        self.format_probe_window(ctx);
+        self.layout_editor_window(ctx);
+        self.recover_vod_window(ctx);
+        self.ad_popup_windows(ctx);
+        self.meta_popup_windows(ctx);
+        self.history_popup_windows(ctx);
+        self.chapters_popup_windows(ctx);
+        self.vod_info_popup_windows(ctx);
+        self.remux_info_popup_windows(ctx);
+        self.collab_history_window(ctx);
+        self.partner_sessions_window(ctx);
+        self.viewer_stats_window(ctx);
+        self.hype_mark_window(ctx);
+        self.hype_override_window(ctx);
+        self.schedule_popup_windows(ctx);
+        self.schedule_sources_window(ctx);
+        self.schedule_day_window(ctx);
+        self.edit_schedule_window(ctx);
+        self.event_properties_windows(ctx);
+        self.chat_popup_windows(ctx);
+        self.instance_properties_windows(ctx);
+        self.channel_properties_windows(ctx);
+        self.emote_viewer_windows(ctx);
+        self.rename_dialog_window(ctx);
+        self.asset_history_windows(ctx);
+        self.recording_properties_windows(ctx);
+        self.processes_window(ctx);
+        self.reorder_columns_window(ctx);
+        self.scheduled_recordings_window(ctx);
+        self.scheduled_recording_form_window(ctx);
+        self.confirm_delete_scheduled_recording_window(ctx);
+        self.confirm_permadelete_trash_window(ctx);
+        self.issues_window(ctx);
+        self.notifications_window(ctx);
+        self.warnings_window(ctx);
+        self.pot_server_log_window(ctx);
+        self.posts_window(ctx);
+        self.posts_excluded_window(ctx);
+        self.format_designer_window(ctx);
+        self.confirm_quit_stop_window(ctx);
+        self.import_window(ctx);
+        self.about_windows(ctx);
+        self.inspector_window(ctx);
+    }
+}
 impl eframe::App for StreamArchiverApp {
     /// eframe's default is 30s, and egui state (scroll positions, window
     /// geometry) changes almost every interaction — so the default rewrites
@@ -2588,6 +2687,12 @@ impl eframe::App for StreamArchiverApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
+
+        // Deliberately here and NOT in `ui()` — see `popup_windows`'s docs:
+        // eframe skips `ui()` while the root window is minimized or hidden,
+        // and a deferred viewport that isn't re-declared during a pass gets
+        // its native window destroyed by egui's end-of-pass GC.
+        self.popup_windows(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3423,65 +3528,6 @@ impl eframe::App for StreamArchiverApp {
         if ctx_save_settings {
             self.save_settings(ui.ctx());
         }
-
-        self.form_window(ui.ctx());
-        self.channel_form_window(ui.ctx());
-        self.group_manager_window(ui.ctx());
-        self.add_to_recording_group_window(ui.ctx());
-        self.confirm_delete_window(ui.ctx());
-        self.confirm_delete_channel_window(ui.ctx());
-        self.drain_manual_delete_results();
-        self.confirm_delete_file_window(ui.ctx());
-        self.confirm_delete_stream_files_window(ui.ctx());
-        self.move_instance_window(ui.ctx());
-        self.merge_channel_window(ui.ctx());
-        self.confirm_delete_segment_window(ui.ctx());
-        self.merge_preview_window(ui.ctx());
-        self.confirm_delete_segments_window(ui.ctx());
-        self.save_preset_window(ui.ctx());
-        self.format_probe_window(ui.ctx());
-        self.layout_editor_window(ui.ctx());
-        self.recover_vod_window(ui.ctx());
-        self.ad_popup_windows(ui.ctx());
-        self.meta_popup_windows(ui.ctx());
-        self.history_popup_windows(ui.ctx());
-        self.chapters_popup_windows(ui.ctx());
-        self.vod_info_popup_windows(ui.ctx());
-        self.remux_info_popup_windows(ui.ctx());
-        self.collab_history_window(ui.ctx());
-        self.partner_sessions_window(ui.ctx());
-        self.viewer_stats_window(ui.ctx());
-        self.hype_mark_window(ui.ctx());
-        self.hype_override_window(ui.ctx());
-        self.schedule_popup_windows(ui.ctx());
-        self.schedule_sources_window(ui.ctx());
-        self.schedule_day_window(ui.ctx());
-        self.edit_schedule_window(ui.ctx());
-        self.event_properties_windows(ui.ctx());
-        self.chat_popup_windows(ui.ctx());
-        self.instance_properties_windows(ui.ctx());
-        self.channel_properties_windows(ui.ctx());
-        self.emote_viewer_windows(ui.ctx());
-        self.rename_dialog_window(ui.ctx());
-        self.asset_history_windows(ui.ctx());
-        self.recording_properties_windows(ui.ctx());
-        self.processes_window(ui.ctx());
-        self.reorder_columns_window(ui.ctx());
-        self.scheduled_recordings_window(ui.ctx());
-        self.scheduled_recording_form_window(ui.ctx());
-        self.confirm_delete_scheduled_recording_window(ui.ctx());
-        self.confirm_permadelete_trash_window(ui.ctx());
-        self.issues_window(ui.ctx());
-        self.notifications_window(ui.ctx());
-        self.warnings_window(ui.ctx());
-        self.pot_server_log_window(ui.ctx());
-        self.posts_window(ui.ctx());
-        self.posts_excluded_window(ui.ctx());
-        self.format_designer_window(ui.ctx());
-        self.confirm_quit_stop_window(ui.ctx());
-        self.import_window(ui.ctx());
-        self.about_windows(ui.ctx());
-        self.inspector_window(ui.ctx());
 
         draw_alt_image_preview(ui.ctx());
 
