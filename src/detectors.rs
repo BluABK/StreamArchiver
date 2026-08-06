@@ -457,6 +457,106 @@ pub fn cached_twitch_user_info(
     cache.get(&login.to_lowercase()).cloned()
 }
 
+/// Record one Twitch account's `broadcaster_type`/`created_at` from a Helix
+/// Get Users call made for a reason OTHER than the opportunistic id-lookup
+/// path above (namely: the channel asset fetch, which already makes this
+/// exact call for the icon/banner and gets these fields for free). Thin
+/// wrapper around [`cache_twitch_user_info`] so callers outside this module
+/// don't need to know its `serde_json::Value`-shaped cache key.
+pub(crate) fn record_twitch_user_info(
+    store: &crate::store::Store,
+    login: &str,
+    broadcaster_type: &str,
+    created_at_rfc3339: &str,
+) {
+    cache_twitch_user_info(
+        store,
+        &serde_json::json!({
+            "login": login,
+            "broadcaster_type": broadcaster_type,
+            "created_at": created_at_rfc3339,
+        }),
+    );
+}
+
+/// Settings-blob cache of a YouTube channel's approximate subscriber count
+/// (Data API `statistics.subscriberCount`, gathered for free alongside the
+/// icon/banner fetch): `account slug -> (subscriber_count, fetched_at unix)`.
+/// Keyed by [`crate::assets::account_slug`] (same identity as the asset dir /
+/// About cache / `AssetAccount`), NOT the resolved `UC…` channel id — a
+/// `/@handle`-form URL's slug is the handle, which wouldn't match the id.
+/// Absent when the channel hides its subscriber count, or before any asset
+/// fetch has run.
+const K_YOUTUBE_CHANNEL_INFO: &str = "youtube_channel_info_cache";
+
+pub(crate) fn record_youtube_channel_info(
+    store: &crate::store::Store,
+    account_slug: &str,
+    subscriber_count: Option<i64>,
+) {
+    if account_slug.is_empty() {
+        return;
+    }
+    let mut cache: std::collections::HashMap<String, (Option<i64>, i64)> = store
+        .get_setting(K_YOUTUBE_CHANNEL_INFO)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    cache.insert(account_slug.to_string(), (subscriber_count, now_unix()));
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = store.set_setting(K_YOUTUBE_CHANNEL_INFO, &json);
+    }
+}
+
+/// Cached YouTube subscriber count for an account slug (see
+/// [`K_YOUTUBE_CHANNEL_INFO`]): `(subscriber_count, fetched_at unix)`.
+pub fn cached_youtube_channel_info(
+    store: &crate::store::Store,
+    account_slug: &str,
+) -> Option<(Option<i64>, i64)> {
+    let cache: std::collections::HashMap<String, (Option<i64>, i64)> =
+        serde_json::from_str(&store.get_setting(K_YOUTUBE_CHANNEL_INFO).ok().flatten()?).ok()?;
+    cache.get(account_slug).cloned()
+}
+
+/// Settings-blob cache of a Kick channel's follower count and verified
+/// checkmark (gathered for free alongside the icon/banner fetch, same v2
+/// channel JSON): `slug -> (follower_count, verified, fetched_at unix)`.
+const K_KICK_CHANNEL_INFO: &str = "kick_channel_info_cache";
+
+pub(crate) fn record_kick_channel_info(
+    store: &crate::store::Store,
+    slug: &str,
+    follower_count: Option<i64>,
+    verified: bool,
+) {
+    if slug.is_empty() {
+        return;
+    }
+    let mut cache: std::collections::HashMap<String, (Option<i64>, bool, i64)> = store
+        .get_setting(K_KICK_CHANNEL_INFO)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    cache.insert(slug.to_lowercase(), (follower_count, verified, now_unix()));
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = store.set_setting(K_KICK_CHANNEL_INFO, &json);
+    }
+}
+
+/// Cached Kick follower/verified info for a channel slug (see
+/// [`K_KICK_CHANNEL_INFO`]): `(follower_count, verified, fetched_at unix)`.
+pub fn cached_kick_channel_info(
+    store: &crate::store::Store,
+    slug: &str,
+) -> Option<(Option<i64>, bool, i64)> {
+    let cache: std::collections::HashMap<String, (Option<i64>, bool, i64)> =
+        serde_json::from_str(&store.get_setting(K_KICK_CHANNEL_INFO).ok().flatten()?).ok()?;
+    cache.get(&slug.to_lowercase()).cloned()
+}
+
 /// Outcome of one in-recording metadata fetch (`*_stream_meta`). The split
 /// between [`Offline`](MetaFetch::Offline) and [`Failed`](MetaFetch::Failed)
 /// matters to the caller's failure-streak warning (`meta_watcher`): a stream

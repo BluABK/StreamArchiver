@@ -98,6 +98,50 @@ pub(super) struct ChannelPropsPopupState {
     pub(super) closed: bool,
 }
 
+/// Partner/affiliate/verified status plus follower-ish counts for one asset
+/// account, formatted as a single `" · "`-joined line — cached
+/// opportunistically alongside that platform's icon/banner asset fetch (see
+/// `crate::detectors::{cached_twitch_user_info, cached_youtube_channel_info,
+/// cached_kick_channel_info}`). `None` until at least one such fetch has run
+/// for this account, or when the platform has nothing to show (Kick with no
+/// verified badge and an unknown follower count, an unsupported platform).
+/// Shared by Instance Properties (one account) and Channel Properties (one
+/// row per account).
+fn cached_channel_meta_line(store: &crate::store::Store, acc: &AssetAccount) -> Option<String> {
+    match acc.platform {
+        Platform::Twitch => {
+            let (btype, created) = crate::detectors::cached_twitch_user_info(store, &acc.account)?;
+            let mut parts: Vec<String> = Vec::new();
+            match btype.as_str() {
+                "partner" => parts.push("Twitch Partner".into()),
+                "affiliate" => parts.push("Twitch Affiliate".into()),
+                _ => {}
+            }
+            if created > 0 {
+                parts.push(format!("account created {}", fmt_date(created)));
+            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        }
+        Platform::YouTube => {
+            let (subs, _) = crate::detectors::cached_youtube_channel_info(store, &acc.account)?;
+            subs.map(|n| format!("{} subscribers", crate::models::group_thousands(n)))
+        }
+        Platform::Kick => {
+            let (followers, verified, _) =
+                crate::detectors::cached_kick_channel_info(store, &acc.account)?;
+            let mut parts: Vec<String> = Vec::new();
+            if verified {
+                parts.push("Kick Verified".into());
+            }
+            if let Some(n) = followers {
+                parts.push(format!("{} followers", crate::models::group_thousands(n)));
+            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        }
+        _ => None,
+    }
+}
+
 impl InstancePropsPopupState {
     /// Header row: account avatar (or placeholder), channel name, and this
     /// instance's platform icon + source-URL link.
@@ -291,29 +335,15 @@ impl InstancePropsPopupState {
             }
         });
 
-        // Extra Twitch account facts, cached opportunistically from Get Users
-        // responses (collab name resolution / id lookups) — absent until one
-        // has passed through.
-        if acc.platform == Platform::Twitch
-            && let Some((btype, created)) =
-                crate::detectors::cached_twitch_user_info(&shared.core.store, &acc.account)
-        {
-            let mut parts: Vec<String> = Vec::new();
-            match btype.as_str() {
-                "partner" => parts.push("Twitch Partner".into()),
-                "affiliate" => parts.push("Twitch Affiliate".into()),
-                _ => {}
-            }
-            if created > 0 {
-                parts.push(format!("account created {}", fmt_date(created)));
-            }
-            if !parts.is_empty() {
-                ui.add_space(2.0);
-                ui.weak(parts.join(" · ")).on_hover_text(
-                    "From Twitch's public account info (Get Users), cached when \
-                     the app last looked this account up.",
-                );
-            }
+        // Partner/affiliate/verified status + follower-ish counts, cached
+        // opportunistically from whatever platform call last touched this
+        // account — absent until one has.
+        if let Some(line) = cached_channel_meta_line(&shared.core.store, &acc) {
+            ui.add_space(2.0);
+            ui.weak(line).on_hover_text(
+                "From this platform's public channel info, cached the last time \
+                 an asset fetch (or, for Twitch, any account lookup) ran.",
+            );
         }
 
         // Thumbnails: this account's original icon/banner. Hover for
@@ -563,7 +593,7 @@ impl ChannelPropsPopupState {
     /// "Assets" section — thumbnail strip, refetch/history controls, About-page
     /// rows, icon-source picker, per-account status grid and emote-viewer
     /// launchers.
-    fn channel_props_assets_section(&mut self, ui: &mut egui::Ui) {
+    fn channel_props_assets_section(&mut self, ui: &mut egui::Ui, shared: &PopupShared) {
         egui::CollapsingHeader::new(egui::RichText::new("Assets").strong())
             .id_salt("ch_props_sec_assets")
             .default_open(true)
@@ -573,6 +603,7 @@ impl ChannelPropsPopupState {
         {
             Self::channel_props_asset_actions(
                 ui,
+                &shared.core.store,
                 &self.ch,
                 &self.accounts,
                 &self.about_latest,
@@ -623,9 +654,11 @@ impl ChannelPropsPopupState {
     }
 
     /// Refetch / open-folder / history button row plus the per-account
-    /// About-page rows.
+    /// channel-info and About-page rows.
+    #[allow(clippy::too_many_arguments)]
     fn channel_props_asset_actions(
         ui: &mut egui::Ui,
+        store: &crate::store::Store,
         ch: &Channel,
         accounts: &[AssetAccount],
         about_latest: &[(crate::store::AboutSnapshotRow, i64)],
@@ -671,6 +704,32 @@ impl ChannelPropsPopupState {
                 *open_asset_history = true;
             }
         });
+
+        // Partner/affiliate/verified status + follower-ish counts — one row
+        // per asset account, cached opportunistically alongside that
+        // account's asset fetch. Rows with nothing cached yet are omitted
+        // entirely rather than shown as "never captured" (unlike About
+        // pages below): unlike the About archive, there's no dedicated fetch
+        // to point at, so "empty" here just means no asset fetch has run yet.
+        let meta_lines: Vec<(&AssetAccount, String)> = accounts
+            .iter()
+            .filter_map(|acc| cached_channel_meta_line(store, acc).map(|line| (acc, line)))
+            .collect();
+        if !meta_lines.is_empty() {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Channel info").strong());
+            for (acc, line) in meta_lines {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("{}:", acc.label));
+                    ui.weak(line);
+                })
+                .response
+                .on_hover_text(
+                    "From this platform's public channel info, cached the last \
+                     time an asset fetch (or, for Twitch, any account lookup) ran.",
+                );
+            }
+        }
 
         // About pages — one row per asset account, each opening the
         // archived About-page viewer (version picker + rendered
@@ -1905,7 +1964,7 @@ impl StreamArchiverApp {
                 .with_inner_size([480.0, 640.0]),
             popup_state.clone(),
             shared,
-            |ctx, s, _shared| {
+            |ctx, s, shared| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     s.closed = true;
                 }
@@ -1923,7 +1982,7 @@ impl StreamArchiverApp {
                 // click to open the file), then the refetch/history controls,
                 // icon-source picker, per-account status grid and emote-viewer
                 // launchers.
-                s.channel_props_assets_section(ui);
+                s.channel_props_assets_section(ui, shared);
 
                 // ── Channel ─────────────────────────────────────────────
                 ChannelPropsPopupState::channel_props_channel_section(

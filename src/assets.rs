@@ -504,20 +504,37 @@ pub async fn fetch_stream_thumbnail(client: &Client, url: &str, dest: &Path) -> 
 /// Download Twitch channel icon and offline banner into `asset_dir/`. Returns
 /// the broadcaster's channel description (bio) from the same Helix response —
 /// input to the About-page snapshot, no extra request.
+/// The bits of a Helix Get Users response the channel asset fetch needs —
+/// `broadcaster_type`/`created_at`/`login` ride along for free on the SAME
+/// call already made for the icon/banner, so `run_twitch_assets` can cache
+/// them (see [`crate::detectors::record_twitch_user_info`]) without any
+/// extra request.
+struct TwitchChannelInfo {
+    description: String,
+    login: String,
+    broadcaster_type: String,
+    created_at: String,
+}
+
 async fn fetch_twitch_channel_assets(
     client: &Client,
     client_id: &str,
     token: &str,
     broadcaster_id: &str,
     asset_dir: &Path,
-) -> Result<String> {
+) -> Result<TwitchChannelInfo> {
     #[derive(Deserialize)]
     struct TwitchUser {
+        login: String,
         profile_image_url: String,
         #[serde(default)]
         offline_image_url: String,
         #[serde(default)]
         description: String,
+        #[serde(default)]
+        broadcaster_type: String,
+        #[serde(default)]
+        created_at: String,
     }
     #[derive(Deserialize)]
     struct UsersResp {
@@ -557,7 +574,12 @@ async fn fetch_twitch_channel_assets(
             warn!("twitch banner: {e}");
         }
     }
-    Ok(user.description)
+    Ok(TwitchChannelInfo {
+        description: user.description,
+        login: user.login,
+        broadcaster_type: user.broadcaster_type,
+        created_at: user.created_at,
+    })
 }
 
 // ---------- Twitch chat usercard (live lookup) ----------
@@ -1523,13 +1545,13 @@ async fn fetch_youtube_channel_assets(
     api_key: &str,
     channel_id: &str,
     asset_dir: &Path,
-) -> Result<(bool, String)> {
+) -> Result<(bool, String, Option<i64>)> {
     if api_key.is_empty() || channel_id.is_empty() {
         bail!("missing YouTube API key or channel ID");
     }
     let url = format!(
         "https://www.googleapis.com/youtube/v3/channels\
-         ?part=snippet,brandingSettings&id={channel_id}&key={api_key}"
+         ?part=snippet,brandingSettings,statistics&id={channel_id}&key={api_key}"
     );
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
@@ -1565,7 +1587,12 @@ async fn fetch_youtube_channel_assets(
         }
     }
     let description = item["snippet"]["description"].as_str().unwrap_or("").to_string();
-    Ok((banner_set, description))
+    // Absent (not a string, or missing) when the channel hides its
+    // subscriber count — best-effort, same idiom as every other
+    // opportunistically-cached platform fact in this module.
+    let subscriber_count =
+        item["statistics"]["subscriberCount"].as_str().and_then(|s| s.parse().ok());
+    Ok((banner_set, description, subscriber_count))
 }
 
 // ---------- Kick ----------
@@ -1643,8 +1670,16 @@ pub async fn run_twitch_assets(
     let ok = match fetch_twitch_channel_assets(client, client_id, token, broadcaster_id, asset_dir)
         .await
     {
-        Ok(desc) => {
-            description = Some(desc);
+        Ok(info) => {
+            if let Some(sink) = about {
+                crate::detectors::record_twitch_user_info(
+                    &sink.store,
+                    &info.login,
+                    &info.broadcaster_type,
+                    &info.created_at,
+                );
+            }
+            description = Some(info.description);
             true
         }
         Err(e) => {
@@ -1870,10 +1905,22 @@ pub async fn run_youtube_assets(
 
     if !api_key.is_empty() && !channel_id.is_empty() {
         match fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await {
-            Ok((banner_set, description)) => {
+            Ok((banner_set, description, subscriber_count)) => {
                 any_ok = true;
                 api_set_banner = banner_set;
                 api_description = Some(description);
+                if let Some(sink) = about {
+                    // Keyed by the About-sink's account slug (same identity
+                    // used for the asset dir / About cache / `AssetAccount`),
+                    // NOT the resolved UC `channel_id` — a `/@handle` URL's
+                    // `account_slug` is the handle, which wouldn't match the
+                    // UC id a later lookup by account would use.
+                    crate::detectors::record_youtube_channel_info(
+                        &sink.store,
+                        &sink.account,
+                        subscriber_count,
+                    );
+                }
             }
             Err(e) => warn!("YouTube channel assets ({channel_id}): {e}"),
         }
@@ -1922,6 +1969,17 @@ pub async fn run_kick_assets(
     match fetch_kick_channel_assets(client, slug, asset_dir).await {
         Ok(v) => {
             if let Some(sink) = about {
+                // Best-effort: `verified` is an object when the channel has a
+                // Kick verification badge, `null` otherwise; `followers_count`
+                // is a top-level channel field, both already in this response.
+                let follower_count = v["followers_count"].as_i64();
+                let verified = v["verified"].is_object();
+                crate::detectors::record_kick_channel_info(
+                    &sink.store,
+                    slug,
+                    follower_count,
+                    verified,
+                );
                 let (bio, links) = kick_about_from_channel_json(&v);
                 if let Err(e) =
                     persist_about_snapshot(client, asset_dir, sink, bio, Vec::new(), links, v, false)
