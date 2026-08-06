@@ -1980,6 +1980,10 @@ impl StreamArchiverApp {
                         cancel: false,
                     })));
                 }
+                // Computed once per frame (not per row) — the Layout submenu's
+                // saved-layouts list, cheap but no reason to re-read the
+                // setting for every visible instance row.
+                let saved_layouts = crate::layout::list_layouts(&self.core.store);
                 table.body(|body| {
                     // Virtualized: only the rows in view are laid out — the old
                     // per-row loop rebuilt every widget of every row each frame.
@@ -2016,6 +2020,7 @@ impl StreamArchiverApp {
                                     hit_instances.contains(&self.rows[ri].monitor.id),
                                     fhits.as_ref(),
                                     self.collab_title_in_name,
+                                    &saved_layouts,
                                     &mut out,
                                 );
                             }
@@ -2087,6 +2092,90 @@ impl StreamArchiverApp {
     /// Apply the self-mutating actions collected while rendering the Streams
     /// grid (expansion toggles, context-menu picks, popup opens, manual
     /// commands). Runs after the table, when `self` is freely mutable again.
+    /// "Play all collab instances (current downloads)" ▸ a Layout submenu
+    /// entry — shared by [`apply_streams_actions`]' own `RowActions` dispatch
+    /// and the Custom layout editor's "Apply now"/"Save as preset…" buttons
+    /// ([`layout_editor_window`]), which resolve to the same
+    /// `(Vec<StreamTarget>, LayoutChoice)` shape and just call this directly
+    /// instead of round-tripping through a row-click action.
+    pub(super) fn dispatch_play_collab_current(
+        &mut self,
+        targets: Vec<StreamTarget>,
+        choice: crate::layout::LayoutChoice,
+    ) {
+        let player = self.settings.media_player_path.trim().to_string();
+        if player.is_empty() {
+            return;
+        }
+        let monitors = crate::display::enumerate_monitors();
+        let rects = crate::layout::resolve_choice(&choice, &self.core.store, &monitors, targets.len());
+        for (t, rect) in targets.into_iter().zip(rects) {
+            let mut cmd = build_player_command(&player, &t);
+            let win32_rect = apply_tile_or_geometry(&mut cmd, &player, Some(rect));
+            if let Some(msg) = spawn_logged(cmd, "stream in player", None, win32_rect) {
+                self.status = msg;
+            }
+        }
+    }
+
+    /// "Play all collab instances (live edge)" ▸ a Layout submenu entry —
+    /// see [`Self::dispatch_play_collab_current`]'s doc comment, same shared-
+    /// dispatch rationale.
+    pub(super) fn dispatch_play_collab_live_edge(
+        &mut self,
+        source_mid: i64,
+        partner_mids: Vec<i64>,
+        untracked: Vec<UntrackedCollabPartner>,
+        choice: crate::layout::LayoutChoice,
+    ) {
+        let player = self.settings.media_player_path.trim().to_string();
+        if player.is_empty() {
+            return;
+        }
+        let meta = crate::ui::player::LiveMetaCtx::from_core(&self.core);
+        let mute_partners = self.settings.mute_collab_instances;
+        let untracked_template = self.settings.collab_untracked_title_template.trim().to_string();
+        let untracked_override = (!untracked_template.is_empty()).then_some(untracked_template.as_str());
+        let n = 1 + partner_mids.len() + untracked.len();
+        let monitors = crate::display::enumerate_monitors();
+        let mut rects = crate::layout::resolve_choice(&choice, &self.core.store, &monitors, n).into_iter();
+        // The clicked-on instance always keeps its own audio — only the
+        // OTHER angles (tracked partners, then untracked ones) respect the
+        // mute setting.
+        if let Some(row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
+            && let Some(msg) = spawn_play_new_instance(
+                row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(), false,
+                rects.next(),
+            )
+        {
+            self.status = msg;
+        }
+        for mid in partner_mids {
+            let rect = rects.next();
+            if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
+                && let Some(msg) = spawn_play_new_instance(
+                    row, &player, &self.settings, &self.core.store, mute_partners, None,
+                    meta.as_ref(), false, rect,
+                )
+            {
+                self.status = msg;
+            }
+        }
+        if !untracked.is_empty()
+            && let Some(source_row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
+        {
+            for partner in untracked {
+                let rect = rects.next();
+                if let Some(msg) = spawn_play_collab_partner(
+                    source_row, &partner, &player, &self.settings, &self.core.store, mute_partners,
+                    untracked_override, meta.as_ref(), rect,
+                ) {
+                    self.status = msg;
+                }
+            }
+        }
+    }
+
     fn apply_streams_actions(
         &mut self,
         ui: &mut egui::Ui,
@@ -2596,81 +2685,10 @@ impl StreamArchiverApp {
             }
         }
         if let Some((targets, choice)) = acts.play_collab_all_current.take() {
-            let player = self.settings.media_player_path.trim().to_string();
-            if !player.is_empty() {
-                let monitors = crate::display::enumerate_monitors();
-                let rects = crate::layout::resolve_choice(&choice, &self.core.store, &monitors, targets.len());
-                for (t, rect) in targets.into_iter().zip(rects) {
-                    let mut cmd = build_player_command(&player, &t);
-                    let win32_rect = apply_tile_or_geometry(&mut cmd, &player, Some(rect));
-                    if let Some(msg) = spawn_logged(cmd, "stream in player", None, win32_rect) {
-                        self.status = msg;
-                    }
-                }
-            }
+            self.dispatch_play_collab_current(targets, choice);
         }
         if let Some((source_mid, partner_mids, untracked, choice)) = acts.play_collab_all_live_edge.take() {
-            let player = self.settings.media_player_path.trim().to_string();
-            if !player.is_empty() {
-                let mute_partners = self.settings.mute_collab_instances;
-                let untracked_template = self.settings.collab_untracked_title_template.trim().to_string();
-                let untracked_override =
-                    (!untracked_template.is_empty()).then_some(untracked_template.as_str());
-                let n = 1 + partner_mids.len() + untracked.len();
-                let monitors = crate::display::enumerate_monitors();
-                let mut rects =
-                    crate::layout::resolve_choice(&choice, &self.core.store, &monitors, n).into_iter();
-                // The clicked-on instance always keeps its own audio — only
-                // the OTHER angles (tracked partners, then untracked ones)
-                // respect the mute setting.
-                if let Some(row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
-                    && let Some(msg) =
-                        spawn_play_new_instance(
-                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
-                        false, rects.next(),
-                    )
-                {
-                    self.status = msg;
-                }
-                for mid in partner_mids {
-                    let rect = rects.next();
-                    if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
-                        && let Some(msg) = spawn_play_new_instance(
-                            row,
-                            &player,
-                            &self.settings,
-                            &self.core.store,
-                            mute_partners,
-                            None,
-                            meta.as_ref(),
-                            false,
-                            rect,
-                        )
-                    {
-                        self.status = msg;
-                    }
-                }
-                if !untracked.is_empty()
-                    && let Some(source_row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
-                {
-                    for partner in untracked {
-                        let rect = rects.next();
-                        if let Some(msg) = spawn_play_collab_partner(
-                            source_row,
-                            &partner,
-                            &player,
-                            &self.settings,
-                            &self.core.store,
-                            mute_partners,
-                            untracked_override,
-                            meta.as_ref(),
-                            rect,
-                        ) {
-                            self.status = msg;
-                        }
-                    }
-                }
-            }
+            self.dispatch_play_collab_live_edge(source_mid, partner_mids, untracked, choice);
         }
         if let Some((source_mid, partner)) = acts.play_collab_partner_live_edge.take() {
             let player = self.settings.media_player_path.trim().to_string();
@@ -2693,6 +2711,13 @@ impl StreamArchiverApp {
             {
                 self.status = msg;
             }
+        }
+        if let Some((labels, targets)) = acts.open_layout_editor.take() {
+            self.open_layout_editor(labels, targets);
+        }
+        if let Some(name) = acts.delete_saved_layout.take() {
+            crate::layout::delete_layout(&self.core.store, &name);
+            self.status = format!("Layout \"{name}\" deleted.");
         }
         if let Some(mid) = acts.follow_raid.take() {
             let player = self.settings.media_player_path.trim().to_string();
@@ -3766,6 +3791,9 @@ impl StreamArchiverApp {
         // Whether title-`@mention` collab partners also get a Name-cell suffix
         // (see `render_instance_row`'s doc comment) — `self.collab_title_in_name`.
         collab_title_in_name: bool,
+        // User-saved tiling layouts, listed in the Layout submenus —
+        // computed once per frame by the caller, not per row.
+        saved_layouts: &[crate::layout::CustomLayout],
         out: &mut StreamsOut,
     ) {
         let mid = row.monitor.id;
@@ -3886,6 +3914,7 @@ impl StreamArchiverApp {
             latest_raid_out.get(&mid),
             col_order, fhits,
             collab_title_in_name,
+            saved_layouts,
             &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);

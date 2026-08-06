@@ -2277,6 +2277,34 @@ pub(super) struct RowActions {
     /// Add-stream form for (set by right-clicking their name in the Name-cell
     /// " × Partner" suffix or 🤝 Collab column/cell — see [`collab_name_label`]).
     pub(super) add_collab_instance: Option<UntrackedCollabPartner>,
+    /// Open the Custom layout editor (set by "🖌 Custom…" in either "Play all
+    /// collab instances" Layout submenu) — a label per entry (display only)
+    /// plus what to actually play once the editor's "Apply now"/"Save as
+    /// preset…" fires.
+    pub(super) open_layout_editor: Option<(Vec<String>, LayoutEditorTargets)>,
+    /// Name of a saved layout to delete (set by the "×" next to it in either
+    /// Layout submenu's saved-layouts list).
+    pub(super) delete_saved_layout: Option<String>,
+}
+
+/// What a Custom layout editor session plays once applied — the same two
+/// shapes [`Actions::play_collab_all_current`]/[`Actions::play_collab_all_live_edge`]
+/// carry, minus the [`crate::layout::LayoutChoice`] (the editor decides that).
+#[derive(Clone)]
+pub(super) enum LayoutEditorTargets {
+    Current(Vec<StreamTarget>),
+    LiveEdge(i64, Vec<i64>, Vec<UntrackedCollabPartner>),
+}
+
+/// Generic per-entry labels for the Custom layout editor's canvas chips —
+/// "which collab angle is which" is nice to have but not worth threading
+/// exact channel names through every filter/collapse step that built the
+/// target list by the time "Custom…" is clicked; the first entry is always
+/// the clicked-on instance itself.
+fn generic_layout_labels(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| if i == 0 { "This instance".to_string() } else { format!("Collab angle {i}") })
+        .collect()
 }
 
 /// A collab partner confirmed via Twitch Shared Chat (`from_title == false`)
@@ -2350,6 +2378,9 @@ pub(super) fn render_instance_row(
     // per `CollabPartner::display`'s `at_mention` styling). Persisted as
     // `collab_title_mentions_in_name`; default on.
     collab_title_in_name: bool,
+    // User-saved tiling layouts (name is the identity), listed in each Layout
+    // submenu alongside the 3 built-in presets — see `crate::layout`.
+    saved_layouts: &[crate::layout::CustomLayout],
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -2497,6 +2528,30 @@ pub(super) fn render_instance_row(
                             ui.close();
                         }
                     }
+                    if !saved_layouts.is_empty() {
+                        ui.separator();
+                        for l in saved_layouts {
+                            ui.horizontal(|ui| {
+                                if ui.button(&l.name).clicked() {
+                                    a.play_collab_all_current = Some((
+                                        all_current.clone(),
+                                        crate::layout::LayoutChoice::Saved(l.name.clone()),
+                                    ));
+                                    ui.close();
+                                }
+                                if ui.small_button("×").on_hover_text("Delete this layout").clicked() {
+                                    a.delete_saved_layout = Some(l.name.clone());
+                                }
+                            });
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("🖌  Custom…").clicked() {
+                        let labels = generic_layout_labels(all_current.len());
+                        a.open_layout_editor =
+                            Some((labels, LayoutEditorTargets::Current(all_current.clone())));
+                        ui.close();
+                    }
                 })
                 .response
                 .on_hover_text(
@@ -2518,6 +2573,39 @@ pub(super) fn render_instance_row(
                             ));
                             ui.close();
                         }
+                    }
+                    if !saved_layouts.is_empty() {
+                        ui.separator();
+                        for l in saved_layouts {
+                            ui.horizontal(|ui| {
+                                if ui.button(&l.name).clicked() {
+                                    a.play_collab_all_live_edge = Some((
+                                        m.id,
+                                        tracked_partner_mids.clone(),
+                                        untracked_live_edge.clone(),
+                                        crate::layout::LayoutChoice::Saved(l.name.clone()),
+                                    ));
+                                    ui.close();
+                                }
+                                if ui.small_button("×").on_hover_text("Delete this layout").clicked() {
+                                    a.delete_saved_layout = Some(l.name.clone());
+                                }
+                            });
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("🖌  Custom…").clicked() {
+                        let n = 1 + tracked_partner_mids.len() + untracked_live_edge.len();
+                        let labels = generic_layout_labels(n);
+                        a.open_layout_editor = Some((
+                            labels,
+                            LayoutEditorTargets::LiveEdge(
+                                m.id,
+                                tracked_partner_mids.clone(),
+                                untracked_live_edge.clone(),
+                            ),
+                        ));
+                        ui.close();
                     }
                 })
                 .response

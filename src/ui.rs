@@ -510,6 +510,7 @@ mod help;
 mod history;
 pub(crate) mod io_view;
 mod issues;
+mod layout_editor;
 pub(crate) mod player;
 mod popup;
 mod posts;
@@ -522,7 +523,7 @@ mod trash;
 mod videos;
 
 #[allow(unused_imports)]
-use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, player::*, popup::*, posts::*, properties::*, schedule::*, settings::*, streams::*, trash::*, videos::*};
+use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, layout_editor::*, player::*, popup::*, posts::*, properties::*, schedule::*, settings::*, streams::*, trash::*, videos::*};
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
 /// `url` is this *instance's* source URL (the platform is derived from it).
@@ -1609,6 +1610,9 @@ pub struct StreamArchiverApp {
     format_probe: Arc<Mutex<FormatProbe>>,
     /// Deferred-viewport state for `format_probe_window` (None = closed).
     format_probe_popup: Option<Arc<Mutex<videos::FormatProbePopupState>>>,
+    /// Deferred-viewport state for the "🖌 Custom…" layout editor
+    /// (`layout_editor_window`), `None` = closed.
+    layout_editor: Option<Arc<Mutex<layout_editor::LayoutEditorPopupState>>>,
     /// Backing state for the "Recover VOD" dialog (`None` = closed).
     recover_form: Option<Arc<Mutex<RecoverVodForm>>>,
     /// Shared state of the async Recover-VOD CDN probe.
@@ -3436,6 +3440,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_segments_window(ui.ctx());
         self.save_preset_window(ui.ctx());
         self.format_probe_window(ui.ctx());
+        self.layout_editor_window(ui.ctx());
         self.recover_vod_window(ui.ctx());
         self.ad_popup_windows(ui.ctx());
         self.meta_popup_windows(ui.ctx());

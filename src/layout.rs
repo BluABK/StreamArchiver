@@ -69,13 +69,28 @@ impl BuiltinPreset {
     }
 }
 
-fn frac_to_pixels(base: PixelRect, frac: (f32, f32, f32, f32)) -> PixelRect {
+pub(crate) fn frac_to_pixels(base: PixelRect, frac: (f32, f32, f32, f32)) -> PixelRect {
     PixelRect {
         x: base.x + (frac.0 * base.w as f32).round() as i32,
         y: base.y + (frac.1 * base.h as f32).round() as i32,
         w: (frac.2 * base.w as f32).round() as i32,
         h: (frac.3 * base.h as f32).round() as i32,
     }
+}
+
+/// Inverse of [`frac_to_pixels`] — an absolute pixel rect, expressed as
+/// fractions of `base` (e.g. a monitor's `work_rect`). Used by the Custom
+/// layout editor to seed its canvas from a built-in preset's pixel math, and
+/// to convert a dragged chip's pixel position back to the persisted
+/// resolution-independent form.
+pub(crate) fn pixels_to_frac(base: PixelRect, rect: PixelRect) -> (f32, f32, f32, f32) {
+    let (bw, bh) = (base.w.max(1) as f32, base.h.max(1) as f32);
+    (
+        (rect.x - base.x) as f32 / bw,
+        (rect.y - base.y) as f32 / bh,
+        rect.w as f32 / bw,
+        rect.h as f32 / bh,
+    )
 }
 
 /// An even grid of `n` cells inside `area` — `cols = ceil(sqrt(n))`,
@@ -377,6 +392,14 @@ mod tests {
         let layouts = list_layouts(&store);
         assert_eq!(layouts.len(), 1);
         assert_eq!(layouts[0].name, "B");
+    }
+
+    #[test]
+    fn pixels_to_frac_is_the_inverse_of_frac_to_pixels() {
+        let base = PixelRect { x: -200, y: 100, w: 1920, h: 1080 };
+        let px = PixelRect { x: 100, y: 200, w: 800, h: 600 };
+        let frac = pixels_to_frac(base, px);
+        assert_eq!(frac_to_pixels(base, frac), px);
     }
 
     #[test]
