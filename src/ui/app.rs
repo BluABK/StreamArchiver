@@ -1211,6 +1211,27 @@ impl StreamArchiverApp {
         // (observed 2026-07-31: tray Quit with chat sidecars and
         // detached captures live).
         self.heartbeat.set_active(false);
+
+        // Belt-and-suspenders against eframe/winit's multi-viewport event
+        // loop occasionally never reaching its own exit condition after a
+        // `ViewportCommand::Close` — observed 2026-08-06 as an indefinite
+        // hang on Quit, plausibly related to the number of independently-
+        // scheduled popup viewports (chat replay, Properties, Inspector,
+        // ...) that can be open at quit time under `show_viewport_deferred`.
+        // `run_native`'s own window teardown should be near-instant; this is
+        // NOT the same budget as `shutdown_on_exit`'s up-to-~150s "stop
+        // recordings" path, which only starts AFTER `run_native` returns
+        // (flipping `RUN_NATIVE_RETURNED`) and so can never race this timer.
+        let core = self.core.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            if !crate::app_core::RUN_NATIVE_RETURNED.load(std::sync::atomic::Ordering::SeqCst) {
+                warn!("eframe did not exit within 12s of Quit — forcing shutdown");
+                core.shutdown_on_exit();
+                std::process::exit(0);
+            }
+        });
+
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 

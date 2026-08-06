@@ -29,6 +29,16 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// child process).
 const DETACH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Flips true the instant `eframe::run_native` returns in `main()`, BEFORE
+/// `shutdown_on_exit()` runs. Checked by the quit-time watchdog spawned in
+/// `request_quit_detach` to tell a genuinely-stuck event loop apart from a
+/// slow-but-progressing `shutdown_on_exit()` — which can legitimately take
+/// up to ~150s on the "Quit & stop recordings" path and only ever starts
+/// AFTER this flips, so it can never race the watchdog's own fallback call
+/// to the same function (see that function's doc for the failure mode this
+/// guards against).
+pub static RUN_NATIVE_RETURNED: AtomicBool = AtomicBool::new(false);
+
 /// Sleep `dur`, returning early (within ~200ms) once `shutdown` is set. Shared by
 /// the background loops (scheduler-adjacent tasks, eventsub, websub, ad-free
 /// refresher) so they all stop promptly on quit.

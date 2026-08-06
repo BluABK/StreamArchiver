@@ -294,10 +294,15 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
 
-    // The UI loop has exited (Quit). By default we DETACH: leave the tool process
-    // trees running so the app can restart/rebuild without stopping downloads (the
-    // next launch re-attaches). Only stop them when the user asked to (the
-    // "Quit & stop recordings" tray item or the stop_downloads_on_quit setting).
+    // The UI loop has exited (Quit) on its own — disarm the quit-time watchdog
+    // spawned in `request_quit_detach` before it can race this normal path
+    // (see `RUN_NATIVE_RETURNED`'s doc).
+    app_core::RUN_NATIVE_RETURNED.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // By default we DETACH: leave the tool process trees running so the app can
+    // restart/rebuild without stopping downloads (the next launch re-attaches).
+    // Only stop them when the user asked to (the "Quit & stop recordings" tray
+    // item or the stop_downloads_on_quit setting).
     core.shutdown_on_exit();
 
     Ok(())
