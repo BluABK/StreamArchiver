@@ -57,57 +57,67 @@ fn entry_pixel_rect(entry: &LayoutEntry, monitors: &[crate::display::PhysicalMon
     crate::layout::frac_to_pixels(m.work_rect, entry.rect_frac)
 }
 
-/// Paint one chip's contents: the channel's avatar (square, scaled to the
-/// chip's height so it grows/shrinks with the window the chip represents) and
-/// its name, wrapped into whatever width is left beside the avatar.
+/// Paint one chip's contents as a centred stack: the channel's avatar, then
+/// its name underneath.
 ///
-/// Both are skipped rather than clipped when the chip is too small to hold
-/// them — a chip dragged down to the 80×60 px minimum is a placement handle,
-/// not a label, and a half-drawn face there reads as a rendering glitch.
+/// **The name is laid out first and the avatar gets whatever height is left**,
+/// so a long username never gets clipped or pushed out — it just squeezes the
+/// picture, and on a chip too short for both the picture disappears entirely
+/// rather than the name. Wrapping is `break_anywhere` because usernames are
+/// single tokens with nothing to word-wrap at, capped at
+/// [`MAX_NAME_ROWS`] lines (egui adds the ellipsis) so one very long name on a
+/// tall chip can't turn the whole face into text.
 fn draw_chip_face(
     painter: &egui::Painter,
     ui: &egui::Ui,
     chip: egui::Rect,
     angle: &super::grid::LayoutAngle,
 ) {
-    const PAD: f32 = 4.0;
-    let inner = chip.shrink(PAD);
-    if inner.width() < 12.0 || inner.height() < 12.0 {
+    /// Gap between the picture and the name.
+    const GAP: f32 = 2.0;
+    /// Most wrapped lines a name may take before it is ellipsised.
+    const MAX_NAME_ROWS: usize = 3;
+    /// Below this the picture is dropped rather than drawn as a smudge.
+    const MIN_AVATAR: f32 = 10.0;
+
+    let inner = chip.shrink(3.0);
+    if inner.width() < 10.0 || inner.height() < 10.0 {
         return;
     }
-    // Scale by height, but never let the face eat more than half the chip —
-    // otherwise a wide-and-short chip's avatar squeezes the name out entirely.
-    let mut text_rect = inner;
-    if let Some(tex) = &angle.avatar {
-        let side = inner.height().min(inner.width() * 0.5);
-        if side >= 12.0 {
-            let img = egui::Rect::from_min_size(
-                egui::pos2(inner.min.x, inner.center().y - side / 2.0),
-                egui::vec2(side, side),
-            );
-            painter.image(
-                tex.id(),
-                img,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            text_rect = egui::Rect::from_min_max(
-                egui::pos2(img.max.x + PAD, inner.min.y),
-                inner.max,
-            );
-        }
-    }
-    if text_rect.width() < 24.0 {
-        return;
-    }
-    let galley = painter.layout(
+
+    let font = egui::FontId::proportional(12.0);
+    let row_h = ui.ctx().fonts_mut(|f| f.row_height(&font));
+    let rows = ((inner.height() / row_h).floor() as usize).clamp(1, MAX_NAME_ROWS);
+    let mut job = egui::text::LayoutJob::simple(
         angle.label.clone(),
-        egui::FontId::proportional(13.0),
+        font,
         ui.visuals().text_color(),
-        text_rect.width(),
+        inner.width(),
     );
+    job.wrap.max_rows = rows;
+    job.wrap.break_anywhere = true;
+    let galley = painter.layout_job(job);
+    let text_h = galley.size().y.min(inner.height());
+
+    let side = (inner.height() - text_h - GAP).min(inner.width()).max(0.0);
+    let avatar = angle.avatar.as_ref().filter(|_| side >= MIN_AVATAR);
+    let stack_h = if avatar.is_some() { side + GAP + text_h } else { text_h };
+    let top = inner.center().y - stack_h / 2.0;
+
+    if let Some(tex) = avatar {
+        painter.image(
+            tex.id(),
+            egui::Rect::from_min_size(
+                egui::pos2(inner.center().x - side / 2.0, top),
+                egui::vec2(side, side),
+            ),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    let text_top = if avatar.is_some() { top + side + GAP } else { top };
     painter.galley(
-        text_rect.center() - galley.size() / 2.0,
+        egui::pos2(inner.center().x - galley.size().x / 2.0, text_top),
         galley,
         ui.visuals().text_color(),
     );
