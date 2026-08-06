@@ -2163,6 +2163,12 @@ pub const K_GRID_SORT: &str = "grid_sort_v1";
 /// added, without the app needing to hardcode a fixed set of "modes".
 pub const K_SAVED_VIEWS: &str = "saved_views_v1";
 
+/// `app_settings` key for user-saved "Play all collab instances" tiling
+/// layouts (JSON `Vec<CustomLayout>`); see [`crate::layout`]. A layout's
+/// identity IS its name, same convention as [`crate::saved_views::SavedView`]
+/// above.
+pub const K_LAYOUT_PRESETS: &str = "layout_presets_v1";
+
 /// `app_settings` key for per-channel schedule-source config (JSON map
 /// `{channel_id -> ChannelSourceConfig}`): Twitter/X handle, a manual schedule
 /// image path/URL, and per-channel OCR overrides. See [`crate::schedule_source`].
