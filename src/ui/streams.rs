@@ -2588,43 +2588,52 @@ impl StreamArchiverApp {
                 && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
                 && let Some(msg) =
                     spawn_play_new_instance(
-                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(), false,
+                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
+                        false, None,
                     )
             {
                 self.status = msg;
             }
         }
-        if let Some(targets) = acts.play_collab_all_current.take() {
+        if let Some((targets, choice)) = acts.play_collab_all_current.take() {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty() {
-                for t in targets {
-                    if let Some(msg) =
-                        spawn_logged(build_player_command(&player, &t), "stream in player", None, None)
-                    {
+                let monitors = crate::display::enumerate_monitors();
+                let rects = crate::layout::resolve_choice(&choice, &self.core.store, &monitors, targets.len());
+                for (t, rect) in targets.into_iter().zip(rects) {
+                    let mut cmd = build_player_command(&player, &t);
+                    let win32_rect = apply_tile_or_geometry(&mut cmd, &player, Some(rect));
+                    if let Some(msg) = spawn_logged(cmd, "stream in player", None, win32_rect) {
                         self.status = msg;
                     }
                 }
             }
         }
-        if let Some((source_mid, partner_mids, untracked)) = acts.play_collab_all_live_edge.take() {
+        if let Some((source_mid, partner_mids, untracked, choice)) = acts.play_collab_all_live_edge.take() {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty() {
                 let mute_partners = self.settings.mute_collab_instances;
                 let untracked_template = self.settings.collab_untracked_title_template.trim().to_string();
                 let untracked_override =
                     (!untracked_template.is_empty()).then_some(untracked_template.as_str());
+                let n = 1 + partner_mids.len() + untracked.len();
+                let monitors = crate::display::enumerate_monitors();
+                let mut rects =
+                    crate::layout::resolve_choice(&choice, &self.core.store, &monitors, n).into_iter();
                 // The clicked-on instance always keeps its own audio — only
                 // the OTHER angles (tracked partners, then untracked ones)
                 // respect the mute setting.
                 if let Some(row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
                     && let Some(msg) =
                         spawn_play_new_instance(
-                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(), false,
+                        row, &player, &self.settings, &self.core.store, false, None, meta.as_ref(),
+                        false, rects.next(),
                     )
                 {
                     self.status = msg;
                 }
                 for mid in partner_mids {
+                    let rect = rects.next();
                     if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
                         && let Some(msg) = spawn_play_new_instance(
                             row,
@@ -2635,6 +2644,7 @@ impl StreamArchiverApp {
                             None,
                             meta.as_ref(),
                             false,
+                            rect,
                         )
                     {
                         self.status = msg;
@@ -2644,6 +2654,7 @@ impl StreamArchiverApp {
                     && let Some(source_row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
                 {
                     for partner in untracked {
+                        let rect = rects.next();
                         if let Some(msg) = spawn_play_collab_partner(
                             source_row,
                             &partner,
@@ -2653,6 +2664,7 @@ impl StreamArchiverApp {
                             mute_partners,
                             untracked_override,
                             meta.as_ref(),
+                            rect,
                         ) {
                             self.status = msg;
                         }
@@ -2676,6 +2688,7 @@ impl StreamArchiverApp {
                     false,
                     untracked_override,
                     meta.as_ref(),
+                    None,
                 )
             {
                 self.status = msg;

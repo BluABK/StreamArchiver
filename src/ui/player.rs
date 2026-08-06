@@ -1113,13 +1113,16 @@ fn spawn_live_title_updater(
 ///   playlist entry (a file that doesn't exist) *and* the real input appended
 ///   after it, since Streamlink adds the input itself when the placeholder is
 ///   missing.
-fn streamlink_player_args(ipc_pipe: Option<&str>, mute: bool) -> Option<String> {
+fn streamlink_player_args(ipc_pipe: Option<&str>, mute: bool, geometry: Option<&str>) -> Option<String> {
     let mut args: Vec<String> = Vec::new();
     if let Some(pipe) = ipc_pipe {
         args.push(format!("--input-ipc-server='{pipe}'"));
     }
     if mute {
         args.push("--mute".into());
+    }
+    if let Some(g) = geometry {
+        args.push(g.to_string());
     }
     (!args.is_empty()).then(|| format!("{} {{playerinput}}", args.join(" ")))
 }
@@ -1498,6 +1501,12 @@ pub(super) fn spawn_play_new_instance(
     title_template_override: Option<&str>,
     meta: Option<&LiveMetaCtx>,
     is_vod: bool,
+    // Requested "Play all collab instances" tile placement, if any — `None`
+    // everywhere else. Not threaded into the `Tool::YtDlp` YouTube live-edge
+    // preview branch ([`spawn_live_preview`]): collab is a Twitch-only
+    // feature (`models::CollabPartner`), so that branch is unreachable from
+    // any tiled call site.
+    tile_rect: Option<crate::display::PixelRect>,
 ) -> Option<String> {
     use crate::downloader::{
         push_track_args, resolve_auth, resolved_quality, split_args, AuthSource,
@@ -1582,9 +1591,18 @@ pub(super) fn spawn_play_new_instance(
             // `error: Failed to start player: C:\...\mpv.exe --mute (Player
             // executable not found)`. --player-args isn't re-split against the
             // player path, so it can't suffer the same failure.
-            if let Some(player_args) =
-                streamlink_player_args(ipc_pipe.as_deref(), mute && player_is_mpv(player))
-            {
+            // Streamlink itself doesn't understand --geometry — an mpv tile
+            // request has to ride inside --player-args like --mute/the IPC
+            // socket above; a non-mpv player instead falls through to
+            // spawn_logged's Win32 fallback below (streamlink spawns it as a
+            // child, so the pid tree walk still finds its window).
+            let mpv_geometry =
+                tile_rect.filter(|_| player_is_mpv(player)).map(|r| r.geometry_arg());
+            if let Some(player_args) = streamlink_player_args(
+                ipc_pipe.as_deref(),
+                mute && player_is_mpv(player),
+                mpv_geometry.as_deref(),
+            ) {
                 args.push("--player-args".into());
                 args.push(player_args);
             }
@@ -1594,7 +1612,8 @@ pub(super) fn spawn_play_new_instance(
             // Streamlink spawns mpv itself here, so its stderr is the only
             // window into BOTH processes for the Twitch path.
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
-            let status = spawn_logged(cmd, "streamlink", Some(m.id), None);
+            let win32_tile_rect = if mpv_geometry.is_some() { None } else { tile_rect };
+            let status = spawn_logged(cmd, "streamlink", Some(m.id), win32_tile_rect);
             // Both updaters start only if Streamlink actually started —
             // otherwise one would sit on a pipe that can never appear and log
             // a spurious warning a minute later.
@@ -1672,7 +1691,8 @@ pub(super) fn spawn_play_new_instance(
                     if mute && player_is_mpv(player) {
                         cmd.arg("--mute");
                     }
-                    spawn_logged(cmd, "media player", Some(m.id), None)
+                    let win32_tile_rect = apply_tile_or_geometry(&mut cmd, player, tile_rect);
+                    spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect)
                 }
                 Err(e) => {
                     warn!(%line, "play-new-instance: failed to spawn yt-dlp: {e}");
@@ -1692,7 +1712,8 @@ pub(super) fn spawn_play_new_instance(
                 cmd.arg("--mute");
             }
             cmd.arg(&m.url);
-            spawn_logged(cmd, "media player", Some(m.id), None)
+            let win32_tile_rect = apply_tile_or_geometry(&mut cmd, player, tile_rect);
+            spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect)
         }
     }
 }
@@ -1721,7 +1742,7 @@ pub(crate) fn spawn_play_vod(
     row.last_game.clear();
     spawn_play_new_instance(
         &row, player, settings, store, false,
-        Some("🎬  VOD: {channel} - {title_trimmed}"), None, true,
+        Some("🎬  VOD: {channel} - {title_trimmed}"), None, true, None,
     )
 }
 
@@ -1760,7 +1781,7 @@ pub(crate) fn spawn_follow_raid(
     row.channel.name = to_display_name.to_string();
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store, false, None, meta, false)
+    spawn_play_new_instance(&row, player, settings, store, false, None, meta, false, None)
 }
 
 /// Tune into a verified-but-untracked collab partner at the live edge, no
@@ -1779,6 +1800,7 @@ pub(super) fn spawn_play_collab_partner(
     mute: bool,
     title_template_override: Option<&str>,
     meta: Option<&LiveMetaCtx>,
+    tile_rect: Option<crate::display::PixelRect>,
 ) -> Option<String> {
     let mut row = source_row.clone();
     row.monitor.id = 0;
@@ -1789,7 +1811,9 @@ pub(super) fn spawn_play_collab_partner(
     // after launch rather than before it (`run_untracked_title_updater`).
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store, mute, title_template_override, meta, false)
+    spawn_play_new_instance(
+        &row, player, settings, store, mute, title_template_override, meta, false, tile_rect,
+    )
 }
 
 #[cfg(test)]
@@ -2249,7 +2273,7 @@ mod tests {
     #[test]
     fn streamlink_player_args_quote_the_pipe_and_use_the_current_input_token() {
         let pipe = r"\\.\pipe\streamarchiver-mpv-1234-99";
-        let v = streamlink_player_args(Some(pipe), false).unwrap();
+        let v = streamlink_player_args(Some(pipe), false, None).unwrap();
         // The pipe path MUST be single-quoted: Streamlink shlex-splits this
         // value in POSIX mode even on Windows, so an unquoted `\\.\pipe\x`
         // arrives as `.pipex` with every backslash eaten as an escape.
@@ -2261,13 +2285,20 @@ mod tests {
 
         // Mute composes into the SAME value: a second --player-args would
         // just override the first.
-        let both = streamlink_player_args(Some(pipe), true).unwrap();
+        let both = streamlink_player_args(Some(pipe), true, None).unwrap();
         assert_eq!(both, format!("--input-ipc-server='{pipe}' --mute {{playerinput}}"));
         assert_eq!(both.matches("{playerinput}").count(), 1);
 
         // Mute alone still works, and nothing at all means no flag.
-        assert_eq!(streamlink_player_args(None, true).unwrap(), "--mute {playerinput}");
-        assert_eq!(streamlink_player_args(None, false), None);
+        assert_eq!(streamlink_player_args(None, true, None).unwrap(), "--mute {playerinput}");
+        assert_eq!(streamlink_player_args(None, false, None), None);
+
+        // Geometry composes alongside the others too.
+        let geo = streamlink_player_args(Some(pipe), true, Some("--geometry=800x600+0+0")).unwrap();
+        assert_eq!(
+            geo,
+            format!("--input-ipc-server='{pipe}' --mute --geometry=800x600+0+0 {{playerinput}}")
+        );
     }
 
     #[test]

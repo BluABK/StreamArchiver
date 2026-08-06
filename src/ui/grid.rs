@@ -2251,18 +2251,21 @@ pub(super) struct RowActions {
     pub(super) backfill_head: Option<i64>,
     /// Targets to open in the player — this instance plus every collab
     /// partner that resolves to a locally-tracked monitor with a currently-
-    /// downloading capture (set by "Play all collab instances (current downloads)").
-    pub(super) play_collab_all_current: Option<Vec<StreamTarget>>,
+    /// downloading capture — plus the chosen tiling layout (set by "Play all
+    /// collab instances (current downloads)" ▸ a Layout submenu entry).
+    pub(super) play_collab_all_current: Option<(Vec<StreamTarget>, crate::layout::LayoutChoice)>,
     /// `(source instance mid, tracked partner mids, verified-but-untracked
-    /// partners)` to open live-edge previews for (set by "Play all collab
-    /// instances (live edge)") — the source instance and every collab
-    /// partner, whether or not it resolves to a locally-tracked monitor. An
-    /// untracked partner is played via a synthetic row cloned from the
-    /// source instance's own tool/quality/auth settings (see
-    /// `player::spawn_play_collab_partner`), same fallback `spawn_follow_raid`
-    /// already uses for an untracked raid target — a title-mention guess
-    /// (unverified) is still skipped rather than auto-played.
-    pub(super) play_collab_all_live_edge: Option<(i64, Vec<i64>, Vec<UntrackedCollabPartner>)>,
+    /// partners, chosen tiling layout)` to open live-edge previews for (set
+    /// by "Play all collab instances (live edge)" ▸ a Layout submenu entry)
+    /// — the source instance and every collab partner, whether or not it
+    /// resolves to a locally-tracked monitor. An untracked partner is played
+    /// via a synthetic row cloned from the source instance's own
+    /// tool/quality/auth settings (see `player::spawn_play_collab_partner`),
+    /// same fallback `spawn_follow_raid` already uses for an untracked raid
+    /// target — a title-mention guess (unverified) is still skipped rather
+    /// than auto-played.
+    pub(super) play_collab_all_live_edge:
+        Option<(i64, Vec<i64>, Vec<UntrackedCollabPartner>, crate::layout::LayoutChoice)>,
     /// `(source instance mid, partner)` for a single verified-but-untracked
     /// collab partner's "▷ Live edge" action in the "Play collab instance…"
     /// submenu — same fallback as `play_collab_all_live_edge`'s untracked case.
@@ -2482,45 +2485,52 @@ pub(super) fn render_instance_row(
                     name: partner.name.clone(),
                 })
                 .collect();
-            if ui
-                .add_enabled(
-                    !media_player.is_empty() && !all_current.is_empty(),
-                    egui::Button::new("👥⏵  Play all collab instances (current downloads)"),
-                )
+            ui.add_enabled_ui(!media_player.is_empty() && !all_current.is_empty(), |ui| {
+                ui.menu_button("👥⏵  Play all collab instances (current downloads) ▸ Layout", |ui| {
+                    ui.set_min_width(160.0);
+                    for preset in crate::layout::BuiltinPreset::ALL {
+                        if ui.button(preset.label()).clicked() {
+                            a.play_collab_all_current = Some((
+                                all_current.clone(),
+                                crate::layout::LayoutChoice::Builtin(preset),
+                            ));
+                            ui.close();
+                        }
+                    }
+                })
+                .response
                 .on_hover_text(
                     "Open every collab angle's currently-downloading capture in the \
                      media player at once — one window per angle that has one, \
-                     including this instance.",
-                )
-                .on_disabled_hover_text(if media_player.is_empty() {
-                    "Set a media player in Settings → Defaults first"
-                } else {
-                    "No playable capture found for this instance or any collab partner"
+                     including this instance — tiled per the chosen layout.",
+                );
+            });
+            ui.add_enabled_ui(!media_player.is_empty(), |ui| {
+                ui.menu_button("👥▷  Play all collab instances (live edge) ▸ Layout", |ui| {
+                    ui.set_min_width(160.0);
+                    for preset in crate::layout::BuiltinPreset::ALL {
+                        if ui.button(preset.label()).clicked() {
+                            a.play_collab_all_live_edge = Some((
+                                m.id,
+                                tracked_partner_mids.clone(),
+                                untracked_live_edge.clone(),
+                                crate::layout::LayoutChoice::Builtin(preset),
+                            ));
+                            ui.close();
+                        }
+                    }
                 })
-                .clicked()
-            {
-                a.play_collab_all_current = Some(all_current);
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    !media_player.is_empty(),
-                    egui::Button::new("👥▷  Play all collab instances (live edge)"),
-                )
+                .response
                 .on_hover_text(
                     "Tune into every collab angle at the live edge in the media player at \
                      once (does not record) — this instance, every locally-tracked collab \
                      partner, and every OTHER verified partner too (a synthetic instance \
                      using this one's tool/quality/auth settings, since there's no local \
                      config for a channel you don't track). A title-mention guess that isn't \
-                     locally tracked is still skipped — too unverified to auto-launch.",
-                )
-                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                .clicked()
-            {
-                a.play_collab_all_live_edge = Some((m.id, tracked_partner_mids, untracked_live_edge));
-                ui.close();
-            }
+                     locally tracked is still skipped — too unverified to auto-launch. Tiled \
+                     per the chosen layout.",
+                );
+            });
             if !collab_plays.is_empty() {
                 ui.menu_button("👥  Play collab instance…", |ui| {
                     ui.set_min_width(170.0);

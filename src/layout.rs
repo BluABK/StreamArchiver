@@ -158,6 +158,41 @@ pub fn resolve_custom(layout: &CustomLayout, monitors: &[PhysicalMonitor], n: us
     out
 }
 
+/// What a "Play all collab instances" menu click asked for: one of the 3
+/// built-in quick presets, a previously-saved [`CustomLayout`] by name, or a
+/// one-off arrangement built in the editor and applied without saving.
+#[derive(Clone, Debug)]
+pub enum LayoutChoice {
+    Builtin(BuiltinPreset),
+    Saved(String),
+    Custom(Vec<LayoutSlot>),
+}
+
+/// Resolve a menu choice to `n` absolute pixel rects, in request order.
+/// Builtins target the primary monitor; a `Saved` name that no longer exists
+/// (deleted between menu-open and click, a narrow race) falls back to
+/// `TileEqually` on the primary monitor, same tolerance as everywhere else
+/// in this module.
+pub fn resolve_choice(
+    choice: &LayoutChoice,
+    store: &Store,
+    monitors: &[PhysicalMonitor],
+    n: usize,
+) -> Vec<PixelRect> {
+    match choice {
+        LayoutChoice::Builtin(preset) => {
+            resolve_builtin(*preset, &crate::display::primary_or_fallback(monitors), n)
+        }
+        LayoutChoice::Saved(name) => match list_layouts(store).into_iter().find(|l| &l.name == name) {
+            Some(layout) => resolve_custom(&layout, monitors, n),
+            None => resolve_builtin(BuiltinPreset::TileEqually, &crate::display::primary_or_fallback(monitors), n),
+        },
+        LayoutChoice::Custom(slots) => {
+            resolve_custom(&CustomLayout { name: String::new(), slots: slots.clone() }, monitors, n)
+        }
+    }
+}
+
 fn all_layouts(store: &Store) -> Vec<CustomLayout> {
     store
         .get_setting(K_LAYOUT_PRESETS)
@@ -298,6 +333,27 @@ mod tests {
         };
         let rects = resolve_custom(&layout, &monitors, 1);
         assert_eq!(rects[0], monitors[0].work_rect);
+    }
+
+    #[test]
+    fn resolve_choice_saved_falls_back_to_tile_equally_when_deleted() {
+        let store = Store::open_in_memory().unwrap();
+        let monitors = vec![monitor(0, 0, 1920, 1080)];
+        // "gone" was never saved — simulates the narrow race where a saved
+        // layout is deleted between menu-open and click.
+        let rects = resolve_choice(&LayoutChoice::Saved("gone".into()), &store, &monitors, 2);
+        assert_eq!(rects.len(), 2);
+        assert_no_overlap(&rects);
+    }
+
+    #[test]
+    fn resolve_choice_saved_resolves_the_matching_layout() {
+        let store = Store::open_in_memory().unwrap();
+        let slot = LayoutSlot { monitor_index: 0, rect_frac: (0.0, 0.0, 0.5, 1.0) };
+        upsert_layout(&store, CustomLayout { name: "Half".into(), slots: vec![slot] });
+        let monitors = vec![monitor(0, 0, 1920, 1080)];
+        let rects = resolve_choice(&LayoutChoice::Saved("Half".into()), &store, &monitors, 1);
+        assert_eq!(rects, vec![PixelRect { x: 0, y: 0, w: 960, h: 1080 }]);
     }
 
     #[test]
