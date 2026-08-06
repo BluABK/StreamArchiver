@@ -3543,7 +3543,8 @@ collapse/expand choices are remembered across restarts:
   viewer (see *About page archive* below).
 - **View emotes** — one launcher per account+provider that has emotes, opening an
   **emote viewer**: a grid of every emote with its chat code (animated emotes play
-  when *Animate emotes* is on in Settings, at browser-accurate speed). A 🔍
+  when *Animate emotes* is on in Settings, at browser-accurate speed — capped at
+  30 fps so an animating pop-out can't starve the main window of repaints). A 🔍
   **filter** box narrows the grid by code (case-insensitive; the tally shows
   *matches of total*), and a **Sort** dropdown orders by name A→Z / Z→A or
   animated-first. Codes still listed in the manifest whose image has gone from

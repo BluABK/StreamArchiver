@@ -2331,7 +2331,10 @@ impl StreamArchiverApp {
         self.heartbeat.set_activity(crate::watchdog::Activity::EmoteViewerGrid);
         let anim_cache = self.emote_anim.clone();
         let animate_emotes = self.chat_settings.lock().unwrap().animate_emotes;
-        let now = ctx.input(|i| i.time);
+        // Only for the wrapper's own LRU/decode bookkeeping below — the grid
+        // reads its animation clock inside the deferred closure instead, see
+        // there.
+        let wrapper_now = ctx.input(|i| i.time);
 
         let (provider, channel_name, account, title_channel) = {
             let v = view.lock().unwrap();
@@ -2361,6 +2364,11 @@ impl StreamArchiverApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     v.closed = true;
                 }
+                // Animation clock — read inside the closure, not captured from
+                // the wrapper: this repaints on the popup viewport's own
+                // schedule, so a captured value would freeze the animation at
+                // the root's frame rate (see `chat_popup_window`).
+                let now = ctx.input(|i| i.time);
                 // Filter + sort applied to on-open snapshots each frame (the lists
                 // are small — a few hundred entries at most for a big 7TV channel).
                 let shown = |filter: &str, sort: EmoteSort, list: &[ViewerEmote]| -> Vec<ViewerEmote> {
@@ -2581,7 +2589,7 @@ impl StreamArchiverApp {
         );
 
         let decode_misses = std::mem::take(&mut self.emote_viewers[idx].lock().unwrap().decode_misses);
-        self.pump_emote_decodes(decode_misses, now, ctx);
+        self.pump_emote_decodes(decode_misses, wrapper_now, ctx);
 
         false
     }

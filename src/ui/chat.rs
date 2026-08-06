@@ -1366,7 +1366,7 @@ pub(super) fn draw_cached_emote(
                 // scrolled-away animation doesn't keep waking the UI.
                 if ui.is_rect_visible(resp.rect) {
                     ctx.request_repaint_after(std::time::Duration::from_secs_f32(
-                        remaining.min(1.0),
+                        remaining.clamp(MIN_ANIM_REPAINT_SECS, 1.0),
                     ));
                 }
                 Some((resp, tex))
@@ -1384,8 +1384,31 @@ pub(super) fn draw_cached_emote(
     }
 }
 
+/// Floor on how often an animated emote may ask its viewport to repaint (30 fps).
+///
+/// `emote_anim::MIN_DELAY` lets a frame's `remaining` come back as low
+/// as 20 ms, and a popup asking for ~20 ms repaints saturates eframe's event
+/// loop: it flips to `ControlFlow::Poll` and the **root** viewport stops being
+/// serviced entirely — measured with `examples/vp_repaint_probe.rs` as root
+/// 0 passes/s while the child ran at 165/s (its own request rate was ignored;
+/// it just free-ran). That starves the main window's 1 Hz heartbeat, which is
+/// also what the UI-freeze watchdog beats on, so a single animating emote could
+/// both freeze the main window and trip a false "UI frozen" alarm.
+///
+/// The cliff is sharp — 25 ms already leaves the root alive — so 1/30 s is a
+/// comfortable margin. It only rate-limits *rendering*: the animation is
+/// sampled against wall-clock time, so it stays in sync and merely drops the
+/// odd frame on emotes whose real delay is shorter than this (rare — Twitch/7TV
+/// emotes are typically 30–100 ms per frame).
+const MIN_ANIM_REPAINT_SECS: f32 = 1.0 / 30.0;
+
+/// How recently an emote must have been drawn to be exempt from budget
+/// eviction. See the comment at the check itself for why this is a window
+/// rather than an exact "this frame" compare.
+const RECENT_DRAW_SECS: f64 = 1.0;
+
 /// Evict the least-recently-drawn ready emotes once the decoded-frame cache exceeds
-/// [`EMOTE_BUDGET_BYTES`]. Emotes drawn this frame (`last_drawn == now`) are kept.
+/// [`EMOTE_BUDGET_BYTES`]. Emotes drawn in the last [`RECENT_DRAW_SECS`] are kept.
 pub(super) fn evict_emote_cache(
     cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
     now: f64,
@@ -1412,7 +1435,12 @@ pub(super) fn evict_emote_cache(
         if cur <= EMOTE_BUDGET_BYTES {
             break;
         }
-        if last_drawn >= now {
+        // Keep anything drawn in the last second rather than requiring
+        // `last_drawn >= now`: `last_drawn` is now stamped by the *popup*
+        // viewport's clock while this sweep runs on the root's, so the two no
+        // longer land on the identical value and an exact compare would evict
+        // emotes that are on screen right now (forcing an immediate re-decode).
+        if now - last_drawn < RECENT_DRAW_SECS {
             continue; // visible this frame — keep
         }
         g.remove(&k);
@@ -2988,8 +3016,7 @@ impl StreamArchiverApp {
             };
 
         // The emote cache is shared (Arc<Mutex>), so the closure can use a clone
-        // without borrowing `self`. Copy the render toggles out too. `now` is the
-        // global animation clock — all instances of an emote animate in lockstep.
+        // without borrowing `self`. Copy the render toggles out too.
         let anim_cache = self.emote_anim.clone();
         let (render_emotes, animate_emotes, appearance) = {
             let cs = self.chat_settings.lock().unwrap();
@@ -3004,7 +3031,10 @@ impl StreamArchiverApp {
                 },
             )
         };
-        let now = ctx.input(|i| i.time);
+        // Animation clock for the LRU/decode bookkeeping the *wrapper* does
+        // below. The emotes themselves must NOT use this one — see the
+        // closure's own `now`.
+        let wrapper_now = ctx.input(|i| i.time);
 
         // Release the lock before registering the deferred closure — it
         // takes its own lock on the SAME Arc each time it repaints, which
@@ -3023,6 +3053,15 @@ impl StreamArchiverApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     popup.closed = true;
                 }
+                // The global animation clock — all instances of an emote animate
+                // in lockstep. Read HERE, inside the deferred closure, not in the
+                // wrapper: this closure repaints on the popup viewport's own
+                // schedule, so a captured value would be frozen at whatever time
+                // the root's last frame had. That is exactly what made animated
+                // emotes advance one frame per root repaint (≈1 fps idle, worse
+                // under load) while the popup itself kept redrawing the same
+                // frame at full speed — sluggish AND stuck.
+                let now = ctx.input(|i| i.time);
                 // Consumed at the end of this closure into `popup.decode_misses`/
                 // `popup.usercard_click` — the deferred closure doesn't run
                 // synchronously with the wrapper call, so these can't be plain
@@ -3922,7 +3961,7 @@ impl StreamArchiverApp {
         );
         // Decode any newly-seen emotes off the UI thread, then LRU-evict the cache.
         let decode_misses = std::mem::take(&mut popup_arc.lock().unwrap().decode_misses);
-        self.pump_emote_decodes(decode_misses, now, ctx);
+        self.pump_emote_decodes(decode_misses, wrapper_now, ctx);
 
         // A username was clicked this frame: build the usercard. Local fields
         // (badges/color/sub-months) come straight from the click; session
