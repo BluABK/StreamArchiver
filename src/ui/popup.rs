@@ -13,12 +13,19 @@
 //! `show_viewport_deferred` repaints independently of the root and doesn't
 //! need to be re-declared every frame to survive, but its callback must be
 //! `Fn(...) + Send + Sync + 'static` — it cannot hold `&mut self`. Popup
-//! state therefore has to live in `Arc<Mutex<T>>`, and anything a popup used
-//! to do directly against `&mut self` beyond its own state (open another
-//! popup, set the status line, ...) goes through [`PopupAction`] instead,
-//! queued here and applied on the main thread the next frame — the same
-//! shape as the existing `ui_rx: Receiver<UiCommand>` tray/doorbell bus
-//! (`StreamArchiverApp::pump_messages`).
+//! state therefore has to live in `Arc<Mutex<T>>`. In practice every one of
+//! the ~68 popups converted to this module found a way to avoid needing
+//! direct `&mut self` access from inside the closure at all — either the
+//! existing "collect during render, apply after `show_deferred_popup`
+//! returns" shape (the wrapper still has real `&mut self`), or moving the
+//! one `&mut self`-requiring action (e.g. `channel_props_apply_pref_change`,
+//! which calls the app-wide `reload_rows()`) to the wrapper instead of the
+//! closure. An escape-hatch action queue was built during Phase 0 for the
+//! case neither shape would fit, but nothing ever needed it — removed
+//! rather than kept as unused scaffolding. If a future popup genuinely can't
+//! avoid a `&mut self` side effect from inside its closure, reintroduce the
+//! same shape as `ui_rx: Receiver<UiCommand>` (`StreamArchiverApp::
+//! pump_messages`): an `mpsc` channel drained once per frame in `logic()`.
 
 use super::*;
 
@@ -29,37 +36,13 @@ use super::*;
 pub(super) struct PopupShared {
     pub(super) core: Arc<AppCore>,
     pub(super) fs_probes: Arc<Mutex<FsProbes>>,
-    pub(super) actions: std::sync::mpsc::Sender<PopupAction>,
-}
-
-/// A side effect a deferred popup closure can't perform directly (no
-/// `&mut self`) — queued via `PopupShared::actions` and applied on the main
-/// thread by [`StreamArchiverApp::pump_popup_actions`]. Grown incrementally:
-/// add a variant only when a popup being migrated actually needs it.
-pub(super) enum PopupAction {
-    SetStatus(String),
 }
 
 impl StreamArchiverApp {
     /// Build a [`PopupShared`] for this frame. Cheap — every field is an
-    /// `Arc` clone or a channel `Sender` clone.
+    /// `Arc` clone.
     pub(super) fn popup_shared(&self) -> PopupShared {
-        PopupShared {
-            core: self.core.clone(),
-            fs_probes: self.fs_probes.clone(),
-            actions: self.popup_actions_tx.clone(),
-        }
-    }
-
-    /// Drain [`PopupAction`]s queued by deferred popup closures since last
-    /// frame. Called once per frame from `logic()`, alongside the other
-    /// per-frame drains (`fs_probes.drain_results()`, `pump_messages`).
-    pub(super) fn pump_popup_actions(&mut self) {
-        while let Ok(action) = self.popup_actions_rx.try_recv() {
-            match action {
-                PopupAction::SetStatus(s) => self.status = s,
-            }
-        }
+        PopupShared { core: self.core.clone(), fs_probes: self.fs_probes.clone() }
     }
 }
 

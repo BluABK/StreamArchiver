@@ -25,7 +25,6 @@ impl StreamArchiverApp {
         egui_ctx: egui::Context,
     ) -> StreamArchiverApp {
         let events_rx = core.subscribe();
-        let (popup_actions_tx, popup_actions_rx) = std::sync::mpsc::channel();
         let autostart = AutoStart::new();
         let autostart_on = autostart.is_enabled();
         // Detach-on-quit is the default; only `=="1"` opts into stopping downloads.
@@ -527,8 +526,6 @@ impl StreamArchiverApp {
             tray,
             ui_rx,
             events_rx,
-            popup_actions_tx,
-            popup_actions_rx,
             autostart,
             autostart_on,
             keep_downloads_on_quit,

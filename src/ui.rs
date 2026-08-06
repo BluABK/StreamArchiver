@@ -1366,11 +1366,6 @@ pub struct StreamArchiverApp {
     tray: TrayIcon,
     ui_rx: Receiver<UiCommand>,
     events_rx: crate::events::EventRx,
-    /// Sending half handed to every deferred-viewport popup's [`PopupShared`]
-    /// (`popup.rs`) — cloned in, never used directly on `self`.
-    popup_actions_tx: std::sync::mpsc::Sender<PopupAction>,
-    /// Drained once per frame by `pump_popup_actions` (`popup.rs`).
-    popup_actions_rx: std::sync::mpsc::Receiver<PopupAction>,
     autostart: AutoStart,
     autostart_on: bool,
     /// When false (the default), quitting detaches downloads so they keep running
@@ -2547,9 +2542,6 @@ impl eframe::App for StreamArchiverApp {
         }
 
         self.pump_messages(ctx);
-        // Apply side effects deferred-viewport popups queued instead of
-        // touching `&mut self` directly (see `popup.rs`).
-        self.pump_popup_actions();
         // Install filesystem-probe results the background worker finished
         // since last frame (never blocks — see `FsProbes`).
         self.fs_probes.lock().unwrap().drain_results();
