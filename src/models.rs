@@ -3043,6 +3043,25 @@ pub struct Recording {
     pub not_recorded_reason: String,
 }
 
+impl Recording {
+    /// Whether re-running the finalize remux on this take would actually
+    /// produce something: its file is still the raw `.ts` inside the capture
+    /// cache, so the automatic remux never completed.
+    ///
+    /// `status == "ended"` is excluded deliberately. That status is only ever
+    /// set on a take that captured **nothing** — the stream was already over, a
+    /// wedged tool was reaped, or Twitch refused a subscriber-only broadcast —
+    /// so its `.ts` is a zero-byte husk. Counting those produced an unclearable
+    /// backlog (a single sub-only stream added 28 of them to one channel's
+    /// "⚠ N need remux" badge in one evening), burying the takes that really
+    /// were one remux away from being archived.
+    pub fn needs_remux(&self) -> bool {
+        self.status != "ended"
+            && self.output_path.ends_with(".ts")
+            && crate::downloader::path_in_cache(&self.output_path)
+    }
+}
+
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
 /// section row. See [`Recording::head_backfill_state`].
 #[derive(Clone, Debug)]
@@ -3405,6 +3424,32 @@ mod tests {
             expires_at: 0,
             level: 0,
         }
+    }
+
+    #[test]
+    fn empty_takes_are_never_offered_for_remux() {
+        let cached_ts = "G:/streams/.sa-cache/Chan/Chan - t.ts";
+        let mut r = Recording::test_stub();
+        r.output_path = cached_ts.into();
+        // A real interrupted capture: its .ts is sitting in the cache with
+        // content, and re-running the remux is exactly the fix.
+        r.status = "completed".into();
+        assert!(r.needs_remux());
+        r.status = "recording".into();
+        assert!(r.needs_remux(), "a crash orphan retargeted to its capture still qualifies");
+
+        // "ended" is only ever set when nothing was captured — a subscriber-only
+        // refusal, a stream that was already over, a reaped wedge. Offering a
+        // remux there built an unclearable backlog (28 takes from one evening).
+        r.status = "ended".into();
+        assert!(!r.needs_remux());
+
+        // And the ordinary cases stay out regardless of status.
+        r.status = "completed".into();
+        r.output_path = "G:/streams/Chan/Chan - t.mkv".into();
+        assert!(!r.needs_remux(), "already remuxed");
+        r.output_path = "G:/streams/Chan/Chan - t.ts".into();
+        assert!(!r.needs_remux(), "a .ts outside the cache was the user's own choice");
     }
 
     #[test]

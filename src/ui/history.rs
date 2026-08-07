@@ -121,7 +121,7 @@ pub(super) fn is_recorded(r: &Recording) -> bool {
     !r.output_path.is_empty() && r.status == "completed"
 }
 pub(super) fn is_remux_pending(r: &Recording) -> bool {
-    r.output_path.ends_with(".ts") && crate::downloader::path_in_cache(&r.output_path)
+    r.needs_remux()
 }
 pub(super) fn is_remuxed(r: &Recording) -> bool {
     !r.output_path.is_empty()

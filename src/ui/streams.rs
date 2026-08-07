@@ -3722,10 +3722,7 @@ impl StreamArchiverApp {
                             .filter_map(|&ri| groups.get(&rows[ri].monitor.id))
                             .flat_map(|gs| gs.iter())
                             .flat_map(|g| g.takes.iter())
-                            .filter(|t| {
-                                t.output_path.ends_with(".ts")
-                                    && crate::downloader::path_in_cache(&t.output_path)
-                            })
+                            .filter(|t| t.needs_remux())
                             .count();
                         if chan_needs_remux > 0 {
                             let lbl = if chan_needs_remux == 1 {
@@ -4053,8 +4050,7 @@ impl StreamArchiverApp {
                 gs.iter()
                     .flat_map(|g| g.takes.iter())
                     .filter(|t| {
-                        t.output_path.ends_with(".ts")
-                            && crate::downloader::path_in_cache(&t.output_path)
+                        t.needs_remux()
                     })
                     .count()
             })
@@ -4558,10 +4554,7 @@ impl StreamArchiverApp {
                         } else {
                             resp.on_hover_text(g.status());
                         }
-                        let nr = g.takes.iter().filter(|t| {
-                            t.output_path.ends_with(".ts")
-                                && crate::downloader::path_in_cache(&t.output_path)
-                        }).count();
+                        let nr = g.takes.iter().filter(|t| t.needs_remux()).count();
                         if nr > 0 {
                             let lbl = if nr == 1 {
                                 "⚠ needs remux".to_string()
@@ -5394,8 +5387,7 @@ impl StreamArchiverApp {
                             ));
                         }
                         // In-progress / needs-attention badges
-                        let needs_remux = t.output_path.ends_with(".ts")
-                            && crate::downloader::path_in_cache(&t.output_path);
+                        let needs_remux = t.needs_remux();
                         let remuxing = background_tasks.iter().any(|bt| {
                             matches!(bt.kind, crate::events::BackgroundTaskKind::Remux(_))
                                 && bt.id == t.id as u64
@@ -5548,8 +5540,7 @@ impl StreamArchiverApp {
                 }
                 // Offer re-remux when the finalized file is still a .ts
                 // (the automatic remux failed at recording end).
-                let needs_remux = t.output_path.ends_with(".ts")
-                    && crate::downloader::path_in_cache(&t.output_path);
+                let needs_remux = t.needs_remux();
                 if needs_remux {
                     let remux_dest = std::path::Path::new(&t.output_path)
                         .parent() // .cache/

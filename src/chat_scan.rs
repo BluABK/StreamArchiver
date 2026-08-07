@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::store::Store;
 
@@ -260,7 +260,19 @@ pub async fn maybe_sweep_chat_scan(store: &Store, now: i64) {
             Ok(Err(e)) => {
                 // Missing/unreadable file: stamp it anyway. Retrying forever on
                 // a sidecar that will never come back would wedge the queue.
-                warn!(rec_id = t.rec_id, path = %t.chat_path, "chat scan: unreadable: {e:#}");
+                //
+                // A sidecar that simply isn't there is the common case while
+                // the backlog of old takes drains (moved, pruned, or written
+                // before chat logging existed) — routine, and at WARN it
+                // buried real problems in the log. Anything else still warns.
+                let missing = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                if missing {
+                    debug!(rec_id = t.rec_id, path = %t.chat_path, "chat scan: sidecar is gone");
+                } else {
+                    warn!(rec_id = t.rec_id, path = %t.chat_path, "chat scan: unreadable: {e:#}");
+                }
                 let _ = store.set_recording_chat_scanned(t.rec_id, now);
                 continue;
             }

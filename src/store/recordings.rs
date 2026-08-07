@@ -1749,6 +1749,10 @@ impl Store {
              FROM recording
              WHERE output_path LIKE '%.ts'
                AND (output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%')
+               -- 'ended' is only ever set on a take that captured nothing, so
+               -- its .ts is a 0-byte husk with nothing to remux. Mirrors
+               -- `Recording::needs_remux` — keep the two in step.
+               AND status != 'ended'
              ORDER BY started_at DESC",
         )?;
         let rows = stmt
