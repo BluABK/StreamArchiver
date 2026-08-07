@@ -171,6 +171,13 @@ impl Supervisor {
         abort: Arc<AtomicBool>,
     ) {
         let monitor_id = row.monitor.id;
+        // A take that captured nothing was never promoted, so its `final_path`
+        // can still point at the working file inside the capture cache. Parts
+        // (and the file they're joined into) belong in the ARCHIVE folder:
+        // leaving them in `.sa-cache` would make the finished take read as
+        // "stuck in cache" and hand it to sweeps that have no business seeing
+        // a finished archive.
+        let final_path = strip_cache_component(&final_path).unwrap_or(final_path);
         let (Some(out_dir), Some(stem)) = (
             final_path.parent().map(Path::to_path_buf),
             final_path.file_stem().map(|s| s.to_string_lossy().into_owned()),
@@ -339,7 +346,20 @@ impl Supervisor {
         // Parts are named after the take that wrote them, but every take's
         // stem carries `[Twitch {stream_id}]`, so one broadcast's parts are
         // findable across takes — which is what makes a restart resumable.
-        if let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::Recovery, out_dir).await {
+        //
+        // The capture cache is searched too: parts written before the archive
+        // folder became the destination live there, and a part is a part
+        // wherever it sits — re-fetching video we already hold would be the
+        // one unforgivable outcome here.
+        let mut dirs = vec![out_dir.to_path_buf()];
+        let cache = cache_dir(out_dir);
+        if cache != out_dir {
+            dirs.push(cache);
+        }
+        for dir in dirs {
+            let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::Recovery, &dir).await else {
+                continue;
+            };
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !name.contains(stream_id) {
@@ -350,7 +370,11 @@ impl Supervisor {
                 }
             }
         }
+        // One entry per index: the same part can exist in both folders (one
+        // was moved, or a copy was left behind), and counting it twice would
+        // inflate `covered` and skip past unfetched video — a silent hole.
         parts.sort_by_key(|(i, _)| *i);
+        parts.dedup_by_key(|(i, _)| *i);
         let next_index = parts.last().map(|(i, _)| i + 1).unwrap_or(1);
 
         // Part zero: the longest existing head for this broadcast. Each covers
