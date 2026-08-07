@@ -136,6 +136,7 @@ impl Supervisor {
             gap_jobs: Arc::new(Mutex::new(HashSet::new())),
             gap_splice_jobs: Arc::new(Mutex::new(HashSet::new())),
             head_backfill_aborts: Arc::new(Mutex::new(HashMap::new())),
+            sub_only_sessions: Arc::new(Mutex::new(HashMap::new())),
             chapter_jobs: Arc::new(Mutex::new(HashSet::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
@@ -2046,6 +2047,19 @@ progress_info: None,
                 return false;
             }
         }
+        // A subscriber-only broadcast is being archived from the CDN instead
+        // (see `sub_only.rs`). The live edge is not ours to take, so asking
+        // again every few minutes only burns a process and a log line — and
+        // the session already covers this broadcast. A forced/manual start
+        // still goes through: the user may know something we don't (they just
+        // subscribed, the streamer opened it up).
+        if !forced && self.sub_only_session_active(monitor_id) {
+            tracing::debug!(
+                monitor_id,
+                "auto start suppressed: subscriber-only CDN capture session owns this broadcast"
+            );
+            return false;
+        }
         {
             let mut active = self.active.lock().unwrap();
             if active.contains_key(&monitor_id) {
@@ -2489,6 +2503,9 @@ progress_info: None,
     /// Manual "Stop": abort the active recording and apply a short cooldown so it
     /// doesn't immediately restart on the next poll.
     fn manual_stop(&self, monitor_id: i64) {
+        // A subscriber-only CDN session has no process to kill, but Stop means
+        // stop: it wraps up after its current pass and joins what it holds.
+        self.abort_sub_only_session(monitor_id);
         let pid = self.active.lock().unwrap().get(&monitor_id).copied();
         // Kill the DASH companion (dual capture) too, if one is running.
         let companion_pid = self.active_secondary.lock().unwrap().get(&monitor_id).copied();
@@ -3869,6 +3886,17 @@ progress_info: None,
         let sub_only = !manually_stopped && !ok && crate::models::sub_only_rejected(&outcome.log);
         if sub_only {
             self.file_sub_only_alert(&row, monitor_id, rec_id, stream_id.as_deref());
+            // Hand the broadcast to a CDN capture session: it archives from the
+            // segments Twitch does serve, incrementally, and holds the monitor
+            // so nothing keeps asking the live edge for a stream it will only
+            // refuse. See `sub_only.rs`.
+            self.maybe_start_sub_only_session(
+                &row,
+                rec_id,
+                stream_id.as_deref(),
+                went_live_at,
+                &final_path,
+            );
         }
         self.finalize_recording(
             &row,

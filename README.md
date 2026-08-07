@@ -2077,6 +2077,46 @@ independent detectors feeding the same table:
 
   ![Process manager listing a running streamlink capture](doc/screenshots/process-manager.png)
 
+### Subscriber-only streams (🔒 CDN capture)
+
+When a Twitch stream is **subscriber-only** and the connected account isn't
+subscribed, the live edge is simply refused — streamlink dies within seconds on
+`UNAUTHORIZED_ENTITLEMENTS`, and every retry dies identically. The broadcast is
+still archivable, though: its own DVR segments stay readable on Twitch's CDN,
+the same ones *Twitch VOD recovery* below reconstructs from.
+
+So instead of retrying a capture that cannot succeed, the app opens a **CDN
+capture session** for that broadcast:
+
+- **Nothing spawns streamlink while it runs.** The refusal is a property of the
+  broadcast, not a transient fault, so asking again every few minutes only
+  produces log noise and doomed take rows. (A manual ▶ **Start** still goes
+  through — you might have just subscribed.)
+- **Each pass fetches only what's new.** Every few minutes the session pulls the
+  span between what it already holds and the live edge into a numbered part
+  file. Nothing already captured is re-read or rewritten.
+- **The parts are joined when the broadcast ends**, into one file on the take
+  that was refused — so a subscriber-only stream leaves a single normal-looking
+  archive entry, not a trail of empty takes. Parts are deleted only after the
+  joined file exists *and* its duration checks out; a failed join keeps
+  everything exactly where it was.
+- **It resumes.** Parts carry the broadcast id in their name, so a restart
+  mid-stream adopts what's on disk — including a head an earlier take had
+  already fetched — and continues from there rather than starting over.
+
+**What this costs you.** The archive is assembled behind the live edge by
+definition: it lags by up to one refresh interval, and the last minutes before
+the stream ends may be missing (the CDN can't serve what hasn't been segmented
+yet). The 🔒 badge on the instance and take rows spells out both, including how
+far behind the copy currently is. Subscribing with the connected account makes
+the stream capture normally instead.
+
+> **Where this came from.** Before this existed the same thing happened by
+> accident: each doomed take queued a head backfill, and each backfill
+> re-fetched the broadcast **from its start**. One two-hour subscriber-only
+> stream produced 22 takes and re-downloaded 11.8 GB per cycle. It worked — at
+> roughly quadratic cost, and only because a capture kept failing on a timer.
+
 ### Twitch VOD recovery (deleted & muted VODs)
 
 ![Recording context menu with Recover VOD / Download post-stream VOD / Backfill head](doc/screenshots/vod-recovery-menu.png)

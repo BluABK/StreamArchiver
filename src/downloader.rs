@@ -167,6 +167,7 @@ mod plan;
 mod process;
 mod raid_follow;
 mod remux;
+mod sub_only;
 mod supervisor;
 mod tools;
 pub(crate) mod vod;
@@ -174,7 +175,7 @@ pub(crate) mod vod;
 #[allow(unused_imports)]
 use {
     ad_probe::*, alerts::*, backfill::*, backfill_discover::*, chat_only::*, gap_recover::*, gap_splice::*,
-    supervisor::*, vod::*,
+    sub_only::*, supervisor::*, vod::*,
 };
 pub use alerts::alert_category;
 /// Re-exported for the UI's 🔒 badge, which quotes the retry cadence.
@@ -414,6 +415,12 @@ pub struct Supervisor {
     /// presence in this map IS "a backfill is running for this rec_id",
     /// shared with the UI via `Supervisor::abort_head_backfill`.
     head_backfill_aborts: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    /// Monitors with a subscriber-only CDN capture session running, each
+    /// holding the flag that session polls to wrap up early. Presence IS "this
+    /// broadcast is being archived from the CDN instead of the live edge" —
+    /// `try_begin` reads it to stop spawning captures Twitch will only refuse.
+    /// See [`sub_only`].
+    sub_only_sessions: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     /// rec_ids with a chapters-embed job in flight — `maybe_spawn_chapters`
     /// is called speculatively from several places, same shape as
     /// `gap_jobs`/`gap_splice_jobs`.
