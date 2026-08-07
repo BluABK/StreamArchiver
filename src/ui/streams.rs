@@ -5306,7 +5306,16 @@ impl StreamArchiverApp {
                             t.status == "recording" && finalizing_recs.contains(&t.id);
                         let shown = if finalizing { "finalizing" } else { t.status.as_str() };
                         let (icon, color) = state_icon_ack(shown, t.err_ack);
-                        let resp = ui.colored_label(color, icon);
+                        let sub_only = crate::models::sub_only_rejected(&t.log_excerpt);
+                        // 🔒 replaces the state glyph outright for a take Twitch
+                        // refused: "ended" reads as "nothing was there", which
+                        // is exactly wrong — the broadcast happened, we just
+                        // weren't entitled to it.
+                        let resp = if sub_only {
+                            ui.colored_label(grid::SUB_ONLY_COLOR, "🔒")
+                        } else {
+                            ui.colored_label(color, icon)
+                        };
                         if finalizing {
                             resp.on_hover_text(FINALIZING_HOVER);
                         } else if t.status == "failed" {
@@ -5318,6 +5327,13 @@ impl StreamArchiverApp {
                                 msg = format!("Acknowledged — {msg}");
                             }
                             resp.on_hover_text(msg);
+                        } else if t.status == "ended"
+                            && crate::models::sub_only_rejected(&t.log_excerpt)
+                        {
+                            // Not "nothing to capture" — Twitch refused us. The
+                            // take is empty on purpose; its head backfill (if
+                            // any) is where this broadcast actually lives.
+                            resp.on_hover_text(grid::sub_only_hover(Some(t.started_at), now));
                         } else if t.status == "ended" {
                             resp.on_hover_text(
                                 "The stream had already ended or wasn't live when we \

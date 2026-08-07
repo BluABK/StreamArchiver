@@ -478,6 +478,20 @@ impl Supervisor {
         else {
             return;
         };
+        // How long the replacement actually is. "A later take's head covers
+        // strictly more of the broadcast" holds by construction — but only if
+        // the fresh head really did reach the live edge of its own take. On a
+        // subscriber-only stream (`UNAUTHORIZED_ENTITLEMENTS`) the head IS the
+        // whole archive: every take captures zero bytes, so deleting a longer
+        // old head for a shorter new one would destroy footage that exists
+        // nowhere else. Compare before removing anything.
+        let keep_secs = match self.store.get_recording(keep_rec_id).ok().flatten() {
+            Some(r) => match r.backfill_path.filter(|p| !p.is_empty()) {
+                Some(p) => media_duration_secs(Path::new(&p)).await,
+                None => None,
+            },
+            None => None,
+        };
         let channel_id = self
             .store
             .get_monitor_with_channel(monitor_id)
@@ -490,6 +504,31 @@ impl Supervisor {
             // before the head file disappears out from under it.
             self.maybe_concat_backfill(old_id).await;
             let path = PathBuf::from(&old_path);
+            // Never trade a longer head for a shorter one. Anything but a
+            // confident "the replacement covers at least as much" keeps the
+            // old file: an unreadable duration on either side, or a fresh head
+            // that came out shorter (a CDN that has already pruned the opening
+            // segments, a truncated fetch that still passed its own duration
+            // check). Disk is cheap; these minutes are not re-fetchable.
+            if crate::iomon::fs::is_file_sync(Cat::CacheSweep, &path) {
+                let old_secs = media_duration_secs(&path).await;
+                let covers = match (keep_secs, old_secs) {
+                    // 1s of slack: the two muxes round differently.
+                    (Some(new), Some(old)) => new + 1 >= old,
+                    _ => false,
+                };
+                if !covers {
+                    warn!(
+                        old_id,
+                        keep_rec_id,
+                        old_secs = old_secs.unwrap_or(-1),
+                        keep_secs = keep_secs.unwrap_or(-1),
+                        "head backfill: keeping the older head — the fresh one doesn't \
+                         verifiably cover it"
+                    );
+                    continue;
+                }
+            }
             // Already gone (user-pruned) counts as removed; otherwise the
             // removal follows the configured disposal method (trash folder /
             // Recycle Bin / permanent — see `crate::disposal`).

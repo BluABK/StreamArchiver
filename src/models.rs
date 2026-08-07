@@ -2394,6 +2394,23 @@ pub(crate) fn po_token_rejected(log: &str) -> bool {
         || log.contains("requires a GVS PO Token")
 }
 
+/// Twitch refused the stream because it is **subscriber-only** and the account
+/// we hold (or no account at all) isn't entitled to it.
+///
+/// `UNAUTHORIZED_ENTITLEMENTS` comes back from Twitch's usher token endpoint,
+/// so streamlink dies within seconds and every retry dies identically — this is
+/// a property of the broadcast, not a transient fault, and it stays true for
+/// the whole stream unless the streamer opens it up mid-broadcast.
+///
+/// It is deliberately NOT treated as a capture failure to be retried hard: the
+/// live edge is unreachable, but Twitch's CDN still serves the broadcast's own
+/// segments, so [head backfill](crate::head_backfill) can still archive it —
+/// lagging the live edge, but archiving it. See
+/// [`SUB_ONLY_COOLDOWN_SECS`](crate::downloader::SUB_ONLY_COOLDOWN_SECS).
+pub(crate) fn sub_only_rejected(log: &str) -> bool {
+    log.contains("UNAUTHORIZED_ENTITLEMENTS")
+}
+
 /// One aggregated time bucket of download traffic for a single class, as
 /// returned by `Store::net_history` — the raw material for the Stats view's
 /// Network/downloads graphs. Backed by the `net_history` table (schema v80):

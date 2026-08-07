@@ -177,6 +177,8 @@ use {
     supervisor::*, vod::*,
 };
 pub use alerts::alert_category;
+/// Re-exported for the UI's 🔒 badge, which quotes the retry cadence.
+pub use supervisor::SUB_ONLY_COOLDOWN_SECS;
 pub use ad_probe::K_AD_PROBE;
 pub use chat_only::K_CHAT_NO_RECORD;
 pub use gap_recover::K_GAP_RECOVER;

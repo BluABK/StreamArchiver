@@ -1705,7 +1705,16 @@ impl Supervisor {
             self.file_po_token_alert(&row, monitor_id, rec_id, used_po_fallback);
         }
         if !manually_stopped && !shutting_down {
-            self.note_result(monitor_id, ended - resume_started, ok, po_rejected, used_po_fallback);
+            self.note_result(
+                monitor_id,
+                ended - resume_started,
+                ok,
+                po_rejected,
+                used_po_fallback,
+                // Resume path: a sub-only rejection can only come from the
+                // original capture, which already set the cadence.
+                false,
+            );
         }
         let _ = self.store.finish_recording(
             rec_id,

@@ -22,6 +22,21 @@ const PO_TOKEN_COOLDOWN_SECS: u64 = 300;
 /// recording — 15 minutes trades take spam against lost footage about evenly.
 const PO_TOKEN_COOLDOWN_MAX_SECS: u64 = 900;
 
+/// Retry cadence for a **subscriber-only** Twitch stream we aren't entitled to
+/// (`UNAUTHORIZED_ENTITLEMENTS`; see [`crate::models::sub_only_rejected`]).
+///
+/// Every attempt dies in seconds, so the old ladder produced a take every ~5
+/// minutes — 22 of them in one two-hour broadcast, each spawning streamlink,
+/// filing a warning, AND kicking off a *full* CDN head backfill that
+/// re-downloads the entire broadcast from its start (10.8 GB, and growing, per
+/// cycle in the case that prompted this).
+///
+/// Ten minutes is the deliberate compromise: the CDN backfill is the only thing
+/// capturing this stream, and it only ever reaches the *current take's start
+/// time*, so this interval is exactly the worst-case gap at the end of the
+/// broadcast — while halving the re-download churn of the old cadence.
+pub const SUB_ONLY_COOLDOWN_SECS: u64 = 600;
+
 // The PO-token rejection predicate lives in `models::po_token_rejected` —
 // the store's failed-take alert filing needs it too (a rejected take that
 // had already captured bytes reaches the finalize catch-all, and must file
@@ -41,7 +56,12 @@ pub(super) use crate::models::po_token_rejected;
 ///   the episodes range from ~7 minutes (2026-07-31 00:03) to 3+ hours
 ///   rejecting two concurrent captures' every attempt (same night, 02:20).
 ///   The ordinary ladder just burns takes against that wall.
-pub(super) fn failure_backoff_secs(fails: u32, duration_secs: i64, po_token_rejected: bool) -> u64 {
+pub(super) fn failure_backoff_secs(
+    fails: u32,
+    duration_secs: i64,
+    po_token_rejected: bool,
+    sub_only: bool,
+) -> u64 {
     let mut wait = (30u64 * fails as u64).min(600);
     const INSTANT_FAIL_SECS: i64 = 10;
     if duration_secs < INSTANT_FAIL_SECS {
@@ -50,6 +70,17 @@ pub(super) fn failure_backoff_secs(fails: u32, duration_secs: i64, po_token_reje
     if po_token_rejected {
         wait = wait
             .max((PO_TOKEN_COOLDOWN_SECS * fails as u64).min(PO_TOKEN_COOLDOWN_MAX_SECS));
+    }
+    // A subscriber-only stream is not a fault to escalate against: retrying the
+    // live edge can only fail identically until the streamer opens it up. But
+    // the retry is not pointless either — each new take triggers a fresh CDN
+    // head backfill, which is the ONLY thing archiving this broadcast, and each
+    // one extends coverage to that take's start. So this is a FLAT cadence
+    // rather than an escalating cooldown: escalating would stretch the archive
+    // gap wider and wider, and never retrying at all would freeze coverage
+    // where it stands.
+    if sub_only {
+        wait = SUB_ONLY_COOLDOWN_SECS;
     }
     wait
 }
@@ -3253,6 +3284,7 @@ progress_info: None,
         ok: bool,
         po_token_rejected: bool,
         used_po_fallback: bool,
+        sub_only: bool,
     ) {
         let mut map = self.backoff.lock().unwrap();
         // Back off on any capture that produced no footage (bytes == 0), even one
@@ -3279,7 +3311,7 @@ progress_info: None,
             // and every held-off minute is live-edge footage lost for good.
             let escalate_po = po_token_rejected
                 && (used_po_fallback || sabr_po_fallback_client(&self.store).is_empty());
-            let wait = failure_backoff_secs(entry.fails, duration_secs, escalate_po);
+            let wait = failure_backoff_secs(entry.fails, duration_secs, escalate_po, sub_only);
             entry.until = Instant::now() + Duration::from_secs(wait);
             warn!(
                 monitor_id,
@@ -3389,6 +3421,57 @@ progress_info: None,
             }
             Ok(_) => {}
             Err(e) => warn!(rec_id, "failed to file PO-token alert: {e:#}"),
+        }
+    }
+
+    /// File the 🔒 "subscriber-only stream" alert — once per **broadcast**, not
+    /// once per take.
+    ///
+    /// The take key is the stream id (falling back to the monitor when Twitch
+    /// gave us none), so the ~dozen doomed takes one sub-only broadcast
+    /// produces collapse into a single row that just increments its count,
+    /// instead of a wall of "capture tool error" noise that buries real
+    /// failures elsewhere in the feed.
+    pub(super) fn file_sub_only_alert(
+        &self,
+        row: &MonitorWithChannel,
+        monitor_id: i64,
+        rec_id: i64,
+        stream_id: Option<&str>,
+    ) {
+        let key = match stream_id.filter(|s| !s.is_empty()) {
+            Some(sid) => format!("sub_only:{sid}"),
+            None => format!("sub_only:mon{monitor_id}"),
+        };
+        let alert = crate::store::NewCaptureAlert {
+            kind: "sub_only".to_string(),
+            severity: "warning".to_string(),
+            source: "capture".to_string(),
+            take_key: key,
+            monitor_id: Some(monitor_id),
+            recording_id: Some(rec_id),
+            video_id: None,
+            channel: row.channel.name.clone(),
+            count: 1,
+            lost_segments: 0,
+            last_line: format!(
+                "This {} broadcast is subscriber-only and the connected account isn't \
+                 entitled to it (UNAUTHORIZED_ENTITLEMENTS), so the live edge can't be \
+                 captured. It is NOT lost: the CDN head backfill is archiving the \
+                 broadcast from its start, re-checked every {}m — that copy lags the live \
+                 edge by up to that long, and the final minutes after the stream ends may \
+                 be missing. Subscribing with the connected account would let it capture \
+                 normally.",
+                row.monitor.platform().label(),
+                SUB_ONLY_COOLDOWN_SECS / 60,
+            ),
+        };
+        match self.store.upsert_capture_alert(&alert) {
+            Ok((id, true)) => {
+                info!(rec_id, "filed subscriber-only alert #{id} for {}", row.channel.name)
+            }
+            Ok(_) => {}
+            Err(e) => warn!(rec_id, "failed to file subscriber-only alert: {e:#}"),
         }
     }
 
@@ -3778,6 +3861,15 @@ progress_info: None,
         if po_rejected {
             self.file_po_token_alert(&row, monitor_id, rec_id, used_po_fallback);
         }
+        // Subscriber-only stream we hold no entitlement for: the live edge is
+        // simply not ours to capture, so this is a *state of the broadcast*
+        // rather than a fault. It changes the retry cadence (see
+        // `SUB_ONLY_COOLDOWN_SECS`) and files one 🔒 alert per broadcast
+        // instead of a "capture tool error" per take.
+        let sub_only = !manually_stopped && !ok && crate::models::sub_only_rejected(&outcome.log);
+        if sub_only {
+            self.file_sub_only_alert(&row, monitor_id, rec_id, stream_id.as_deref());
+        }
         self.finalize_recording(
             &row,
             monitor_id,
@@ -3799,7 +3891,7 @@ progress_info: None,
         // otherwise reset the wait to 30s, and a captured one would clear it entirely,
         // either way re-triggering the moment the next LIVE signal arrives.
         if !manually_stopped {
-            self.note_result(monitor_id, duration, ok, po_rejected, used_po_fallback);
+            self.note_result(monitor_id, duration, ok, po_rejected, used_po_fallback, sub_only);
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
     }
@@ -4879,20 +4971,61 @@ mod tests {
     #[test]
     fn failure_backoff_escalates_po_token_rejections_to_a_15_minute_cap() {
         // Generic ladder: 30s × fails, capped at 10 min.
-        assert_eq!(failure_backoff_secs(1, 120, false), 30);
-        assert_eq!(failure_backoff_secs(3, 120, false), 90);
-        assert_eq!(failure_backoff_secs(25, 120, false), 600);
+        assert_eq!(failure_backoff_secs(1, 120, false, false), 30);
+        assert_eq!(failure_backoff_secs(3, 120, false, false), 90);
+        assert_eq!(failure_backoff_secs(25, 120, false, false), 600);
         // Instant deaths floor at 5 min regardless of fail count.
-        assert_eq!(failure_backoff_secs(1, 3, false), 300);
+        assert_eq!(failure_backoff_secs(1, 3, false, false), 300);
         // PO rejection: 5/10/15 then flat 15 — never the 30s burn, never
         // unbounded either.
-        assert_eq!(failure_backoff_secs(1, 120, true), 300);
-        assert_eq!(failure_backoff_secs(2, 120, true), 600);
-        assert_eq!(failure_backoff_secs(3, 120, true), 900);
-        assert_eq!(failure_backoff_secs(25, 120, true), 900);
+        assert_eq!(failure_backoff_secs(1, 120, true, false), 300);
+        assert_eq!(failure_backoff_secs(2, 120, true, false), 600);
+        assert_eq!(failure_backoff_secs(3, 120, true, false), 900);
+        assert_eq!(failure_backoff_secs(25, 120, true, false), 900);
         // Tiers compose: an instant PO death takes the larger wait.
-        assert_eq!(failure_backoff_secs(1, 3, true), 300);
-        assert_eq!(failure_backoff_secs(4, 3, true), 900);
+        assert_eq!(failure_backoff_secs(1, 3, true, false), 300);
+        assert_eq!(failure_backoff_secs(4, 3, true, false), 900);
+    }
+
+    /// A subscriber-only stream is a FLAT cadence, not a ladder — every retry
+    /// also refreshes the CDN head backfill that is the only thing archiving
+    /// the broadcast, so escalating would widen the archive gap with each
+    /// attempt. (Nyana Banyana, 2026-08-07: 22 doomed takes in two hours, each
+    /// re-downloading the whole broadcast from Twitch's CDN.)
+    #[test]
+    fn subscriber_only_retries_at_a_flat_cadence_and_never_escalates() {
+        for fails in [1u32, 3, 25] {
+            assert_eq!(
+                failure_backoff_secs(fails, 19, false, true),
+                SUB_ONLY_COOLDOWN_SECS,
+                "fails={fails}"
+            );
+        }
+        // It also wins over the instant-death floor and the PO ladder: those
+        // escalate against a fault, and this isn't one.
+        assert_eq!(failure_backoff_secs(9, 3, true, true), SUB_ONLY_COOLDOWN_SECS);
+        // Without the flag this exact failure shape is what caused the churn:
+        // a 19-second death clears the instant-death floor (10s), so the first
+        // retry comes 30 seconds later and the ladder crawls up from there.
+        assert_eq!(failure_backoff_secs(1, 19, false, false), 30);
+    }
+
+    /// Straight off the wire (Nyana Banyana, 2026-08-07): streamlink's own
+    /// error line, and the usher token's rejection reason as it appears in the
+    /// ad-probe URL. Both mean the same thing and must both be recognised.
+    #[test]
+    fn subscriber_only_rejection_is_recognised_but_ordinary_failures_are_not() {
+        use crate::models::sub_only_rejected;
+        assert!(sub_only_rejected("[plugins.twitch][error] UNAUTHORIZED_ENTITLEMENTS"));
+        assert!(sub_only_rejected(
+            r#"...%22reason%22%3A%22UNAUTHORIZED_ENTITLEMENTS%22..."#
+        ));
+        // Neither a healthy capture nor an unrelated failure.
+        assert!(!sub_only_rejected(""));
+        assert!(!sub_only_rejected("[cli][info] Writing output to file"));
+        assert!(!sub_only_rejected(
+            "[plugins.twitch][error] Unable to open URL: https://usher.ttvnw.net/"
+        ));
     }
 
     /// Detected from the real logs of the 2026-07-31 Dokibird incident. All

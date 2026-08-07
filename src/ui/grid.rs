@@ -95,6 +95,41 @@ pub(super) fn fmt_ad_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
 }
 
+/// The 🔒 badge's colour — a muted lock, not an error red: a subscriber-only
+/// stream isn't a fault, it's a broadcast we aren't entitled to.
+pub(super) const SUB_ONLY_COLOR: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x93, 0xe0);
+
+/// Hover text for the 🔒 **subscriber-only** badge.
+///
+/// `covers_until` is how far the CDN head backfill has archived this broadcast
+/// (its take's own start time), so the reader sees the lag instead of guessing
+/// at it — this archive is assembled behind the live edge by definition, and
+/// that gap is the one number worth acting on.
+pub(super) fn sub_only_hover(covers_until: Option<i64>, now: i64) -> String {
+    let mut out = "🔒 Subscriber-only stream — the connected account isn't entitled to it \
+                   (UNAUTHORIZED_ENTITLEMENTS), so the live edge can't be captured directly."
+        .to_string();
+    match covers_until.filter(|t| *t > 0) {
+        Some(t) => out.push_str(&format!(
+            "\n\nIt is still being archived, from Twitch's CDN: the head backfill holds this \
+             broadcast from its start up to {} — roughly {} behind live. That gap closes each \
+             time the capture retries (every {} minutes), and the last minutes before the \
+             stream ends may be missing.",
+            fmt_datetime_short(t),
+            crate::rolling::fmt_remaining((now - t).max(0)),
+            crate::downloader::SUB_ONLY_COOLDOWN_SECS / 60,
+        )),
+        None => out.push_str(
+            "\n\nCapture falls back to the CDN head backfill, which archives the broadcast from \
+             its start and always lags the live edge.",
+        ),
+    }
+    out.push_str(
+        "\n\nSubscribing with the connected Twitch account would let this capture normally.",
+    );
+    out
+}
+
 /// Resolve an instance's ad-free status into a (label, tooltip) for display.
 /// Manual flag wins; otherwise the auto Twitch-sub result (`Some(true)` = sub'd,
 /// `Some(false)` = checked & not sub'd, `None` = unknown/not checked). Returns
@@ -3224,6 +3259,16 @@ pub(super) fn render_instance_row(
                         resp.on_hover_text(&m.last_state);
                     }
                     rolling_rollup_badge(ui, rolling_count, false);
+                    // Subscriber-only: the last take was refused by Twitch, so
+                    // what's being archived is the CDN head backfill, behind
+                    // the live edge. Shown while the channel is still live —
+                    // that's when the lag is actionable.
+                    if m.last_state == "live"
+                        && crate::models::sub_only_rejected(&row.last_recording_log)
+                    {
+                        ui.colored_label(SUB_ONLY_COLOR, egui::RichText::new("🔒").small())
+                            .on_hover_text(sub_only_hover(row.last_recording_started, now));
+                    }
                     if let Some(platform) = standby_for {
                         ui.colored_label(
                             egui::Color32::from_rgb(0x7e, 0x9c, 0xd8),
