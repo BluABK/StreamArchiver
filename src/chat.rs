@@ -260,6 +260,36 @@ struct ChatEvent {
     ts: i64,
 }
 
+/// One line describing a parsed chat event, for the app log.
+///
+/// The generic `event {kind} by {actor} (x{amount})` this replaces read as an
+/// accusation on the moderation kinds: `event msg_deleted by bwaido_` says
+/// bwaido_ deleted something, when in fact a moderator deleted *their* message.
+/// [`ChatEvent::actor`] is the person an event happened **to** for those kinds
+/// (neither platform discloses which moderator acted), so the voice has to
+/// change with the kind — and `(x0)` is noise wherever there's no count.
+fn describe_event(ev: &ChatEvent) -> String {
+    let who = if ev.actor.is_empty() { "someone" } else { ev.actor.as_str() };
+    match ev.kind {
+        "msg_deleted" => format!("a moderator deleted a message from {who}"),
+        "timeout" => format!("{who} was timed out by a moderator ({}s)", ev.amount),
+        "ban" => format!("{who} was banned by a moderator"),
+        "chat_purge" => format!("a moderator removed every message from {who}"),
+        "chat_clear" => "a moderator cleared the chat".to_string(),
+        "chat_mode" => format!("chat mode changed: {}", ev.detail),
+        "role_change" => format!("{who} {}", ev.detail),
+        // The rest genuinely are things the actor did.
+        "bits" => format!("{who} cheered {} bits", ev.amount),
+        "sub" => format!("{who} subscribed"),
+        "resub" => format!("{who} resubscribed ({} months)", ev.amount.max(1)),
+        "subgift" => format!("{who} gifted {} sub(s)", ev.amount.max(1)),
+        "raid_in" => format!("{who} raided in with {} viewers", ev.amount),
+        "dono" => format!("{who} sent a {} Hype Chat", ev.detail),
+        other if ev.amount != 0 => format!("event {other} by {who} (x{})", ev.amount),
+        other => format!("event {other} by {who}"),
+    }
+}
+
 /// One logged chat message (serialized as a JSON line in the sidecar).
 #[derive(Serialize)]
 struct ChatLine<'a> {
@@ -498,10 +528,7 @@ async fn session(
                                     // graph for the same reason; skip the per-event
                                     // log line too instead of flooding the app log.
                                     Ok(true) if ev.kind == "first_chat" => {}
-                                    Ok(true) => debug!(
-                                        "chat ({login}): event {} by {} (x{})",
-                                        ev.kind, ev.actor, ev.amount
-                                    ),
+                                    Ok(true) => debug!("chat ({login}): {}", describe_event(&ev)),
                                     Ok(false) => {} // deduped (EventSub saw the raid first)
                                     Err(e) => {
                                         debug!("chat ({login}): event record failed: {e:#}")
@@ -1354,6 +1381,40 @@ mod tests {
                     msg-param-sub-plan=1000 :tmi.twitch.tv USERNOTICE #streamer";
         let ev = parse_chat_event(gift).expect("mystery gift parses");
         assert_eq!((ev.amount, ev.detail.as_str()), (20, "663 gifts lifetime"));
+    }
+
+    #[test]
+    fn moderation_log_lines_dont_blame_the_person_it_happened_to() {
+        let ev = |kind: &'static str, actor: &str, amount: i64, detail: &str| ChatEvent {
+            kind,
+            actor: actor.into(),
+            target: String::new(),
+            amount,
+            tier: String::new(),
+            detail: detail.into(),
+            ts: 0,
+        };
+        // The line that prompted this: "event msg_deleted by bwaido_ (x0)".
+        assert_eq!(
+            describe_event(&ev("msg_deleted", "bwaido_", 0, "")),
+            "a moderator deleted a message from bwaido_"
+        );
+        assert_eq!(
+            describe_event(&ev("timeout", "spammer", 600, "")),
+            "spammer was timed out by a moderator (600s)"
+        );
+        assert_eq!(describe_event(&ev("ban", "spammer", 0, "")), "spammer was banned by a moderator");
+        assert_eq!(
+            describe_event(&ev("chat_purge", "spammer", 0, "")),
+            "a moderator removed every message from spammer"
+        );
+        assert_eq!(describe_event(&ev("chat_clear", "", 0, "")), "a moderator cleared the chat");
+
+        // Things the actor really did keep the active voice…
+        assert_eq!(describe_event(&ev("bits", "carol", 500, "")), "carol cheered 500 bits");
+        assert_eq!(describe_event(&ev("raid_in", "dave", 250, "")), "dave raided in with 250 viewers");
+        // …and an unknown kind still says something, without a bogus "(x0)".
+        assert_eq!(describe_event(&ev("milestone", "eve", 0, "")), "event milestone by eve");
     }
 
     #[test]
