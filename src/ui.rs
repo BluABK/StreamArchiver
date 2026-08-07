@@ -602,6 +602,12 @@ struct MonitorForm {
     /// typed — stored as seconds). See [`crate::rolling`].
     rolling: Option<bool>,
     rolling_ttl_hours: String,
+    /// Simulcast-dedup overrides for this instance (`None` = inherit the
+    /// channel, then the global default). `Off` here is an exemption:
+    /// always record this instance even when a preferred sibling is live.
+    /// See [`crate::simulcast`].
+    simulcast_pref: Option<crate::simulcast::SimulcastPref>,
+    simulcast_ad_free_pref: Option<crate::simulcast::SimulcastPref>,
     /// "Always show this instance's info on the channel row when it's live" —
     /// the strongest tier of `crate::platform_pref` (beats both the channel
     /// and global platform preference). Loaded from / saved to the monitor
@@ -700,6 +706,8 @@ impl MonitorForm {
             disposal_method: None,
             rolling: None,
             rolling_ttl_hours: String::new(),
+            simulcast_pref: None,
+            simulcast_ad_free_pref: None,
             chapters_enabled: None,
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
@@ -765,6 +773,8 @@ impl MonitorForm {
             disposal_method: None,
             rolling: None,
             rolling_ttl_hours: String::new(),
+            simulcast_pref: None,
+            simulcast_ad_free_pref: None,
             primary_pin: false,
             chapters_enabled: None,
             chapters_coalesce_secs: String::new(),
@@ -832,6 +842,8 @@ impl MonitorForm {
             disposal_method: None,
             rolling: None,
             rolling_ttl_hours: String::new(),
+            simulcast_pref: None,
+            simulcast_ad_free_pref: None,
             chapters_enabled: None,
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
@@ -939,6 +951,35 @@ fn platform_pref_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<Platform>
             ui.selectable_value(value, Some(Platform::Twitch), Platform::Twitch.label());
             ui.selectable_value(value, Some(Platform::YouTube), Platform::YouTube.label());
             ui.selectable_value(value, Some(Platform::Kick), Platform::Kick.label());
+        })
+        .response
+}
+
+/// An **Inherit / (off) / Twitch / YouTube / Kick** dropdown for a simulcast
+/// dedup override (`None` = inherit the level above). `off_label` spells out
+/// what `Off` means in this particular row — "record every live instance" for
+/// the everyday preference, "no ad-free override" for the other — since the
+/// same enum backs both. See [`crate::simulcast`].
+fn simulcast_pref_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut Option<crate::simulcast::SimulcastPref>,
+    off_label: &str,
+) -> egui::Response {
+    use crate::simulcast::SimulcastPref;
+    let selected = match value {
+        None => "Inherit",
+        Some(SimulcastPref::Off) => off_label,
+        Some(p) => p.label(),
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "Inherit");
+            ui.selectable_value(value, Some(SimulcastPref::Off), off_label);
+            for p in SimulcastPref::ALL.into_iter().filter(|p| *p != SimulcastPref::Off) {
+                ui.selectable_value(value, Some(p), p.label());
+            }
         })
         .response
 }
@@ -1433,6 +1474,17 @@ pub struct StreamArchiverApp {
     /// behavior). Persisted as `primary_platform_pref`; overridable per
     /// channel/instance — see [`crate::platform_pref`].
     primary_platform_pref: Option<Platform>,
+    /// Global simulcast-dedup preference: which platform to record when a
+    /// channel is live on several at once, and the platform that overrides it
+    /// when an instance there is ad-free. Both `Off` by default (dedup
+    /// disabled) and overridable per channel/instance — see
+    /// [`crate::simulcast`]. Distinct from `primary_platform_pref` above,
+    /// which is display-only.
+    simulcast_pref: crate::simulcast::SimulcastPref,
+    simulcast_ad_free_pref: crate::simulcast::SimulcastPref,
+    /// The settle window as typed (minutes; empty = the module default). Only
+    /// persisted — in seconds — when it parses to something positive.
+    simulcast_settle_mins: String,
     /// The process-manager dialog: whether it's open, its last snapshot, and when
     /// that snapshot was taken (throttles the per-row `pid_alive`/DB queries).
     show_processes: bool,
@@ -3249,6 +3301,8 @@ impl eframe::App for StreamArchiverApp {
                             rolling: None,
                             rolling_ttl_hours: String::new(),
                             primary_platform_pref: None,
+                            simulcast_pref: None,
+                            simulcast_ad_free_pref: None,
                             chapters_enabled: None,
                             chapters_coalesce_secs: String::new(),
                             follow_my_raids: None,
@@ -3544,6 +3598,8 @@ impl eframe::App for StreamArchiverApp {
                 rolling: None,
                 rolling_ttl_hours: String::new(),
                 primary_platform_pref: None,
+                simulcast_pref: None,
+                simulcast_ad_free_pref: None,
                 chapters_enabled: None,
                 chapters_coalesce_secs: String::new(),
                 follow_my_raids: None,

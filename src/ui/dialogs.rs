@@ -3863,6 +3863,40 @@ impl StreamArchiverApp {
                                 });
                                 ui.end_row();
 
+                                ui.label("Simulcast: record only");
+                                simulcast_pref_combo(
+                                    ui,
+                                    "form_simulcast_pref",
+                                    &mut s.simulcast_pref,
+                                    "Off — always record this instance",
+                                )
+                                .on_hover_text(
+                                    "When this channel is live on more than one platform at once, \
+                                     record only that platform's instance. Setting it to Off here \
+                                     is an exemption: this instance is always recorded, even when \
+                                     a preferred sibling is live. Inherit follows the channel, \
+                                     then the global default (Settings → Automation → Simulcast \
+                                     dedup).",
+                                );
+                                ui.end_row();
+
+                                ui.label("…prefer when ad-free");
+                                simulcast_pref_combo(
+                                    ui,
+                                    "form_simulcast_ad_free_pref",
+                                    &mut s.simulcast_ad_free_pref,
+                                    "No ad-free override",
+                                )
+                                .on_hover_text(
+                                    "Overrides the row above whenever this channel's instance on \
+                                     THIS platform is ad-free for you (marked ad-free by hand, or \
+                                     a detected Twitch subscription) — no ad breaks means no hard \
+                                     cuts, so it's the better copy. Ignored when that instance \
+                                     isn't live. Inherit follows the channel, then the global \
+                                     default.",
+                                );
+                                ui.end_row();
+
                                 ui.label("Embed chapters");
                                 tristate_combo(ui, "form_chapters_enabled", &mut s.chapters_enabled)
                                     .on_hover_text(

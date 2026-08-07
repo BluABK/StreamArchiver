@@ -54,6 +54,22 @@ pub(super) fn failure_backoff_secs(fails: u32, duration_secs: i64, po_token_reje
     wait
 }
 
+/// The live-state facts a start signal carries, snapshotted once per
+/// [`Supervisor::try_begin`] so its several "live, but not captured here"
+/// branches all write the same thing (see
+/// [`Supervisor::mark_live_not_recording`]).
+struct LiveMeta {
+    went_live_at: Option<i64>,
+    /// `went_live_at` is our own first-seen time, not the platform's.
+    approximate: bool,
+    stream_id: Option<String>,
+    title: Option<String>,
+    game: Option<String>,
+    thumbnail_url: Option<String>,
+    viewers: Option<i64>,
+    tags: Option<String>,
+}
+
 impl Supervisor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1800,6 +1816,152 @@ progress_info: None,
         killed_secs_ago.is_some_and(|secs| secs < STALL_RESTART_COOLDOWN_SECS)
     }
 
+    /// Everything the "mark it live, we're not capturing it here" bookkeeping
+    /// needs, snapshotted once in [`Self::try_begin`] so its several decline
+    /// branches can't drift apart — they did, three copies deep, before this
+    /// existed.
+    fn mark_live_not_recording(
+        &self,
+        row: &MonitorWithChannel,
+        meta: &LiveMeta,
+        session_reason: Option<&str>,
+    ) {
+        let monitor_id = row.monitor.id;
+        // The channel IS live — keep last_state and the live meta
+        // (title/game/thumbnail/viewers/go-live time) as fresh as a poll would,
+        // so Went Live/Started On/Duration/viewers aren't blank just because
+        // this broadcast arrived via a push signal instead.
+        let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+        let (live_since, live_since_approx) = match meta.went_live_at {
+            Some(t) => (Some(t), meta.approximate),
+            None => (Some(now_unix()), true),
+        };
+        let _ = self.store.set_monitor_live_meta(
+            monitor_id,
+            meta.title.as_deref().unwrap_or(""),
+            meta.game.as_deref().unwrap_or(""),
+            meta.thumbnail_url.as_deref().unwrap_or(""),
+            // Hardcoding -1 here would clobber the correct count the
+            // scheduler's own poll wrote moments earlier in the same tick.
+            meta.viewers.unwrap_or(-1),
+            live_since,
+            live_since_approx,
+        );
+        if let Some(t) = meta.tags.as_deref() {
+            let _ = self.store.set_monitor_tags(monitor_id, t);
+        }
+        let Some(reason) = session_reason else {
+            return;
+        };
+        // The broadcast still happened — track it as a take-shaped row with no
+        // capture behind it (see `insert_not_recorded_session`), so the Streams
+        // grid shows a 👁 "not recorded" row instead of leaving no trace. One
+        // session per broadcast: this runs on every poll while the stream stays
+        // live, so reuse the open one rather than inserting a second.
+        let session = match self.store.open_not_recorded_session(monitor_id) {
+            Ok(Some(open)) => Some(open),
+            Ok(None) => match self.store.insert_not_recorded_session(
+                monitor_id,
+                live_since.unwrap_or_else(now_unix),
+                meta.went_live_at,
+                live_since_approx,
+                meta.stream_id.as_deref(),
+            ) {
+                Ok(rec_id) => {
+                    // Stamped on insert only: a session reused across polls
+                    // keeps the reason it opened with.
+                    if !reason.is_empty() {
+                        let _ = self.store.set_not_recorded_reason(rec_id, reason);
+                    }
+                    if let Some(t) = meta.title.as_deref().filter(|t| !t.is_empty()) {
+                        let _ = self.store.insert_meta_change(rec_id, 0, "title", "", t);
+                    }
+                    if let Some(g) = meta.game.as_deref().filter(|g| !g.is_empty()) {
+                        let _ = self.store.insert_meta_change(rec_id, 0, "category", "", g);
+                    }
+                    Some((rec_id, live_since.unwrap_or_else(now_unix)))
+                }
+                Err(e) => {
+                    warn!(monitor_id, "failed to record not-recorded stream session: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(monitor_id, "failed to look up the not-recorded stream session: {e:#}");
+                None
+            }
+        };
+        // Not recording the video doesn't mean not archiving the chat: chat is
+        // tiny, per-platform, and unrecoverable once the broadcast ends (see
+        // `chat_only.rs`). Attached to the session so it starts and stops with
+        // the broadcast; a no-op when already running, which matters because
+        // this re-runs every poll.
+        if let Some((rec_id, session_started_at)) = session {
+            self.maybe_start_chat_only(
+                row,
+                rec_id,
+                session_started_at,
+                meta.stream_id.as_deref(),
+                meta.title.as_deref(),
+                meta.game.as_deref(),
+                meta.went_live_at,
+            );
+        }
+    }
+
+    /// Resolve simulcast dedup for one start attempt: gather this channel's
+    /// instances into [`crate::simulcast::InstanceState`]s and ask
+    /// [`crate::simulcast::decide`].
+    ///
+    /// All the policy lives in that pure function; this only supplies the
+    /// facts it can't see — which captures are running here, and which takes
+    /// they opened.
+    fn simulcast_decision(
+        &self,
+        monitor_id: i64,
+        row: &MonitorWithChannel,
+        siblings: &[MonitorWithChannel],
+    ) -> crate::simulcast::SimulcastDecision {
+        use crate::simulcast::{InstanceState, SimulcastCtx, SimulcastDecision};
+        // Nothing to dedup against: skip even the settings read.
+        if siblings.is_empty() {
+            return SimulcastDecision::Record;
+        }
+        let ctx = SimulcastCtx::load(&self.store);
+        let active = self.active.lock().unwrap().keys().copied().collect::<Vec<i64>>();
+        let finalizing = self.finalizing.lock().unwrap().keys().copied().collect::<Vec<i64>>();
+        let states: Vec<InstanceState> = std::iter::once(row)
+            .chain(siblings.iter())
+            .map(|m| {
+                let mid = m.monitor.id;
+                // This monitor's slot was reserved a moment ago (`try_begin`
+                // inserts before loading the row), so `active` would claim it
+                // is capturing when it hasn't decided to yet.
+                let capturing = mid != monitor_id && active.contains(&mid);
+                InstanceState {
+                    monitor_id: mid,
+                    platform: m.monitor.platform(),
+                    capturing,
+                    finalizing: finalizing.contains(&mid),
+                    live_state: m.monitor.last_state == "live",
+                    live_since: m.monitor.last_live_since,
+                    last_take_ended: m.last_recording_ended,
+                    take_started_at: capturing
+                        .then(|| self.store.open_recording_for_monitor(mid).ok().flatten())
+                        .flatten()
+                        .map(|open| open.started_at),
+                    automation_on: m.automation_on(),
+                    auto_record_on: m.auto_record_on(),
+                    detection_disabled: m.monitor.detection_method == DetectionMethod::Disabled,
+                    stop_held: self.stop_hold_blocks(mid, None, None).is_some(),
+                    ad_free: m.monitor.ad_free || m.ad_free_sub == Some(true),
+                    policy: ctx.policy_for(m.channel.id, mid),
+                }
+            })
+            .collect();
+        crate::simulcast::decide(&states, monitor_id, now_unix(), ctx.settle_secs)
+    }
+
     /// Reserve the monitor and spawn its recording task. Returns false if it was
     /// skipped (already active, or in backoff when not bypassing). `forced`
     /// marks a user-initiated start: it additionally bypasses the Auto gate —
@@ -1868,12 +2030,27 @@ progress_info: None,
             self.backoff.lock().unwrap().remove(&monitor_id);
         }
 
-        let mut row = match self.store.get_monitor_with_channel(monitor_id) {
-            Ok(Some(r)) => r,
+        // Siblings ride along free: this is the same one-pass load
+        // `get_monitor_with_channel` was already doing, split instead of
+        // discarded (see its doc). Simulcast dedup needs them below.
+        let (mut row, siblings) = match self.store.get_monitor_with_siblings(monitor_id) {
+            Ok(Some(v)) => v,
             _ => {
                 self.release_active(monitor_id, "try_begin: monitor row vanished/query failed after reserving");
                 return false;
             }
+        };
+        // The live-state snapshot every "it's live, we're just not capturing
+        // it here" branch below writes.
+        let live_meta = LiveMeta {
+            went_live_at,
+            approximate,
+            stream_id: stream_id.clone(),
+            title: stream_title.clone(),
+            game: stream_game.clone(),
+            thumbnail_url: thumbnail_url.clone(),
+            viewers: stream_viewers,
+            tags: stream_tags.clone(),
         };
         // Trigger words: a title/game match starts a recording even with Auto
         // off, and its per-rule overrides apply even with Auto on.
@@ -1994,23 +2171,7 @@ progress_info: None,
             self.release_active(monitor_id, "try_begin: blacklist trigger matched — vetoing automatic start");
             // Keep the UI's live state fresh exactly like the Auto-off path
             // below — the channel IS live, it's just not being recorded.
-            let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
-            let (live_since, live_since_approx) = match went_live_at {
-                Some(t) => (Some(t), approximate),
-                None => (Some(now_unix()), true),
-            };
-            let _ = self.store.set_monitor_live_meta(
-                monitor_id,
-                stream_title.as_deref().unwrap_or(""),
-                stream_game.as_deref().unwrap_or(""),
-                thumbnail_url.as_deref().unwrap_or(""),
-                stream_viewers.unwrap_or(-1),
-                live_since,
-                live_since_approx,
-            );
-            if let Some(t) = stream_tags.as_deref() {
-                let _ = self.store.set_monitor_tags(monitor_id, t);
-            }
+            self.mark_live_not_recording(&row, &live_meta, None);
             // Log + notify once per broadcast — try_begin re-runs on every
             // poll while the stream stays live.
             let key = stream_id
@@ -2053,78 +2214,73 @@ progress_info: None,
             // sends a LiveSignal here regardless of Auto) — see `manual_start`'s
             // parallel branch below, which already got this right.
             self.release_active(monitor_id, "try_begin: Auto-record is off for this channel/instance");
-            let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
-            let (live_since, live_since_approx) = match went_live_at {
-                Some(t) => (Some(t), approximate),
-                None => (Some(now_unix()), true),
-            };
-            let _ = self.store.set_monitor_live_meta(
-                monitor_id,
-                stream_title.as_deref().unwrap_or(""),
-                stream_game.as_deref().unwrap_or(""),
-                thumbnail_url.as_deref().unwrap_or(""),
-                stream_viewers.unwrap_or(-1),
-                live_since,
-                live_since_approx,
-            );
-            if let Some(t) = stream_tags.as_deref() {
-                let _ = self.store.set_monitor_tags(monitor_id, t);
-            }
-            // Not recording, but the broadcast still happened — track it as a
-            // take-shaped row with no capture behind it (see
-            // `insert_not_recorded_session`'s doc comment), so it shows up in
-            // the Streams grid with a "not recorded" note instead of leaving
-            // no trace at all that Auto-off channels went live. One session
-            // per broadcast: `try_begin` re-runs on every poll while the
-            // stream stays live, so reuse the open one rather than inserting
-            // a second — either way we end up holding the session the
-            // chat-only capture below hangs off.
-            let session = match self.store.open_not_recorded_session(monitor_id) {
-                Ok(Some(open)) => Some(open),
-                Ok(None) => match self.store.insert_not_recorded_session(
-                    monitor_id,
-                    live_since.unwrap_or_else(now_unix),
-                    went_live_at,
-                    live_since_approx,
-                    stream_id.as_deref(),
-                ) {
-                    Ok(rec_id) => {
-                        if let Some(t) = stream_title.as_deref().filter(|t| !t.is_empty()) {
-                            let _ = self.store.insert_meta_change(rec_id, 0, "title", "", t);
-                        }
-                        if let Some(g) = stream_game.as_deref().filter(|g| !g.is_empty()) {
-                            let _ = self.store.insert_meta_change(rec_id, 0, "category", "", g);
-                        }
-                        Some((rec_id, live_since.unwrap_or_else(now_unix)))
-                    }
-                    Err(e) => {
-                        warn!(monitor_id, "failed to record not-recorded stream session: {e:#}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    warn!(monitor_id, "failed to look up the not-recorded stream session: {e:#}");
-                    None
-                }
-            };
-            // Not recording the video doesn't mean not archiving the chat:
-            // Auto-record is a disk-space control, and chat is both tiny and
-            // unrecoverable once the broadcast ends (see `chat_only.rs`).
-            // Attached to the session above so it starts and stops with the
-            // broadcast; a no-op when already running, which matters because
-            // this branch re-runs on every poll while the stream stays live.
-            if let Some((rec_id, session_started_at)) = session {
-                self.maybe_start_chat_only(
-                    &row,
-                    rec_id,
-                    session_started_at,
-                    stream_id.as_deref(),
-                    stream_title.as_deref(),
-                    stream_game.as_deref(),
-                    went_live_at,
-                );
-            }
+            // `""` is the historical reason: Auto-record was off. Anything else
+            // names a newer one (see `Recording::not_recorded_reason`).
+            self.mark_live_not_recording(&row, &live_meta, Some(""));
             return false;
+        }
+        // Simulcast dedup: another instance of this channel is carrying this
+        // same broadcast on the preferred platform, so don't capture it twice.
+        // Sits after the blacklist veto and the Auto-off branch (both are
+        // stronger, more specific "don't record" answers) and skips a forced
+        // start or a trigger-word match, which are explicit "record this".
+        if !forced && trigger_hit.is_none() {
+            match self.simulcast_decision(monitor_id, &row, &siblings) {
+                crate::simulcast::SimulcastDecision::Record => {}
+                crate::simulcast::SimulcastDecision::Standby { winner, winner_platform } => {
+                    self.release_active(
+                        monitor_id,
+                        "try_begin: simulcast dedup — another instance has this broadcast",
+                    );
+                    let reason = format!(
+                        "{} recording this broadcast on the {} instance instead",
+                        crate::simulcast::SKIP_REASON_PREFIX,
+                        winner_platform.label()
+                    );
+                    // Same bookkeeping as Auto-off, chat-only included: chat is
+                    // per-platform, so the standby instance still archives its
+                    // own conversation while the other records the video.
+                    self.mark_live_not_recording(&row, &live_meta, Some(&reason));
+                    // Once per broadcast, not once per poll.
+                    let key = stream_id
+                        .clone()
+                        .unwrap_or_else(|| went_live_at.unwrap_or(0).to_string());
+                    let fresh = self
+                        .blocked_notified
+                        .lock()
+                        .unwrap()
+                        .insert(monitor_id, key.clone())
+                        != Some(key);
+                    if fresh {
+                        info!(
+                            monitor_id,
+                            winner,
+                            "simulcast dedup: standing by for the {} instance of {} (failover armed)",
+                            winner_platform.tag(),
+                            row.channel.name
+                        );
+                    }
+                    return false;
+                }
+                crate::simulcast::SimulcastDecision::Takeover { stop } => {
+                    // This instance is the preferred source and the broadcast is
+                    // still settling: stop the duplicate(s) and record here.
+                    // Plain `manual_stop` sets no hold (unlike
+                    // `manual_stop_hold`), so those instances stay armed as
+                    // failover — the same automated-stop path the
+                    // quality-upgrade restart uses.
+                    for loser in stop {
+                        info!(
+                            monitor_id,
+                            loser,
+                            "simulcast dedup: taking {} over to the preferred {} instance",
+                            row.channel.name,
+                            row.monitor.platform().tag()
+                        );
+                        self.manual_stop(loser);
+                    }
+                }
+            }
         }
         // A "Stop (allow triggers)" hold still blocks plain Auto-record: only
         // an actual trigger match (or a forced/manual start, which already
@@ -2136,23 +2292,7 @@ progress_info: None,
         {
             tracing::debug!(monitor_id, "auto start suppressed (no trigger matched): {reason}");
             self.release_active(monitor_id, "try_begin: manual-stop hold blocks plain Auto-record");
-            let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
-            let (live_since, live_since_approx) = match went_live_at {
-                Some(t) => (Some(t), approximate),
-                None => (Some(now_unix()), true),
-            };
-            let _ = self.store.set_monitor_live_meta(
-                monitor_id,
-                stream_title.as_deref().unwrap_or(""),
-                stream_game.as_deref().unwrap_or(""),
-                thumbnail_url.as_deref().unwrap_or(""),
-                stream_viewers.unwrap_or(-1),
-                live_since,
-                live_since_approx,
-            );
-            if let Some(t) = stream_tags.as_deref() {
-                let _ = self.store.set_monitor_tags(monitor_id, t);
-            }
+            self.mark_live_not_recording(&row, &live_meta, None);
             return false;
         }
         let trigger_info = trigger_hit.as_ref().map(|h| h.describe()).unwrap_or_default();

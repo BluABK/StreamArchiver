@@ -81,6 +81,13 @@ pub(super) struct ChannelForm {
     /// Preferred platform when this channel has multiple instances
     /// simultaneously live (`None` = inherit the global default).
     pub(super) primary_platform_pref: Option<Platform>,
+    /// Simulcast-dedup overrides for this channel (`None` = inherit global):
+    /// which platform to record when several are live at once, and the
+    /// platform that overrides it when its instance is ad-free. Unlike
+    /// `primary_platform_pref` above, these decide what gets CAPTURED — see
+    /// [`crate::simulcast`].
+    pub(super) simulcast_pref: Option<crate::simulcast::SimulcastPref>,
+    pub(super) simulcast_ad_free_pref: Option<crate::simulcast::SimulcastPref>,
     /// Chapter-embedding master toggle override for this channel (`None` =
     /// inherit global).
     pub(super) chapters_enabled: Option<bool>,
@@ -583,8 +590,41 @@ impl StreamArchiverApp {
                                          live, show this platform's info on the channel row instead of \
                                          whichever went live earliest. An instance-level pin (per \
                                          instance) overrides this. Inherit follows the global default \
-                                         (Settings → Interface → Display).",
+                                         (Settings → Interface → Display). DISPLAY only — to control \
+                                         which one gets RECORDED, see Simulcast dedup below.",
                                     );
+                                ui.end_row();
+
+                                ui.label("Simulcast: record only");
+                                simulcast_pref_combo(
+                                    ui,
+                                    "chform_simulcast_pref",
+                                    &mut s.simulcast_pref,
+                                    "Off — record every live instance",
+                                )
+                                .on_hover_text(
+                                    "When this channel is live on more than one platform at once, \
+                                     record only this one — one copy of a simulcast instead of two. \
+                                     If that platform isn't live, whatever is live still records. \
+                                     The other instances stay armed as failover. Inherit follows \
+                                     the global default (Settings → Automation → Simulcast dedup).",
+                                );
+                                ui.end_row();
+
+                                ui.label("…prefer when ad-free");
+                                simulcast_pref_combo(
+                                    ui,
+                                    "chform_simulcast_ad_free_pref",
+                                    &mut s.simulcast_ad_free_pref,
+                                    "No ad-free override",
+                                )
+                                .on_hover_text(
+                                    "Overrides the row above whenever this channel's instance on \
+                                     THIS platform is ad-free for you (marked by hand, or a \
+                                     detected Twitch subscription) — its stream has no ad-break \
+                                     cuts either, so it's the better copy. Ignored when that \
+                                     instance isn't live.",
+                                );
                                 ui.end_row();
 
                                 ui.label("Embed chapters");
@@ -771,6 +811,10 @@ impl StreamArchiverApp {
                 let id_opt = f.id;
                 let color = f.color.trim().to_string();
                 let platform_pref = f.primary_platform_pref;
+                let simulcast_scope = crate::simulcast::SimulcastScope {
+                    pref: f.simulcast_pref,
+                    ad_free_pref: f.simulcast_ad_free_pref,
+                };
                 let vod_scope = crate::vod_archive::VodArchiveScope {
                     download: f.vod_download,
                     replace: f.vod_replace,
@@ -891,6 +935,11 @@ impl StreamArchiverApp {
                             &self.core.store,
                             cid,
                             platform_pref,
+                        );
+                        let _ = crate::simulcast::save_channel_simulcast_scope(
+                            &self.core.store,
+                            cid,
+                            &simulcast_scope,
                         );
                         // The preference feeds the cached Streams-view rollup
                         // (`StreamsViewCache::platform_pref`) — bump the rev so
@@ -1757,6 +1806,59 @@ impl StreamArchiverApp {
                 .cloned()
                 .unwrap_or_default();
 
+            // Which live instances are standing by for a sibling that's
+            // recording this broadcast instead (see `crate::simulcast`), and
+            // which platform took it. Derived rather than plumbed out of the
+            // supervisor: same facts, no new shared state, and correct after a
+            // restart. Deliberately narrower than the supervisor's own
+            // decision — only an actually-running sibling capture counts — so
+            // the badge never claims a standby that isn't visibly happening.
+            let simulcast_standby: HashMap<i64, String> = {
+                let ctx = crate::simulcast::SimulcastCtx::load(&self.core.store);
+                let mut out = HashMap::new();
+                for e in &chan_entries {
+                    if e.rows.len() < 2 {
+                        continue;
+                    }
+                    let mons: Vec<&MonitorWithChannel> =
+                        e.rows.iter().map(|&i| &self.rows[i]).collect();
+                    for m in &mons {
+                        let mid = m.monitor.id;
+                        if active_ids.contains(&mid)
+                            || m.monitor.last_state != "live"
+                            || !m.auto_record_on()
+                            || !m.automation_on()
+                        {
+                            continue;
+                        }
+                        let policy = ctx.policy_for(e.channel.id, mid);
+                        // Ad-free override, same rule the decision uses: the
+                        // instance on that platform has to be live AND ad-free.
+                        let ad_free_live = |p: crate::models::Platform| {
+                            mons.iter().any(|s| {
+                                s.monitor.platform() == p
+                                    && (s.monitor.ad_free || s.ad_free_sub == Some(true))
+                                    && (active_ids.contains(&s.monitor.id)
+                                        || s.monitor.last_state == "live")
+                            })
+                        };
+                        let pref = policy
+                            .ad_free_pref
+                            .filter(|p| ad_free_live(*p))
+                            .or(policy.pref);
+                        let Some(pref) = pref.filter(|p| *p != m.monitor.platform()) else {
+                            continue;
+                        };
+                        if mons.iter().any(|s| {
+                            s.monitor.platform() == pref && active_ids.contains(&s.monitor.id)
+                        }) {
+                            out.insert(mid, pref.label().to_string());
+                        }
+                    }
+                }
+                out
+            };
+
             // Channel-level sort/filter model (one entry per top-level channel row).
             let model: Vec<Vec<Cell>> = chan_entries
                 .iter()
@@ -1780,6 +1882,7 @@ impl StreamArchiverApp {
                 rolling_counts,
                 model,
                 platform_pref,
+                simulcast_standby,
             });
         }
     }
@@ -2094,6 +2197,10 @@ impl StreamArchiverApp {
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
                                     &exp_instances, instance_avatars,
                                     cache.rolling_counts.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
+                                    cache
+                                        .simulcast_standby
+                                        .get(&self.rows[ri].monitor.id)
+                                        .map(String::as_str),
                                     &stop_holds_snapshot, &ad_running, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
                                     hit_instances.contains(&self.rows[ri].monitor.id),
@@ -2488,6 +2595,9 @@ impl StreamArchiverApp {
                 mf.join_cleanup = dsc.join_cleanup;
                 mf.disposal_method = dsc.method;
                 mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, r.monitor.id);
+                let smsc = crate::simulcast::load_monitor_simulcast_scope(&self.core.store, r.monitor.id);
+                mf.simulcast_pref = smsc.pref;
+                mf.simulcast_ad_free_pref = smsc.ad_free_pref;
                 let mchsc = crate::chapters::load_monitor_chapters_scope(&self.core.store, r.monitor.id);
                 mf.chapters_enabled = mchsc.enabled;
                 mf.chapters_coalesce_secs = mchsc.coalesce_secs.map(|v| v.to_string()).unwrap_or_default();
@@ -2598,6 +2708,7 @@ impl StreamArchiverApp {
                 let hbsc = crate::head_backfill::load_channel_head_backfill_scope(&self.core.store, cid);
                 let dsc = crate::disposal::load_channel_disposal_scope(&self.core.store, cid);
                 let platform_pref = crate::platform_pref::channel_primary_platform(&self.core.store, cid);
+                let smsc = crate::simulcast::load_channel_simulcast_scope(&self.core.store, cid);
                 let chsc = crate::chapters::load_channel_chapters_scope(&self.core.store, cid);
                 let chapters_coalesce_secs =
                     chsc.coalesce_secs.map(|v| v.to_string()).unwrap_or_default();
@@ -2643,6 +2754,8 @@ impl StreamArchiverApp {
                     rolling: dsc.rolling,
                     rolling_ttl_hours: crate::rolling::secs_to_hours_field(dsc.rolling_ttl_secs),
                     primary_platform_pref: platform_pref,
+                    simulcast_pref: smsc.pref,
+                    simulcast_ad_free_pref: smsc.ad_free_pref,
                     chapters_enabled: chsc.enabled,
                     chapters_coalesce_secs,
                     follow_my_raids,
@@ -3888,6 +4001,9 @@ impl StreamArchiverApp {
         // Takes of THIS instance still counting down towards rolling
         // auto-deletion — the 🕰 rollup badge (see `crate::rolling`).
         rolling_count: i64,
+        // Set when this instance is live but standing by for a sibling that is
+        // recording the broadcast on the named platform (see `crate::simulcast`).
+        standby_for: Option<&str>,
         stop_holds_snapshot: &HashMap<i64, crate::downloader::StopHold>,
         ad_running: &impl Fn(i64) -> bool,
         sel_color: egui::Color32,
@@ -4019,6 +4135,7 @@ impl StreamArchiverApp {
             instance_avatars.get(&mid),
             instance_avatars,
             rolling_count,
+            standby_for,
             inst_latest_rec_id,
             scheduled_recordings,
             stop_hold_desc,
@@ -5207,11 +5324,20 @@ impl StreamArchiverApp {
                                  tried — nothing to capture (not a failure).",
                             );
                         } else if t.status == "not_recorded" {
-                            resp.on_hover_text(
-                                "Not recorded — Auto-record was off for this channel/instance \
-                                 while this stream was live, so nothing was captured. Kept as \
-                                 a history entry (title/category/duration) only.",
-                            );
+                            // Why it wasn't captured. Empty is the historical
+                            // (and still commonest) reason, Auto-record off;
+                            // anything else names itself — see
+                            // `Recording::not_recorded_reason`.
+                            let why = if t.not_recorded_reason.is_empty() {
+                                "Auto-record was off for this channel/instance".to_string()
+                            } else {
+                                t.not_recorded_reason.clone()
+                            };
+                            resp.on_hover_text(format!(
+                                "Not recorded — {why} while this stream was live, so nothing was \
+                                 captured here. Kept as a history entry \
+                                 (title/category/duration) only."
+                            ));
                         } else if let Some(code) = t.exit_code {
                             resp.on_hover_text(format!("exit code {code}"));
                         } else {

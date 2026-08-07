@@ -214,9 +214,10 @@ two tools on one URL.
      mirrors Went Live and Lost time is blank, since nothing is being captured.
      The stream isn't forgotten once it ends, either: it gets its own **👁 not
      recorded** take row in the Streams grid (title/category/start/end time,
-     no file — hover the state icon for the note), the same way a real
-     recording would, so an Auto-off channel's history still shows *that* it
-     streamed even though nothing was captured. **Chat still is**, though —
+     no file — hover the state icon for the note, which names *why* it wasn't
+     captured: Auto-record off, or *Simulcast dedup* recording it on another
+     instance), the same way a real recording would, so an Auto-off channel's
+     history still shows *that* it streamed even though nothing was captured. **Chat still is**, though —
      by default an Auto-off broadcast gets a chat-only sidecar attached to
      that row (see *Chat without a recording*), because chat is tiny and
      can't be fetched back later. Turning Auto on (or a trigger/manual Start
@@ -235,7 +236,9 @@ two tools on one URL.
    instance form) beats a per-**channel** override (channel form's "Preferred
    platform when multiple live") beats the **global default** (Settings →
    Interface → Display). None configured = the original earliest-live
-   behavior, unchanged.
+   behavior, unchanged. This preference is **display only** — for which
+   instance actually gets *recorded* when a channel simulcasts, see *Simulcast
+   dedup* below.
 
    A take whose capture has **ended** but whose finalize (the remux/promote
    into the output dir) is still running — or waiting in the disk-gate queue,
@@ -278,6 +281,66 @@ two tools on one URL.
 4. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
    downloads, and **start at login** (autostart). Folder fields have a **Browse…**
    button.
+
+#### Simulcast dedup (⇄)
+
+Many channels here have several **instances** — the same streamer on Twitch
+*and* YouTube. When they simulcast, both go live and both record, giving you two
+copies of one broadcast at double the disk and I/O, neither better than the
+other. The extra instances are meant to be redundancy, not duplicate archives.
+
+Turn on **Settings → Automation → Simulcast dedup** and pick a platform: when a
+channel is live on more than one at once, only that one records. Two rules keep
+it from ever costing you a broadcast:
+
+- **Exclusives still record.** If nothing is live on the preferred platform,
+  whatever *is* live records exactly as before — a platform-exclusive stream is
+  never skipped waiting for a channel that isn't broadcasting.
+- **The others stay armed.** A held-back instance ("standing by", ⇄ next to its
+  live state) keeps polling, and takes over if the preferred instance is live
+  but never actually starts capturing — Auto off there, repeated errors, or a
+  capture that dies mid-stream. That's genuine failover, not a disabled row.
+
+**The ad-free override.** The usual reason to prefer YouTube is Twitch's ad
+breaks: an ad is a hard cut in the captured file. But on a channel you're
+**subscribed** to, Twitch has no ad breaks either — so *"…but prefer this
+platform when it's ad-free"* flips the choice for exactly those channels. It
+fires when the instance on that platform is marked ad-free by hand **or** has a
+detected Twitch subscription (Settings → Accounts, refreshed every few hours),
+and only while that instance is actually live.
+
+**Three tiers**, the usual chain: instance (its own form) beats channel
+(channel form) beats the global default, and the two fields resolve
+independently — a channel can pick the everyday platform while one instance
+overrides only the ad-free rule. Setting an instance to **Off** is an
+exemption: always record this one, even when a preferred sibling is live.
+
+**The settle window** ("Wait for the preferred platform for N minutes", default
+3) covers the fact that instances poll independently, so the non-preferred one
+often notices the broadcast first. Within that window the preferred instance
+**takes over**: the duplicate capture is stopped (no restart hold — it stays
+armed) and recording continues on the preferred platform, which loses almost
+nothing since Twitch head-backfill and YouTube live-from-start both recover the
+opening. After the window, the running capture is the intact copy of that
+broadcast and is left alone — the preferred instance stands by instead of
+starting a second, later, worse copy. The same number decides how long a
+standby waits for the preferred instance to get going before taking the
+broadcast itself.
+
+**What you see.** The standby instance shows ● live with a **⇄** badge (hover
+it for which platform has the broadcast), and once the stream ends it keeps a
+**👁 not recorded** row whose hover names the reason. Its **chat is still
+archived** — chat is per-platform, tiny, and unrecoverable, so the two
+platforms' conversations are both kept even though only one video is. And
+because the broadcast wasn't missed, it's excluded from the missed-stream VOD
+backfill and the discovery scan, which would otherwise "recover" the exact
+duplicate this feature exists to prevent.
+
+Worth knowing: dedup is across platforms, not within one — two instances on the
+*same* preferred platform still both record. A takeover leaves the stopped
+capture's partial take on disk; nothing here ever deletes a file. And a manual
+▶ **Start**, a scheduled recording and a trigger-word match all bypass dedup
+entirely — those are explicit instructions to record *this* instance.
 
 #### Channel groups (🏷)
 
@@ -2382,6 +2445,16 @@ filename. This feature layers automation on top of that fix:
   same space as the stored stream id — best-effort there. Run it on demand
   for one channel via **🔎 Scan for missed streams** (stream row context
   menu), independent of the setting.
+
+**Broadcasts that weren't actually missed are excluded.** A 👁 row created by
+*Simulcast dedup* means a sibling instance recorded that same broadcast — so
+both paths above skip it, rather than downloading the exact duplicate the dedup
+just avoided. Discovery applies the same rule to a VOD it finds in a listing:
+if another instance of that channel has a real capture covering that window
+*and* dedup is on for this one, the row is filed with the reason instead of
+queued for download. With dedup off it behaves as before, because then a
+sibling's copy is a separate archive and a failed capture here still deserves
+its recovery.
 
 > **Notes.** Twitch is the only platform with a CDN-recovery fallback — the
 > segment-reconstruction trick only works within Twitch's own storage

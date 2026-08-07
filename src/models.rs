@@ -3014,6 +3014,16 @@ pub struct Recording {
     /// Rolling-recording bookkeeping — see [`Rolling`]. Default (all zeroes)
     /// for every ordinary take.
     pub rolling: Rolling,
+    /// Why this `not_recorded` take exists (schema v90), for the rows where
+    /// "we saw it live and didn't capture it" needs an explanation: `''` (the
+    /// historical case) means Auto-record was off, `simulcast: …` means another
+    /// instance of the channel was recording the same broadcast (see
+    /// [`crate::simulcast`]). Empty on every ordinary take.
+    ///
+    /// Read by the 👁 row's hover text and — load-bearing — by the two VOD
+    /// backfill paths, which must not "recover" a broadcast that was skipped
+    /// deliberately because a sibling already has it.
+    pub not_recorded_reason: String,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3129,6 +3139,7 @@ impl Recording {
             chapters_attempts: 0,
             chat_path: String::new(),
             rolling: crate::models::Rolling::default(),
+            not_recorded_reason: String::new(),
         }
     }
 }

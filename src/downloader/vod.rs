@@ -353,6 +353,18 @@ pub(crate) fn attempt_missed_stream_backfill(
     rec_id: i64,
 ) {
     tokio::spawn(async move {
+        // A broadcast simulcast dedup deliberately declined must not be
+        // "recovered" here: a sibling instance recorded the same stream, so
+        // this would fetch the exact duplicate that feature exists to prevent
+        // — at full file size, hours after the fact. The guard lives inside
+        // this one routine rather than at its callers so nothing added later
+        // can miss it.
+        if let Ok(Some(rec)) = store.get_recording(rec_id)
+            && crate::simulcast::is_simulcast_skip(&rec.not_recorded_reason)
+        {
+            tracing::debug!(rec_id, "missed-stream backfill skipped: {}", rec.not_recorded_reason);
+            return;
+        }
         let Some((murl, ..)) = store.recording_archive_now(rec_id).ok().flatten() else {
             return;
         };

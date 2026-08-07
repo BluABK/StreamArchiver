@@ -105,7 +105,33 @@ pub(crate) async fn discover_missed_streams_for_monitor(
             discover_via_ytdlp(&store, monitor_id, &row.monitor.url, "", false).await
         }
     };
+    // Discovery only ever sees THIS instance's own VOD listing, so a broadcast
+    // that simulcast dedup deliberately declined here — because a sibling
+    // instance recorded it — looks exactly like a gap. Stamp those rows with
+    // the reason instead of downloading a second copy of a stream we already
+    // have. Gated on dedup actually being on for this instance: with it off, a
+    // sibling's copy is a *different* archive and a failed capture here still
+    // deserves its VOD recovery.
+    let dedup_on = crate::simulcast::SimulcastCtx::load(&store)
+        .policy_for(row.channel.id, monitor_id)
+        .pref
+        .is_some();
     for rec_id in &found {
+        if dedup_on
+            && let Ok(Some(rec)) = store.get_recording(*rec_id)
+            && store
+                .sibling_take_covers(monitor_id, rec.started_at, crate::vod_archive::VOD_MATCH_WINDOW_SECS)
+                .unwrap_or(false)
+        {
+            let _ = store.set_not_recorded_reason(
+                *rec_id,
+                &format!(
+                    "{} another instance of this channel recorded this broadcast",
+                    crate::simulcast::SKIP_REASON_PREFIX
+                ),
+            );
+            continue;
+        }
         attempt_missed_stream_backfill(ctx.clone(), store.clone(), events.clone(), manual_tx.clone(), *rec_id);
     }
     found.len()

@@ -611,6 +611,29 @@ impl Store {
             .find(|r| r.monitor.id == id))
     }
 
+    /// The monitor plus every OTHER instance of the same channel, from the one
+    /// pass `get_monitor_with_channel` was already paying for.
+    ///
+    /// `list_monitors_with_channels` loads every monitor with its correlated
+    /// subqueries and the single-row lookup above throws all but one away — so
+    /// for callers that need the siblings too ([`crate::simulcast`]'s gate),
+    /// splitting that same result is free, where a second `WHERE channel_id`
+    /// query would double an already-expensive read on every live poll.
+    pub fn get_monitor_with_siblings(
+        &self,
+        id: i64,
+    ) -> Result<Option<(MonitorWithChannel, Vec<MonitorWithChannel>)>> {
+        let all = self.list_monitors_with_channels()?;
+        let Some(me) = all.iter().find(|r| r.monitor.id == id).cloned() else {
+            return Ok(None);
+        };
+        let siblings = all
+            .into_iter()
+            .filter(|r| r.channel.id == me.channel.id && r.monitor.id != id)
+            .collect();
+        Ok(Some((me, siblings)))
+    }
+
     /// The monitor and stream/video id a recording belongs to (so a
     /// `RecordingFinished` event can resolve the channel for a rich toast and
     /// build a platform-specific VOD URL when a video id is known).

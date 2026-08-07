@@ -1751,7 +1751,25 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 89)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 89);
+        if version < 90 {
+            // Why a "seen live, not recorded" row exists (see
+            // `insert_not_recorded_session`). Until now there was exactly one
+            // reason — Auto-record was off — and the Streams grid hardcoded
+            // that sentence. Simulcast dedup (`crate::simulcast`) adds a
+            // second: another instance of the same channel is recording this
+            // broadcast.
+            //
+            // It is not decoration. Two VOD-backfill paths turn a closed
+            // not-recorded row into "we missed this broadcast, download it",
+            // which for a deliberately-skipped simulcast would fetch the exact
+            // duplicate the feature exists to prevent — they read this column
+            // to tell the two cases apart.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN not_recorded_reason TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 90)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 90);
         Ok(())
     }
 }

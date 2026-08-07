@@ -296,6 +296,46 @@ impl Store {
         Ok(Some(rec_id))
     }
 
+    /// Whether a **different** instance of the same channel actually captured
+    /// a broadcast covering `at` (± `slack` seconds).
+    ///
+    /// The missed-stream discovery scan only ever sees one instance's own VOD
+    /// listing, so a simulcast broadcast that was deliberately recorded on a
+    /// sibling instead looks exactly like a gap. This is how it tells the two
+    /// apart. Only real captures count — a `not_recorded` row on the sibling
+    /// means nobody has the broadcast.
+    pub fn sibling_take_covers(&self, monitor_id: i64, at: i64, slack: i64) -> Result<bool> {
+        let conn = self.db();
+        let covered: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM recording r
+                JOIN monitor m  ON m.id  = r.monitor_id
+                JOIN monitor me ON me.id = ?1
+                WHERE m.channel_id = me.channel_id
+                  AND r.monitor_id != ?1
+                  AND r.status != 'not_recorded'
+                  AND COALESCE(r.output_path, '') != ''
+                  AND ?2 >= r.started_at - ?3
+                  AND ?2 <= COALESCE(r.ended_at, r.started_at) + ?3)",
+            params![monitor_id, at, slack],
+            |r| r.get(0),
+        )?;
+        Ok(covered)
+    }
+
+    /// Record why a `not_recorded` take wasn't captured (see
+    /// [`crate::models::Recording::not_recorded_reason`]). Only set on insert —
+    /// a session reused across polls keeps the reason it opened with, so the
+    /// row can't flip its story mid-broadcast.
+    pub fn set_not_recorded_reason(&self, rec_id: i64, reason: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET not_recorded_reason = ?2 WHERE id = ?1",
+            params![rec_id, reason],
+        )?;
+        Ok(())
+    }
+
     /// Point a take at the chat sidecar being written for it (see
     /// [`crate::models::Recording::chat_path`]). Persisted at spawn for EVERY
     /// chat producer (recorded takes and chat-only sessions alike) since the
@@ -1467,7 +1507,8 @@ impl Store {
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
             gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
             COALESCE(chapters_json, ''), chapters_attempts, chat_path,
-            rolling_ttl_secs, rolling_from, rolling_kept_at, rolling_expired_at";
+            rolling_ttl_secs, rolling_from, rolling_kept_at, rolling_expired_at,
+            COALESCE(not_recorded_reason, '')";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -1518,6 +1559,7 @@ impl Store {
                 kept_at: r.get(43)?,
                 expired_at: r.get(44)?,
             },
+            not_recorded_reason: r.get(45)?,
         })
     }
 
@@ -1753,6 +1795,7 @@ impl Store {
                     chapters_attempts: 0,
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
+                    not_recorded_reason: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1823,6 +1866,7 @@ impl Store {
                     chapters_attempts: 0,
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
+                    not_recorded_reason: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1916,6 +1960,7 @@ impl Store {
                     chapters_attempts: 0,
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
+                    not_recorded_reason: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2002,6 +2047,7 @@ impl Store {
                     chapters_attempts: 0,
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
+                    not_recorded_reason: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2068,6 +2114,7 @@ impl Store {
                     chapters_attempts: 0,
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
+                    not_recorded_reason: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2272,6 +2319,7 @@ impl Store {
                     chapters_attempts: 0,
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
+                    not_recorded_reason: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2582,6 +2630,59 @@ mod tests {
 
         // Closing again (no open session) is a harmless no-op.
         assert!(store.close_open_not_recorded_sessions(mid, 3_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn not_recorded_reason_defaults_empty_and_survives_a_close() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let id = store.insert_not_recorded_session(mid, 1_000, Some(1_000), false, Some("s1")).unwrap();
+        // Empty = the historical reason (Auto-record was off).
+        assert_eq!(store.get_recording(id).unwrap().unwrap().not_recorded_reason, "");
+        assert!(!crate::simulcast::is_simulcast_skip(""));
+
+        let reason = "simulcast: recording this broadcast on the YouTube instance instead";
+        store.set_not_recorded_reason(id, reason).unwrap();
+        assert!(crate::simulcast::is_simulcast_skip(reason));
+        // Both read paths agree, and closing the session doesn't wipe it — the
+        // VOD-backfill guard runs *after* the close.
+        store.close_open_not_recorded_sessions(mid, 2_000).unwrap();
+        assert_eq!(store.get_recording(id).unwrap().unwrap().not_recorded_reason, reason);
+        assert_eq!(store.recordings_for_monitor(mid).unwrap()[0].not_recorded_reason, reason);
+    }
+
+    #[test]
+    fn sibling_take_covers_only_real_captures_on_other_instances() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let tw = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let mut yt_mon = sample_monitor(cid);
+        yt_mon.url = "https://youtube.com/@a".into();
+        let yt = store.insert_monitor(&yt_mon).unwrap();
+        // A different channel entirely — must never count.
+        let other_cid = store.upsert_channel("B", "https://twitch.tv/b", Platform::Twitch).unwrap();
+        let other = store.insert_monitor(&sample_monitor(other_cid)).unwrap();
+
+        let rid = store
+            .insert_recording(yt, 1_000, "C:/tmp/a.mkv", None, false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(rid, 5_000, 10, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+
+        assert!(store.sibling_take_covers(tw, 3_000, 0).unwrap(), "inside the sibling's take");
+        assert!(!store.sibling_take_covers(tw, 9_000, 0).unwrap(), "well after it");
+        assert!(store.sibling_take_covers(tw, 5_100, 300).unwrap(), "within the slack");
+        assert!(!store.sibling_take_covers(yt, 3_000, 0).unwrap(), "its own take doesn't count");
+        assert!(!store.sibling_take_covers(other, 3_000, 0).unwrap(), "another channel doesn't count");
+
+        // A sibling that also didn't record covers nothing — nobody has it.
+        let ghost = store.insert_not_recorded_session(yt, 20_000, Some(20_000), false, Some("s2")).unwrap();
+        store.close_open_not_recorded_sessions(yt, 21_000).unwrap();
+        let _ = ghost;
+        assert!(!store.sibling_take_covers(tw, 20_500, 0).unwrap());
     }
 
     #[test]

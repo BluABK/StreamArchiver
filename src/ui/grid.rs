@@ -1016,6 +1016,11 @@ pub(super) struct StreamsViewCache {
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.
     pub(super) platform_pref: crate::platform_pref::PlatformPrefCtx,
+    /// Live instances currently standing by because a sibling is recording
+    /// this broadcast on the preferred platform, mapped to that platform's
+    /// label — the ⇄ badge. Derived during the rebuild (it reads the simulcast
+    /// settings), never per frame. See [`crate::simulcast`].
+    pub(super) simulcast_standby: HashMap<i64, String>,
 }
 
 pub(super) fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
@@ -2468,6 +2473,10 @@ pub(super) fn render_instance_row(
     // How many of this instance's takes are counting down towards rolling
     // auto-deletion (0 = none) — the 🕰 rollup badge.
     rolling_count: i64,
+    // Set when this instance is live but standing by because a sibling is
+    // recording the broadcast on the named platform (simulcast dedup) — the ⇄
+    // badge in the State cell.
+    standby_for: Option<&str>,
     // The most recently started recording for this monitor, if any — the
     // target of the "Backfill head" manual action.
     latest_rec_id: Option<i64>,
@@ -3215,6 +3224,18 @@ pub(super) fn render_instance_row(
                         resp.on_hover_text(&m.last_state);
                     }
                     rolling_rollup_badge(ui, rolling_count, false);
+                    if let Some(platform) = standby_for {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x7e, 0x9c, 0xd8),
+                            egui::RichText::new("⇄").small(),
+                        )
+                        .on_hover_text(format!(
+                            "Standing by — this channel's {platform} instance is recording this \
+                             broadcast, so it isn't captured twice (Simulcast dedup). This \
+                             instance stays armed: if that capture stops while the stream is \
+                             still live, it takes over. Chat here is still being archived."
+                        ));
+                    }
                     if recording && !finalizing && row.capture_offline {
                         // The channel is NOT live anymore — the capture is
                         // draining backlog/tail or muxing. Without this the

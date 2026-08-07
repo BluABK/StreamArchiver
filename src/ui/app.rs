@@ -96,6 +96,22 @@ impl StreamArchiverApp {
         let dnd_end = setting_or_empty(&core, crate::notifications::K_DND_END);
         let dnd_end = if dnd_end.is_empty() { "08:00".to_string() } else { dnd_end };
         let primary_platform_pref = crate::platform_pref::global_primary_platform(&core.store);
+        let simulcast_pref = crate::simulcast::global_pref(&core.store);
+        let simulcast_ad_free_pref = crate::simulcast::global_ad_free_pref(&core.store);
+        // Stored in seconds, edited in minutes. Left blank when it's the
+        // default, so the field reads as "unset" rather than pre-filled with a
+        // number the user never chose.
+        let simulcast_settle_mins = match core
+            .store
+            .get_setting(crate::simulcast::K_SIMULCAST_SETTLE_SECS)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+        {
+            Some(secs) => format!("{}", secs as f64 / 60.0),
+            None => String::new(),
+        };
 
         let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
         let schedule_large_avatar = setting_or_empty(&core, K_SCHEDULE_LARGE_AVATAR) == "1";
@@ -549,6 +565,9 @@ impl StreamArchiverApp {
             dnd_start,
             dnd_end,
             primary_platform_pref,
+            simulcast_pref,
+            simulcast_ad_free_pref,
+            simulcast_settle_mins,
             show_processes: false,
             processes: Vec::new(),
             processes_refreshed: None,
@@ -1541,6 +1560,10 @@ impl StreamArchiverApp {
             rolling_ttl_secs: crate::rolling::hours_field_to_secs(&form.rolling_ttl_hours),
         };
         let primary_pin = form.primary_pin;
+        let simulcast_scope = crate::simulcast::SimulcastScope {
+            pref: form.simulcast_pref,
+            ad_free_pref: form.simulcast_ad_free_pref,
+        };
         let chapters_scope = crate::chapters::ChaptersScope {
             enabled: form.chapters_enabled,
             coalesce_secs: form.chapters_coalesce_secs.trim().parse().ok(),
@@ -1631,6 +1654,8 @@ impl StreamArchiverApp {
                         Some(allow_delete),
                     );
                     let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
+                    let _ =
+                        crate::simulcast::save_monitor_simulcast_scope(&store, mid, &simulcast_scope);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
                         store.next_scheduled_streams(now_unix()).map_err(|e| e.to_string())?;
@@ -2308,6 +2333,9 @@ impl StreamArchiverApp {
                         mf.rolling = dsc.rolling;
                         mf.rolling_ttl_hours = crate::rolling::secs_to_hours_field(dsc.rolling_ttl_secs);
                         mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
+                        let smsc = crate::simulcast::load_monitor_simulcast_scope(&self.core.store, self.rows[idx].monitor.id);
+                        mf.simulcast_pref = smsc.pref;
+                        mf.simulcast_ad_free_pref = smsc.ad_free_pref;
                         let mchsc = crate::chapters::load_monitor_chapters_scope(&self.core.store, self.rows[idx].monitor.id);
                         mf.chapters_enabled = mchsc.enabled;
                         mf.chapters_coalesce_secs = mchsc.coalesce_secs.map(|v| v.to_string()).unwrap_or_default();

@@ -1313,6 +1313,7 @@ mod tests {
             chapters_attempts: 0,
             chat_path: String::new(),
             rolling: crate::models::Rolling::default(),
+            not_recorded_reason: String::new(),
         }
     }
 

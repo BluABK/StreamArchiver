@@ -639,6 +639,7 @@ impl StreamArchiverApp {
             self.settings_ad_probe_section(ui);
             self.settings_disk_io_section(ui);
             // Automation: what starts/stops/fetches on its own.
+            self.settings_simulcast_section(ui);
             self.settings_trigger_words_section(ui);
             self.settings_blacklist_triggers_section(ui);
             self.settings_raid_follow_section(ui);
@@ -1667,7 +1668,9 @@ impl StreamArchiverApp {
                  from whichever instance went live earliest. Set a preferred platform to show \
                  that one's info instead whenever it's live — useful when one platform's \
                  metadata is richer (e.g. Twitch's game/category). Can be overridden per \
-                 channel in Properties, or per instance with a pin (highest priority).",
+                 channel in Properties, or per instance with a pin (highest priority). \
+                 DISPLAY only: it never changes which instance gets recorded — that's \
+                 Settings → Automation → Simulcast dedup.",
             );
 
             ui.add_space(8.0);
@@ -3187,6 +3190,132 @@ impl StreamArchiverApp {
                 });
             }
             }
+    }
+
+    /// "Simulcast dedup" — the global tier of [`crate::simulcast`].
+    ///
+    /// Written straight through on change (like the display-side platform
+    /// preference) rather than waiting for a Save: these are one-click pickers
+    /// with nothing to validate, and the next go-live reads them from the DB.
+    fn settings_simulcast_section(&mut self, ui: &mut egui::Ui) {
+        use crate::simulcast::SimulcastPref;
+        if self.section_shown(
+            SettingsTab::Automation,
+            "Simulcast dedup",
+            &["simulcast", "dedup", "duplicate", "multi", "platform", "instance", "preferred", "one copy", "ad-free", "sub", "failover", "standby"],
+        ) {
+            ui.add_space(12.0);
+            ui.heading("Simulcast dedup ⇄");
+            ui.label(
+                "When one channel is live on several platforms at once, record only the \
+                 preferred one instead of archiving the same broadcast twice. If the preferred \
+                 platform ISN'T live, whatever is live records as normal — a platform exclusive \
+                 is never skipped. The other instances stay armed: if the preferred one is live \
+                 but never actually starts capturing (Auto off there, errors, a capture that \
+                 dies), a sibling takes over.",
+            );
+            ui.add_space(6.0);
+            let pick = |ui: &mut egui::Ui,
+                            label: &str,
+                            id: &str,
+                            key: &'static str,
+                            off_label: &str,
+                            current: SimulcastPref,
+                            hover: &str|
+             -> Option<SimulcastPref> {
+                let mut chosen = None;
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let text =
+                        if current == SimulcastPref::Off { off_label } else { current.label() };
+                    egui::ComboBox::from_id_salt(id)
+                        .selected_text(text)
+                        .show_ui(ui, |ui| {
+                            for p in SimulcastPref::ALL {
+                                let l = if p == SimulcastPref::Off { off_label } else { p.label() };
+                                if ui.selectable_label(current == p, l).clicked() && current != p {
+                                    let _ = self.core.store.set_setting(key, p.as_str());
+                                    chosen = Some(p);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(hover);
+                });
+                chosen
+            };
+            if let Some(v) = pick(
+                ui,
+                "Simulcast: record only",
+                "settings_simulcast_pref",
+                crate::simulcast::K_SIMULCAST_PREF,
+                "Off — record every live instance",
+                self.simulcast_pref,
+                "The platform to keep when a channel is live on more than one at the same \
+                 time. Channel and instance Properties can override it — an instance set to \
+                 Off is always recorded, even when a preferred sibling is live. Note this is \
+                 NOT the same as Interface → Display's preferred platform, which only decides \
+                 what the channel ROW shows.",
+            ) {
+                self.simulcast_pref = v;
+            }
+            if let Some(v) = pick(
+                ui,
+                "…but prefer this platform when it's ad-free",
+                "settings_simulcast_ad_free_pref",
+                crate::simulcast::K_SIMULCAST_AD_FREE_PREF,
+                "No ad-free override",
+                self.simulcast_ad_free_pref,
+                "Overrides the choice above whenever the instance on THIS platform is ad-free \
+                 for you — marked ad-free by hand, or a detected Twitch subscription. The point \
+                 is ad-break hard cuts: prefer YouTube normally, but take Twitch on the \
+                 channels you're subscribed to, where its stream has no ad breaks either. \
+                 Ignored when that instance isn't live.",
+            ) {
+                self.simulcast_ad_free_pref = v;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Wait for the preferred platform for");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.simulcast_settle_mins)
+                        .hint_text("minutes")
+                        .desired_width(60.0),
+                );
+                ui.label("minutes");
+                let changed = resp.changed();
+                resp.on_hover_text(
+                    "How long one broadcast counts as \"still settling\", which decides two \
+                     things: how long a standing-by instance waits for the preferred one to \
+                     actually start capturing before taking over as failover, and how early a \
+                     capture that beat the preferred platform to it can still be switched over \
+                     (later than that, the running capture is the intact copy and is left \
+                     alone). Empty or 0 uses the default of 3 minutes.",
+                );
+                if changed {
+                    // Minutes in the field, seconds in the DB — a blank or
+                    // garbage entry stores nothing, so the default applies.
+                    let secs = self
+                        .simulcast_settle_mins
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| *v > 0.0)
+                        .map(|v| (v * 60.0).round() as i64);
+                    let _ = self.core.store.set_setting(
+                        crate::simulcast::K_SIMULCAST_SETTLE_SECS,
+                        &secs.map(|s| s.to_string()).unwrap_or_default(),
+                    );
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Dedup is across platforms, not within one: two instances on the same \
+                     preferred platform still both record.",
+                )
+                .small()
+                .weak(),
+            );
+        }
     }
 
     fn settings_trigger_words_section(&mut self, ui: &mut egui::Ui) {
