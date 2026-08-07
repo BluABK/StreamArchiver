@@ -617,7 +617,7 @@ Once the live recording finishes, the head and the capture are **losslessly
 concatenated** (stream copy, no re-encode) into `{stem}.full.mkv` — a true
 full-stream file — and, by default, **both parts are kept**. Keeping the parts
 means a joined stream occupies double its size, so an opt-in **After full.mkv
-join** setting (Settings → Downloads → *Automatic deletion*; overridable
+join** setting (Settings → Post-processing → *Automatic deletion*; overridable
 per-channel and per-instance) can instead delete just the head, or both parts —
 in which case the take's main file becomes the full. The cleanup only runs
 after the join passes its duration sanity check, and removals follow the
@@ -662,7 +662,7 @@ it's just as recoverable from the same still-growing CDN playlist while the
 stream stays live. With this setting on (**default**), every take gets its own
 fresh, **full** head backfill (go-live through *that* take's start, not just
 the incremental gap since the previous take), not only the stream's first.
-Global default in Settings → Downloads → *Head backfill on new takes*;
+Global default in Settings → Automation → *Head backfill on new takes*;
 override per-channel or per-instance like the other 3-level toggles. Turning
 it off restores the original behavior (first take only). Before doing that
 full fetch, it checks whether an earlier take of the same broadcast is
@@ -782,7 +782,7 @@ fallback take itself gets rejected.
 
 A few features delete finished recordings on their own: the post-join parts
 cleanup above, superseded old heads, and a live capture displaced by *Replace
-with VOD*. **Settings → Downloads → Automatic deletion** controls what such a
+with VOD*. **Settings → Post-processing → Automatic deletion** controls what such a
 delete actually does — with the usual global < channel < instance override
 chain (channel Properties / edit instance). A take started by a
 [trigger word](#trigger-words-force-record-on-titlegame-match-) can go one
@@ -1702,14 +1702,14 @@ exactly like before splicing existed" rather than guess:
 - The result is built at a brand-new path and verified before the
   recording is ever re-pointed at it; the pre-splice file and consumed
   patches are only touched afterward, and only per the **Gap splice
-  cleanup** setting (Settings → Downloads → Twitch VOD recovery), which
+  cleanup** setting (Settings → Automation → Twitch VOD recovery), which
   defaults to **Keep** (nothing deleted until you opt in) — same
   Trash/Recycle-Bin disposal path as every other cleanup setting.
 - If any check fails or is uncertain, the take is left exactly as-is and
   flagged in the **Issues** panel (🩹 *Recovered gap patches couldn't be
   spliced in*) explaining which check blocked it, with a button to open the
   patch folder and a Dismiss action.
-- Toggle: Settings → Downloads → Twitch VOD recovery → *Splice recovered
+- Toggle: Settings → Automation → Twitch VOD recovery → *Splice recovered
   gaps into a gapless file* (default on).
 
 **Past streams too.** At startup a **retro sweep** scans the existing
@@ -1723,7 +1723,7 @@ and still-running takes are left to the live scanner. Recovery progress shows as
 recovered ✔"* line on the Warnings row — and once **every** range is
 recovered the row flips **green** ("Lost segments — Nihmune — recovered",
 ✅) so healed damage stops reading as an open wound; a **🩹 Patches**
-button opens the folder with the recovered files. Toggle: Settings → Downloads →
+button opens the folder with the recovered files. Toggle: Settings → Automation →
 Twitch VOD recovery → *Recover lost segments automatically* (default on);
 per-range failures retry up to 5 times and never affect the capture itself.
 
@@ -1741,7 +1741,7 @@ player (mpv, VLC, …). Five independently-toggleable kinds:
   *"{category} — {title}"* chapter instead of two — some streamers update
   both together instantly, so a short window is enough; others update them
   minutes apart, so raise it per channel/instance (the usual global →
-  channel → instance override, Settings → Downloads → Chapters / channel
+  channel → instance override, Settings → Post-processing → Chapters / channel
   Properties / edit instance) if a particular streamer's title and game
   changes are landing as separate chapters when they shouldn't. A change is
   judged by the value actually differing from the last one seen, not by
@@ -1818,7 +1818,7 @@ backlog (a first-run sweep, a bulk re-embed) is never invisible between
 For more direct control: right-click a stream/take row → **📑 Embed
 chapters** (or **🔁 Re-embed chapters** once it already has some) to run it
 immediately instead of waiting for a restart, which also works as a retry
-after a `"failed"`/`"skipped"` outcome; and Settings → Downloads → Chapters
+after a `"failed"`/`"skipped"` outcome; and Settings → Post-processing → Chapters
 → **Re-embed chapters** re-runs embedding across every eligible recording in
 one go, including ones that already have chapters — useful after changing
 which kinds are enabled. Both reconstruct "Recovered"/"Muted" gap markers
@@ -1828,7 +1828,7 @@ happened — if a patch was since deleted by a cleanup policy, that
 reconstruction is skipped rather than guessed (title/category/raid chapters
 still embed normally either way).
 
-Toggle: Settings → Downloads → Chapters → *Embed chapters* (default on),
+Toggle: Settings → Post-processing → Chapters → *Embed chapters* (default on),
 which the channel Properties dialog and per-instance edit dialog can both
 override (Inherit / On / Off, same chain as every other feature toggle).
 The four/five event kinds and the raid viewer threshold are global-only
@@ -1888,7 +1888,7 @@ independent detectors feeding the same table:
   despite every one of them showing streamlink's unconditional `Will skip ad
   segments` banner — meaning the detector had been effectively blind since it
   shipped.
-- **Live-manifest probe** (Settings → Downloads → *Twitch ad-break
+- **Live-manifest probe** (Settings → Recording → *Twitch ad-break
   detection*, default on) — polls the live stream's own HLS playlist
   directly, roughly every 10 s, via the same public access every Twitch
   player (and streamlink itself) uses, and reads the `EXT-X-DATERANGE` ad
@@ -2166,7 +2166,7 @@ polled regardless).
   only during a rerun week.
 - An **enabled** checkbox per rule, so seasonal rules can be kept but parked.
 
-There's also one **all-triggers default** (Settings → Downloads → Trigger
+There's also one **all-triggers default** (Settings → Automation → Trigger
 words, below the rule list): applies to any trigger-started take whose own
 rule doesn't set a Deletion override, still beating the channel/instance
 method. *Inherit* there means trigger-started takes get no special treatment
@@ -2178,7 +2178,7 @@ VOD options — **global < per-channel < per-instance** — but as a *list*, eac
 level picks a mode: **Inherit** (use the level above unchanged), **Extend**
 (inherited rules *plus* this level's own), **Replace** (only this level's
 rules), or **Off** (no triggers here at all, inherited ones included). Global
-rules live in **Settings → Downloads → Trigger words**; the channel and
+rules live in **Settings → Automation → Trigger words**; the channel and
 instance overrides in their **Properties** windows ("Trigger words" section).
 
 **What you see when one fires.** A **⚡ Trigger matched** notification + rich
@@ -2209,7 +2209,7 @@ want archived, like "rerun", "24/7", a specific game, or sponsored segments.
 Rules use the same shape (field, Contains/Regex pattern, per-rule enable, the
 optional 🕓 active period) and the same **global < per-channel < per-instance**
 Inherit/Extend/Replace/Off resolution; global rules live in **Settings →
-Downloads → Blacklist triggers**, overrides in the Properties windows
+Automation → Blacklist triggers**, overrides in the Properties windows
 ("Blacklist triggers" section). Semantics:
 
 - A blacklist match vetoes **both** Auto-record starts and trigger-word
@@ -2353,7 +2353,7 @@ downloaded VOD** or **Retry download**.
 
 Retroactively grabs whatever's still recoverable about a stream this app
 missed, before the platform prunes/removes it — opt-in, off by default
-(Settings → Downloads → *Twitch VOD recovery* → **Auto-backfill missed
+(Settings → Automation → *Twitch VOD recovery* → **Auto-backfill missed
 streams**).
 
 **Is this the same as "📥 Download post-stream VOD"?** No — but they're now
@@ -2666,7 +2666,7 @@ fully independent behaviors — either, both, or neither can be on at once:
   raid"**, enabled once a recent raid-out is known: opens the target at the
   live edge in your media player, same as ▷ Play stream (live edge), without
   recording. Works regardless of either auto setting below.
-- **Auto-record (opt-in, default off)** — *Settings → Downloads → Follow
+- **Auto-record (opt-in, default off)** — *Settings → Automation → Follow
   raid* has a master toggle ("Auto-record raid targets", off by default —
   unlike most toggles here, this creates new recordings of channels you
   didn't curate), overridable per channel/instance ("Auto-record my raids")
@@ -2764,7 +2764,7 @@ is deleted automatically once a set time has passed, unless you say to keep
 it. It's the "record everything, review, throw most of it away" workflow —
 without it a channel is either archived forever or not recorded at all.
 
-Turn it on in **Settings → Downloads → Automatic deletion** (off by default,
+Turn it on in **Settings → Post-processing → Automatic deletion** (off by default,
 one week), or override it per channel / per instance in their edit forms —
 the usual three-level chain, with the switch and the retention resolving
 **independently**, so a channel can be rolling while one of its instances
@@ -2856,7 +2856,7 @@ while recording. Discrete **stream events** are archived alongside:
     supersedes any inferred sibling on every confirmed poll for as long as
     the train runs (not just its first sighting, so a later contribution
     burst re-inferred mid-train still gets cleaned up). Toggle under
-    *Settings → Maintenance → Hype trains* (default on). Twitch's
+    *Settings → Stats → Hype trains* (default on). Twitch's
     streamer-set kickoff thresholds
     themselves aren't readable anonymously — and don't need to be, see
     auto-tune below.
@@ -2865,7 +2865,7 @@ while recording. Discrete **stream events** are archived alongside:
     (configurable weights; tier-2/3 subs count 2×/5×) and flags a
     train-like burst when a window's summed points, event count and
     distinct-chatter count all pass their thresholds. Everything is
-    editable under *Settings → Maintenance → Hype trains*, with optional
+    editable under *Settings → Stats → Hype trains*, with optional
     **per-channel sensitivity overrides** (⚙ in the Channel Stats view) for
     channels much smaller/bigger than your average.
   - **Manual** — 🚂 *Mark hype train* (Channel Stats button, channel/instance
@@ -2928,7 +2928,7 @@ Where to look:
   window ("Viewer stats" section) as a permanent, no-hover reference.
 
 Viewer history is **kept forever** by default (a sample row is ~30 bytes).
-Under *Settings → Maintenance → Channel stats history* you can compress old
+Under *Settings → Stats → Channel stats history* you can compress old
 samples into 10-minute buckets — peaks and total airtime are preserved
 exactly (buckets store the peak; aggregation is peak-preserving all the way
 up) — either once via **Compress now** or automatically past a configurable
@@ -3364,7 +3364,7 @@ and, unlike the video, is **unrecoverable** once the broadcast ends: Twitch
 publishes no transcript and YouTube's live-chat replay dies with the stream.
 So when a monitored channel goes live with **Auto** off, chat is still
 captured on its own. This is on by default and switched off under
-**Settings → Downloads → Chat logging**.
+**Settings → Recording → Chat logging**.
 
 - It still needs the instance's own **Log chat** tick, and the same
   platform support as above (Twitch, or YouTube with yt-dlp). Turning **Log
@@ -3942,7 +3942,7 @@ together:
 
 #### Settings → "YouTube SABR (live-from-start)"
 
-![Settings → Downloads: SABR, trigger words, and VOD recovery configuration](doc/screenshots/sabr-settings.png)
+![Settings: SABR, trigger words, and VOD recovery configuration (trigger words and VOD recovery have since moved to the Automation tab)](doc/screenshots/sabr-settings.png)
 
 | Field | Purpose |
 |---|---|

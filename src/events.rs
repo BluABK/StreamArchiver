@@ -70,7 +70,7 @@ pub enum BackgroundTaskKind {
     /// the recording id (mirrors `GapSplice`).
     Chapters(i64),
     /// Bulk re-embed of chapters across every eligible recording (Settings →
-    /// Downloads → Chapters → "Re-embed chapters"), mirrors `ReRemuxAll`.
+    /// Post-processing → Chapters → "Re-embed chapters"), mirrors `ReRemuxAll`.
     ReembedChaptersAll,
     /// An ad-hoc "Follow raid" capture of an untracked (not one of the
     /// user's own channels) raid target — the only UI surface it gets, since
@@ -645,7 +645,7 @@ pub enum ManualCommand {
     /// straight re-run after changing which chapter kinds are enabled.
     RetriggerChapters(i64),
     /// Bulk re-embed of chapters across every eligible recording (Settings →
-    /// Downloads → Chapters → "Re-embed chapters"), regardless of each
+    /// Post-processing → Chapters → "Re-embed chapters"), regardless of each
     /// take's current `chapters_state` — mirrors `ReRemuxAll`.
     ReembedChaptersAll,
     /// One-shot sweep: scan every archived Twitch chat log (`.chat.jsonl`)

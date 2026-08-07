@@ -378,7 +378,7 @@ impl StreamArchiverApp {
                         .on_hover_text(
                             "Per-channel hype-train inference override: raise or \
                              lower this channel's burst thresholds without touching \
-                             the global tuning (Settings → Maintenance → Hype \
+                             the global tuning (Settings → Stats → Hype \
                              trains).",
                         )
                         .clicked()
@@ -456,7 +456,7 @@ impl StreamArchiverApp {
                 ui.label("Span:").on_hover_text(
                     "How far back to look. Viewer history is kept forever (optionally \
                      compressed to 10-minute buckets after a configurable age — \
-                     Settings → Maintenance → Channel stats history).",
+                     Settings → Stats → Channel stats history).",
                 );
                 for s in super::PollSpan::ALL {
                     let resp = ui

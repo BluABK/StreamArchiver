@@ -484,7 +484,7 @@ impl InstancePropsPopupState {
                 egui::RichText::new(
                     "Start recording when the live title/game matches — even with Auto \
                      off. Inherits the channel's rules, which inherit the global ones \
-                     (Settings → Downloads → Trigger words).",
+                     (Settings → Automation → Trigger words).",
                 )
                 .small()
                 .weak(),
@@ -501,7 +501,7 @@ impl InstancePropsPopupState {
                 egui::RichText::new(
                     "PREVENT automatic recording while the live title/game matches — \
                      manual ▶ Start still records. Inherits the channel's blacklist, \
-                     which inherits the global one (Settings → Downloads → Blacklist \
+                     which inherits the global one (Settings → Automation → Blacklist \
                      triggers).",
                 )
                 .small()
@@ -1004,7 +1004,7 @@ impl ChannelPropsPopupState {
                 egui::RichText::new(
                     "Start recording when the live title/game matches — even with Auto \
                      off — for every instance in this channel. Inherits the global rules \
-                     (Settings → Downloads → Trigger words); instances can override again.",
+                     (Settings → Automation → Trigger words); instances can override again.",
                 )
                 .small()
                 .weak(),
@@ -1021,7 +1021,7 @@ impl ChannelPropsPopupState {
                 egui::RichText::new(
                     "PREVENT automatic recording while the live title/game matches — for \
                      every instance in this channel; manual ▶ Start still records. \
-                     Inherits the global blacklist (Settings → Downloads → Blacklist \
+                     Inherits the global blacklist (Settings → Automation → Blacklist \
                      triggers); instances can override again.",
                 )
                 .small()

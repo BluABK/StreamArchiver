@@ -2835,7 +2835,7 @@ impl StreamArchiverApp {
                         "Override the burst thresholds for this channel only — a \
                          small channel's trains ride on far fewer contributions \
                          than a big one's. Weights and window stay global \
-                         (Settings → Maintenance → Hype trains).",
+                         (Settings → Stats → Hype trains).",
                     );
                     ui.add_space(6.0);
                     egui::Grid::new("hype_override_grid")
@@ -3641,7 +3641,7 @@ impl StreamArchiverApp {
                                      sidecar. Other platforms/tools don't capture chat. \
                                      By default this also applies when the stream ISN'T being \
                                      recorded (Auto-record off) — chat is tiny and unrecoverable \
-                                     after the fact; see Settings → Downloads → Chat logging to \
+                                     after the fact; see Settings → Recording → Chat logging to \
                                      restrict it to actual recordings.",
                                 );
                                 ui.end_row();
@@ -3816,7 +3816,7 @@ impl StreamArchiverApp {
                                          stream's disk cost), delete just the head, or delete both parts \
                                          (the take then points at the full). Deletions follow the \
                                          deletion method below. Inherit follows the channel, then the \
-                                         global default (Settings → Downloads → Automatic deletion).",
+                                         global default (Settings → Post-processing → Automatic deletion).",
                                     );
                                 ui.end_row();
 
@@ -3869,7 +3869,7 @@ impl StreamArchiverApp {
                                         "Embed chapter markers (title/category changes, raids, \
                                          recovered/muted gap-splice segments) into finalized recordings \
                                          for this instance. Inherit follows the channel, then the global \
-                                         default (Settings → Downloads → Chapters).",
+                                         default (Settings → Post-processing → Chapters).",
                                     );
                                 ui.end_row();
 
@@ -3882,8 +3882,8 @@ impl StreamArchiverApp {
                                 .on_hover_text(
                                     "How many seconds apart a title change and a category/game change \
                                      may land and still merge into one chapter, for this instance. Blank \
-                                     inherits the channel, then the global default (Settings → Downloads \
-                                     → Chapters).",
+                                     inherits the channel, then the global default (Settings → \
+                                     Post-processing → Chapters).",
                                 );
                                 ui.end_row();
 

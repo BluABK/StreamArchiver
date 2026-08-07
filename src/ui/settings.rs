@@ -5,21 +5,39 @@ use super::*;
 /// Settings category tabs — the flat Settings page is grouped into these.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsTab {
+    /// Credentials and authentication of every kind: detection API keys,
+    /// platform OAuth accounts, WebSub, download cookies/tokens.
     Accounts,
+    /// Capture-time behaviour: output defaults, monitor defaults, chat
+    /// logging, ad-break detection, disk I/O limits.
     Recording,
+    /// What starts, stops or fetches recordings on its own: trigger words,
+    /// blacklist, follow-raid, head backfill, VOD download/recovery.
+    Automation,
+    /// What happens to files after capture: remux, chapters, file
+    /// management, automatic deletion (incl. rolling recordings).
+    PostProcessing,
+    /// Download-tool plumbing: yt-dlp arguments, custom tools, SABR, the
+    /// GVS PO token server.
     Downloads,
     Schedule,
+    /// Channel-stats features: viewer-history retention, hype trains.
+    Stats,
     Interface,
     System,
+    /// Manual batch operations (re-remux all, thumbnails, reorganize, …).
     Maintenance,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 7] = [
+    const ALL: [SettingsTab; 10] = [
         SettingsTab::Accounts,
         SettingsTab::Recording,
+        SettingsTab::Automation,
+        SettingsTab::PostProcessing,
         SettingsTab::Downloads,
         SettingsTab::Schedule,
+        SettingsTab::Stats,
         SettingsTab::Interface,
         SettingsTab::System,
         SettingsTab::Maintenance,
@@ -29,8 +47,11 @@ impl SettingsTab {
         match self {
             SettingsTab::Accounts => "Accounts",
             SettingsTab::Recording => "Recording",
+            SettingsTab::Automation => "Automation",
+            SettingsTab::PostProcessing => "Post-processing",
             SettingsTab::Downloads => "Downloads",
             SettingsTab::Schedule => "Schedule",
+            SettingsTab::Stats => "Stats",
             SettingsTab::Interface => "Interface",
             SettingsTab::System => "System",
             SettingsTab::Maintenance => "Maintenance",
@@ -42,8 +63,11 @@ impl SettingsTab {
         match self {
             SettingsTab::Accounts => "accounts",
             SettingsTab::Recording => "recording",
+            SettingsTab::Automation => "automation",
+            SettingsTab::PostProcessing => "postprocessing",
             SettingsTab::Downloads => "downloads",
             SettingsTab::Schedule => "schedule",
+            SettingsTab::Stats => "stats",
             SettingsTab::Interface => "interface",
             SettingsTab::System => "system",
             SettingsTab::Maintenance => "maintenance",
@@ -578,7 +602,9 @@ impl StreamArchiverApp {
             });
         });
         if self.settings_search.trim().is_empty() {
-            ui.horizontal(|ui| {
+            // Wrapped: ten tabs no longer reliably fit one row at narrow
+            // window widths.
+            ui.horizontal_wrapped(|ui| {
                 for tab in SettingsTab::ALL {
                     if ui
                         .selectable_value(&mut self.settings_tab, tab, tab.label())
@@ -593,44 +619,60 @@ impl StreamArchiverApp {
         // Each section below is gated by `section_shown(category, …)`: only the
         // active tab's sections render (or search matches). Inner code keeps its
         // original indentation to avoid a whole-file reflow.
+        // Sections render grouped by tab, in each tab's display order — only
+        // one tab's group actually draws per frame (the `section_shown` gate),
+        // but keeping the call order grouped means a SEARCH, which renders
+        // matches across every tab, lists them in a coherent order too.
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // Accounts: detection keys → platform accounts → push/quota →
+            // download cookies/tokens (authentication of every kind).
             self.settings_detection_credentials_section(ui);
-            self.settings_youtube_data_api_section(ui);
-            self.settings_discord_import_section(ui);
-            self.settings_schedule_sources_section(ui);
             self.settings_twitch_account_section(ui);
             self.settings_google_account_section(ui);
             self.settings_websub_section(ui);
-            self.settings_defaults_section(ui);
-            self.settings_display_section(ui);
-            self.settings_table_columns_section(ui);
+            self.settings_youtube_data_api_section(ui);
             self.settings_download_auth_section(ui);
-            self.settings_ytdlp_args_section(ui);
-            self.settings_sabr_section(ui);
-            self.settings_pot_server_section(ui);
-            self.settings_custom_tools_section(ui);
+            // Recording: capture-time behaviour.
+            self.settings_defaults_section(ui);
             self.settings_monitor_defaults_section(ui);
-            self.settings_startup_section(ui);
-            self.settings_notifications_section(ui);
-            self.settings_shutdown_section(ui);
-            self.settings_remux_section(ui);
+            self.settings_chat_section(ui);
+            self.settings_ad_probe_section(ui);
             self.settings_disk_io_section(ui);
-            self.settings_file_management_section(ui);
-            self.settings_vod_download_section(ui);
-            self.settings_head_backfill_section(ui);
-            self.settings_disposal_section(ui);
+            // Automation: what starts/stops/fetches on its own.
             self.settings_trigger_words_section(ui);
             self.settings_blacklist_triggers_section(ui);
-            self.settings_vod_recovery_section(ui);
-            self.settings_chapters_section(ui);
             self.settings_raid_follow_section(ui);
-            self.settings_ad_probe_section(ui);
-            self.settings_chat_section(ui);
+            self.settings_head_backfill_section(ui);
+            self.settings_vod_download_section(ui);
+            self.settings_vod_recovery_section(ui);
+            // Post-processing: the file's life after capture, in the order
+            // it actually happens — remux, chapters, organize, delete.
+            self.settings_remux_section(ui);
+            self.settings_chapters_section(ui);
+            self.settings_file_management_section(ui);
+            self.settings_disposal_section(ui);
+            // Downloads: tool plumbing.
+            self.settings_ytdlp_args_section(ui);
+            self.settings_custom_tools_section(ui);
+            self.settings_sabr_section(ui);
+            self.settings_pot_server_section(ui);
+            // Schedule.
+            self.settings_schedule_sources_section(ui);
+            self.settings_discord_import_section(ui);
+            // Stats.
             self.settings_stats_history_section(ui);
             self.settings_hype_trains_section(ui);
-            self.settings_maintenance_section(ui);
+            // Interface.
+            self.settings_display_section(ui);
+            self.settings_table_columns_section(ui);
+            self.settings_notifications_section(ui);
+            // System.
+            self.settings_startup_section(ui);
+            self.settings_shutdown_section(ui);
             self.settings_db_backup_section(ui);
             self.settings_diagnostics_section(ui);
+            // Maintenance (manual batch operations).
+            self.settings_maintenance_section(ui);
 
             ui.add_space(16.0);
         });
@@ -1716,7 +1758,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_download_auth_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Download authentication", &["download", "auth", "cookies", "browser", "token", "profile", "login"]) {
+            if self.section_shown(SettingsTab::Accounts, "Download authentication", &["download", "auth", "cookies", "browser", "token", "profile", "login"]) {
             ui.add_space(12.0);
             ui.heading("Download authentication");
             ui.label("Default for capturing sub-only / members-only / ad-reduced streams. Per-channel settings override this.");
@@ -2649,7 +2691,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_remux_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Recording, "Remux", &["remux", "mkv", "thumbnail", "title", "subtitles", "embed", "cover", "throttle", "readrate", "disk", "speed"]) {
+            if self.section_shown(SettingsTab::PostProcessing, "Remux", &["remux", "mkv", "thumbnail", "title", "subtitles", "embed", "cover", "throttle", "readrate", "disk", "speed"]) {
             ui.add_space(12.0);
             ui.heading("Remux");
             ui.label("Controls what gets embedded into MKV files when a recording is finalized (TS→MKV remux).");
@@ -2797,7 +2839,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_file_management_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Recording, "File Management", &["file", "management", "subdirectories", "organize", "split", "folders"]) {
+            if self.section_shown(SettingsTab::PostProcessing, "File Management", &["file", "management", "subdirectories", "organize", "split", "folders"]) {
             ui.add_space(12.0);
             ui.heading("File Management");
             ui.label("Split captured files into per-type subdirectories under the monitor output directory.");
@@ -2832,7 +2874,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_vod_download_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Post-stream VOD download", &["vod", "download", "archive", "replace", "post-stream", "published"]) {
+            if self.section_shown(SettingsTab::Automation, "Post-stream VOD download", &["vod", "download", "archive", "replace", "post-stream", "published"]) {
             ui.add_space(12.0);
             ui.heading("Post-stream VOD download 📼");
             ui.label(
@@ -2861,7 +2903,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_head_backfill_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Head backfill on new takes", &["head", "backfill", "take", "retake", "reconnect", "capture from start"]) {
+            if self.section_shown(SettingsTab::Automation, "Head backfill on new takes", &["head", "backfill", "take", "retake", "reconnect", "capture from start"]) {
             ui.add_space(12.0);
             ui.heading("Head backfill on new takes 🧩");
             ui.label(
@@ -2921,7 +2963,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_disposal_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Automatic deletion", &["delete", "deletion", "cleanup", "trash", "recycle", "bin", "disposal", "join", "full", "parts", "head"]) {
+            if self.section_shown(SettingsTab::PostProcessing, "Automatic deletion", &["delete", "deletion", "cleanup", "trash", "recycle", "bin", "disposal", "join", "full", "parts", "head"]) {
             ui.add_space(12.0);
             ui.heading("Automatic deletion 🗑");
             ui.label(
@@ -3148,7 +3190,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_trigger_words_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Trigger words", &["trigger", "word", "karaoke", "unarchived", "force", "auto", "title", "game", "regex", "delete", "deletion", "disposal"]) {
+            if self.section_shown(SettingsTab::Automation, "Trigger words", &["trigger", "word", "karaoke", "unarchived", "force", "auto", "title", "game", "regex", "delete", "deletion", "disposal"]) {
             ui.add_space(12.0);
             ui.heading("Trigger words ⚡");
             ui.label(
@@ -3190,7 +3232,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_blacklist_triggers_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Blacklist triggers", &["blacklist", "block", "trigger", "prevent", "skip", "rerun", "veto", "title", "game", "regex"]) {
+            if self.section_shown(SettingsTab::Automation, "Blacklist triggers", &["blacklist", "block", "trigger", "prevent", "skip", "rerun", "veto", "title", "game", "regex"]) {
             ui.add_space(12.0);
             ui.heading("Blacklist triggers 🚫");
             ui.label(
@@ -3381,7 +3423,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_vod_recovery_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Twitch VOD recovery", &["vod", "recovery", "muted", "deleted", "cdn", "recover", "unmute", "gap", "lost", "segment", "warnings"]) {
+            if self.section_shown(SettingsTab::Automation, "Twitch VOD recovery", &["vod", "recovery", "muted", "deleted", "cdn", "recover", "unmute", "gap", "lost", "segment", "warnings"]) {
             ui.add_space(12.0);
             ui.heading("Twitch VOD recovery 🛟");
             ui.label(
@@ -3521,7 +3563,7 @@ impl StreamArchiverApp {
 
     fn settings_chapters_section(&mut self, ui: &mut egui::Ui) {
         if self.section_shown(
-            SettingsTab::Downloads,
+            SettingsTab::PostProcessing,
             "Chapters",
             &["chapters", "chapter", "title", "category", "game", "raid", "muted", "recovered", "bookmark", "coalesce", "window", "interval", "sync"],
         ) {
@@ -3639,7 +3681,7 @@ impl StreamArchiverApp {
 
     fn settings_raid_follow_section(&mut self, ui: &mut egui::Ui) {
         if self.section_shown(
-            SettingsTab::Downloads,
+            SettingsTab::Automation,
             "Follow raid",
             &["raid", "follow", "raid-follow", "raid target"],
         ) {
@@ -3745,7 +3787,7 @@ impl StreamArchiverApp {
 
     fn settings_ad_probe_section(&mut self, ui: &mut egui::Ui) {
         if self.section_shown(
-            SettingsTab::Downloads,
+            SettingsTab::Recording,
             "Twitch ad-break detection",
             &["ad", "ads", "advertisement", "ad break", "ad probe", "manifest", "📢"],
         ) {
@@ -3772,7 +3814,7 @@ impl StreamArchiverApp {
 
     fn settings_chat_section(&mut self, ui: &mut egui::Ui) {
         if self.section_shown(
-            SettingsTab::Downloads,
+            SettingsTab::Recording,
             "Chat logging",
             &["chat", "chat log", "jsonl", "live_chat", "irc", "auto", "not recorded", "💬"],
         ) {
@@ -3818,7 +3860,7 @@ impl StreamArchiverApp {
 
     fn settings_stats_history_section(&mut self, ui: &mut egui::Ui) {
         if self.section_shown(
-            SettingsTab::Maintenance,
+            SettingsTab::Stats,
             "Channel stats history",
             &["stats", "viewer", "history", "downsample", "compress", "retention", "graph"],
         ) {
@@ -3901,7 +3943,7 @@ impl StreamArchiverApp {
 
     fn settings_hype_trains_section(&mut self, ui: &mut egui::Ui) {
         if self.section_shown(
-            SettingsTab::Maintenance,
+            SettingsTab::Stats,
             "Hype trains",
             &["hype", "train", "inference", "weights", "points", "gql", "auto-tune", "burst", "kickoff"],
         ) {

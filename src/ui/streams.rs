@@ -529,7 +529,7 @@ impl StreamArchiverApp {
                                          the stream's disk cost), delete just the head, or delete \
                                          both parts (the take then points at the full). Deletions \
                                          follow the deletion method below. Inherit follows the \
-                                         global default (Settings → Downloads → Automatic deletion).",
+                                         global default (Settings → Post-processing → Automatic deletion).",
                                     );
                                 ui.end_row();
 
@@ -593,8 +593,8 @@ impl StreamArchiverApp {
                                         "Embed chapter markers (title/category changes, raids, \
                                          recovered/muted gap-splice segments) into finalized \
                                          recordings for every instance in this channel. Inherit \
-                                         follows the global default (Settings → Downloads → \
-                                         Chapters).",
+                                         follows the global default (Settings → \
+                                         Post-processing → Chapters).",
                                     );
                                 ui.end_row();
 
@@ -608,7 +608,7 @@ impl StreamArchiverApp {
                                     "How many seconds apart a title change and a category/game \
                                      change may land and still merge into one chapter, for every \
                                      instance in this channel. Blank inherits the global default \
-                                     (Settings → Downloads → Chapters).",
+                                     (Settings → Post-processing → Chapters).",
                                 );
                                 ui.end_row();
 
