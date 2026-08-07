@@ -743,6 +743,7 @@ impl StreamArchiverApp {
             schedule_month_icons,
             deep_filter_texts: None,
             raid_out_cache: None,
+            rolling_counts_cache: None,
             saved_layouts_cache: None,
             schedule_day_popup: None,
             show_schedule_sources: false,

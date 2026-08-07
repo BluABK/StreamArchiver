@@ -1664,6 +1664,18 @@ impl StreamArchiverApp {
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default();
+            // Same rev-keyed treatment (and same reason) as `raid_out_cache`:
+            // one small indexed query per grid rebuild, never per frame.
+            if self.rolling_counts_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
+            {
+                let fresh = self.core.store.rolling_counts_by_monitor().unwrap_or_default();
+                self.rolling_counts_cache = Some((self.streams_cache_rev, fresh));
+            }
+            let rolling_counts = self
+                .rolling_counts_cache
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
 
             // Per-recording ad-break detail (offsets) for the cut-list tooltips on
             // expanded history rows. Cached (cleared on reload) so we issue the SELECT
@@ -1765,6 +1777,7 @@ impl StreamArchiverApp {
                 active_recordings,
                 twitch_login_to_mid,
                 latest_raid_out,
+                rolling_counts,
                 model,
                 platform_pref,
             });
@@ -2062,7 +2075,8 @@ impl StreamArchiverApp {
                             Vis::Channel(ci) => {
                                 Self::channel_row(
                                     &mut tr, &chan_entries[ci], &self.rows, groups,
-                                    channel_avatars, channel_name_colors, twitch_login_to_mid, &ptex,
+                                    channel_avatars, channel_name_colors, twitch_login_to_mid,
+                                    &cache.rolling_counts, &ptex,
                                     active_ids, &finalizing_ids, &active_chat_ids,
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
@@ -2079,6 +2093,7 @@ impl StreamArchiverApp {
                                     &self.scheduled_recordings, &ptex, now, active_ids,
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
                                     &exp_instances, instance_avatars,
+                                    cache.rolling_counts.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
                                     &stop_holds_snapshot, &ad_running, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
                                     hit_instances.contains(&self.rows[ri].monitor.id),
@@ -3178,6 +3193,9 @@ impl StreamArchiverApp {
         channel_avatars: &HashMap<i64, egui::TextureHandle>,
         channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
         login_to_mid: &HashMap<String, i64>,
+        // Per-monitor rolling-recording counts (see `StreamsViewCache`) —
+        // summed across this channel's instances for the 🕰 rollup badge.
+        rolling_counts: &HashMap<i64, i64>,
         ptex: &PlatformTextures,
         active_ids: &HashSet<i64>,
         finalizing_ids: &HashSet<i64>,
@@ -3496,6 +3514,14 @@ impl StreamArchiverApp {
                             };
                             ui.colored_label(color, icon).on_hover_text(hover);
                         }
+                        // Rolling recordings under this channel, summed across
+                        // its instances — unlike the badges below this one is
+                        // NOT present-state-only: a collapsed channel hiding
+                        // that something under it is about to be auto-deleted
+                        // is exactly the case this exists to prevent.
+                        let rolling: i64 =
+                            mons.iter().map(|m| rolling_counts.get(&m.monitor.id).copied().unwrap_or(0)).sum();
+                        rolling_rollup_badge(ui, rolling, true);
                         // Bubble the instances' live badges up while
                         // they're active — a collapsed channel otherwise
                         // hides that a recording was trigger-started or
@@ -3843,6 +3869,9 @@ impl StreamArchiverApp {
         selected_monitor: Option<i64>,
         exp_instances: &HashSet<i64>,
         instance_avatars: &HashMap<i64, egui::TextureHandle>,
+        // Takes of THIS instance still counting down towards rolling
+        // auto-deletion — the 🕰 rollup badge (see `crate::rolling`).
+        rolling_count: i64,
         stop_holds_snapshot: &HashMap<i64, crate::downloader::StopHold>,
         ad_running: &impl Fn(i64) -> bool,
         sel_color: egui::Color32,
@@ -3973,6 +4002,7 @@ impl StreamArchiverApp {
             inst_stream_target.as_ref(), &media_player,
             instance_avatars.get(&mid),
             instance_avatars,
+            rolling_count,
             inst_latest_rec_id,
             scheduled_recordings,
             stop_hold_desc,
@@ -5195,6 +5225,7 @@ impl StreamArchiverApp {
                         ) {
                             out.open_warnings = true;
                         }
+                        rolling_take_badge(ui, t, now);
                         // Published-VOD view count (from the checker's Get
                         // Videos polls — free data, refreshed while the mute
                         // watch runs).

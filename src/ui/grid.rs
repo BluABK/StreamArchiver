@@ -1007,6 +1007,11 @@ pub(super) struct StreamsViewCache {
     /// Each monitor's most recent `raid_out` event, if any — powers the
     /// "Follow raid" play action's enabled state and target.
     pub(super) latest_raid_out: HashMap<i64, crate::models::StreamEventRow>,
+    /// Takes still counting down towards rolling auto-deletion, by monitor id
+    /// (absent = none) — the 🕰 rollup badge on instance and channel rows. A
+    /// DB read, so it lives here rather than in the render path; see
+    /// [`crate::rolling`].
+    pub(super) rolling_counts: HashMap<i64, i64>,
     pub(super) model: Vec<Vec<Cell>>,
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.
@@ -1896,6 +1901,72 @@ pub(super) fn instance_label(url: &str) -> String {
     if s.is_empty() { "(no URL)".to_string() } else { s.to_string() }
 }
 
+/// The 🕰 rolling-recording badge for one take: a countdown while its file is
+/// still scheduled for auto-deletion, and a marker once it has been kept or
+/// swept. Nothing at all for an ordinary take. See [`crate::rolling`].
+pub(super) fn rolling_take_badge(ui: &mut egui::Ui, t: &crate::models::Recording, now: i64) {
+    use crate::models::RollingState;
+    match t.rolling.state(t.ended_at) {
+        RollingState::None => {}
+        RollingState::Rolling { deadline } => {
+            let (text, hover) = match deadline {
+                Some(d) => (
+                    format!("🕰 {}", crate::rolling::fmt_remaining(d - now)),
+                    format!(
+                        "Rolling recording — this file is deleted automatically at {}, unless \
+                         you Keep it (📥 Backlog → Rolling recordings). The take's history row \
+                         stays either way.",
+                        fmt_datetime_short(d)
+                    ),
+                ),
+                None => (
+                    "🕰".to_string(),
+                    "Rolling recording — its countdown starts when this capture finishes."
+                        .to_string(),
+                ),
+            };
+            // Under a day left is the point at which "decide about this
+            // eventually" becomes "decide now".
+            let soon = deadline.is_some_and(|d| d - now < 86_400);
+            if soon {
+                ui.colored_label(HL_ERROR_TEXT, text)
+            } else {
+                ui.weak(text)
+            }
+            .on_hover_text(hover);
+        }
+        RollingState::Kept { at } => {
+            ui.weak("🕰📌").on_hover_text(format!(
+                "Kept from a rolling recording on {} — it was scheduled for automatic deletion \
+                 and you chose to keep it, so it's an ordinary archived stream now.",
+                fmt_datetime_short(at)
+            ));
+        }
+        RollingState::Expired { at } => {
+            ui.weak("🕰🗑").on_hover_text(format!(
+                "Rolling recording expired on {} — the video file was deleted automatically \
+                 because its time ran out and it wasn't kept. Everything else about the take \
+                 (title, stats, chat log, chapters, notes) was preserved.",
+                fmt_datetime_short(at)
+            ));
+        }
+    }
+}
+
+/// The 🕰 rollup badge for an instance or channel row: how many takes beneath
+/// it are still counting down towards auto-deletion. Nothing when none are.
+pub(super) fn rolling_rollup_badge(ui: &mut egui::Ui, count: i64, is_channel: bool) {
+    if count <= 0 {
+        return;
+    }
+    ui.weak(format!("🕰{count}")).on_hover_text(format!(
+        "{count} rolling recording(s) under this {} are counting down towards automatic \
+         deletion. Open 📥 Backlog → Rolling recordings to see when, and to Keep any you want \
+         to hold on to.",
+        if is_channel { "channel" } else { "instance" }
+    ));
+}
+
 /// Just the channel/user name, for places with no room for a URL — currently
 /// the Custom layout editor's chips, where the other angles are collab
 /// partners shown by their platform display name and this has to match.
@@ -2394,6 +2465,9 @@ pub(super) fn render_instance_row(
     // put a face on each collab angle's chip in the Custom layout editor
     // (`LayoutAngle`), which needs the *partners'* avatars, not just this row's.
     instance_avatars: &HashMap<i64, egui::TextureHandle>,
+    // How many of this instance's takes are counting down towards rolling
+    // auto-deletion (0 = none) — the 🕰 rollup badge.
+    rolling_count: i64,
     // The most recently started recording for this monitor, if any — the
     // target of the "Backfill head" manual action.
     latest_rec_id: Option<i64>,
@@ -3140,6 +3214,7 @@ pub(super) fn render_instance_row(
                     } else {
                         resp.on_hover_text(&m.last_state);
                     }
+                    rolling_rollup_badge(ui, rolling_count, false);
                     if recording && !finalizing && row.capture_offline {
                         // The channel is NOT live anymore — the capture is
                         // draining backlog/tail or muxing. Without this the

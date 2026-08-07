@@ -1982,6 +1982,10 @@ pub struct StreamArchiverApp {
     /// streams cache's *per-second* stamp was pure waste. It was also the
     /// single most expensive thing the UI thread did — see migration 87.
     raid_out_cache: Option<(u64, HashMap<i64, crate::models::StreamEventRow>)>,
+    /// Per-monitor count of takes still counting down towards rolling
+    /// auto-deletion, cached against `streams_cache_rev` — same shape and same
+    /// reasoning as [`Self::raid_out_cache`]. Backs the 🕰 rollup badge.
+    rolling_counts_cache: Option<(u64, HashMap<i64, i64>)>,
     /// Saved custom window layouts for the collab-play "Layout ▸" submenu,
     /// cached against `streams_cache_rev` — read once per grid rebuild instead
     /// of once per frame (it is a settings-table read, not a hot query, but

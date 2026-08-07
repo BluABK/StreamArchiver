@@ -2706,16 +2706,65 @@ fully independent behaviors — either, both, or neither can be on at once:
 Two cross-channel views over your entire recording history (every channel,
 newest 500 broadcasts by default — **⬇ Load more** raises the cap):
 
-- **📥 Backlog** — a to-do list for catching up. Every broadcast has a watch
-  state: **Unwatched** (default) → **Started** → **Skipped**/**Watched**.
-  Opening a finished take (▶/⏵, either the inline buttons or the context
-  menu) or tuning into a channel's live edge while it's actively recording
-  auto-advances Unwatched/Skipped → Started — it never downgrades a take
-  you've already marked Started or Watched. Each row also has its own four
-  toggle buttons for setting the state directly. The **Show:** chips at the
-  top filter which states are visible (defaults to hiding Watched). Watch
-  state belongs to the *broadcast*, not any one file — a reconnect that
-  produces multiple takes for the same stream shares one state.
+- **📥 Backlog** — a to-do list for catching up, as a **full grid**: watch
+  state, platform, channel, title, game, went live, started, duration, size,
+  💬 chat (click to open the replay), ✏ changes, 📢 ads and status. Columns
+  hide/show, resize, reorder and sort like every other table, and it defaults
+  to **newest first, flat across every channel** — which is exactly why it
+  isn't just a mode of 📺 Streams, where rows are grouped under channel
+  containers instead.
+
+  Every broadcast has a watch state: **Unwatched** (default) → **Started** →
+  **Skipped**/**Watched**. Opening a finished take (▶/⏵, either the inline
+  buttons or the context menu) or tuning into a channel's live edge while it's
+  actively recording auto-advances Unwatched/Skipped → Started — it never
+  downgrades a take you've already marked Started or Watched. Each row's Watch
+  cell also sets the state directly. The **Show:** chips at the top filter
+  which states are visible (defaults to hiding Watched). Watch state belongs
+  to the *broadcast*, not any one file — a reconnect that produces multiple
+  takes for the same stream shares one state.
+
+  At the top sits the **🕰 Rolling recordings** section — see below.
+
+### Rolling recordings 🕰
+
+A channel or instance can be put in **rolling mode**: everything it captures
+is deleted automatically once a set time has passed, unless you say to keep
+it. It's the "record everything, review, throw most of it away" workflow —
+without it a channel is either archived forever or not recorded at all.
+
+Turn it on in **Settings → Downloads → Automatic deletion** (off by default,
+one week), or override it per channel / per instance in their edit forms —
+the usual three-level chain, with the switch and the retention resolving
+**independently**, so a channel can be rolling while one of its instances
+keeps its own retention (or opts out entirely).
+
+- **Only captures started after you turn it on are affected.** The retention
+  is stamped onto each take when its recording starts and frozen there, the
+  same way a trigger rule is. Enabling rolling mode can never put something
+  you already have at risk, and changing the retention never re-times takes
+  that already exist. Turning it back **off** likewise doesn't rescue takes
+  already counting down — Keep those individually.
+- **What expiry actually deletes is the video file, nothing else.** It goes
+  through the same deletion method as any other automatic cleanup (trash
+  folder / Recycle Bin / permanent), and the take's history row survives
+  intact: title, stats, chat log, chapters and notes are all kept. Channel
+  Stats and the Backlog entry stay correct; only the media is gone.
+- **The 🕰 Rolling recordings section** at the top of 📥 Backlog lists
+  everything still counting down, **soonest first** (a countdown list wants
+  urgency, not recency), with its remaining time — red under a day — and a
+  **📌 Keep** button. It ignores the Show: watch-state chips on purpose: a
+  file about to be deleted has to be visible whether or not you've watched
+  it. Tick **Show kept** to also list the ones you've rescued, each with
+  **↩ Unkeep**, which restarts the countdown from now rather than resuming it
+  (so un-keeping something old never deletes it seconds later).
+- **Markers elsewhere.** A take row in 📺 Streams shows **🕰 6d 4h** while it's
+  counting down, **🕰📌** once kept ("kept from a rolling recording") and
+  **🕰🗑** once expired ("the video was auto-deleted, everything else was
+  kept"). Instance and channel rows carry a **🕰N** rollup of how many takes
+  underneath them are counting down — shown even when the channel is
+  collapsed, since a collapsed row hiding an imminent deletion is precisely
+  what that badge exists to prevent.
 - **🗃 Stream History** — the same list with a checkbox filter bank instead:
   Missing/deleted VOD, Muted VOD, VOD check pending, Recorded, Remux
   pending, Remuxed, Chapters embedded/pending, Failed (unacked),

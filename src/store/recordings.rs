@@ -131,6 +131,28 @@ impl Store {
         Ok(rows)
     }
 
+    /// How many takes per monitor are currently counting down towards
+    /// auto-deletion — the 🕰 rollup badge on the Streams grid's instance and
+    /// channel rows.
+    ///
+    /// Monitors with none are absent from the map. Served by
+    /// `idx_recording_rolling` (a partial index over `rolling_ttl_secs > 0`),
+    /// so this stays cheap however large the recording table gets — but it is
+    /// still a DB read, so cache it against `streams_cache_rev` rather than
+    /// calling it from a render path.
+    pub fn rolling_counts_by_monitor(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, COUNT(*) FROM recording
+             WHERE rolling_ttl_secs > 0 AND rolling_kept_at = 0 AND rolling_expired_at = 0
+             GROUP BY monitor_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<std::collections::HashMap<i64, i64>>>()?;
+        Ok(rows)
+    }
+
     /// Currently-open "seen live but not recorded" session for this monitor
     /// (`status = 'not_recorded'`, `ended_at IS NULL`), if any — `(id,
     /// started_at)`. Used both to avoid opening a second session while one is
