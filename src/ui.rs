@@ -2015,6 +2015,11 @@ pub struct StreamArchiverApp {
     channel_block_drafts: HashMap<i64, crate::triggers::TriggerScope>,
     /// Per-open instance-Properties BLACKLIST-trigger scope drafts (saved on change).
     instance_block_drafts: HashMap<i64, crate::triggers::TriggerScope>,
+    /// Per-open instance-Properties chat-moderation history, newest first.
+    /// Loaded once per window (it's history — it doesn't move while you read
+    /// it) and dropped when the window closes, so a popup render pass never
+    /// touches the database.
+    instance_moderation: HashMap<i64, Vec<crate::models::StreamEventRow>>,
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
     edit_schedule: Option<Arc<Mutex<EditScheduleDraft>>>,

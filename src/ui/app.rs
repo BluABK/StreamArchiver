@@ -755,6 +755,7 @@ impl StreamArchiverApp {
             instance_trigger_drafts: HashMap::new(),
             channel_block_drafts: HashMap::new(),
             instance_block_drafts: HashMap::new(),
+            instance_moderation: HashMap::new(),
             edit_schedule: None,
             schedule_selected: HashSet::new(),
             merge_preview: None,

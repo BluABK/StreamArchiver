@@ -2848,8 +2848,11 @@ while recording. Discrete **stream events** are archived alongside:
   chat logger is running; the two sources dedup against each other.
 - **Moderation events** — message deletions (with the deleted text), timeouts,
   bans, chat clears, chat-mode changes and badge-inferred role changes, also
-  from the logged chat (see *Chat logs* below for the replay integration).
-  Deletions + timeouts + bans roll up as **Mod acts** in the overview table.
+  from the logged chat (see *Chat logs* below for the replay integration, and
+  for what each platform does and doesn't disclose). YouTube contributes
+  deletions and **"all messages removed"** rows, harvested from its chat
+  sidecar once a capture finishes. All of them roll up as **Mod acts** in the
+  overview table.
 - **Hype trains** are captured three ways, one event row per train:
   - **Confirmed** — the app polls Twitch's *public* hype-train state
     (the same anonymous GQL data every logged-out viewer sees on the site;
@@ -3396,20 +3399,49 @@ captured on its own. This is on by default and switched off under
   recording or a **Stop hold** is active: those both mean "skip this
   broadcast", not "save the disk".
 
-**Moderation is archived too** (Twitch): the logger records single-message
+**Moderation is archived too.** On **Twitch** the logger records single-message
 **deletions**, **timeouts/bans** and **full chat clears**, chat-mode changes
 (slow / subs-only / emote-only / followers-only / unique-chat), and
 badge-inferred **role changes** (someone starts or stops chatting with a
 mod/VIP badge — the only signal available anonymously, so it's best-effort
-and only visible when the person actually chats). In the chat replay,
-deleted/purged messages render **struck-through with the original text
-preserved** — the live chat hides what mods remove; the archive keeps
-receipts — and timeouts, bans, clears, mode changes and role changes appear
-as muted ℹ notice lines. The same events land in the **Channel Stats** event
-history (with a "Mod acts" column in the overview). Old chat logs load
-unchanged; they just predate the markers. Replies carry a small **↩ name**
+and only visible when the person actually chats). On **YouTube** the same two
+actions the platform exposes are read out of yt-dlp's chat sidecar: a single
+message being deleted, and a moderator removing **everything one person
+said**. In the chat replay, deleted/removed messages render **struck-through
+with the original text preserved** — the live chat hides what mods remove; the
+archive keeps receipts — and on Twitch the timeouts, bans, clears, mode
+changes and role changes also appear as muted ℹ notice lines. Old chat logs
+load unchanged; they just predate the markers. Replies carry a small **↩ name**
 prefix showing who they answer, and **📣 mod announcements** show as notice
 lines too.
+
+Where the two platforms differ, the app says so rather than guessing:
+
+- **Nobody says WHO moderated, or why.** Neither platform tells an anonymous
+  listener which moderator acted or what reason they gave — that needs
+  broadcaster-level credentials. Every moderation record here names the person
+  it happened *to*, never the person who did it.
+- **YouTube can't tell a timeout from a ban.** Its "remove this author's
+  messages" action is the same whether someone was muted for ten minutes or
+  banned outright, so those are recorded as their own **`chat_purge`** kind
+  ("all messages removed") instead of being filed under a `timeout` or `ban`
+  that might be wrong. Twitch reports the duration, so Twitch rows do
+  distinguish them.
+- **Twitch is recorded live; YouTube is recorded at the end.** Our own IRC
+  client sees Twitch actions as they happen. YouTube chat is captured by
+  yt-dlp with no hook of ours in the loop, so a background sweep reads the
+  finished sidecar once the capture ends (a few takes a minute, so an existing
+  archive backfills itself over time). The strikethrough in the replay is
+  parsed straight from the file and doesn't wait for that — only the recorded
+  *statistics* do.
+- **Un-bans are invisible.** No platform announces one to a listener, so a
+  recorded ban only ever means "banned as of the last thing we saw", which is
+  how the UI words it.
+- **Kick** chat isn't captured at all yet, so none of this applies there.
+
+All of it lands in the **Channel Stats** event history (with a "Mod acts"
+column in the overview), in each chatter's **usercard**, and in the **Chat
+moderation** section of instance **Properties**.
 
 Emote images in the replay have the app's standard image affordances:
 **Alt-hover** shows a full-resolution floating preview, and **right-click**
@@ -3454,8 +3486,20 @@ network call. Below that, **This channel:** cross-references the sender's
 Twitch display name against this channel's locally-recorded event history
 (bits cheered, subs gifted, raids brought in, timeouts/bans) — again purely
 local, no network — and **Recent messages in this log** shows a scrollable
-feed of up to their last 50 messages in the log currently open. A 🔔
-**"Highlight messages of this user"** toggle tints that person's rows
+feed of up to their last 50 messages in the log currently open.
+
+**🔨 Moderation** is its own section on the card: their last known state
+(clean / has had messages deleted / timed out — with the time left if the
+timeout hasn't run out yet / banned / all messages removed), the counts behind
+it, and a scrollable log of the actual actions with dates and the deleted
+text. It covers **every broadcast this channel has recorded**, not just the
+one you're looking at, and it's matched both by display name and by the
+platform's stable id (Twitch's account id, YouTube's channel id) so a rename
+doesn't lose someone's history. The clean case is shown too — "no moderation
+actions on record" is the answer you opened the card for, and a section that
+quietly disappears can't tell you apart from one that wasn't checked.
+
+A 🔔 **"Highlight messages of this user"** toggle tints that person's rows
 throughout the chat so they're easy to track while scrolling (one
 highlighted user per chat window at a time). Turning on **Settings →
 Interface → Display → "Fetch live Twitch info for chat usercards"** (off by
@@ -3463,17 +3507,24 @@ default) additionally fetches that user's live avatar and Twitch
 account-created date via the Helix API each time a card opens; a failed
 lookup shows **N/A** for those two fields and files a warning in the 🔔 feed
 / 🚨 Warnings window rather than blocking the rest of the card. "Copy
-username" and "Open Twitch profile" round out the card.
+username" and a profile link round out the card.
 
-A **👥** button opens **Users in chat**: every unique Twitch sender in the
+**YouTube chatters get a card too**, built from the same log and the same
+recorded moderation history — everything except the live Twitch lookup, which
+has no YouTube equivalent (so no avatar or account-created row), and the
+profile button opens their YouTube channel instead. Very old logs captured
+before this shipped carry no per-chatter identity at all, so their names stay
+plain labels.
+
+A **👥** button opens **Users in chat**: every unique sender in the
 currently-loaded log, grouped by role (Broadcaster → Moderators → VIPs →
 Subscribers → Users, alphabetical within each group) using their most recent
 message's badges — so a mid-broadcast promotion shows their current role,
 not whoever they were when they first spoke. A filter box narrows by name;
 clicking anyone opens their usercard the same as clicking their name in
-chat. Twitch-only, and built entirely from the already-archived log (no
-network) — there's no "Chat Bots" group like Twitch's own list since nothing
-in an anonymous chat capture reliably marks an account as a bot.
+chat. Built entirely from the already-archived log (no network) — there's no
+"Chat Bots" group like Twitch's own list since nothing in an anonymous chat
+capture reliably marks an account as a bot.
 
 **Top supporters and Hype Train**, shown inline above the message list
 whenever a broadcast has data for them — both reconstructed entirely from
@@ -3661,8 +3712,19 @@ section carries the account's icon/banner thumbnails, its status row, **⟳
 Refetch** (this account only), **📂** (this account's folder), **🕑 History**
 (this account's changes only), **ℹ About** (this account's archived About
 page), and its emote-viewer launchers. It uses the same
-collapsible-section layout (**Monitor · Assets · Schedule sources**, the last
-collapsed by default) with a scrollbar when needed.
+collapsible-section layout (**Monitor · Assets · Chat moderation · Trigger
+words · Schedule sources**, the last few collapsed by default) with a
+scrollbar when needed.
+
+**Chat moderation** (collapsed by default) is the read-only history side of
+what the chat logger captured for *this* instance: how many messages were
+deleted, how many timeouts and bans, YouTube's "all messages removed" count,
+chat clears, room-mode changes, the last mode change seen, the five chatters
+with the most actions against them, and a scrollable log of the recent ones.
+It's loaded once when the window opens (history doesn't move while you read
+it) and says so plainly when there's nothing recorded — no moderation seen,
+chat logging off, or a platform whose chat isn't captured. See *Chat logs* for
+what each platform does and doesn't disclose.
 
 **Change history.** Manifests and images are overwritten wholesale on each
 refetch, so a removed emote code or a swapped banner would otherwise vanish with

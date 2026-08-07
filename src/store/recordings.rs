@@ -17,6 +17,22 @@ pub struct ExpiredRolling {
     pub output_path: String,
 }
 
+/// One finished take whose chat sidecar hasn't been mined for moderation
+/// actions yet — see [`Store::recordings_needing_chat_scan`] and
+/// [`crate::chat_scan`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatScanTarget {
+    pub rec_id: i64,
+    pub monitor_id: i64,
+    /// Broadcast id (`''` when unknown) — copied onto every event row the scan
+    /// writes, so they group with the rest of that broadcast's history.
+    pub stream_id: String,
+    /// Capture start, the anchor for the sidecar's relative (VOD-replay)
+    /// timestamps.
+    pub started_at: i64,
+    pub chat_path: String,
+}
+
 impl Store {
     // ----- recordings -----
 
@@ -129,6 +145,52 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Finished takes whose chat sidecar still has to be mined for moderation
+    /// actions ([`crate::chat_scan`]), oldest first.
+    ///
+    /// Only takes that have **ended** qualify: a live YouTube sidecar is still
+    /// being appended to by yt-dlp, and re-reading a growing file every sweep
+    /// would be both wasteful and duplicate-prone. The chat replay strikes
+    /// deleted messages the moment it parses them either way, so nothing the
+    /// user can see waits on this — only the recorded statistics do.
+    ///
+    /// `chat_scanned_at = 0` is the "never scanned" sentinel (schema v89), and
+    /// `idx_recording_chat_unscanned` covers exactly this predicate, so the
+    /// query stays cheap once the backlog has drained.
+    pub fn recordings_needing_chat_scan(&self, limit: i64) -> Result<Vec<ChatScanTarget>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, COALESCE(stream_id, ''), started_at, chat_path
+             FROM recording
+             WHERE chat_scanned_at = 0
+               AND COALESCE(chat_path, '') != ''
+               AND ended_at IS NOT NULL
+             ORDER BY id
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(ChatScanTarget {
+                    rec_id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    stream_id: r.get(2)?,
+                    started_at: r.get(3)?,
+                    chat_path: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Stamp a take's chat sidecar as mined. Also used to force a **rescan**
+    /// (stamp 0), which is why it takes the timestamp rather than reading the
+    /// clock itself.
+    pub fn set_recording_chat_scanned(&self, rec_id: i64, at: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE recording SET chat_scanned_at = ?2 WHERE id = ?1", params![rec_id, at])?;
+        Ok(())
     }
 
     /// How many takes per monitor are currently counting down towards
@@ -3117,6 +3179,40 @@ mod tests {
         store.set_head_backfill_state(rid, "").unwrap();
         assert!(store.queued_head_backfills().unwrap().is_empty());
         assert_eq!(store.get_recording(rid).unwrap().unwrap().head_backfill_state, "");
+    }
+
+    #[test]
+    fn chat_scan_queue_only_offers_finished_takes_with_a_sidecar() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://youtube.com/@a", Platform::YouTube).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let take = |n: i64, chat: Option<&str>, finished: bool| {
+            let rid = store
+                .insert_recording(mid, n, &format!("C:/tmp/{n}.mkv"), None, false, Some("s1"), None, "", "")
+                .unwrap();
+            if let Some(p) = chat {
+                store.set_recording_chat_path(rid, p).unwrap();
+            }
+            if finished {
+                store
+                    .finish_recording(rid, n + 10, 1, Some(0), "completed", &format!("C:/tmp/{n}.mkv"), "")
+                    .unwrap();
+            }
+            rid
+        };
+        let ready = take(100, Some("C:/tmp/100.live_chat.json"), true);
+        let _no_sidecar = take(200, None, true);
+        let _still_recording = take(300, Some("C:/tmp/300.live_chat.json"), false);
+
+        let queue = store.recordings_needing_chat_scan(10).unwrap();
+        assert_eq!(queue.iter().map(|t| t.rec_id).collect::<Vec<_>>(), vec![ready]);
+        let t = &queue[0];
+        assert_eq!((t.monitor_id, t.stream_id.as_str(), t.started_at), (mid, "s1", 100));
+        assert_eq!(t.chat_path, "C:/tmp/100.live_chat.json");
+
+        // Once stamped it never comes back — that's what drains the queue.
+        store.set_recording_chat_scanned(ready, 9_999).unwrap();
+        assert!(store.recordings_needing_chat_scan(10).unwrap().is_empty());
     }
 
     #[test]

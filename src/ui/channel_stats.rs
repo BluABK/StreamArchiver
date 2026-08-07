@@ -65,6 +65,7 @@ fn event_color(kind: &str) -> egui::Color32 {
         "msg_deleted" => egui::Color32::from_rgb(0xef, 0x53, 0x50),
         "timeout" => egui::Color32::from_rgb(0xff, 0xa7, 0x26),
         "ban" => egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+        "chat_purge" => egui::Color32::from_rgb(0xd8, 0x43, 0x15),
         "chat_clear" => egui::Color32::from_rgb(0x8d, 0x6e, 0x63),
         "chat_mode" => egui::Color32::from_rgb(0x78, 0x90, 0x9c),
         "role_change" => egui::Color32::from_rgb(0xff, 0xd5, 0x4f),
@@ -89,6 +90,7 @@ fn event_label(kind: &str) -> &'static str {
         "msg_deleted" => "Deleted msg",
         "timeout" => "Timeout",
         "ban" => "Ban",
+        "chat_purge" => "Msgs removed",
         "chat_clear" => "Chat clear",
         "chat_mode" => "Chat mode",
         "role_change" => "Role change",
@@ -150,6 +152,13 @@ fn event_line_segs(e: &StreamEventRow) -> Vec<EventLineSeg> {
         ],
         "timeout" => vec![Name(e.actor.clone()), Text(format!(" was timed out ({})", fmt_timeout(e.amount)))],
         "ban" => vec![Name(e.actor.clone()), Text(" was banned".into())],
+        // YouTube's by-author removal: a moderator wiped everything this
+        // person said, and the platform never says whether that was a
+        // timeout or a ban — so this line claims neither.
+        "chat_purge" => vec![
+            Name(e.actor.clone()),
+            Text(" had every message removed by a moderator".into()),
+        ],
         "chat_clear" => vec![Text("chat was cleared".into())],
         "chat_mode" => vec![Text(e.detail.clone())],
         "role_change" => vec![Name(e.actor.clone()), Text(format!(" {}", e.detail))],

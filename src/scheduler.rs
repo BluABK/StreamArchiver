@@ -571,6 +571,10 @@ async fn tick(
     // Rolling-recording expiry sweep (self-throttled to once a minute; a no-op
     // single query when nothing is due).
     crate::rolling::maybe_sweep_rolling(&ctx.store, events, checked_at).await;
+    // YouTube chat-moderation harvest (self-throttled, a few finished takes per
+    // pass). Twitch records its own as they happen; YouTube's only exist inside
+    // yt-dlp's sidecar, so they're read back once the capture is over.
+    crate::chat_scan::maybe_sweep_chat_scan(&ctx.store, checked_at).await;
 
     // ── Twitch "Stream Together" collab refresh ──
     // Piggybacks each monitor's own poll cadence (only monitors polled this

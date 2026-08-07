@@ -3,8 +3,9 @@
 
 use super::*;
 
-/// Source platform of a captured chat message (drives username colouring).
-#[derive(Clone)]
+/// Source platform of a captured chat message (drives username colouring,
+/// which identity keys a usercard, and whether a live lookup is possible).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChatPlatform {
     YouTube,
     Twitch,
@@ -60,9 +61,16 @@ pub(super) struct ChatMessage {
     /// Twitch: sender's lowercase login (deletion/purge markers match on it).
     /// Empty for YouTube and pre-feature logs.
     pub(super) login: String,
-    /// Twitch IRCv3 message id — what a `del` marker references. Empty for
-    /// YouTube / old logs (single-message deletions then can't match).
+    /// Per-message id — what a `del` marker references. Twitch's IRCv3 `id`
+    /// tag, or YouTube's `liveChatTextMessageRenderer.id`. Empty on
+    /// pre-feature logs, where single-message deletions can't be matched.
     pub(super) msg_id: String,
+    /// YouTube's stable `UC…` author channel id — what a
+    /// `markChatItemsByAuthorAsDeletedAction` names when a moderator removes
+    /// everything one person said, and the key the usercard cross-references
+    /// against recorded moderation events. Empty for Twitch (which identifies
+    /// a chatter by `login` instead) and for pre-feature logs.
+    pub(super) author_id: String,
     /// `Some(reason)` once a moderation marker struck this message
     /// ("deleted by a moderator", "timed out (10m)", …) — renders
     /// strikethrough with the reason on hover. Applied by
@@ -94,6 +102,16 @@ pub(super) struct ChatMessage {
     pub(super) badge_info: String,
 }
 
+impl ChatMessage {
+    /// What a [`ChatMarker::Purge`] matches this message against: the Twitch
+    /// login, or YouTube's author channel id. Empty when neither is known
+    /// (pre-feature logs), which can never match a marker — deliberately, since
+    /// an empty key would otherwise strike every anonymous-looking message.
+    pub(super) fn purge_key(&self) -> &str {
+        if !self.login.is_empty() { &self.login } else { &self.author_id }
+    }
+}
+
 /// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
 pub(super) const CHAT_ROW_EST: f32 = 20.0;
 
@@ -106,10 +124,13 @@ pub(super) const CHAT_ROW_EST: f32 = 20.0;
 /// [`ChatLog::apply_markers`].
 #[derive(Clone)]
 pub(super) enum ChatMarker {
-    /// A single message was deleted (matched by Twitch message id).
+    /// A single message was deleted (matched by [`ChatMessage::msg_id`]).
     Delete { msg_id: String },
-    /// Everything a user said up to this point was purged (timeout/ban).
-    Purge { login: String, reason: String },
+    /// Everything one chatter had said up to this point was removed — a
+    /// Twitch timeout/ban, or YouTube's remove-by-author. `key` is matched
+    /// against [`ChatMessage::purge_key`]: a lowercase Twitch login, or a
+    /// YouTube `UC…` channel id.
+    Purge { key: String, reason: String },
     /// The whole chat was cleared.
     Clear,
 }
@@ -160,8 +181,8 @@ impl ChatLog {
                 ChatMarker::Delete { msg_id } => {
                     deleted_ids.insert(msg_id.as_str(), ());
                 }
-                ChatMarker::Purge { login, reason } => {
-                    let e = purges.entry(login.as_str()).or_insert((m.ts_secs, reason));
+                ChatMarker::Purge { key, reason } => {
+                    let e = purges.entry(key.as_str()).or_insert((m.ts_secs, reason));
                     if m.ts_secs >= e.0 {
                         *e = (m.ts_secs, reason);
                     }
@@ -176,7 +197,7 @@ impl ChatLog {
             if !msg.msg_id.is_empty() && deleted_ids.contains_key(msg.msg_id.as_str()) {
                 msg.deleted = Some("deleted by a moderator".into());
             } else if let Some((pts, reason)) =
-                (!msg.login.is_empty()).then(|| purges.get(msg.login.as_str())).flatten()
+                (!msg.purge_key().is_empty()).then(|| purges.get(msg.purge_key())).flatten()
                 && msg.timestamp_secs <= *pts
             {
                 msg.deleted = Some((*reason).to_string());
@@ -232,6 +253,14 @@ pub(super) struct UserCardPopup {
     /// (bits/gift-subs/raids/timeouts) — computed once from the DB when the
     /// card opens, not re-queried per frame. Empty when nothing matched.
     pub(super) channel_stats: Vec<String>,
+    /// Which platform's chat this card was opened from — decides whether the
+    /// live Twitch lookup runs at all, and which profile link is offered.
+    pub(super) platform: ChatPlatform,
+    /// Every moderation action this channel has on record against them,
+    /// newest first (`Store::moderation_events_for_user`), and the state
+    /// derived from it. Queried once on open, like `channel_stats`.
+    pub(super) moderation: Vec<crate::models::StreamEventRow>,
+    pub(super) mod_summary: crate::models::ModerationSummary,
     pub(super) fetch: Arc<Mutex<UserCardFetch>>,
 }
 
@@ -909,13 +938,28 @@ pub(super) struct ChatAppearance {
 /// same shape to open a usercard on click without re-scanning the log.
 #[derive(Clone)]
 pub(super) struct UserCardClick {
+    /// Twitch login; empty for YouTube, which identifies a chatter by
+    /// `user_id` (their `UC…` channel id) instead.
     pub(super) login: String,
     pub(super) display_name: String,
     pub(super) color: Option<egui::Color32>,
     pub(super) badges: Vec<String>,
     pub(super) badge_icons: Vec<Option<std::path::PathBuf>>,
     pub(super) badge_info: String,
+    /// The platform's own id for this chatter: Twitch's numeric `user-id`, or
+    /// YouTube's channel id. Decides both the live-lookup path and how
+    /// recorded moderation events are matched back to them.
     pub(super) user_id: String,
+    pub(super) platform: ChatPlatform,
+}
+
+impl UserCardClick {
+    /// What identifies this chatter within a log: the Twitch login, else the
+    /// platform id. Same key [`ChatMessage::purge_key`] produces, so a card
+    /// and a moderation marker always agree on who is who.
+    pub(super) fn key(&self) -> &str {
+        if !self.login.is_empty() { &self.login } else { &self.user_id }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1003,20 +1047,24 @@ pub(super) fn render_chat_message(
             resp.on_hover_text(format!("From {}'s chat (Shared Chat)", msg.source_name));
         }
         // Username — bold, platform/user colour, adjusted for contrast on the
-        // chat panel's background so dark colours stay legible. Clickable on
-        // Twitch (opens the usercard) — YouTube messages carry no `login`/
-        // `user_id` to build one from, so they stay a plain label.
+        // chat panel's background so dark colours stay legible. Clickable
+        // wherever the message carries an identity to build a card from: a
+        // Twitch login, or a YouTube author channel id. Pre-feature logs have
+        // neither and stay a plain label.
         let name_color = chat_username_color(msg, ui.visuals().panel_fill);
         let name_text = egui::RichText::new(format!("{}:", msg.author))
             .strong()
             .size(appearance.font_pt)
             .color(name_color);
         let mut click: Option<UserCardClick> = None;
-        if matches!(msg.platform, ChatPlatform::Twitch) && !msg.login.is_empty() {
+        if !msg.purge_key().is_empty() {
             let resp = ui
                 .add(egui::Label::new(name_text).sense(egui::Sense::click()))
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Click for user info");
+                .on_hover_text(
+                    "Click for user info — messages in this log, what this channel has \
+                     recorded about them, and any moderation actions against them",
+                );
             if resp.clicked() {
                 click = Some(UserCardClick {
                     login: msg.login.clone(),
@@ -1025,7 +1073,14 @@ pub(super) fn render_chat_message(
                     badges: msg.badges.clone(),
                     badge_icons: msg.badge_icons.clone(),
                     badge_info: msg.badge_info.clone(),
-                    user_id: msg.user_id.clone(),
+                    // Twitch numeric id, or YouTube's channel id — whichever
+                    // this platform gave us.
+                    user_id: if msg.user_id.is_empty() {
+                        msg.author_id.clone()
+                    } else {
+                        msg.user_id.clone()
+                    },
+                    platform: msg.platform.clone(),
                 });
             }
         } else {
@@ -1735,6 +1790,131 @@ pub(super) fn summarize_user_events(
     lines
 }
 
+/// One line describing a chatter's last known moderation state, plus whether
+/// it should be drawn as a warning.
+///
+/// "Last known" is the whole point: neither platform tells an anonymous
+/// listener about un-bans or un-timeouts, so a ban we recorded in March says
+/// nothing about today. The wording never asserts a present-tense state that
+/// we can't actually observe — except for a timeout whose own duration hasn't
+/// run out yet, which is arithmetic rather than a guess.
+pub(super) fn moderation_state_line(
+    state: crate::models::ModerationState,
+    now: i64,
+) -> (String, bool) {
+    use crate::models::ModerationState as S;
+    match state {
+        S::Clean => ("✔ No moderation actions on record".to_string(), false),
+        S::MessagesDeleted => {
+            ("⚠ Has had messages deleted, but was never timed out or banned".to_string(), false)
+        }
+        S::TimedOut { at, secs, until } if until > now => (
+            format!(
+                "⏳ Timed out for {} on {} — {} left",
+                fmt_timeout_secs(secs),
+                fmt_datetime_short(at),
+                crate::rolling::fmt_remaining(until - now)
+            ),
+            true,
+        ),
+        S::TimedOut { at, secs, .. } => (
+            format!("⚠ Last timed out for {} on {}", fmt_timeout_secs(secs), fmt_datetime_short(at)),
+            false,
+        ),
+        S::Banned { at } => {
+            (format!("🚫 Banned on {} (no un-ban seen since)", fmt_datetime_short(at)), true)
+        }
+        S::Purged { at } => (
+            format!(
+                "🚫 All their messages were removed on {} — YouTube doesn't say whether that \
+                 was a timeout or a ban",
+                fmt_datetime_short(at)
+            ),
+            true,
+        ),
+    }
+}
+
+/// `600` → `"10m"`. Shared by the usercard and instance Properties.
+pub(super) fn fmt_timeout_secs(secs: i64) -> String {
+    match secs {
+        s if s <= 0 => "an unknown time".to_string(),
+        s if s >= 86_400 && s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// One recorded moderation action as a single readable line.
+pub(super) fn moderation_event_line(e: &crate::models::StreamEventRow) -> String {
+    match e.kind.as_str() {
+        "msg_deleted" if e.detail.is_empty() => "message deleted".to_string(),
+        "msg_deleted" => format!("message deleted: \u{201c}{}\u{201d}", e.detail),
+        "timeout" => format!("timed out for {}", fmt_timeout_secs(e.amount)),
+        "ban" => "banned".to_string(),
+        "chat_purge" if e.detail.is_empty() => "all messages removed".to_string(),
+        "chat_purge" => format!("all messages removed ({})", e.detail),
+        other => other.to_string(),
+    }
+}
+
+/// The usercard's 🔨 Moderation section: what this channel has on record
+/// against this chatter, and what that adds up to.
+///
+/// Always shown, including the reassuring empty case — "nothing on record" is
+/// exactly the answer someone opening this is looking for, and a section that
+/// silently vanishes can't distinguish "clean" from "not checked".
+fn usercard_moderation_section(ui: &mut egui::Ui, card: &UserCardPopup) {
+    let now = crate::models::now_unix();
+    ui.separator();
+    ui.label(egui::RichText::new("🔨 Moderation:").weak()).on_hover_text(
+        "Timeouts, bans and deleted messages this channel has recorded for this chatter, \
+         across every broadcast — not just the one you're viewing. Captured passively from \
+         chat: neither platform tells a listener WHO moderated, why, or when someone was \
+         un-banned, so this is only ever what was last seen.",
+    );
+    let (line, warn) = moderation_state_line(card.mod_summary.state(&card.moderation), now);
+    if warn {
+        ui.colored_label(grid::HL_ERROR_TEXT, line);
+    } else {
+        ui.label(line);
+    }
+    if card.mod_summary.is_clean() {
+        return;
+    }
+    let s = card.mod_summary;
+    let mut parts: Vec<String> = Vec::new();
+    if s.deleted > 0 {
+        parts.push(format!("{} message(s) deleted", s.deleted));
+    }
+    if s.timeouts > 0 {
+        parts.push(format!("{} timeout(s)", s.timeouts));
+    }
+    if s.bans > 0 {
+        parts.push(format!("{} ban(s)", s.bans));
+    }
+    if s.purges > 0 {
+        parts.push(format!("{} removal(s)", s.purges));
+    }
+    ui.label(egui::RichText::new(parts.join(" · ")).small().weak());
+    egui::ScrollArea::vertical()
+        .id_salt("usercard_moderation")
+        .max_height(120.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for e in &card.moderation {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.label(
+                        egui::RichText::new(fmt_datetime_short(e.at)).monospace().small().weak(),
+                    );
+                    ui.label(egui::RichText::new(moderation_event_line(e)).small());
+                });
+            }
+        });
+}
+
 /// The most recent Hype Train for a broadcast, everything the chat replay
 /// needs to draw a Twitch-style progress bar (or, once it's over, a static
 /// reached-level summary) — see [`load_broadcast_stats`]'s doc for where
@@ -1812,8 +1992,11 @@ pub(super) fn user_role_label(badges: &[String]) -> &'static str {
 pub(super) fn build_users_panel(log: &ChatLog) -> Vec<ChatUserEntry> {
     let mut latest: HashMap<&str, &ChatMessage> = HashMap::new();
     for m in &log.messages {
-        if matches!(m.platform, ChatPlatform::Twitch) && !m.login.is_empty() {
-            latest.insert(&m.login, m);
+        // Keyed the same way a moderation marker matches (login on Twitch,
+        // author channel id on YouTube), so both platforms' chatters are
+        // listed and each one's card opens on the identity it was built from.
+        if !m.system && !m.purge_key().is_empty() {
+            latest.insert(m.purge_key(), m);
         }
     }
     let mut entries: Vec<ChatUserEntry> = latest
@@ -1827,7 +2010,8 @@ pub(super) fn build_users_panel(log: &ChatLog) -> Vec<ChatUserEntry> {
                 badges: m.badges.clone(),
                 badge_icons: m.badge_icons.clone(),
                 badge_info: m.badge_info.clone(),
-                user_id: m.user_id.clone(),
+                user_id: if m.user_id.is_empty() { m.author_id.clone() } else { m.user_id.clone() },
+                platform: m.platform,
             },
         })
         .collect();
@@ -1899,7 +2083,8 @@ pub(crate) struct ChatChunk {
     pub(super) messages: Vec<ChatMessage>,
     pub(crate) fetches: Vec<EmojiFetch>,
     pub(crate) parsed_to: u64,
-    /// Moderation markers found in this byte range (Twitch sidecars only).
+    /// Moderation markers found in this byte range — Twitch marker lines
+    /// written live by our own logger, or YouTube's own deletion actions.
     pub(super) markers: Vec<MarkerAt>,
 }
 
@@ -2018,6 +2203,11 @@ pub(super) fn parse_chat_chunk(
     let mut messages = Vec::new();
     let mut fetches: Vec<EmojiFetch> = Vec::new();
     let mut markers: Vec<MarkerAt> = Vec::new();
+    // YouTube only: where in the stream the last message landed, so an
+    // untimestamped moderation action can be stamped at its place in the file
+    // (see `parse_yt_chat_line`). A chunk that starts mid-file begins at 0,
+    // which is correct for a purge — it strikes everything before it anyway.
+    let mut yt_last_ts = 0.0_f64;
     let mut parsed_to = from;
     let mut pos = from;
     // Carries a partial line across window boundaries.
@@ -2055,7 +2245,13 @@ pub(super) fn parse_chat_chunk(
                     continue;
                 }
                 if is_yt {
-                    parse_yt_chat_line(line, &mut messages, &mut fetches);
+                    parse_yt_chat_line(
+                        line,
+                        &mut messages,
+                        &mut markers,
+                        &mut fetches,
+                        &mut yt_last_ts,
+                    );
                 } else if line.contains("\"marker\":") {
                     // Moderation marker / notice line (cheap substring gate —
                     // markers are rare next to messages).
@@ -2485,11 +2681,36 @@ pub(super) async fn tail_chat(
 }
 
 /// Parse one line of a YouTube `.live_chat.json` file (a line can carry several
-/// messages in the VOD-replay format), appending to `out`.
-pub(super) fn parse_yt_chat_line(line: &str, out: &mut Vec<ChatMessage>, fetches: &mut Vec<EmojiFetch>) {
+/// actions in the VOD-replay format), appending messages to `out` and any
+/// moderation actions to `markers`.
+///
+/// `last_ts` carries the newest message timestamp seen so far, in stream-
+/// relative seconds. Moderation actions in the live format have no timestamp of
+/// their own (only messages do), so they're stamped at the position in the file
+/// where they appear — which is exactly what a purge marker needs, since it
+/// strikes everything said up to that point.
+pub(super) fn parse_yt_chat_line(
+    line: &str,
+    out: &mut Vec<ChatMessage>,
+    markers: &mut Vec<MarkerAt>,
+    fetches: &mut Vec<EmojiFetch>,
+    last_ts: &mut f64,
+) {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
+    };
+    let mut handle = |action: &serde_json::Value,
+                      offset_ms: Option<i64>,
+                      out: &mut Vec<ChatMessage>,
+                      markers: &mut Vec<MarkerAt>| {
+        if let Some(msg) = yt_action_to_msg(action, offset_ms, fetches) {
+            *last_ts = msg.timestamp_secs;
+            out.push(msg);
+        } else if let Some(marker) = yt_action_to_marker(action) {
+            let ts_secs = offset_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(*last_ts);
+            markers.push(MarkerAt { ts_secs, marker });
+        }
     };
     if let Some(replay) = v.get("replayChatItemAction") {
         // VOD replay format: replayChatItemAction.{videoOffsetTimeMsec, actions[]}
@@ -2498,14 +2719,34 @@ pub(super) fn parse_yt_chat_line(line: &str, out: &mut Vec<ChatMessage>, fetches
             .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
         if let Some(actions) = replay.get("actions").and_then(|a| a.as_array()) {
             for action in actions {
-                if let Some(msg) = yt_action_to_msg(action, offset_ms, fetches) {
-                    out.push(msg);
-                }
+                handle(action, offset_ms, out, markers);
             }
         }
-    } else if let Some(msg) = yt_action_to_msg(&v, None, fetches) {
-        // Live format: addChatItemAction directly at the top level of each line.
-        out.push(msg);
+    } else {
+        // Live format: the action sits directly at the top level of each line.
+        handle(&v, None, out, markers);
+    }
+}
+
+/// Turn one YouTube live-chat action into a replay marker, if it is one.
+///
+/// Which actions count — and why a by-author removal must not be called a
+/// timeout or a ban — is [`crate::chat_scan::yt_moderation_action`]'s business.
+/// Sharing that classifier with the archival scan is deliberate: the
+/// strikethrough you see and the statistics that get recorded can then never
+/// disagree about what happened.
+pub(super) fn yt_action_to_marker(action: &serde_json::Value) -> Option<ChatMarker> {
+    use crate::chat_scan::YtModAction;
+    match crate::chat_scan::yt_moderation_action(action)? {
+        YtModAction::DeleteMessage { item_id } => {
+            Some(ChatMarker::Delete { msg_id: item_id.to_string() })
+        }
+        YtModAction::PurgeAuthor { channel_id, reason } => Some(ChatMarker::Purge {
+            key: channel_id.to_string(),
+            // YouTube reports the removal but not what caused it, so the
+            // fallback wording claims neither a timeout nor a ban.
+            reason: reason.unwrap_or_else(|| "all messages removed by a moderator".to_string()),
+        }),
     }
 }
 
@@ -2529,6 +2770,10 @@ pub(super) fn yt_action_to_msg(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Identity, for moderation markers: the item id a single-message deletion
+    // targets, and the author's stable channel id a by-author removal names.
+    let msg_id = r["id"].as_str().unwrap_or("").to_string();
+    let author_id = r["authorExternalChannelId"].as_str().unwrap_or("").to_string();
     // YouTube pre-tokenizes the body as `message.runs[]`: text runs are literal,
     // emoji runs carry either a standard unicode char (`emojiId`) or a custom
     // channel emoji (image-only). Build the display `segments` and the verbatim
@@ -2616,12 +2861,13 @@ pub(super) fn yt_action_to_msg(
         color_override: None,
         platform: ChatPlatform::YouTube,
         login: String::new(),
-        msg_id: String::new(),
+        msg_id,
         deleted: None,
         system: false,
         reply_to: String::new(),
         source_name: String::new(),
         user_id: String::new(),
+        author_id,
         badge_info: String::new(),
     })
 }
@@ -2651,6 +2897,7 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
         reply_to: String::new(),
         source_name: String::new(),
         user_id: String::new(),
+        author_id: String::new(),
         badge_info: String::new(),
     };
     match kind {
@@ -2675,7 +2922,7 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
             };
             let n = notice(format!("{login} was {reason}"));
             Some((
-                Some(MarkerAt { ts_secs, marker: ChatMarker::Purge { login, reason } }),
+                Some(MarkerAt { ts_secs, marker: ChatMarker::Purge { key: login, reason } }),
                 Some(n),
             ))
         }
@@ -2768,6 +3015,9 @@ pub(super) fn parse_twitch_chat_line(
         reply_to: v["reply"].as_str().unwrap_or("").to_string(),
         source_name,
         user_id: v["user_id"].as_str().unwrap_or("").to_string(),
+        // Twitch identifies a chatter by login in the moderation feed, so this
+        // stays empty — see `ChatMessage::author_id`.
+        author_id: String::new(),
         badge_info: v["badge_info"].as_str().unwrap_or("").to_string(),
     })
 }
@@ -3501,7 +3751,17 @@ impl StreamArchiverApp {
                                     ui.label(card.message_count.to_string());
                                     ui.end_row();
                                     if !card.user_id.is_empty() {
-                                        ui.label("User ID:");
+                                        let (label, tip) = match card.platform {
+                                            ChatPlatform::Twitch => (
+                                                "User ID:",
+                                                "Twitch's numeric account id — stable across name changes.",
+                                            ),
+                                            ChatPlatform::YouTube => (
+                                                "Channel ID:",
+                                                "YouTube's channel id for this chatter — stable across name changes.",
+                                            ),
+                                        };
+                                        ui.label(label).on_hover_text(tip);
                                         ui.label(&card.user_id);
                                         ui.end_row();
                                     }
@@ -3510,19 +3770,27 @@ impl StreamArchiverApp {
                                         ui.label(fmt_chat_ts(secs));
                                         ui.end_row();
                                     }
-                                    ui.label("Account created:");
-                                    let created = match &*card.fetch.lock().unwrap() {
-                                        UserCardFetch::Loaded { created_at: Some(c), .. } => {
-                                            chrono::DateTime::parse_from_rfc3339(c)
-                                                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                                                .unwrap_or_else(|_| c.clone())
-                                        }
-                                        UserCardFetch::Loading => "…".to_string(),
-                                        _ => "N/A".to_string(),
-                                    };
-                                    ui.label(created);
-                                    ui.end_row();
+                                    // Twitch-only (Helix); a YouTube card never
+                                    // makes a request, so the row would only
+                                    // ever read "N/A".
+                                    if card.platform == ChatPlatform::Twitch {
+                                        ui.label("Account created:");
+                                        let created = match &*card.fetch.lock().unwrap() {
+                                            UserCardFetch::Loaded { created_at: Some(c), .. } => {
+                                                chrono::DateTime::parse_from_rfc3339(c)
+                                                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                                                    .unwrap_or_else(|_| c.clone())
+                                            }
+                                            UserCardFetch::Loading => "…".to_string(),
+                                            _ => "N/A".to_string(),
+                                        };
+                                        ui.label(created);
+                                        ui.end_row();
+                                    }
                                 });
+
+                                // ── Moderation record ────────────────────────
+                                usercard_moderation_section(ui, card);
 
                                 // Cross-referenced against this channel's locally-recorded
                                 // event history (bits/gifts/raids/timeouts) — see
@@ -3569,32 +3837,69 @@ impl StreamArchiverApp {
 
                                 ui.separator();
                                 ui.horizontal(|ui| {
+                                    // Highlighting keys on the same identity
+                                    // the log rows carry, so it works for a
+                                    // YouTube chatter (no login) too.
+                                    let key = if card.login.is_empty() {
+                                        card.user_id.clone()
+                                    } else {
+                                        card.login.clone()
+                                    };
                                     let highlighted =
-                                        popup.highlight_login.as_deref() == Some(card.login.as_str());
+                                        popup.highlight_login.as_deref() == Some(key.as_str());
                                     if ui
                                         .selectable_label(highlighted, "🔔")
                                         .on_hover_text("Highlight messages of this user")
                                         .clicked()
                                     {
                                         popup.highlight_login =
-                                            if highlighted { None } else { Some(card.login.clone()) };
+                                            if highlighted { None } else { Some(key.clone()) };
                                     }
+                                    let copy = if card.login.is_empty() {
+                                        card.display_name.clone()
+                                    } else {
+                                        card.login.clone()
+                                    };
                                     if ui
                                         .button("Copy username")
-                                        .on_hover_text("Copy this user's login to the clipboard")
+                                        .on_hover_text(
+                                            "Copy this user's name to the clipboard (their login \
+                                             on Twitch, their display name on YouTube)",
+                                        )
                                         .clicked()
                                     {
-                                        ctx.copy_text(card.login.clone());
+                                        ctx.copy_text(copy);
                                     }
-                                    if ui
-                                        .button("Open Twitch profile")
-                                        .on_hover_text("Open twitch.tv/{login} in your browser")
-                                        .clicked()
-                                    {
-                                        crate::platform::open_url(&format!(
-                                            "https://twitch.tv/{}",
-                                            card.login
-                                        ));
+                                    match card.platform {
+                                        ChatPlatform::Twitch => {
+                                            if ui
+                                                .button("Open Twitch profile")
+                                                .on_hover_text("Open twitch.tv/{login} in your browser")
+                                                .clicked()
+                                            {
+                                                crate::platform::open_url(&format!(
+                                                    "https://twitch.tv/{}",
+                                                    card.login
+                                                ));
+                                            }
+                                        }
+                                        ChatPlatform::YouTube => {
+                                            if ui
+                                                .add_enabled(
+                                                    !card.user_id.is_empty(),
+                                                    egui::Button::new("Open YouTube channel"),
+                                                )
+                                                .on_hover_text(
+                                                    "Open this chatter's YouTube channel in your browser",
+                                                )
+                                                .clicked()
+                                            {
+                                                crate::platform::open_url(&format!(
+                                                    "https://www.youtube.com/channel/{}",
+                                                    card.user_id
+                                                ));
+                                            }
+                                        }
                                     }
                                 });
                             });
@@ -3978,10 +4283,11 @@ impl StreamArchiverApp {
                 let load_state = popup_arc.lock().unwrap().load_state.clone();
                 let guard = load_state.lock().unwrap();
                 if let ChatLoadState::Loaded(log) = &*guard {
+                    let key = req.key();
                     let mut all: Vec<(f64, String)> = log
                         .messages
                         .iter()
-                        .filter(|m| m.login == req.login)
+                        .filter(|m| !m.system && m.purge_key() == key)
                         .map(|m| (m.timestamp_secs, m.text.clone()))
                         .collect();
                     let count = all.len();
@@ -3995,25 +4301,34 @@ impl StreamArchiverApp {
                 }
             };
             let monitor_id = popup_arc.lock().unwrap().monitor_id;
-            // Cross-reference this user's Twitch display name against the
-            // channel's locally-recorded `stream_event` history — local DB
-            // query, no network, so it's fine to run inline on the click.
-            let channel_stats = self
-                .core
-                .store
-                .get_monitor_with_channel(monitor_id)
-                .ok()
-                .flatten()
-                .and_then(|m| {
-                    self.core
-                        .store
-                        .stream_events_range(m.channel.id, 0, crate::models::now_unix())
-                        .ok()
-                })
+            let channel_id =
+                self.core.store.get_monitor_with_channel(monitor_id).ok().flatten().map(|m| m.channel.id);
+            // Cross-reference this user's display name against the channel's
+            // locally-recorded `stream_event` history — local DB query, no
+            // network, so it's fine to run inline on the click.
+            let channel_stats = channel_id
+                .and_then(|cid| self.core.store.stream_events_range(cid, 0, crate::models::now_unix()).ok())
                 .map(|events| summarize_user_events(&events, &req.display_name))
                 .unwrap_or_default();
-            let want_live =
-                self.chat_settings.lock().unwrap().fetch_usercard_info && !req.user_id.is_empty();
+            // Their moderation record in this channel (both platforms; see
+            // `Store::moderation_events_for_user` for how the two identities
+            // are matched). Newest first, capped — a card is a summary, not an
+            // audit log.
+            const MODERATION_CAP: i64 = 50;
+            let moderation = channel_id
+                .and_then(|cid| {
+                    self.core
+                        .store
+                        .moderation_events_for_user(cid, &req.display_name, &req.user_id, MODERATION_CAP)
+                        .ok()
+                })
+                .unwrap_or_default();
+            let mod_summary = crate::models::ModerationSummary::from_events(&moderation);
+            // Live info exists only for Twitch (Helix); a YouTube card is
+            // local-only, which is why the platform rides along on the click.
+            let want_live = self.chat_settings.lock().unwrap().fetch_usercard_info
+                && !req.user_id.is_empty()
+                && req.platform == ChatPlatform::Twitch;
             let fetch = Arc::new(Mutex::new(if want_live {
                 UserCardFetch::Loading
             } else {
@@ -4090,6 +4405,9 @@ impl StreamArchiverApp {
                 first_seen_secs,
                 recent_messages,
                 channel_stats,
+                platform: req.platform,
+                moderation,
+                mod_summary,
                 fetch,
             });
         }
@@ -4293,6 +4611,7 @@ mod tests {
             reply_to: String::new(),
             source_name: String::new(),
             user_id: String::new(),
+            author_id: String::new(),
             badge_info: String::new(),
         }
     }
@@ -4329,19 +4648,75 @@ mod tests {
             loading_older: false,
             markers: Vec::new(),
         };
-        // A YouTube message (no login) must never show up in a Twitch-only panel.
+        // A YouTube chatter is listed too, keyed by their channel id — that's
+        // the identity their usercard and any deletion marker both use.
         let mut yt = plain_msg(1.0, "", "", "yt viewer");
         yt.platform = ChatPlatform::YouTube;
+        yt.author = "YT Viewer".to_string();
+        yt.author_id = "UCyt".to_string();
         log.messages.push(yt);
+        // One with no identity at all (a pre-feature log line) still can't be:
+        // there would be nothing to open a card on.
+        let mut anon = plain_msg(2.0, "", "", "anonymous");
+        anon.platform = ChatPlatform::YouTube;
+        log.messages.push(anon);
 
         let entries = build_users_panel(&log);
         // Deduped: one entry for "bob" (not two), using their later, mod-badged message.
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         let bob = entries.iter().find(|e| e.click.login == "bob").expect("bob present");
         assert_eq!(bob.role, "Moderators");
         // Moderators sort before Users (alice has no badges).
         assert_eq!(entries[0].click.login, "bob");
-        assert_eq!(entries[1].click.login, "alice");
+        let yt_entry = entries
+            .iter()
+            .find(|e| e.click.display_name == "YT Viewer")
+            .expect("the YouTube chatter is listed");
+        assert_eq!((yt_entry.click.login.as_str(), yt_entry.click.user_id.as_str()), ("", "UCyt"));
+        assert_eq!(yt_entry.click.key(), "UCyt");
+    }
+
+    #[test]
+    fn youtube_deletions_and_author_purges_strike_messages() {
+        // A replay line carrying a message, then the two moderator actions.
+        let mut msgs = Vec::new();
+        let mut markers = Vec::new();
+        let mut fetches = Vec::new();
+        let mut last = 0.0;
+        for line in [
+            r#"{"replayChatItemAction":{"videoOffsetTimeMsec":"1000","actions":[{"addChatItemAction":{"item":{"liveChatTextMessageRenderer":{"id":"m1","authorExternalChannelId":"UCspam","authorName":{"simpleText":"Spammer"},"message":{"runs":[{"text":"spam"}]}}}}}]}}"#,
+            r#"{"replayChatItemAction":{"videoOffsetTimeMsec":"2000","actions":[{"addChatItemAction":{"item":{"liveChatTextMessageRenderer":{"id":"m2","authorExternalChannelId":"UCspam","authorName":{"simpleText":"Spammer"},"message":{"runs":[{"text":"more spam"}]}}}}}]}}"#,
+            r#"{"replayChatItemAction":{"videoOffsetTimeMsec":"3000","actions":[{"addChatItemAction":{"item":{"liveChatTextMessageRenderer":{"id":"m3","authorExternalChannelId":"UCok","authorName":{"simpleText":"Regular"},"message":{"runs":[{"text":"hello"}]}}}}}]}}"#,
+            r#"{"replayChatItemAction":{"videoOffsetTimeMsec":"4000","actions":[{"markChatItemAsDeletedAction":{"targetItemId":"m1"}}]}}"#,
+            r#"{"replayChatItemAction":{"videoOffsetTimeMsec":"5000","actions":[{"markChatItemsByAuthorAsDeletedAction":{"externalChannelId":"UCspam","deletedStateMessage":{"runs":[{"text":"Message deleted by moderator"}]}}}]}}"#,
+        ] {
+            parse_yt_chat_line(line, &mut msgs, &mut markers, &mut fetches, &mut last);
+        }
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(markers.len(), 2);
+        // A later message from the purged author, after the action.
+        let mut later = msgs[0].clone();
+        later.timestamp_secs = 9.0;
+        later.msg_id = "m4".into();
+        msgs.push(later);
+
+        let mut log = ChatLog {
+            messages: msgs,
+            row_heights: Vec::new(),
+            measured_width: 0.0,
+            parsed_to: 0,
+            loading_older: false,
+            markers,
+        };
+        log.apply_markers();
+        assert_eq!(log.messages[0].deleted.as_deref(), Some("deleted by a moderator"));
+        assert_eq!(
+            log.messages[1].deleted.as_deref(),
+            Some("Message deleted by moderator"),
+            "the by-author removal strikes their other messages, using YouTube's own wording"
+        );
+        assert_eq!(log.messages[2].deleted, None, "a different author is untouched");
+        assert_eq!(log.messages[3].deleted, None, "messages after the removal stand");
     }
 
     #[test]

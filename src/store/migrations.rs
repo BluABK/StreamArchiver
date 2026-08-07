@@ -1731,7 +1731,27 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 88)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 88);
+        if version < 89 {
+            // YouTube chat moderation (see `crate::chat_scan`). Twitch's own
+            // logger records deletions/timeouts/bans as `stream_event` rows the
+            // moment they happen; YouTube chat arrives as a yt-dlp sidecar with
+            // no live hook, so its moderation actions are harvested by a sweep
+            // that reads the finished `.live_chat.json` once. This column is
+            // that sweep's "already read this one" stamp (0 = never scanned),
+            // which also makes a rescan a one-line UPDATE.
+            //
+            // The partial index is what the sweep's own predicate walks: only
+            // unscanned takes with a sidecar, which drains to (almost) empty in
+            // normal operation.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN chat_scanned_at INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS idx_recording_chat_unscanned
+                     ON recording(chat_scanned_at)
+                     WHERE chat_scanned_at = 0 AND chat_path <> '';",
+            )?;
+            conn.pragma_update(None, "user_version", 89)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 89);
         Ok(())
     }
 }

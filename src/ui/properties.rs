@@ -46,6 +46,12 @@ pub(super) struct InstancePropsPopupState {
     pub(super) trigger_draft: crate::triggers::TriggerScope,
     pub(super) block_draft: crate::triggers::TriggerScope,
     pub(super) global_order: Vec<SourceEntry>,
+    /// This instance's recorded chat-moderation history, newest first
+    /// (`Store::moderation_events_for_monitor`). Loaded once when the window
+    /// opens and cached by the parent — never re-queried per frame, since a
+    /// deferred popup that hits the DB every pass is exactly what stalls the
+    /// root viewport.
+    pub(super) moderation: Vec<crate::models::StreamEventRow>,
     /// Set by the deferred closure; drained by the wrapper next call, same
     /// as every other Pattern-C conversion this session — including the
     /// plain `bool`s, which must be reset after reading (see `form_window`'s
@@ -141,6 +147,11 @@ fn cached_channel_meta_line(store: &crate::store::Store, acc: &AssetAccount) -> 
         _ => None,
     }
 }
+
+/// How much of an instance's moderation history the Properties window keeps.
+/// Enough to see a pattern, bounded so a channel with a hyperactive mod team
+/// doesn't pull tens of thousands of rows into a popup that shows a summary.
+const INSTANCE_MODERATION_CAP: i64 = 500;
 
 impl InstancePropsPopupState {
     /// Header row: account avatar (or placeholder), channel name, and this
@@ -510,6 +521,165 @@ impl InstancePropsPopupState {
             if trigger_scope_editor(ui, &mut self.block_draft, "inst_block_triggers", false) {
                 self.block_dirty = true;
             }
+            });
+    }
+
+    /// "Chat moderation" section — what this instance's captured chat says
+    /// moderators did while it was recording.
+    ///
+    /// Read-only history, not settings: totals, the chatters it happened to
+    /// most, the room's last mode change, and a scrollable log of the recent
+    /// actions. Only what a passive listener can observe is here — no
+    /// platform ever names the acting moderator, and un-bans are never
+    /// announced, so nothing claims to be a present-tense state.
+    fn instance_props_moderation_section(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::chat::{fmt_timeout_secs, moderation_event_line};
+        egui::CollapsingHeader::new(egui::RichText::new("Chat moderation").strong())
+            .id_salt("inst_props_sec_moderation")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Deletions, timeouts and bans seen in this instance's captured chat. \
+                         Twitch reports them live while recording; YouTube's are read back out \
+                         of the chat sidecar once a capture finishes. Neither platform tells a \
+                         listener who moderated, why, or when someone was un-banned.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if self.moderation.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Nothing recorded — no moderation seen, chat logging off, or a \
+                             platform whose chat isn't captured (Kick).",
+                        )
+                        .weak(),
+                    );
+                    return;
+                }
+                let (mut del, mut to, mut bans, mut purge, mut clears, mut modes) =
+                    (0, 0, 0, 0, 0, 0);
+                // Who it happened to, most-moderated first. Keyed by name
+                // rather than id: a name is what the user recognises, and the
+                // ids differ per platform anyway.
+                let mut per_user: std::collections::HashMap<&str, i64> =
+                    std::collections::HashMap::new();
+                for e in &self.moderation {
+                    match e.kind.as_str() {
+                        "msg_deleted" => del += 1,
+                        "timeout" => to += 1,
+                        "ban" => bans += 1,
+                        "chat_purge" => purge += 1,
+                        "chat_clear" => clears += 1,
+                        "chat_mode" => modes += 1,
+                        _ => {}
+                    }
+                    if matches!(
+                        e.kind.as_str(),
+                        "msg_deleted" | "timeout" | "ban" | "chat_purge"
+                    ) && !e.actor.is_empty()
+                    {
+                        *per_user.entry(e.actor.as_str()).or_default() += 1;
+                    }
+                }
+                egui::Grid::new("props_moderation").num_columns(2).spacing([12.0, 4.0]).show(
+                    ui,
+                    |ui| {
+                        ui.label("Messages deleted");
+                        ui.label(del.to_string());
+                        ui.end_row();
+                        ui.label("Timeouts");
+                        ui.label(to.to_string());
+                        ui.end_row();
+                        ui.label("Bans");
+                        ui.label(bans.to_string());
+                        ui.end_row();
+                        if purge > 0 {
+                            ui.label("Chatters wiped").on_hover_text(
+                                "YouTube removed everything one person had said. The platform \
+                                 doesn't say whether that was a timeout or a ban.",
+                            );
+                            ui.label(purge.to_string());
+                            ui.end_row();
+                        }
+                        if clears > 0 {
+                            ui.label("Chat cleared");
+                            ui.label(clears.to_string());
+                            ui.end_row();
+                        }
+                        if modes > 0 {
+                            ui.label("Mode changes").on_hover_text(
+                                "Slow / followers-only / subs-only / emote-only / unique-chat \
+                                 being switched on or off.",
+                            );
+                            ui.label(modes.to_string());
+                            ui.end_row();
+                        }
+                        // The most recent room-mode change is the closest thing
+                        // to "how is this chat configured" that a listener can
+                        // know — it's a last-seen delta, not the live state.
+                        if let Some(last_mode) =
+                            self.moderation.iter().find(|e| e.kind == "chat_mode")
+                        {
+                            ui.label("Last mode change").on_hover_text(
+                                "The last room-state change seen while recording — not \
+                                 necessarily how the chat is set up right now.",
+                            );
+                            ui.label(format!(
+                                "{} ({})",
+                                last_mode.detail,
+                                fmt_datetime_short(last_mode.at)
+                            ));
+                            ui.end_row();
+                        }
+                    },
+                );
+                if !per_user.is_empty() {
+                    let mut top: Vec<(&str, i64)> = per_user.into_iter().collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    top.truncate(5);
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Most moderated:").weak()).on_hover_text(
+                        "Chatters with the most recorded actions against them, across this \
+                         instance's whole captured history.",
+                    );
+                    for (name, n) in top {
+                        ui.label(
+                            egui::RichText::new(format!("{name} — {n} action(s)")).small(),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Recent:").weak());
+                egui::ScrollArea::vertical()
+                    .id_salt("inst_props_moderation_log")
+                    .max_height(140.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for e in &self.moderation {
+                            let who = if e.actor.is_empty() { "—" } else { e.actor.as_str() };
+                            let what = match e.kind.as_str() {
+                                "chat_clear" => "chat cleared".to_string(),
+                                "chat_mode" => e.detail.clone(),
+                                "role_change" => format!("{who} {}", e.detail),
+                                "timeout" => {
+                                    format!("{who} timed out for {}", fmt_timeout_secs(e.amount))
+                                }
+                                _ => format!("{who}: {}", moderation_event_line(e)),
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                ui.label(
+                                    egui::RichText::new(fmt_datetime_short(e.at))
+                                        .monospace()
+                                        .small()
+                                        .weak(),
+                                );
+                                ui.label(egui::RichText::new(what).small());
+                            });
+                        }
+                    });
             });
     }
 
@@ -1199,6 +1369,7 @@ impl StreamArchiverApp {
                 self.instance_scope_drafts.remove(&mid);
                 self.instance_trigger_drafts.remove(&mid);
                 self.instance_block_drafts.remove(&mid);
+                self.instance_moderation.remove(&mid);
                 // Free the shared per-channel asset caches when this was the
                 // last Properties window (channel or instance) showing them.
                 let cid = self.rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
@@ -1265,6 +1436,20 @@ impl StreamArchiverApp {
         self.instance_block_drafts
             .entry(m.id)
             .or_insert_with(|| crate::triggers::load_monitor_block_scope(&self.core.store, m.id));
+        // Queried once per open and held for the window's lifetime, like the
+        // drafts above: this is history, it doesn't change while you look at
+        // it, and re-running it every pass would put a DB read on the popup's
+        // render path.
+        let moderation = self
+            .instance_moderation
+            .entry(m.id)
+            .or_insert_with(|| {
+                self.core
+                    .store
+                    .moderation_events_for_monitor(m.id, INSTANCE_MODERATION_CAP)
+                    .unwrap_or_default()
+            })
+            .clone();
         let global_order = load_source_order(&self.core.store);
 
         let popup_state = self.instance_props_registry.get_or_init(mid, || InstancePropsPopupState {
@@ -1283,6 +1468,7 @@ impl StreamArchiverApp {
             trigger_draft: self.instance_trigger_drafts.get(&mid).cloned().unwrap_or_default(),
             block_draft: self.instance_block_drafts.get(&mid).cloned().unwrap_or_default(),
             global_order: global_order.clone(),
+            moderation: moderation.clone(),
             refetch: false,
             open_emote_viewer: None,
             open_asset_history: false,
@@ -1313,6 +1499,7 @@ impl StreamArchiverApp {
             s.trigger_draft = self.instance_trigger_drafts.get(&mid).cloned().unwrap_or_default();
             s.block_draft = self.instance_block_drafts.get(&mid).cloned().unwrap_or_default();
             s.global_order = global_order;
+            s.moderation = moderation;
         }
 
         let shared = self.popup_shared();
@@ -1350,6 +1537,9 @@ impl StreamArchiverApp {
                 if s.inst_account.is_some() {
                     s.instance_props_assets_section(ui, shared);
                 }
+
+                // ── Chat moderation (this instance) ──────────────────────
+                s.instance_props_moderation_section(ui);
 
                 // ── Trigger words (this instance) ────────────────────────
                 s.instance_props_triggers_section(ui);

@@ -935,22 +935,24 @@ impl EventTracker {
             .filter(|v| *v > 0)
             .unwrap_or_else(|| crate::models::now_unix() * 1000);
         let trailing = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
-        let ev = |kind: &'static str, actor: String, amount: i64, detail: String| ChatEvent {
-            kind,
-            actor,
-            target: String::new(),
-            amount,
-            tier: String::new(),
-            detail,
-            ts: ts / 1000,
+        // `target` carries the platform's stable id for the chatter in `actor`
+        // where one is available (see `StreamEventRow::target`) — for the
+        // moderation kinds that's `target-user-id`, which survives a display-
+        // name change and is what a usercard matches on.
+        let ev = |kind: &'static str, actor: String, target: String, amount: i64, detail: String| {
+            ChatEvent { kind, actor, target, amount, tier: String::new(), detail, ts: ts / 1000 }
         };
+        let user_id = || tag("target-user-id").unwrap_or("").to_string();
 
         if after.starts_with("CLEARMSG ") {
             // A single message deleted by a moderator; the trailing param is
             // the original text (already archived — the marker just flags it).
             let login = tag("login").unwrap_or("").to_string();
             let target_id = tag("target-msg-id").unwrap_or("");
-            events.push(ev("msg_deleted", login.clone(), 0, excerpt(trailing, 120)));
+            // CLEARMSG identifies the author by login only — no user id — so
+            // this row's `target` stays empty and the usercard matches it by
+            // name (see `Store::moderation_events_for_user`).
+            events.push(ev("msg_deleted", login.clone(), String::new(), 0, excerpt(trailing, 120)));
             if !target_id.is_empty() {
                 markers.push(format!(
                     r#"{{"ts":{ts},"marker":"del","id":{}}}"#,
@@ -961,20 +963,20 @@ impl EventTracker {
             let target = trailing.trim();
             if target.is_empty() {
                 // Full chat clear.
-                events.push(ev("chat_clear", String::new(), 0, String::new()));
+                events.push(ev("chat_clear", String::new(), String::new(), 0, String::new()));
                 markers.push(format!(r#"{{"ts":{ts},"marker":"clear"}}"#));
             } else {
                 let secs = tag("ban-duration").and_then(|v| v.parse::<i64>().ok());
                 match secs {
                     Some(d) => {
-                        events.push(ev("timeout", target.to_string(), d, String::new()));
+                        events.push(ev("timeout", target.to_string(), user_id(), d, String::new()));
                         markers.push(format!(
                             r#"{{"ts":{ts},"marker":"purge","login":{},"secs":{d}}}"#,
                             serde_json::Value::from(target)
                         ));
                     }
                     None => {
-                        events.push(ev("ban", target.to_string(), 0, String::new()));
+                        events.push(ev("ban", target.to_string(), user_id(), 0, String::new()));
                         markers.push(format!(
                             r#"{{"ts":{ts},"marker":"purge","login":{}}}"#,
                             serde_json::Value::from(target)
@@ -1055,7 +1057,7 @@ impl EventTracker {
                         changes.push(format!("Subs-only {}", if v { "on" } else { "off" }));
                     }
                     for c in changes {
-                        events.push(ev("chat_mode", String::new(), 0, c.clone()));
+                        events.push(ev("chat_mode", String::new(), String::new(), 0, c.clone()));
                         markers.push(format!(
                             r#"{{"ts":{ts},"marker":"notice","text":{}}}"#,
                             serde_json::Value::from(c)
@@ -1096,7 +1098,7 @@ impl EventTracker {
                     _ => {}
                 }
                 for d in deltas {
-                    events.push(ev("role_change", name.clone(), 0, d.to_string()));
+                    events.push(ev("role_change", name.clone(), String::new(), 0, d.to_string()));
                     markers.push(format!(
                         r#"{{"ts":{ts},"marker":"notice","text":{}}}"#,
                         serde_json::Value::from(format!("{name} {d}"))
@@ -1368,16 +1370,23 @@ mod tests {
         let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
         assert_eq!((m["marker"].as_str(), m["id"].as_str()), (Some("del"), Some("abc-123")));
 
-        let timeout = "@ban-duration=600;tmi-sent-ts=1700000011000 \
+        // CLEARMSG names the author by login only — no account id to record.
+        assert!(evs[0].target.is_empty());
+
+        let timeout = "@ban-duration=600;target-user-id=4242;tmi-sent-ts=1700000011000 \
                        :tmi.twitch.tv CLEARCHAT #streamer :spammer";
         let (evs, marks) = t.track(timeout);
         assert_eq!((evs[0].kind, evs[0].amount), ("timeout", 600));
+        // The stable account id, which survives a display-name change.
+        assert_eq!(evs[0].target, "4242");
         let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
         assert_eq!(m["secs"].as_i64(), Some(600));
 
-        let ban = "@tmi-sent-ts=1700000012000 :tmi.twitch.tv CLEARCHAT #streamer :spammer";
+        let ban = "@target-user-id=4242;tmi-sent-ts=1700000012000 \
+                   :tmi.twitch.tv CLEARCHAT #streamer :spammer";
         let (evs, marks) = t.track(ban);
         assert_eq!(evs[0].kind, "ban");
+        assert_eq!(evs[0].target, "4242");
         let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
         assert!(m["secs"].is_null(), "no duration = permanent ban");
 

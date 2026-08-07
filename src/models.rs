@@ -2458,11 +2458,19 @@ pub struct StreamEventRow {
     pub stream_id: String,
     /// `sub` | `resub` | `subgift` | `bits` | `raid_in` | `raid_out`, plus
     /// the chat-moderation kinds (v60): `msg_deleted` | `timeout` | `ban` |
-    /// `chat_clear` | `chat_mode` | `role_change`.
+    /// `chat_clear` | `chat_mode` | `role_change`, and `chat_purge` (v89 —
+    /// YouTube's "all of this author's messages were removed", which that
+    /// platform reports without saying whether it was a timeout or a ban).
     pub kind: String,
-    /// Who did it: subscriber, gifter, cheerer, or incoming raider.
+    /// Who did it: subscriber, gifter, cheerer, incoming raider — or, for the
+    /// moderation kinds, the chatter it was done TO (the acting moderator is
+    /// never disclosed by either platform's anonymous feed).
     pub actor: String,
     /// Gift recipient (`''` for a community batch) or outgoing-raid target.
+    /// For the moderation kinds it's the platform's **stable id** for the
+    /// chatter named in `actor` — Twitch's `target-user-id`, YouTube's `UC…`
+    /// channel id — which is what survives a display-name change. `''` when
+    /// the source didn't give one (Twitch `CLEARMSG` carries only a login).
     pub target: String,
     /// Bits cheered, gift-batch size, raid party size, resub months, or
     /// timeout seconds.
@@ -2490,6 +2498,91 @@ pub struct StreamEventRow {
     /// Current level (schema v86; `hype_train` rows only, `0` otherwise) —
     /// stored as its own column rather than parsed back out of `detail`.
     pub level: i64,
+}
+
+/// What one chatter's recorded moderation history adds up to, newest action
+/// first — see [`ModerationSummary`].
+///
+/// Every variant is **as of the last thing we recorded**, never a live lookup:
+/// neither platform tells an anonymous listener about un-bans or un-timeouts,
+/// so a `Banned` chatter may well have been forgiven since. The UI wording has
+/// to say "last known", not "is".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModerationState {
+    /// Nothing on record.
+    Clean,
+    /// Messages removed individually, but never timed out or banned.
+    MessagesDeleted,
+    /// Twitch timeout with a known duration. `until` is when it lapsed (or
+    /// lapses) — compare against the clock to tell "currently muted" from
+    /// "was muted for a while, ages ago".
+    TimedOut { at: i64, secs: i64, until: i64 },
+    /// Twitch permanent ban (`CLEARCHAT` with no duration).
+    Banned { at: i64 },
+    /// YouTube removed everything this author had said. The action doesn't say
+    /// whether a moderator hid them temporarily or banned them outright, so
+    /// this deliberately claims neither.
+    Purged { at: i64 },
+}
+
+/// One chatter's moderation record within a channel: the derived
+/// [`ModerationState`] plus the raw counts behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModerationSummary {
+    pub deleted: usize,
+    pub timeouts: usize,
+    pub bans: usize,
+    pub purges: usize,
+    /// When the most recent action of any kind landed (`0` = none).
+    pub last_at: i64,
+}
+
+impl ModerationSummary {
+    /// Fold this chatter's moderation rows (any order, any of the four
+    /// per-user kinds — room-wide kinds are ignored) into counts.
+    pub fn from_events(events: &[StreamEventRow]) -> ModerationSummary {
+        let mut s = ModerationSummary::default();
+        for e in events {
+            match e.kind.as_str() {
+                "msg_deleted" => s.deleted += 1,
+                "timeout" => s.timeouts += 1,
+                "ban" => s.bans += 1,
+                "chat_purge" => s.purges += 1,
+                _ => continue,
+            }
+            s.last_at = s.last_at.max(e.at);
+        }
+        s
+    }
+
+    /// The strongest thing on record, decided by **recency** rather than
+    /// severity: a ban followed by a later timeout means the ban was lifted at
+    /// some point (we never see the un-ban itself), so the timeout is the
+    /// truer "last known" state. Individual deletions only speak when nothing
+    /// heavier ever happened.
+    pub fn state(&self, events: &[StreamEventRow]) -> ModerationState {
+        let latest = events
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "timeout" | "ban" | "chat_purge"))
+            .max_by_key(|e| e.at);
+        match latest {
+            Some(e) if e.kind == "timeout" => ModerationState::TimedOut {
+                at: e.at,
+                secs: e.amount,
+                until: e.at + e.amount.max(0),
+            },
+            Some(e) if e.kind == "ban" => ModerationState::Banned { at: e.at },
+            Some(e) => ModerationState::Purged { at: e.at },
+            None if self.deleted > 0 => ModerationState::MessagesDeleted,
+            None => ModerationState::Clean,
+        }
+    }
+
+    /// True when nothing at all is on record — the common case, and the one
+    /// where the UI shows a single reassuring line instead of a section.
+    pub fn is_clean(&self) -> bool {
+        self.deleted == 0 && self.timeouts == 0 && self.bans == 0 && self.purges == 0
+    }
 }
 
 /// One broadcast's aggregate line in the Channel Stats per-stream breakdown
@@ -3267,6 +3360,76 @@ pub fn group_recordings(recordings: &[Recording]) -> Vec<StreamGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mod_event(kind: &str, at: i64, amount: i64) -> StreamEventRow {
+        StreamEventRow {
+            id: 0,
+            monitor_id: 1,
+            at,
+            stream_id: String::new(),
+            kind: kind.to_string(),
+            actor: "spammer".into(),
+            target: String::new(),
+            amount,
+            tier: String::new(),
+            detail: String::new(),
+            goal: 0,
+            expires_at: 0,
+            level: 0,
+        }
+    }
+
+    #[test]
+    fn moderation_state_is_the_most_recent_action_not_the_harshest() {
+        // A ban, then a later timeout: the un-ban itself is never announced to
+        // a listener, but a subsequent timeout proves they were let back in —
+        // so "timed out" is the honest last-known state, not "banned".
+        let events = vec![mod_event("ban", 1_000, 0), mod_event("timeout", 2_000, 600)];
+        let s = ModerationSummary::from_events(&events);
+        assert_eq!((s.bans, s.timeouts, s.last_at), (1, 1, 2_000));
+        assert_eq!(
+            s.state(&events),
+            ModerationState::TimedOut { at: 2_000, secs: 600, until: 2_600 }
+        );
+
+        // The other way round, the ban stands.
+        let events = vec![mod_event("timeout", 1_000, 600), mod_event("ban", 2_000, 0)];
+        let s = ModerationSummary::from_events(&events);
+        assert_eq!(s.state(&events), ModerationState::Banned { at: 2_000 });
+    }
+
+    #[test]
+    fn moderation_state_deletions_alone_and_nothing_at_all() {
+        let none: Vec<StreamEventRow> = Vec::new();
+        let s = ModerationSummary::from_events(&none);
+        assert!(s.is_clean());
+        assert_eq!(s.state(&none), ModerationState::Clean);
+
+        // Deleted messages only speak when nothing heavier ever happened.
+        let events = vec![mod_event("msg_deleted", 10, 0), mod_event("msg_deleted", 20, 0)];
+        let s = ModerationSummary::from_events(&events);
+        assert!(!s.is_clean());
+        assert_eq!(s.deleted, 2);
+        assert_eq!(s.state(&events), ModerationState::MessagesDeleted);
+    }
+
+    #[test]
+    fn youtube_removal_claims_neither_timeout_nor_ban() {
+        let events = vec![mod_event("chat_purge", 5_000, 0)];
+        let s = ModerationSummary::from_events(&events);
+        assert_eq!((s.purges, s.bans, s.timeouts), (1, 0, 0));
+        assert_eq!(s.state(&events), ModerationState::Purged { at: 5_000 });
+    }
+
+    #[test]
+    fn moderation_summary_ignores_room_wide_kinds() {
+        // `chat_clear`/`chat_mode`/`role_change` describe the room, not a
+        // person — they must never make a chatter look moderated.
+        let events = vec![mod_event("chat_clear", 1, 0), mod_event("chat_mode", 2, 0)];
+        let s = ModerationSummary::from_events(&events);
+        assert!(s.is_clean() && s.last_at == 0);
+        assert_eq!(s.state(&events), ModerationState::Clean);
+    }
 
     #[test]
     fn auto_record_on_requires_both_channel_and_monitor_enabled() {

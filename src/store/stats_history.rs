@@ -36,6 +36,27 @@ pub const K_VH_DOWNSAMPLE_LAST: &str = "viewer_history_downsample_last";
 /// Window within which a raid observed by both chat and EventSub is one event.
 const RAID_DEDUP_SECS: i64 = 300;
 
+/// Map a `stream_event` row selected in the canonical column order
+/// (`monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id,
+/// goal, expires_at, level`) into a [`StreamEventRow`].
+fn map_stream_event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StreamEventRow> {
+    Ok(StreamEventRow {
+        monitor_id: r.get(0)?,
+        at: r.get(1)?,
+        stream_id: r.get(2)?,
+        kind: r.get(3)?,
+        actor: r.get(4)?,
+        target: r.get(5)?,
+        amount: r.get(6)?,
+        tier: r.get(7)?,
+        detail: r.get(8)?,
+        id: r.get(9)?,
+        goal: r.get(10)?,
+        expires_at: r.get(11)?,
+        level: r.get(12)?,
+    })
+}
+
 impl Store {
     /// Fold one tick's live viewer samples into minute buckets. `samples` =
     /// `(monitor_id, viewers, followers, stream_id)`; viewers keep the bucket
@@ -274,6 +295,67 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every chat-moderation event this channel has recorded against one
+    /// chatter, newest first — what the chat usercard's 🔨 Moderation section
+    /// and [`crate::models::ModerationState`] are built from.
+    ///
+    /// Matched two ways because the two platforms identify a chatter
+    /// differently: Twitch rows carry the display name in `actor`, YouTube's
+    /// (harvested by [`crate::chat_scan`]) carry the name there too but also
+    /// the stable `UC…` channel id in `target`, which survives a display-name
+    /// change. Pass `id_key = ""` when there is no id to match on.
+    pub fn moderation_events_for_user(
+        &self,
+        channel_id: i64,
+        name: &str,
+        id_key: &str,
+        limit: i64,
+    ) -> Result<Vec<StreamEventRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT e.monitor_id, e.at, e.stream_id, e.kind, e.actor, e.target, e.amount, e.tier,
+                    e.detail, e.id, e.goal, e.expires_at, e.level
+             FROM stream_event e
+             JOIN monitor m ON m.id = e.monitor_id
+             WHERE m.channel_id = ?1
+               AND e.kind IN ('msg_deleted', 'timeout', 'ban', 'chat_purge')
+               AND (lower(e.actor) = lower(?2) OR (?3 != '' AND e.target = ?3))
+             ORDER BY e.at DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id, name, id_key, limit], map_stream_event_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every chat-moderation and room-state event recorded for one capture
+    /// instance, newest first — the instance Properties "Chat moderation"
+    /// section. Includes the context kinds (`chat_clear`, `chat_mode`,
+    /// `role_change`) that [`Self::moderation_events_for_user`] leaves out,
+    /// since those describe the room rather than any one chatter.
+    pub fn moderation_events_for_monitor(
+        &self,
+        monitor_id: i64,
+        limit: i64,
+    ) -> Result<Vec<StreamEventRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id,
+                    goal, expires_at, level
+             FROM stream_event
+             WHERE monitor_id = ?1
+               AND kind IN ('msg_deleted', 'timeout', 'ban', 'chat_purge', 'chat_clear',
+                            'chat_mode', 'role_change')
+             ORDER BY at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, limit], map_stream_event_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The most recent `raid_out` event for a monitor, if any — powers the
     /// "Follow raid" play action and the auto-record orchestration. `target`
     /// is the raid target's display name; `detail` carries its resolved
@@ -508,7 +590,7 @@ impl Store {
                 "bits" => e[2] += amount,
                 "raid_in" => e[3] += count,
                 "raid_out" => e[4] += count,
-                "msg_deleted" | "timeout" | "ban" => e[5] += count,
+                "msg_deleted" | "timeout" | "ban" | "chat_purge" => e[5] += count,
                 _ => {}
             }
         }
@@ -571,7 +653,7 @@ impl Store {
                     "bits" => s.totals[2] += e.amount,
                     "raid_in" => s.totals[3] += 1,
                     "raid_out" => s.totals[4] += 1,
-                    "msg_deleted" | "timeout" | "ban" => s.totals[5] += 1,
+                    "msg_deleted" | "timeout" | "ban" | "chat_purge" => s.totals[5] += 1,
                     _ => {}
                 }
             }
@@ -634,7 +716,7 @@ impl Store {
                     "bits" => s.totals[2] += e.amount,
                     "raid_in" => s.totals[3] += 1,
                     "raid_out" => s.totals[4] += 1,
-                    "msg_deleted" | "timeout" | "ban" => s.totals[5] += 1,
+                    "msg_deleted" | "timeout" | "ban" | "chat_purge" => s.totals[5] += 1,
                     _ => {}
                 }
             }
@@ -857,6 +939,45 @@ mod tests {
         let m = sample_monitor(cid);
         let mid = store.insert_monitor(&m).unwrap();
         (cid, mid)
+    }
+
+    #[test]
+    fn moderation_queries_match_by_name_or_stable_id_and_split_room_kinds() {
+        let store = Store::open_in_memory().unwrap();
+        let (cid, mid) = channel_with_monitor(&store);
+        let ev = |at, kind, actor, target, amount| {
+            store.record_stream_event(mid, at, "s1", kind, actor, target, amount, "", "").unwrap()
+        };
+        // Twitch: matched by display name; the timeout also carries the id.
+        ev(100, "msg_deleted", "Spammer", "", 0);
+        ev(110, "timeout", "Spammer", "4242", 600);
+        // YouTube: display name changed since, so only the channel id matches.
+        ev(120, "chat_purge", "OldName", "UCyt", 0);
+        // Room-wide and unrelated kinds must never come back as "this user's".
+        ev(130, "chat_clear", "", "", 0);
+        ev(140, "bits", "Spammer", "", 500);
+        ev(150, "ban", "SomeoneElse", "", 0);
+
+        // Case-insensitive on the name, newest first.
+        let mine = store.moderation_events_for_user(cid, "spammer", "", 50).unwrap();
+        assert_eq!(
+            mine.iter().map(|e| (e.at, e.kind.as_str())).collect::<Vec<_>>(),
+            vec![(110, "timeout"), (100, "msg_deleted")],
+        );
+        // The renamed YouTube chatter is found by id even though the name misses.
+        let by_id = store.moderation_events_for_user(cid, "NewName", "UCyt", 50).unwrap();
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].kind, "chat_purge");
+        // An empty id must not match every row whose target happens to be ''.
+        let nobody = store.moderation_events_for_user(cid, "NobodyHere", "", 50).unwrap();
+        assert!(nobody.is_empty());
+
+        // The per-instance view keeps the room-wide kinds and drops the rest.
+        let all = store.moderation_events_for_monitor(mid, 50).unwrap();
+        let kinds: Vec<&str> = all.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"chat_clear"));
+        assert!(!kinds.contains(&"bits"), "non-moderation events stay out");
+        assert_eq!(all.len(), 5);
     }
 
     #[test]
