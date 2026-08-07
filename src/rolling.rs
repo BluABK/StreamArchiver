@@ -17,6 +17,89 @@
 //! (`crate::manual_delete`), so the take's title, stats, chat log, chapters and
 //! notes all survive and only the video is gone.
 
+use tracing::{info, warn};
+
+use crate::events::{AppEvent, EventTx};
+use crate::store::Store;
+
+/// `app_settings` key holding the unix time of the last expiry sweep, so a
+/// restart-heavy session doesn't re-scan on every scheduler tick.
+const K_LAST_SWEEP: &str = "rolling_last_sweep";
+/// Minimum gap between expiry sweeps. A rolling TTL is measured in hours, so
+/// a minute of slack either way is irrelevant — this exists only to keep the
+/// query off the every-tick path.
+const SWEEP_INTERVAL_SECS: i64 = 60;
+
+/// Dispose of every rolling take whose TTL has elapsed without being kept.
+///
+/// Self-throttled to [`SWEEP_INTERVAL_SECS`] — call it from the scheduler tick
+/// alongside the log-retention and DB-backup sweeps and let it decide.
+///
+/// Each expiry is the same two steps the manual "Delete file from disk" action
+/// performs (`ui::dialogs::spawn_manual_delete_file`): dispose of the media by
+/// the configured method, then clear `output_path`. The history row is left
+/// entirely alone, so the take keeps its title, stats, chat log, chapters and
+/// notes and only loses the video.
+///
+/// A disposal failure is logged and **not** stamped as expired, so the next
+/// sweep retries — matching this codebase's "disposal failures never escalate"
+/// rule. A take whose file has already vanished is stamped without a disposal
+/// attempt.
+pub async fn maybe_sweep_rolling(store: &Store, events: &EventTx, now: i64) {
+    let last = store
+        .get_setting(K_LAST_SWEEP)
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if now - last < SWEEP_INTERVAL_SECS {
+        return;
+    }
+    let _ = store.set_setting(K_LAST_SWEEP, &now.to_string());
+
+    let due = match store.expired_rolling_recordings(now) {
+        Ok(v) if v.is_empty() => return,
+        Ok(v) => v,
+        Err(e) => {
+            warn!("rolling: expiry query failed: {e:#}");
+            return;
+        }
+    };
+    info!(count = due.len(), "rolling: disposing of expired recordings");
+    for r in due {
+        let path = std::path::PathBuf::from(&r.output_path);
+        // Already gone (moved/deleted outside the app): nothing to dispose of,
+        // but the take is still expired — stamp it so it stops being queried.
+        if crate::iomon::fs::metadata(crate::iomon::Cat::CacheSweep, &path).await.is_err() {
+            let _ = store.mark_rolling_expired(r.rec_id, now);
+            let _ = store.update_recording_output_path(r.rec_id, "");
+            let _ = events.send(AppEvent::RecordingUpdated { recording_id: r.rec_id });
+            continue;
+        }
+        match crate::disposal::dispose_media(
+            store,
+            r.channel_id,
+            r.monitor_id,
+            &path,
+            r.rec_id,
+            "rolling recording expired",
+        )
+        .await
+        {
+            Ok(d) => {
+                let _ = store.update_recording_output_path(r.rec_id, "");
+                let _ = store.mark_rolling_expired(r.rec_id, now);
+                let _ = events.send(AppEvent::RecordingUpdated { recording_id: r.rec_id });
+                info!(rec_id = r.rec_id, path = %r.output_path, "rolling: {}", d.describe());
+            }
+            Err(e) => {
+                // Left un-stamped on purpose: the next sweep tries again.
+                warn!(rec_id = r.rec_id, path = %r.output_path, "rolling: disposal failed: {e}");
+            }
+        }
+    }
+}
+
 /// Render a stored TTL (seconds) for the hours-based text field the
 /// channel/instance forms use. `None` (inherit) is an empty field.
 pub fn secs_to_hours_field(secs: Option<i64>) -> String {

@@ -568,6 +568,9 @@ async fn tick(
     crate::app_paths::maybe_prune_old_logs(&ctx.store, checked_at);
     // Rolling database backup sweep (runs at most every `db_backup_interval_hours`).
     crate::db_backup::maybe_run_backup(&ctx.store, checked_at);
+    // Rolling-recording expiry sweep (self-throttled to once a minute; a no-op
+    // single query when nothing is due).
+    crate::rolling::maybe_sweep_rolling(&ctx.store, events, checked_at).await;
 
     // ── Twitch "Stream Together" collab refresh ──
     // Piggybacks each monitor's own poll cadence (only monitors polled this

@@ -3769,6 +3769,14 @@ progress_info: None,
                 trigger_rule_json,
             )
             .unwrap_or(0);
+        // Rolling mode is resolved ONCE here and frozen onto the take, the same
+        // way `trigger_rule_json` is: a later settings change must not re-time
+        // (or newly endanger) a take that is already recorded. See
+        // `crate::rolling`.
+        if let Some(ttl) = crate::disposal::effective_rolling(&self.store, row.channel.id, monitor_id)
+        {
+            let _ = self.store.set_recording_rolling_ttl(rec_id, ttl);
+        }
         let _ = self
             .store
             .set_monitor_check_result(monitor_id, "recording", started_at);

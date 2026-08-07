@@ -6,6 +6,17 @@ use super::*;
 /// `(id, started_at, ended_at, status)` — see `Store::earlier_takes_for_stream`.
 pub type EarlierTakeRow = (i64, i64, Option<i64>, String);
 
+/// One rolling take due for disposal — everything
+/// [`crate::disposal::dispose_media`] needs, without a second lookup. See
+/// [`Store::expired_rolling_recordings`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredRolling {
+    pub rec_id: i64,
+    pub monitor_id: i64,
+    pub channel_id: i64,
+    pub output_path: String,
+}
+
 impl Store {
     // ----- recordings -----
 
@@ -31,6 +42,93 @@ impl Store {
             params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64, stream_id, take_group, trigger_info, trigger_rule_json],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Stamp a freshly-inserted take with the rolling TTL resolved for its
+    /// instance (see [`crate::disposal::effective_rolling`]).
+    ///
+    /// Deliberately a second statement rather than another parameter on
+    /// [`Self::insert_recording`], whose argument list is already at the
+    /// `too_many_arguments` limit and which a dozen tests call positionally.
+    /// The gap between the two writes is harmless: the sweep only ever looks
+    /// at takes that have already ended.
+    pub fn set_recording_rolling_ttl(&self, rec_id: i64, ttl_secs: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET rolling_ttl_secs = ?2 WHERE id = ?1",
+            params![rec_id, ttl_secs],
+        )?;
+        Ok(())
+    }
+
+    /// **Keep** a rolling take: it stops counting down and becomes an ordinary
+    /// archived stream that happens to have come from a rolling recording.
+    pub fn keep_rolling_recording(&self, rec_id: i64, now: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET rolling_kept_at = ?2 WHERE id = ?1 AND rolling_expired_at = 0",
+            params![rec_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// **Unkeep**: put a kept take back in the rolling set, with the clock
+    /// **restarted** from `now` rather than resumed from when it ended —
+    /// otherwise un-keeping anything older than its TTL would delete it on the
+    /// next sweep, seconds later. See [`crate::models::Rolling::from`].
+    pub fn unkeep_rolling_recording(&self, rec_id: i64, now: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET rolling_kept_at = 0, rolling_from = ?2
+             WHERE id = ?1 AND rolling_expired_at = 0",
+            params![rec_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a take as expired once the sweep has disposed of its file.
+    pub fn mark_rolling_expired(&self, rec_id: i64, now: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET rolling_expired_at = ?2 WHERE id = ?1",
+            params![rec_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Rolling takes whose TTL has elapsed and which the user never kept —
+    /// what [`crate::rolling`]'s sweep disposes of.
+    ///
+    /// Excludes, in order: non-rolling takes, already-kept ones, already-swept
+    /// ones, takes still recording (`ended_at IS NULL` — the clock only starts
+    /// when the capture finishes) and takes with no file left to delete. The
+    /// deadline mirrors `Rolling::deadline`: `rolling_from` when the user
+    /// un-kept it, otherwise `ended_at`.
+    pub fn expired_rolling_recordings(&self, now: i64) -> Result<Vec<ExpiredRolling>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.monitor_id, m.channel_id, COALESCE(r.output_path, '')
+             FROM recording r JOIN monitor m ON m.id = r.monitor_id
+             WHERE r.rolling_ttl_secs > 0
+               AND r.rolling_kept_at = 0
+               AND r.rolling_expired_at = 0
+               AND r.ended_at IS NOT NULL
+               AND COALESCE(r.output_path, '') != ''
+               AND (CASE WHEN r.rolling_from > 0 THEN r.rolling_from ELSE r.ended_at END)
+                   + r.rolling_ttl_secs <= ?1
+             ORDER BY r.id",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |r| {
+                Ok(ExpiredRolling {
+                    rec_id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    channel_id: r.get(2)?,
+                    output_path: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Currently-open "seen live but not recorded" session for this monitor
@@ -2997,6 +3095,88 @@ mod tests {
         store.set_head_backfill_state(rid, "").unwrap();
         assert!(store.queued_head_backfills().unwrap().is_empty());
         assert_eq!(store.get_recording(rid).unwrap().unwrap().head_backfill_state, "");
+    }
+
+    #[test]
+    fn expired_rolling_recordings_excludes_everything_that_isnt_actually_due() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        const TTL: i64 = 3600;
+        const ENDED: i64 = 10_000;
+        let now = ENDED + TTL + 1; // one second past every deadline below
+
+        // Helper: a finished take with a file, optionally rolling.
+        let take = |n: i64, ttl: i64| {
+            let rid = store
+                .insert_recording(mid, n, &format!("C:/tmp/{n}.mkv"), None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, ENDED, 1, Some(0), "completed", &format!("C:/tmp/{n}.mkv"), "").unwrap();
+            if ttl > 0 {
+                store.set_recording_rolling_ttl(rid, ttl).unwrap();
+            }
+            rid
+        };
+
+        let due = take(1, TTL);
+        let not_rolling = take(2, 0);
+        let kept = take(3, TTL);
+        store.keep_rolling_recording(kept, now).unwrap();
+        let already_swept = take(4, TTL);
+        store.mark_rolling_expired(already_swept, now).unwrap();
+        let no_file = take(5, TTL);
+        store.update_recording_output_path(no_file, "").unwrap();
+        // Still recording: no `ended_at`, so the clock hasn't started.
+        let recording = store
+            .insert_recording(mid, 6, "C:/tmp/6.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store.set_recording_rolling_ttl(recording, TTL).unwrap();
+
+        let got: Vec<i64> =
+            store.expired_rolling_recordings(now).unwrap().into_iter().map(|r| r.rec_id).collect();
+        assert_eq!(got, vec![due], "only the genuinely-due take");
+        let _ = (not_rolling, kept, already_swept, no_file, recording);
+
+        // One second before the deadline it isn't due yet.
+        assert!(store.expired_rolling_recordings(ENDED + TTL - 1).unwrap().is_empty());
+
+        // The due row carries what `dispose_media` needs, no second lookup.
+        let row = &store.expired_rolling_recordings(now).unwrap()[0];
+        assert_eq!((row.monitor_id, row.channel_id), (mid, cid));
+        assert_eq!(row.output_path, "C:/tmp/1.mkv");
+    }
+
+    #[test]
+    fn unkeep_restarts_the_countdown_so_an_old_take_isnt_instantly_due() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        const TTL: i64 = 3600;
+        let rid = store
+            .insert_recording(mid, 1, "C:/tmp/a.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store.finish_recording(rid, 100, 1, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+        store.set_recording_rolling_ttl(rid, TTL).unwrap();
+
+        let now = 1_000_000; // aeons past `ended_at + TTL`
+        assert_eq!(store.expired_rolling_recordings(now).unwrap().len(), 1);
+
+        // Keeping takes it out of the sweep entirely…
+        store.keep_rolling_recording(rid, now).unwrap();
+        assert!(store.expired_rolling_recordings(now).unwrap().is_empty());
+
+        // …and un-keeping puts it back with a FULL fresh TTL, not instantly due.
+        store.unkeep_rolling_recording(rid, now).unwrap();
+        assert!(
+            store.expired_rolling_recordings(now).unwrap().is_empty(),
+            "unkeep must restart the clock, not resume an already-elapsed one"
+        );
+        assert_eq!(store.expired_rolling_recordings(now + TTL).unwrap().len(), 1);
+
+        // An expired take can no longer be kept or un-kept back into the pool.
+        store.mark_rolling_expired(rid, now + TTL).unwrap();
+        store.unkeep_rolling_recording(rid, now + TTL).unwrap();
+        assert!(store.expired_rolling_recordings(now + TTL * 10).unwrap().is_empty());
     }
 
     #[test]
