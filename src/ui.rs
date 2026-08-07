@@ -2101,6 +2101,12 @@ pub struct StreamArchiverApp {
     /// Deferred-viewport state for each open instance-Properties window,
     /// keyed by monitor id — see [`properties::InstancePropsPopupState`].
     instance_props_registry: PopupRegistry<i64, properties::InstancePropsPopupState>,
+    /// Open user-Properties windows, keyed by `(channel id, lowercased
+    /// name)` — one per person per channel, since the same name is a
+    /// different stranger in another channel's records.
+    user_props_popups: Vec<(i64, String)>,
+    /// Deferred-viewport state for each — see [`properties::UserPropsPopupState`].
+    user_props_registry: PopupRegistry<(i64, String), properties::UserPropsPopupState>,
     /// Open channel-Properties windows (one per channel).
     channel_properties_popups: Vec<i64>,
     /// Deferred-viewport state for each open channel-Properties window,
@@ -2659,6 +2665,7 @@ impl StreamArchiverApp {
         self.chat_popup_windows(ctx);
         self.instance_properties_windows(ctx);
         self.channel_properties_windows(ctx);
+        self.user_properties_windows(ctx);
         self.emote_viewer_windows(ctx);
         self.rename_dialog_window(ctx);
         self.asset_history_windows(ctx);

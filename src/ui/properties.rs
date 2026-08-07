@@ -148,6 +148,140 @@ fn cached_channel_meta_line(store: &crate::store::Store, acc: &AssetAccount) -> 
     }
 }
 
+/// How much of one chatter's moderation history the user-Properties window
+/// keeps — a summary window, not an audit log.
+const USER_PROPS_MODERATION_CAP: i64 = 100;
+
+/// Deferred-viewport state for one open user-Properties window. Everything is
+/// snapshotted at open: this is history about a person, and it doesn't move
+/// while you read it.
+pub(super) struct UserPropsPopupState {
+    /// Whose records these are. Kept even though the body renders the
+    /// channel NAME: the id is what a future action (jump to that
+    /// channel, re-query) would need, and it is the key half that makes
+    /// two same-named strangers distinct windows.
+    #[allow(dead_code)]
+    pub(super) channel_id: i64,
+    /// The channel whose records these are — the same name is a stranger
+    /// elsewhere, so the window says whose archive it's speaking for.
+    pub(super) channel: String,
+    pub(super) name: String,
+    /// `summarize_user_events` lines (bits/gifts/raids/subs), shared verbatim
+    /// with the chat usercard.
+    pub(super) stats: Vec<String>,
+    pub(super) moderation: Vec<crate::models::StreamEventRow>,
+    pub(super) summary: crate::models::ModerationSummary,
+    /// Whether this channel has a Twitch instance — decides if a profile link
+    /// can be built from the display name.
+    pub(super) twitch: bool,
+    pub(super) closed: bool,
+}
+
+impl UserPropsPopupState {
+    /// The window body: who they are to this channel, and what it has on
+    /// record about them.
+    fn user_props_body(&mut self, ui: &mut egui::Ui) {
+        let now = crate::models::now_unix();
+        let color = readable_color(twitch_username_color(&self.name), ui.visuals().panel_fill);
+        paint_user_banner(ui, twitch_username_color(&self.name), 32.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&self.name).strong().size(16.0).color(color));
+        });
+        ui.label(
+            egui::RichText::new(format!("as seen by {}", self.channel)).small().weak(),
+        )
+        .on_hover_text(
+            "Everything here comes from what this ONE channel recorded while we were \
+             capturing its chat — not a platform-wide profile.",
+        );
+        ui.separator();
+
+        if self.stats.is_empty() {
+            ui.label(
+                egui::RichText::new("No bits, gift subs or raids on record for this channel.")
+                    .weak(),
+            );
+        } else {
+            for line in &self.stats {
+                ui.label(line);
+            }
+        }
+
+        // ── Moderation ───────────────────────────────────────────────────
+        ui.separator();
+        ui.label(egui::RichText::new("🔨 Moderation:").weak()).on_hover_text(
+            "Timeouts, bans and deleted messages recorded for this chatter across every \
+             broadcast of this channel. Captured passively from chat: neither platform \
+             says WHO moderated, why, or when someone was un-banned, so this is only ever \
+             what was last seen.",
+        );
+        let (line, warn) =
+            crate::ui::chat::moderation_state_line(self.summary.state(&self.moderation), now);
+        if warn {
+            ui.colored_label(grid::HL_ERROR_TEXT, line);
+        } else {
+            ui.label(line);
+        }
+        if !self.summary.is_clean() {
+            let s = self.summary;
+            let mut parts: Vec<String> = Vec::new();
+            if s.deleted > 0 {
+                parts.push(format!("{} message(s) deleted", s.deleted));
+            }
+            if s.timeouts > 0 {
+                parts.push(format!("{} timeout(s)", s.timeouts));
+            }
+            if s.bans > 0 {
+                parts.push(format!("{} ban(s)", s.bans));
+            }
+            if s.purges > 0 {
+                parts.push(format!("{} removal(s)", s.purges));
+            }
+            ui.label(egui::RichText::new(parts.join(" · ")).small().weak());
+            egui::ScrollArea::vertical()
+                .id_salt("user_props_moderation")
+                .max_height(200.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for e in &self.moderation {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            ui.label(
+                                egui::RichText::new(fmt_datetime_short(e.at))
+                                    .monospace()
+                                    .small()
+                                    .weak(),
+                            );
+                            ui.label(
+                                egui::RichText::new(crate::ui::chat::moderation_event_line(e))
+                                    .small(),
+                            );
+                        });
+                    }
+                });
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .button("Copy username")
+                .on_hover_text("Copy this name to the clipboard")
+                .clicked()
+            {
+                ui.ctx().copy_text(self.name.clone());
+            }
+            if self.twitch
+                && ui
+                    .button("Open Twitch profile")
+                    .on_hover_text("Open twitch.tv/{name} in your browser")
+                    .clicked()
+            {
+                crate::platform::open_url(&format!("https://twitch.tv/{}", self.name));
+            }
+        });
+    }
+}
+
 /// How much of an instance's moderation history the Properties window keeps.
 /// Enough to see a pattern, bounded so a channel with a hyperactive mod team
 /// doesn't pull tens of thousands of rows into a popup that shows a summary.
@@ -1984,6 +2118,109 @@ impl StreamArchiverApp {
     /// Properties" context-menu item, or clicking a coloured/linked tracked-
     /// channel name elsewhere in the app (Collab column, name-suffix, Stats
     /// events/leaderboards).
+    /// Open (or focus) the user-Properties window for one chatter of a
+    /// channel — the click target behind every coloured name in an events
+    /// table.
+    ///
+    /// Everything shown is what this channel has already recorded about them,
+    /// queried once here: the same local cross-reference the chat usercard
+    /// does, plus their moderation record. Deliberately NOT the chat usercard
+    /// itself — that one's badges, message count and recent-messages feed all
+    /// come from a loaded chat log, which doesn't exist in this context, and a
+    /// card that silently drops half its sections would read as broken.
+    pub(super) fn open_user_properties(&mut self, channel_id: i64, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let key = (channel_id, name.to_lowercase());
+        if self.user_props_popups.iter().any(|(c, n)| *c == key.0 && *n == key.1) {
+            return; // already open — the viewport focuses itself
+        }
+        let events =
+            self.core.store.stream_events_range(channel_id, 0, crate::models::now_unix()).unwrap_or_default();
+        let moderation = self
+            .core
+            .store
+            .moderation_events_for_user(channel_id, name, "", USER_PROPS_MODERATION_CAP)
+            .unwrap_or_default();
+        let channel = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        // Twitch is the only platform whose chatters have a public profile URL
+        // we can build from a display name.
+        let twitch = self
+            .rows
+            .iter()
+            .any(|r| r.channel.id == channel_id && r.monitor.platform() == Platform::Twitch);
+        let state = UserPropsPopupState {
+            channel_id,
+            channel,
+            name: name.to_string(),
+            stats: crate::ui::chat::summarize_user_events(&events, name),
+            summary: crate::models::ModerationSummary::from_events(&moderation),
+            moderation,
+            twitch,
+            closed: false,
+        };
+        self.user_props_registry.get_or_init(key.clone(), || state);
+        self.user_props_popups.push(key);
+    }
+
+    /// Render every open user-Properties window.
+    pub(super) fn user_properties_windows(&mut self, ctx: &egui::Context) {
+        let open: Vec<(i64, String)> = self.user_props_popups.clone();
+        let mut closed: Vec<(i64, String)> = Vec::new();
+        for key in open {
+            // `open_user_properties` always seeds the registry before pushing
+            // the key, so this only ever hands back the seeded state; the
+            // fallback exists because `get_or_init` has no infallible getter.
+            let state = self.user_props_registry.get_or_init(key.clone(), || UserPropsPopupState {
+                channel_id: key.0,
+                channel: String::new(),
+                name: key.1.clone(),
+                stats: Vec::new(),
+                moderation: Vec::new(),
+                summary: crate::models::ModerationSummary::default(),
+                twitch: false,
+                closed: true,
+            });
+            let title = {
+                let s = state.lock().unwrap();
+                format!("👤 {} — {}", s.name, s.channel)
+            };
+            let shared = self.popup_shared();
+            show_deferred_popup(
+                ctx,
+                egui::ViewportId::from_hash_of(("user_props_vp", &key)),
+                egui::ViewportBuilder::default().with_title(title).with_inner_size([420.0, 460.0]),
+                state.clone(),
+                shared,
+                |ctx, s, _shared| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        s.closed = true;
+                    }
+                    #[allow(deprecated)]
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            s.user_props_body(ui);
+                        });
+                    });
+                },
+            );
+            if state.lock().unwrap().closed {
+                closed.push(key);
+            }
+        }
+        for key in closed {
+            self.user_props_popups.retain(|k| k != &key);
+            self.user_props_registry.remove(&key);
+        }
+    }
+
     pub(super) fn open_channel_properties(&mut self, cid: i64) {
         if !self.channel_properties_popups.contains(&cid) {
             self.channel_properties_popups.push(cid);

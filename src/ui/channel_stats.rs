@@ -887,6 +887,9 @@ impl StreamArchiverApp {
     /// INFERRED burst is deleted — that's a confirmed false positive), or
     /// open a clicked tracked-channel name's Properties window.
     fn apply_events_table_out(&mut self, channel_id: i64, out: EventsTableOut) {
+        if let Some(name) = out.open_user_props {
+            self.open_user_properties(channel_id, &name);
+        }
         if let Some(cid) = out.open_channel_props {
             self.open_channel_properties(cid);
         }
@@ -1393,6 +1396,9 @@ pub(super) struct EventsTableOut {
     /// Channel id to open Properties for — set by clicking a coloured/linked
     /// tracked-channel name within an event line.
     pub open_channel_props: Option<i64>,
+    /// Display name to open user Properties for — set by clicking any other
+    /// coloured name in an event line (a chatter, an untracked raider).
+    pub open_user_props: Option<String>,
 }
 
 /// The recent-events table shown under the graphs, with a live text filter
@@ -1469,8 +1475,14 @@ fn events_table_ui(
                                     Some(&(cid, color)) => (Some(cid), Some(color)),
                                     None => (None, None),
                                 };
-                                if let Some(cid) = tracked_name_label(ui, &n, cid, color) {
-                                    out.open_channel_props = Some(cid);
+                                match event_name_label(ui, &n, cid, color) {
+                                    Some(NameClick::Channel(cid)) => {
+                                        out.open_channel_props = Some(cid)
+                                    }
+                                    Some(NameClick::User(name)) => {
+                                        out.open_user_props = Some(name)
+                                    }
+                                    None => {}
                                 }
                             }
                         }

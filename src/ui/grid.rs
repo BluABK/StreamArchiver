@@ -435,6 +435,56 @@ pub(super) fn meta_value_cell(ui: &mut egui::Ui, value: &str, hl: Option<&str>) 
 /// Streams-grid row (Collab column, name-suffix, Stats events), so the same
 /// identity always reads as the same colour and is always a shortcut to its
 /// Properties window.
+/// What clicking a name in an event line asks for.
+pub(super) enum NameClick {
+    /// A tracked channel of ours — its own Properties window.
+    Channel(i64),
+    /// Anyone else (a chatter, a raider we don't monitor) — their user
+    /// Properties, built from what this channel has recorded about them.
+    User(String),
+}
+
+/// Render a name inside an event line: coloured, and clickable through to
+/// whatever "who is this" window fits it.
+///
+/// A tracked channel keeps its own colour and opens channel Properties (see
+/// [`tracked_name_label`]). Everyone else — the overwhelming majority of names
+/// in an events table — used to render as flat grey text with nothing behind
+/// it, even though the app knows plenty about them: what they've cheered,
+/// gifted and raided, and every moderation action against them. They now get
+/// the same deterministic colour chat gives them, and open user Properties.
+pub(super) fn event_name_label(
+    ui: &mut egui::Ui,
+    name: &str,
+    cid: Option<i64>,
+    color: Option<egui::Color32>,
+) -> Option<NameClick> {
+    if cid.is_some() {
+        return tracked_name_label(ui, name, cid, color).map(NameClick::Channel);
+    }
+    if name.trim().is_empty() {
+        ui.label(name);
+        return None;
+    }
+    // Same per-name hash chat uses, so one person reads the same colour in the
+    // replay, the notifications feed and here; adjusted for the panel it lands
+    // on so dark hashes stay legible.
+    let color = readable_color(twitch_username_color(name), ui.visuals().panel_fill);
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(name).color(color).underline())
+            .sense(egui::Sense::click()),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(
+        "Click for this user's Properties — what this channel has recorded about them \
+         (bits, gift subs, raids) and any moderation actions against them.",
+    )
+    .clicked()
+    .then(|| NameClick::User(name.to_string()))
+}
+
 pub(super) fn tracked_name_label(
     ui: &mut egui::Ui,
     name: &str,

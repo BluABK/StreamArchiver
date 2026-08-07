@@ -3028,6 +3028,16 @@ Where to look:
     that broadcast), and a **filterable event list** (type a name to see
     everything one user did).
 
+  Every **name in the event list is coloured and clickable** — the same
+  per-name colour chat gives that person, so they read consistently across the
+  replay, the 🔔 feed and here. One of your own tracked channels opens its
+  channel Properties; anyone else opens **user Properties**: what this channel
+  has recorded about them (bits, gift subs, raids, subs) and their 🔨
+  moderation record — deletions, timeouts, bans, with dates and the deleted
+  text. It's scoped to that one channel's archive on purpose, not a
+  platform-wide profile, and it says so. Works from both the Stats tab and the
+  📈 popup.
+
   Span selector from **1 m** to **All**; an **Auto refresh** checkbox re-runs
   the queries once a minute while the tab is open. The 🤝 Collabs partner
   overview lives here too. (The old Stats tab is now **App Stats** and keeps
