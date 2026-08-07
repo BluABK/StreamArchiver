@@ -130,6 +130,41 @@ pub(super) fn scope_override_editor(
 /// `with_actions: false` = blacklist mode: the per-rule start-action controls
 /// (From start / Lead / Only while matching) are hidden — a veto has no
 /// recording to act on, and the fields are ignored at match time.
+/// One bound of a trigger rule's active period as an editable text field.
+///
+/// The rule stores a unix timestamp but the user edits text, so the
+/// in-progress draft lives in egui temp memory keyed by `(salt, which, i)` —
+/// a per-frame local would reset on every keystroke (see the ComboBox
+/// persistence rule), and the rule structs deliberately carry no UI drafts.
+/// The rule is only written on a successful parse; invalid text stays in the
+/// field, tinted, changing nothing.
+fn active_bound_field(
+    ui: &mut egui::Ui,
+    salt: &str,
+    i: usize,
+    which: &str,
+    hint: &str,
+    value: &mut Option<i64>,
+) -> egui::Response {
+    let id = egui::Id::new((salt, which, i));
+    let mut draft: String = ui
+        .data_mut(|d| d.get_temp(id))
+        .unwrap_or_else(|| crate::triggers::format_active_bound(*value));
+    let parsed = crate::triggers::parse_active_bound(&draft);
+    let mut edit = egui::TextEdit::singleline(&mut draft).hint_text(hint).desired_width(130.0);
+    if parsed.is_none() {
+        edit = edit.text_color(HL_ERROR_TEXT);
+    }
+    let resp = ui.add(edit);
+    if resp.changed() {
+        if let Some(v) = crate::triggers::parse_active_bound(&draft) {
+            *value = v;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(id, draft));
+    resp
+}
+
 pub(super) fn trigger_rules_editor(
     ui: &mut egui::Ui,
     rules: &mut Vec<crate::triggers::TriggerRule>,
@@ -220,6 +255,37 @@ pub(super) fn trigger_rules_editor(
                  warnings (e.g. \"dangerously broad — blacklist per channel if it misfires\"). \
                  Not used for matching and not shown in notifications.",
             );
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(24.0); // roughly align under the row above
+            let active_now = r.active_at(now_unix());
+            ui.label(if active_now { "🕓" } else { "🕓💤" }).on_hover_text(if active_now {
+                "Active period (optional): the rule only matches between these times — e.g. an \
+                 event-scoped rule that should only fire during AGDQ/SGDQ week. Empty = no \
+                 bound on that side; both empty = always active. The rule is currently IN its \
+                 active period."
+            } else {
+                "Active period (optional) — the rule is currently OUTSIDE its active period, \
+                 so it matches nothing right now. It stays here, ready for the next event, \
+                 and the Schedule dry-run still previews it against each event's own time."
+            });
+            active_bound_field(ui, salt, i, "active_from", "From…", &mut r.active_from)
+                .on_hover_text(
+                    "Start of the active period, local time — \"2026-01-05 18:00\" or just \
+                     \"2026-01-05\" (midnight). Empty = active since forever.",
+                );
+            ui.label("→");
+            active_bound_field(ui, salt, i, "active_until", "Until…", &mut r.active_until)
+                .on_hover_text(
+                    "End of the active period (exclusive), local time — \"2026-01-12 06:00\" \
+                     or just \"2026-01-12\" (midnight). Empty = never expires. For a rule \
+                     with \"Only while matching\", the window closing also ends a recording \
+                     it started, after the grace delay.",
+                );
+            if r.active_from.is_some_and(|f| r.active_until.is_some_and(|u| u <= f)) {
+                ui.colored_label(HL_ERROR_TEXT, "empty window")
+                    .on_hover_text("\"Until\" is not after \"From\" — this rule can never match.");
+            }
         });
         if !with_actions {
             continue;

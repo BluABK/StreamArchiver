@@ -1900,6 +1900,7 @@ progress_info: None,
                     &rules,
                     stream_title.as_deref(),
                     stream_game.as_deref(),
+                    now_unix(),
                 );
             }
             // The signal carried no title/game (EventSub push) but rules need
@@ -1987,6 +1988,7 @@ progress_info: None,
                 &block_rules,
                 stream_title.as_deref(),
                 stream_game.as_deref(),
+                now_unix(),
             )
         {
             self.release_active(monitor_id, "try_begin: blacklist trigger matched — vetoing automatic start");

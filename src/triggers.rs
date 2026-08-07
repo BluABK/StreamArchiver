@@ -141,6 +141,31 @@ pub struct TriggerRule {
     /// overrides above.
     #[serde(default)]
     pub disposal_override: Option<crate::disposal::DisposalMethod>,
+    /// Optional activity window: the rule only matches between these two unix
+    /// timestamps (`None` = unbounded on that side, so both-`None` — every
+    /// pre-existing rule — is "always active"). Half-open `[from, until)`,
+    /// evaluated in [`first_match`] rather than at resolution time so the rule
+    /// editors still show an out-of-window rule and the Schedule dry-run can
+    /// evaluate at the *event's* time. The use case is an event-scoped rule:
+    /// "record this game, but only during AGDQ week" — outside the window the
+    /// rule sits disabled without being deleted, ready for the next event.
+    ///
+    /// For a rule with [`Self::stop_on_unmatch`], the window closing counts as
+    /// an unmatch too: the running check re-evaluates through `first_match`,
+    /// so a recording started by an event-scoped rule ends (after the grace
+    /// delay) when the window does — consistent with "this rule is only in
+    /// force during the event".
+    #[serde(default)]
+    pub active_from: Option<i64>,
+    #[serde(default)]
+    pub active_until: Option<i64>,
+}
+
+impl TriggerRule {
+    /// Whether this rule is in force at `at` — see [`Self::active_from`].
+    pub fn active_at(&self, at: i64) -> bool {
+        self.active_from.is_none_or(|f| at >= f) && self.active_until.is_none_or(|u| at < u)
+    }
 }
 
 impl Default for TriggerRule {
@@ -157,8 +182,48 @@ impl Default for TriggerRule {
             lead_secs: 0,
             end_delay_secs: 0,
             disposal_override: None,
+            active_from: None,
+            active_until: None,
         }
     }
+}
+
+// ---------- active-window field parsing (shared with the rule editors) ----------
+
+/// Format an activity bound for the editor's text field: local
+/// `YYYY-MM-DD HH:MM`, or `""` for an unbounded side.
+pub fn format_active_bound(ts: Option<i64>) -> String {
+    match ts {
+        Some(t) => {
+            use chrono::TimeZone;
+            chrono::Local
+                .timestamp_opt(t, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    }
+}
+
+/// Parse an editor field back into an activity bound. Outer `None` = invalid
+/// input (the editor tints the field and leaves the rule unchanged);
+/// `Some(None)` = empty = unbounded. Accepts local `YYYY-MM-DD HH:MM` or a
+/// bare `YYYY-MM-DD` (midnight) — event windows are usually whole days.
+pub fn parse_active_bound(s: &str) -> Option<Option<i64>> {
+    use chrono::TimeZone;
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(None);
+    }
+    let dt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        })?;
+    chrono::Local.from_local_datetime(&dt).single().map(|dt| Some(dt.timestamp()))
 }
 
 /// How a channel/instance scope combines with the level above it.
@@ -402,6 +467,14 @@ impl TriggerHit {
         if let Some(m) = self.rule.disposal_override {
             s.push_str(&format!(" · deletion forced to {}", m.label()));
         }
+        match (self.rule.active_from, self.rule.active_until) {
+            (None, None) => {}
+            (from, until) => s.push_str(&format!(
+                " · active {} → {}",
+                from.map(|t| format_active_bound(Some(t))).unwrap_or_else(|| "…".into()),
+                until.map(|t| format_active_bound(Some(t))).unwrap_or_else(|| "…".into()),
+            )),
+        }
         s
     }
 }
@@ -422,14 +495,21 @@ fn pattern_matches(rule: &TriggerRule, value: &str) -> bool {
     }
 }
 
-/// First rule (in order) that matches the title/game, or `None`.
+/// First rule (in order) that matches the title/game **and is active at
+/// `at`**, or `None`.
+///
+/// `at` is "when is this being evaluated": callers acting on the live stream
+/// pass now, while the Schedule dry-run passes the event's start time — so an
+/// AGDQ-week rule previews ⚡ on next week's AGDQ events even though its
+/// window hasn't opened yet, which is the answer the preview exists to give.
 pub fn first_match(
     rules: &[TriggerRule],
     title: Option<&str>,
     game: Option<&str>,
+    at: i64,
 ) -> Option<TriggerHit> {
     for rule in rules {
-        if !rule.enabled {
+        if !rule.enabled || !rule.active_at(at) {
             continue;
         }
         let candidates: [(&'static str, Option<&str>); 2] = [("title", title), ("game", game)];
@@ -484,40 +564,40 @@ mod tests {
     fn substring_matching_is_case_insensitive_and_field_scoped() {
         let rules = vec![rule(TriggerField::Title, false, "karaoke")];
         // Case-insensitive substring on the title.
-        let hit = first_match(&rules, Some("UNARCHIVED KARAOKE NIGHT!!"), None).unwrap();
+        let hit = first_match(&rules, Some("UNARCHIVED KARAOKE NIGHT!!"), None, 0).unwrap();
         assert_eq!(hit.field, "title");
         assert_eq!(hit.matched, "UNARCHIVED KARAOKE NIGHT!!");
         // Title-scoped rule must NOT hit the game field.
-        assert!(first_match(&rules, None, Some("Karaoke")).is_none());
+        assert!(first_match(&rules, None, Some("Karaoke"), 0).is_none());
         // Any-field rule hits the game too.
         let any = vec![rule(TriggerField::Any, false, "just chatting")];
         assert_eq!(
-            first_match(&any, Some("morning"), Some("Just Chatting")).unwrap().field,
+            first_match(&any, Some("morning"), Some("Just Chatting"), 0).unwrap().field,
             "game"
         );
         // Phrases match as substrings.
         let phrase = vec![rule(TriggerField::Title, false, "no vod")];
-        assert!(first_match(&phrase, Some("chill stream (NO VOD)"), None).is_some());
+        assert!(first_match(&phrase, Some("chill stream (NO VOD)"), None, 0).is_some());
         // Disabled rules never fire.
         let mut off = rule(TriggerField::Any, false, "karaoke");
         off.enabled = false;
-        assert!(first_match(&[off], Some("karaoke"), None).is_none());
+        assert!(first_match(&[off], Some("karaoke"), None, 0).is_none());
     }
 
     #[test]
     fn regex_matching_and_invalid_patterns() {
         let rules = vec![rule(TriggerField::Title, true, r"unarchi(v|ve)d")];
-        assert!(first_match(&rules, Some("UNARCHIVED singing"), None).is_some());
-        assert!(first_match(&rules, Some("archived rerun"), None).is_none());
+        assert!(first_match(&rules, Some("UNARCHIVED singing"), None, 0).is_some());
+        assert!(first_match(&rules, Some("archived rerun"), None, 0).is_none());
         // Invalid regex: never matches, and pattern_error reports it.
         let bad = rule(TriggerField::Any, true, r"un[closed");
-        assert!(first_match(&[bad.clone()], Some("un[closed"), None).is_none());
+        assert!(first_match(&[bad.clone()], Some("un[closed"), None, 0).is_none());
         assert!(pattern_error(&bad).is_some());
         assert!(pattern_error(&rules[0]).is_none());
         // describe() renders regex with slashes and notes the override.
         let mut r = rule(TriggerField::Title, true, "karaoke");
         r.capture_from_start = Some(true);
-        let hit = first_match(&[r], Some("karaoke"), None).unwrap();
+        let hit = first_match(&[r], Some("karaoke"), None, 0).unwrap();
         assert_eq!(hit.describe(), "title ~ /karaoke/ · capture-from-start forced on");
     }
 
@@ -525,19 +605,19 @@ mod tests {
     fn describe_notes_lead_and_stop_on_unmatch() {
         let mut r = rule(TriggerField::Title, false, "gdq segment");
         r.lead_secs = 30;
-        let hit = first_match(&[r], Some("gdq segment"), None).unwrap();
+        let hit = first_match(&[r], Some("gdq segment"), None, 0).unwrap();
         assert_eq!(hit.describe(), "title ~ \"gdq segment\" · lead 30s");
 
         let mut r2 = rule(TriggerField::Title, false, "gdq segment");
         r2.stop_on_unmatch = true;
         r2.end_delay_secs = 15;
-        let hit2 = first_match(&[r2], Some("gdq segment"), None).unwrap();
+        let hit2 = first_match(&[r2], Some("gdq segment"), None, 0).unwrap();
         assert_eq!(hit2.describe(), "title ~ \"gdq segment\" · stops when unmatched (+15s)");
 
         // stop_on_unmatch with no end delay omits the "+Ns" part.
         let mut r3 = rule(TriggerField::Title, false, "gdq segment");
         r3.stop_on_unmatch = true;
-        let hit3 = first_match(&[r3], Some("gdq segment"), None).unwrap();
+        let hit3 = first_match(&[r3], Some("gdq segment"), None, 0).unwrap();
         assert_eq!(hit3.describe(), "title ~ \"gdq segment\" · stops when unmatched");
     }
 
@@ -545,7 +625,7 @@ mod tests {
     fn describe_notes_disposal_override() {
         let mut r = rule(TriggerField::Title, false, "unarchived");
         r.disposal_override = Some(crate::disposal::DisposalMethod::Trash);
-        let hit = first_match(&[r], Some("unarchived karaoke"), None).unwrap();
+        let hit = first_match(&[r], Some("unarchived karaoke"), None, 0).unwrap();
         assert_eq!(hit.describe(), "title ~ \"unarchived\" · deletion forced to Trash folder");
     }
 
@@ -599,6 +679,66 @@ mod tests {
     }
 
     #[test]
+    fn active_window_gates_matching_by_evaluation_time() {
+        let rule = TriggerRule {
+            pattern: "gdq".into(),
+            active_from: Some(1_000),
+            active_until: Some(2_000),
+            ..Default::default()
+        };
+        let rules = [rule];
+        // Same title, three evaluation times: before, inside, after. The
+        // window is half-open — active at its first second, over at `until`.
+        assert!(first_match(&rules, Some("AGDQ 2026"), None, 999).is_none());
+        assert!(first_match(&rules, Some("AGDQ 2026"), None, 1_000).is_some());
+        assert!(first_match(&rules, Some("AGDQ 2026"), None, 1_999).is_some());
+        assert!(first_match(&rules, Some("AGDQ 2026"), None, 2_000).is_none());
+
+        // One-sided bounds: from-only stays active forever after; until-only
+        // was active since forever. No bounds = every pre-existing rule.
+        let from_only =
+            TriggerRule { pattern: "gdq".into(), active_from: Some(1_000), ..Default::default() };
+        assert!(first_match(&[from_only.clone()], Some("gdq"), None, 999).is_none());
+        assert!(first_match(&[from_only], Some("gdq"), None, i64::MAX).is_some());
+        let until_only =
+            TriggerRule { pattern: "gdq".into(), active_until: Some(1_000), ..Default::default() };
+        assert!(first_match(&[until_only.clone()], Some("gdq"), None, 0).is_some());
+        assert!(first_match(&[until_only], Some("gdq"), None, 1_000).is_none());
+        assert!(TriggerRule::default().active_at(0) && TriggerRule::default().active_at(i64::MAX));
+
+        // A windowed rule outside its window doesn't shadow a later
+        // always-active rule in the same list.
+        let seasonal = TriggerRule {
+            pattern: "gdq".into(),
+            label: "event only".into(),
+            active_until: Some(10),
+            ..Default::default()
+        };
+        let evergreen =
+            TriggerRule { pattern: "gdq".into(), label: "always".into(), ..Default::default() };
+        let hit = first_match(&[seasonal, evergreen], Some("gdq"), None, 5_000).unwrap();
+        assert_eq!(hit.rule.label, "always");
+    }
+
+    #[test]
+    fn active_bound_field_roundtrips_and_rejects_garbage() {
+        // Date-and-time and bare-date (midnight) forms both parse; the
+        // formatted form re-parses to the same instant (local tz).
+        let ts = parse_active_bound("2026-01-05 18:00").unwrap().unwrap();
+        assert_eq!(parse_active_bound(&format_active_bound(Some(ts))).unwrap(), Some(ts));
+        let midnight = parse_active_bound("2026-01-05").unwrap().unwrap();
+        assert_eq!(format_active_bound(Some(midnight)), "2026-01-05 00:00");
+        assert!(midnight < ts);
+
+        // Empty = unbounded, not an error; garbage = error, not "unbounded" —
+        // a typo must never silently widen a rule's window.
+        assert_eq!(parse_active_bound("  "), Some(None));
+        assert_eq!(format_active_bound(None), "");
+        assert_eq!(parse_active_bound("during AGDQ"), None);
+        assert_eq!(parse_active_bound("2026-13-40"), None);
+    }
+
+    #[test]
     fn serde_roundtrip_and_forward_compat() {
         let scope = TriggerScope {
             mode: TriggerMode::Extend,
@@ -614,6 +754,8 @@ mod tests {
                 lead_secs: 30,
                 end_delay_secs: 15,
                 disposal_override: Some(crate::disposal::DisposalMethod::Trash),
+                active_from: Some(1_767_500_000),
+                active_until: Some(1_768_100_000),
             }],
         };
         let json = serde_json::to_string(&scope).unwrap();
@@ -651,7 +793,7 @@ mod tests {
         let mut r = rule(TriggerField::Title, true, r"delet\w+.{0,30}(video|vod)");
         r.label = "Deletion-flagged title".into();
         r.note = "note text never appears in describe()".into();
-        let hit = first_match(&[r], Some("I will delete this video in 2 days"), None).unwrap();
+        let hit = first_match(&[r], Some("I will delete this video in 2 days"), None, 0).unwrap();
         assert_eq!(
             hit.describe(),
             "Deletion-flagged title (title ~ /delet\\w+.{0,30}(video|vod)/)"

@@ -1305,10 +1305,14 @@ pub(super) async fn meta_watcher(
             if let Some(rule) = &stop_rule
                 && !stop_sent
             {
+                // Evaluated at now, so an event-scoped rule's window closing
+                // counts as an unmatch: a recording started by "only during
+                // AGDQ week" ends (after the grace delay) when the week does.
                 let matches_now = crate::triggers::first_match(
                     std::slice::from_ref(rule),
                     Some(meta.title.as_str()),
                     Some(meta.game.as_str()),
+                    now_unix(),
                 )
                 .is_some();
                 match last_matched {

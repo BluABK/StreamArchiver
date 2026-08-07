@@ -2147,6 +2147,23 @@ polled regardless).
   quietly defeated by a laxer setting elsewhere. *Inherit* = no special
   treatment. Frozen into the take at the moment it starts, so a later edit to
   the rule never changes how an already-started take's files get disposed of.
+- **🕓 Active period** — optional *From*/*Until* bounds (local time,
+  `2026-01-05 18:00` or just `2026-01-05` for midnight; *Until* is exclusive)
+  outside which the rule matches nothing: the event-scoped rule. "Record this
+  game, but **only during AGDQ/SGDQ week**" is one rule with the event's dates
+  — outside the window it sits parked without being deleted or manually
+  toggled, ready to be re-dated for the next event. Either side can be left
+  empty (no bound on that side; both empty = always active, which is every
+  pre-existing rule). The editor shows 🕓💤 while a rule is outside its
+  window, and invalid text in the field turns red and changes nothing — a typo
+  can never silently widen a window. Two interactions worth knowing: the
+  [Schedule dry-run preview](#schedule-%EF%B8%8F) evaluates each event at the
+  event's *own start time*, so an AGDQ-week rule already previews ⚡ on next
+  week's AGDQ events before its window opens; and for a rule with *Only while
+  matching*, the window closing counts as an unmatch — a recording it started
+  ends (after the End delay grace) when the event window does. Works on
+  blacklist rules too: e.g. suppress a specific game's automatic recordings
+  only during a rerun week.
 - An **enabled** checkbox per rule, so seasonal rules can be kept but parked.
 
 There's also one **all-triggers default** (Settings → Downloads → Trigger
@@ -2189,11 +2206,11 @@ to the automatic recording and the match is recorded the same way.
 The exact inverse of trigger words: while the live title or game matches a
 blacklist rule, **automatic recording is suppressed** — for streams you never
 want archived, like "rerun", "24/7", a specific game, or sponsored segments.
-Rules use the same shape (field, Contains/Regex pattern, per-rule enable) and
-the same **global < per-channel < per-instance** Inherit/Extend/Replace/Off
-resolution; global rules live in **Settings → Downloads → Blacklist
-triggers**, overrides in the Properties windows ("Blacklist triggers"
-section). Semantics:
+Rules use the same shape (field, Contains/Regex pattern, per-rule enable, the
+optional 🕓 active period) and the same **global < per-channel < per-instance**
+Inherit/Extend/Replace/Off resolution; global rules live in **Settings →
+Downloads → Blacklist triggers**, overrides in the Properties windows
+("Blacklist triggers" section). Semantics:
 
 - A blacklist match vetoes **both** Auto-record starts and trigger-word
   starts — an explicit "don't record this" beats "record this".

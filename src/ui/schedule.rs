@@ -686,7 +686,7 @@ impl StreamArchiverApp {
                         )
                     });
                 let game = (!s.category.is_empty()).then_some(s.category.as_str());
-                preview_trigger(rules, block_rules, &s.title, game)
+                preview_trigger(rules, block_rules, &s.title, game, s.start_time)
             } else {
                 TriggerPreview::None
             };

@@ -152,12 +152,16 @@ pub(super) fn preview_trigger(
     block_rules: &[crate::triggers::TriggerRule],
     title: &str,
     game: Option<&str>,
+    // When the event HAPPENS, not now: an activity-windowed rule ("only
+    // during AGDQ week") must preview ⚡ on next week's events even though
+    // its window hasn't opened yet — that's the question the preview answers.
+    at: i64,
 ) -> TriggerPreview {
     let title = (!title.is_empty()).then_some(title);
-    if let Some(hit) = crate::triggers::first_match(block_rules, title, game) {
+    if let Some(hit) = crate::triggers::first_match(block_rules, title, game, at) {
         return TriggerPreview::Blocked(hit);
     }
-    match crate::triggers::first_match(rules, title, game) {
+    match crate::triggers::first_match(rules, title, game, at) {
         Some(hit) => TriggerPreview::WouldFire(hit),
         None => TriggerPreview::None,
     }
@@ -1434,7 +1438,7 @@ mod tests {
     fn preview_trigger_none_when_nothing_matches() {
         let rules = vec![rule("karaoke")];
         assert!(matches!(
-            preview_trigger(&rules, &[], "Just chatting", None),
+            preview_trigger(&rules, &[], "Just chatting", None, 0),
             TriggerPreview::None
         ));
     }
@@ -1442,7 +1446,7 @@ mod tests {
     #[test]
     fn preview_trigger_would_fire_on_whitelist_match() {
         let rules = vec![rule("karaoke")];
-        match preview_trigger(&rules, &[], "Friday Karaoke Night", None) {
+        match preview_trigger(&rules, &[], "Friday Karaoke Night", None, 0) {
             TriggerPreview::WouldFire(hit) => assert_eq!(hit.matched, "Friday Karaoke Night"),
             _ => panic!("expected WouldFire, got a different preview"),
         }
@@ -1454,7 +1458,7 @@ mod tests {
         // supervisor.rs's try_begin: blacklist checked first, unconditional veto).
         let rules = vec![rule("karaoke")];
         let block_rules = vec![rule("rerun")];
-        match preview_trigger(&rules, &block_rules, "Karaoke rerun night", None) {
+        match preview_trigger(&rules, &block_rules, "Karaoke rerun night", None, 0) {
             TriggerPreview::Blocked(hit) => assert_eq!(hit.matched, "Karaoke rerun night"),
             _ => panic!("expected Blocked, got a different preview"),
         }
@@ -1466,7 +1470,7 @@ mod tests {
             field: crate::triggers::TriggerField::Game,
             ..rule("just chatting")
         }];
-        match preview_trigger(&rules, &[], "unrelated title", Some("Just Chatting")) {
+        match preview_trigger(&rules, &[], "unrelated title", Some("Just Chatting"), 0) {
             TriggerPreview::WouldFire(hit) => assert_eq!(hit.field, "game"),
             _ => panic!("expected WouldFire on the game field, got a different preview"),
         }
