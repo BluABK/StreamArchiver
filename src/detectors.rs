@@ -87,6 +87,13 @@ pub struct DetectOutcome {
     /// Platform game/category id (Twitch `game_id`) — stored for box-art
     /// lookups; not displayed directly.
     pub stream_game_id: Option<String>,
+    /// The broadcast is gated behind a paid membership/subscription and
+    /// this account may not be entitled to it — YouTube members-only today
+    /// (spotted on the `/streams` tab, see [`StreamsTabLive`]). Detection
+    /// still reports it LIVE: whether we can capture it is the capture
+    /// layer's business, and a gated broadcast that goes unrecorded still
+    /// belongs in the history.
+    pub members_only: bool,
 }
 
 impl DetectOutcome {
@@ -107,6 +114,7 @@ impl DetectOutcome {
             stream_tags: None,
             stream_language: None,
             stream_game_id: None,
+            members_only: false,
         }
     }
     fn live_at(
@@ -144,6 +152,10 @@ impl DetectOutcome {
         self.stream_viewers = stream_viewers;
         self
     }
+    fn with_members_only(mut self, members_only: bool) -> DetectOutcome {
+        self.members_only = members_only;
+        self
+    }
     fn with_stream_followers(mut self, stream_followers: Option<i64>) -> DetectOutcome {
         self.stream_followers = stream_followers;
         self
@@ -177,6 +189,7 @@ impl DetectOutcome {
             stream_tags: None,
             stream_language: None,
             stream_game_id: None,
+            members_only: false,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -196,6 +209,7 @@ impl DetectOutcome {
             stream_tags: None,
             stream_language: None,
             stream_game_id: None,
+            members_only: false,
         }
     }
 }
@@ -601,6 +615,10 @@ pub struct DetectContext {
     /// (multi-second, token-spending) re-OCR when the source image is unchanged.
     /// Persisted to `app_settings` (K_OCR_IMAGE_HASHES) so cache hits survive restarts.
     ocr_cache: Mutex<HashMap<(i64, String), (u64, Vec<ScheduleSegment>)>>,
+    /// When each monitor last paid for the `/streams`-tab fallback scrape
+    /// (see `youtube_streams_tab_live`). In-memory only: a missed gated
+    /// go-live after a restart costs one extra poll, not correctness.
+    yt_streams_checked: Mutex<HashMap<i64, std::time::Instant>>,
 }
 
 /// FNV-1a 64-bit hash — simple, stable, and fast; used instead of `DefaultHasher`
@@ -715,6 +733,7 @@ impl DetectContext {
             twitch_refresh: Mutex::new(()),
             fingerprint,
             ocr_cache,
+            yt_streams_checked: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3562,11 +3581,66 @@ impl DetectContext {
                         .with_stream_viewers(yt_watching_now(&body))
                         .with_stream_followers(yt_subscriber_count(&body))
                 } else {
-                    DetectOutcome::offline(item.monitor_id)
+                    // `/live` says no — but it isn't the whole truth. A gated
+                    // (members-only) broadcast doesn't surface there at all for
+                    // an unentitled viewer; YouTube serves the next upcoming
+                    // stream's watch page instead, so the channel reads offline
+                    // for the entire broadcast. The `/streams` tab still lists
+                    // it. Throttled, because that page is ~1 MB and most
+                    // offline polls have nothing to find.
+                    match self.youtube_streams_tab_live(item).await {
+                        Some(hit) => DetectOutcome::live(item.monitor_id, "live")
+                            .with_stream_id(Some(hit.video_id))
+                            .with_stream_title(Some(hit.title).filter(|t| !t.is_empty()))
+                            .with_members_only(hit.members_only),
+                        None => DetectOutcome::offline(item.monitor_id),
+                    }
                 }
             }
             Err(e) => DetectOutcome::err(item.monitor_id, e.to_string()),
         }
+    }
+
+    /// The `/streams`-tab fallback for [`Self::scrape_youtube`], rate-limited
+    /// per monitor (see [`YT_STREAMS_FALLBACK_SECS`]).
+    ///
+    /// Only reached when `/live` reported offline, so the cost lands on
+    /// channels that aren't streaming — hence the throttle. A hit means the
+    /// channel IS live and `/live` simply didn't say so.
+    async fn youtube_streams_tab_live(&self, item: &DetectItem) -> Option<StreamsTabLive> {
+        {
+            let mut last = self.yt_streams_checked.lock().await;
+            let now = std::time::Instant::now();
+            if let Some(t) = last.get(&item.monitor_id)
+                && now.duration_since(*t).as_secs() < YT_STREAMS_FALLBACK_SECS
+            {
+                return None;
+            }
+            last.insert(item.monitor_id, now);
+        }
+        let url = youtube_streams_url(&item.url);
+        let rb = self
+            .http
+            .get(&url)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let body = self
+            .fingerprint
+            .apply_yt_nav_headers(rb)
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        let hit = find_streams_tab_live(&body)?;
+        info!(
+            monitor_id = item.monitor_id,
+            video_id = hit.video_id.as_str(),
+            members_only = hit.members_only,
+            "youtube: live stream found on the /streams tab that /live didn't report"
+        );
+        Some(hit)
     }
 
     /// Title + (broad) content category of a currently-live YouTube channel,
@@ -4659,6 +4733,13 @@ fn youtube_live_url(url: &str) -> String {
     }
 }
 
+/// How long to wait before paying for another `/streams`-tab check on a
+/// monitor whose `/live` page said offline. The page is ~1 MB and most
+/// offline polls have nothing to find, so this trades a few minutes of
+/// detection latency on gated broadcasts for not multiplying every YouTube
+/// monitor's bandwidth by its poll rate.
+const YT_STREAMS_FALLBACK_SECS: u64 = 300;
+
 /// Build the YouTube `/streams` (live tab) URL for a channel URL, normalizing a
 /// trailing `/live` or `/streams` first.
 pub(crate) fn youtube_streams_url(url: &str) -> String {
@@ -5367,6 +5448,102 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
     }
 }
 
+/// A live stream found on a channel's **/streams** tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamsTabLive {
+    pub(crate) video_id: String,
+    pub(crate) title: String,
+    /// The item carries a `Members only` badge — capturing it needs an account
+    /// with that membership (see [`crate::models::members_only_rejected`]).
+    pub(crate) members_only: bool,
+}
+
+/// Find a currently-live stream on a channel's `/streams` tab.
+///
+/// This exists because **`/live` does not always resolve to the live stream**.
+/// Observed 2026-08-07 (Nyana Banyana): the channel was live with a
+/// members-only stream while `/live` served an *upcoming* premiere instead —
+/// `playabilityStatus: LIVE_STREAM_OFFLINE`, "This live event will begin in 7
+/// days". Nothing on that page mentioned the running broadcast, so the scrape
+/// reported the channel offline for its whole duration. The `/streams` tab
+/// lists it plainly, the same one the web UI shows.
+///
+/// Reads the Polymer `lockupViewModel` shape (the same one
+/// [`extract_lockup_viewmodel`] parses for schedules): a live entry carries a
+/// `THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE` overlay badge, its video id lives in
+/// the thumbnail URL, and a gated one adds a `BADGE_MEMBERS_ONLY` badge.
+pub(crate) fn find_streams_tab_live(body: &str) -> Option<StreamsTabLive> {
+    let data = extract_json_after(body, "ytInitialData")?;
+    let mut found = None;
+    collect_live_lockups(&data, &mut found);
+    found
+}
+
+fn collect_live_lockups(v: &Value, out: &mut Option<StreamsTabLive>) {
+    if out.is_some() {
+        return; // first (newest) live entry wins
+    }
+    match v {
+        Value::Object(map) => {
+            if map.contains_key("contentImage")
+                && let Some(hit) = extract_live_lockup(map)
+            {
+                *out = Some(hit);
+                return;
+            }
+            for val in map.values() {
+                collect_live_lockups(val, out);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                collect_live_lockups(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Some` when this `lockupViewModel` is a stream that is live *right now*.
+///
+/// The LIVE badge is the only thing that says "now": a finished stream keeps
+/// its duration overlay, an upcoming one its schedule row, and both otherwise
+/// look identical here.
+fn extract_live_lockup(map: &serde_json::Map<String, Value>) -> Option<StreamsTabLive> {
+    let overlays = map
+        .get("contentImage")
+        .and_then(|ci| ci.get("thumbnailViewModel"))
+        .and_then(|tv| tv.get("overlays"))
+        .and_then(|o| o.as_array())?;
+    let live = overlays.iter().any(|o| {
+        o.pointer("/thumbnailBottomOverlayViewModel/badges")
+            .and_then(|b| b.as_array())
+            .is_some_and(|badges| {
+                badges.iter().any(|b| {
+                    b.pointer("/thumbnailBadgeViewModel/badgeStyle").and_then(Value::as_str)
+                        == Some("THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE")
+                })
+            })
+    });
+    if !live {
+        return None;
+    }
+    let video_id = extract_yt_video_id_from_thumbnail(map)?;
+    let lmvm = map
+        .get("metadata")
+        .and_then(|m| m.get("lockupMetadataViewModel"))?;
+    let title = lmvm
+        .pointer("/title/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // `BADGE_MEMBERS_ONLY` sits in the metadata rows next to the title.
+    let members_only = serde_json::to_string(lmvm)
+        .map(|s| s.contains("BADGE_MEMBERS_ONLY"))
+        .unwrap_or(false);
+    Some(StreamsTabLive { video_id, title, members_only })
+}
+
 /// Extract `(start_unix, title, video_id)` from a `lockupViewModel` object.
 /// The video ID is parsed from the thumbnail URL in `contentImage`.
 fn extract_lockup_viewmodel(
@@ -5920,6 +6097,53 @@ mod tests {
             "live on youtube.com/@ana today",
             "youtube.com/@ana"
         ));
+    }
+
+    /// Shapes taken verbatim from the real `/streams` page that exposed this
+    /// gap (Nyana Banyana, 2026-08-07): she was live with a members-only
+    /// stream while `/live` served an upcoming premiere and reported offline.
+    #[test]
+    fn finds_a_live_stream_on_the_streams_tab() {
+        let live_lockup = r#"{"lockupViewModel":{"contentImage":{"thumbnailViewModel":{"image":{"sources":[{"url":"https://i.ytimg.com/vi/7e2KSC8W--U/hqdefault.jpg?v=7"}]},"overlays":[{"thumbnailBottomOverlayViewModel":{"badges":[{"thumbnailBadgeViewModel":{"text":"LIVE","badgeStyle":"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"}}]}}]}},"metadata":{"lockupMetadataViewModel":{"title":{"content":"ayo members only"},"metadata":{"contentMetadataViewModel":{"metadataRows":[{"badges":[{"badgeViewModel":{"badgeText":"Members only","badgeStyle":"BADGE_MEMBERS_ONLY"}}]}]}}}}}}"#;
+        let body = format!("<script>var ytInitialData = {{\"contents\":[{live_lockup}]}};</script>");
+        let hit = find_streams_tab_live(&body).expect("the LIVE badge is the signal");
+        assert_eq!(hit.video_id, "7e2KSC8W--U");
+        assert_eq!(hit.title, "ayo members only");
+        assert!(hit.members_only);
+    }
+
+    #[test]
+    fn a_finished_or_upcoming_stream_is_not_live() {
+        // Same shape, but with the duration overlay a finished VOD carries
+        // instead of the LIVE badge — the distinction the whole fallback rests
+        // on, since everything else about the two entries looks alike.
+        let vod = r#"{"lockupViewModel":{"contentImage":{"thumbnailViewModel":{"image":{"sources":[{"url":"https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg"}]},"overlays":[{"thumbnailBottomOverlayViewModel":{"badges":[{"thumbnailBadgeViewModel":{"text":"2:25:19","badgeStyle":"THUMBNAIL_OVERLAY_BADGE_STYLE_DEFAULT"}}]}}]}},"metadata":{"lockupMetadataViewModel":{"title":{"content":"LAST MEMBER STREAM"}}}}}"#;
+        let body = format!("<script>var ytInitialData = {{\"contents\":[{vod}]}};</script>");
+        assert_eq!(find_streams_tab_live(&body), None);
+        // And a page with no lockups at all (consent wall, layout change).
+        assert_eq!(find_streams_tab_live("<html>nothing here</html>"), None);
+    }
+
+    #[test]
+    fn a_public_live_stream_is_not_flagged_members_only() {
+        let public = r#"{"lockupViewModel":{"contentImage":{"thumbnailViewModel":{"image":{"sources":[{"url":"https://i.ytimg.com/vi/bbbbbbbbbbb/hqdefault.jpg"}]},"overlays":[{"thumbnailBottomOverlayViewModel":{"badges":[{"thumbnailBadgeViewModel":{"text":"LIVE","badgeStyle":"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"}}]}}]}},"metadata":{"lockupMetadataViewModel":{"title":{"content":"open stream"}}}}}"#;
+        let body = format!("<script>var ytInitialData = {{\"contents\":[{public}]}};</script>");
+        let hit = find_streams_tab_live(&body).expect("live");
+        assert_eq!((hit.video_id.as_str(), hit.members_only), ("bbbbbbbbbbb", false));
+    }
+
+    #[test]
+    fn members_only_refusals_are_recognised() {
+        use crate::models::members_only_rejected;
+        // yt-dlp's wording for an unentitled account, both shapes.
+        assert!(members_only_rejected(
+            "ERROR: [youtube] 7e2KSC8W--U: Join this channel to get access to members-only content like this video, and other exclusive perks."
+        ));
+        assert!(members_only_rejected(
+            "ERROR: [youtube] abc: This video is available to this channel's members on level: Nyanbiches. Join this channel to get access to members-only content"
+        ));
+        assert!(!members_only_rejected("ERROR: [youtube] abc: Video unavailable"));
+        assert!(!members_only_rejected(""));
     }
 
     #[test]

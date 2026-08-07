@@ -2411,6 +2411,26 @@ pub(crate) fn sub_only_rejected(log: &str) -> bool {
     log.contains("UNAUTHORIZED_ENTITLEMENTS")
 }
 
+/// YouTube refused the stream because it is **members-only** and the account
+/// we're using (or no account at all) doesn't hold that membership.
+///
+/// The YouTube analogue of [`sub_only_rejected`], and just as permanent for the
+/// broadcast — but with one crucial difference: there is no CDN fallback here.
+/// Twitch's DVR segments stay readable to anyone, which is what
+/// [`crate::downloader::sub_only`] exploits; YouTube gates the manifest itself,
+/// so an unentitled account gets nothing at all. A members-only broadcast we
+/// can't open is recorded in the history and not captured.
+///
+/// Configuring cookies from a browser signed into an account that HAS the
+/// membership (Settings → Accounts → Download authentication) makes these
+/// captures work normally, which is why a refusal is worth surfacing rather
+/// than silently retrying.
+pub(crate) fn members_only_rejected(log: &str) -> bool {
+    log.contains("members-only")
+        || log.contains("Join this channel to get access")
+        || log.contains("available to this channel's members")
+}
+
 /// One aggregated time bucket of download traffic for a single class, as
 /// returned by `Store::net_history` — the raw material for the Stats view's
 /// Network/downloads graphs. Backed by the `net_history` table (schema v80):

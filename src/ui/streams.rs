@@ -5299,7 +5299,8 @@ impl StreamArchiverApp {
                             t.status == "recording" && finalizing_recs.contains(&t.id);
                         let shown = if finalizing { "finalizing" } else { t.status.as_str() };
                         let (icon, color) = state_icon_ack(shown, t.err_ack);
-                        let sub_only = crate::models::sub_only_rejected(&t.log_excerpt);
+                        let sub_only = crate::models::sub_only_rejected(&t.log_excerpt)
+                            || crate::models::members_only_rejected(&t.log_excerpt);
                         // 🔒 replaces the state glyph outright for a take Twitch
                         // refused: "ended" reads as "nothing was there", which
                         // is exactly wrong — the broadcast happened, we just
@@ -5321,12 +5322,18 @@ impl StreamArchiverApp {
                             }
                             resp.on_hover_text(msg);
                         } else if t.status == "ended"
-                            && crate::models::sub_only_rejected(&t.log_excerpt)
+                            && (crate::models::sub_only_rejected(&t.log_excerpt)
+                                || crate::models::members_only_rejected(&t.log_excerpt))
                         {
                             // Not "nothing to capture" — Twitch refused us. The
                             // take is empty on purpose; its head backfill (if
                             // any) is where this broadcast actually lives.
-                            resp.on_hover_text(grid::sub_only_hover(Some(t.started_at), now));
+                            let platform = rows
+                                .iter()
+                                .find(|r| r.monitor.id == mid)
+                                .map(|r| r.monitor.platform())
+                                .unwrap_or(Platform::Twitch);
+                            resp.on_hover_text(grid::sub_only_hover(platform, Some(t.started_at), now));
                         } else if t.status == "ended" {
                             resp.on_hover_text(
                                 "The stream had already ended or wasn't live when we \

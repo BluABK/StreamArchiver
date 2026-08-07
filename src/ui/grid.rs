@@ -105,7 +105,16 @@ pub(super) const SUB_ONLY_COLOR: egui::Color32 = egui::Color32::from_rgb(0xc0, 0
 /// (its take's own start time), so the reader sees the lag instead of guessing
 /// at it — this archive is assembled behind the live edge by definition, and
 /// that gap is the one number worth acting on.
-pub(super) fn sub_only_hover(covers_until: Option<i64>, now: i64) -> String {
+pub(super) fn sub_only_hover(platform: Platform, covers_until: Option<i64>, now: i64) -> String {
+    // YouTube gates the manifest itself — there is no public CDN copy to fall
+    // back on, so the wording must not imply one is being fetched.
+    if platform != Platform::Twitch {
+        return "🔒 Members-only stream — the credentials in use don't hold this channel's \
+                membership, so it can't be captured. It's still recorded in the history as \
+                seen-live. Point Settings → Accounts → Download authentication at a browser \
+                profile signed in with the membership and it will capture normally."
+            .to_string();
+    }
     let mut out = "🔒 Subscriber-only stream — the connected account isn't entitled to it \
                    (UNAUTHORIZED_ENTITLEMENTS), so the live edge can't be captured directly."
         .to_string();
@@ -3264,10 +3273,11 @@ pub(super) fn render_instance_row(
                     // the live edge. Shown while the channel is still live —
                     // that's when the lag is actionable.
                     if m.last_state == "live"
-                        && crate::models::sub_only_rejected(&row.last_recording_log)
+                        && (crate::models::sub_only_rejected(&row.last_recording_log)
+                            || crate::models::members_only_rejected(&row.last_recording_log))
                     {
                         ui.colored_label(SUB_ONLY_COLOR, egui::RichText::new("🔒").small())
-                            .on_hover_text(sub_only_hover(row.last_recording_started, now));
+                            .on_hover_text(sub_only_hover(m.platform(), row.last_recording_started, now));
                     }
                     if let Some(platform) = standby_for {
                         ui.colored_label(

@@ -3258,6 +3258,7 @@ progress_info: None,
                     stream_tags: None,
                     stream_language: None,
                     stream_game_id: None,
+                    members_only: false,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -3280,6 +3281,7 @@ progress_info: None,
                 stream_tags: None,
                 stream_language: None,
                 stream_game_id: None,
+                members_only: false,
             },
             _ => self.ctx.detect_scrape(&item).await,
         }
@@ -3471,17 +3473,33 @@ progress_info: None,
             channel: row.channel.name.clone(),
             count: 1,
             lost_segments: 0,
-            last_line: format!(
-                "This {} broadcast is subscriber-only and the connected account isn't \
-                 entitled to it (UNAUTHORIZED_ENTITLEMENTS), so the live edge can't be \
-                 captured. It is NOT lost: the CDN head backfill is archiving the \
-                 broadcast from its start, re-checked every {}m — that copy lags the live \
-                 edge by up to that long, and the final minutes after the stream ends may \
-                 be missing. Subscribing with the connected account would let it capture \
-                 normally.",
-                row.monitor.platform().label(),
-                SUB_ONLY_COOLDOWN_SECS / 60,
-            ),
+            last_line: match row.monitor.platform() {
+                // Twitch gates the manifest but not the DVR segments, so the
+                // broadcast is still archivable — just behind the live edge.
+                Platform::Twitch => format!(
+                    "This Twitch broadcast is subscriber-only and the connected account isn't \
+                     entitled to it (UNAUTHORIZED_ENTITLEMENTS), so the live edge can't be \
+                     captured. It is NOT lost: a CDN capture session is archiving the \
+                     broadcast from its start, extending every few minutes — that copy lags \
+                     the live edge, and the last minutes before the stream ends may be \
+                     missing. Subscribing with the connected account would let it capture \
+                     normally.",
+                ),
+                // YouTube gates the manifest itself: without the membership
+                // there is nothing to fetch, so say so plainly rather than
+                // implying something is being archived.
+                _ => format!(
+                    "This {} broadcast is members-only and the credentials in use don't hold \
+                     that membership, so it can't be captured — unlike Twitch, there's no \
+                     public CDN copy to fall back on. The broadcast is still recorded in the \
+                     history (👁 seen live, not recorded). Point Settings → Accounts → \
+                     Download authentication at a browser profile signed in with the \
+                     membership and it will capture normally; retries are held off to every \
+                     {}m meanwhile.",
+                    row.monitor.platform().label(),
+                    SUB_ONLY_COOLDOWN_SECS / 60,
+                ),
+            },
         };
         match self.store.upsert_capture_alert(&alert) {
             Ok((id, true)) => {
@@ -3883,8 +3901,14 @@ progress_info: None,
         // rather than a fault. It changes the retry cadence (see
         // `SUB_ONLY_COOLDOWN_SECS`) and files one 🔒 alert per broadcast
         // instead of a "capture tool error" per take.
-        let sub_only = !manually_stopped && !ok && crate::models::sub_only_rejected(&outcome.log);
-        if sub_only {
+        // Both platforms' "you aren't entitled to this broadcast" refusals
+        // share a cadence and a badge; only Twitch has a CDN fallback to
+        // hand the broadcast to afterwards.
+        let gated = !manually_stopped
+            && !ok
+            && (crate::models::sub_only_rejected(&outcome.log)
+                || crate::models::members_only_rejected(&outcome.log));
+        if gated {
             self.file_sub_only_alert(&row, monitor_id, rec_id, stream_id.as_deref());
             // Hand the broadcast to a CDN capture session: it archives from the
             // segments Twitch does serve, incrementally, and holds the monitor
@@ -3919,7 +3943,7 @@ progress_info: None,
         // otherwise reset the wait to 30s, and a captured one would clear it entirely,
         // either way re-triggering the moment the next LIVE signal arrives.
         if !manually_stopped {
-            self.note_result(monitor_id, duration, ok, po_rejected, used_po_fallback, sub_only);
+            self.note_result(monitor_id, duration, ok, po_rejected, used_po_fallback, gated);
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
     }
