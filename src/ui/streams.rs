@@ -2730,12 +2730,7 @@ impl StreamArchiverApp {
             crate::platform::open_path(&p);
         }
         if let Some((key, mid)) = mark_started_stream {
-            // Never downgrades an already-started/watched broadcast; a
-            // never-touched key (no row yet) behaves as "unwatched".
-            let cur = self.core.store.stream_watch_state(&key).ok().flatten().map(|(s, _)| s);
-            if history::should_advance_to_started(cur.as_deref()) {
-                let _ = self.core.store.set_stream_watch_state(&key, mid, "started");
-            }
+            self.mark_broadcast_started(&key, mid);
         }
         if let Some(target) = open_in_player.or_else(|| acts.stream_in_player.take()) {
             let player = self.settings.media_player_path.trim().to_string();
@@ -2916,9 +2911,7 @@ impl StreamArchiverApp {
                 }));
             }
         }
-        if let Some(rid) = open_recording_props
-            && !self.rec_props_popups.iter().any(|p| p.lock().unwrap().rec_id == rid)
-        {
+        if let Some(rid) = open_recording_props {
             // Seed the notes draft from the cached recording (already loaded).
             let notes = self
                 .rec_cache
@@ -2927,12 +2920,35 @@ impl StreamArchiverApp {
                 .find(|r| r.id == rid)
                 .map(|r| r.notes.clone())
                 .unwrap_or_default();
-            self.rec_props_popups.push(Arc::new(Mutex::new(RecPropsPopup {
-                rec_id: rid,
-                notes,
-                notes_dirty: false,
-                closed: false,
-            })));
+            self.open_recording_properties(rid, notes);
+        }
+    }
+
+    /// Open a take's 📄 Properties window (no-op when it's already open).
+    /// `notes` seeds the editable notes draft — the caller supplies it because
+    /// the two callers read from different in-memory lists (Streams' per-monitor
+    /// `rec_cache`, Backlog's flat `history_all`) and neither should hit the DB
+    /// for a field it already has.
+    pub(super) fn open_recording_properties(&mut self, rec_id: i64, notes: String) {
+        if self.rec_props_popups.iter().any(|p| p.lock().unwrap().rec_id == rec_id) {
+            return;
+        }
+        self.rec_props_popups.push(Arc::new(Mutex::new(RecPropsPopup {
+            rec_id,
+            notes,
+            notes_dirty: false,
+            closed: false,
+        })));
+    }
+
+    /// Advance a broadcast's watch state to "started" because the user just
+    /// opened/played it — never downgrades one already marked started/watched
+    /// (see [`history::should_advance_to_started`]). Shared by the Streams take
+    /// row and the Backlog row.
+    pub(super) fn mark_broadcast_started(&mut self, key: &str, mid: i64) {
+        let cur = self.core.store.stream_watch_state(key).ok().flatten().map(|(s, _)| s);
+        if history::should_advance_to_started(cur.as_deref()) {
+            let _ = self.core.store.set_stream_watch_state(key, mid, "started");
         }
     }
 

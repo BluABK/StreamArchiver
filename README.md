@@ -2724,6 +2724,20 @@ newest 500 broadcasts by default — **⬇ Load more** raises the cap):
   to the *broadcast*, not any one file — a reconnect that produces multiple
   takes for the same stream shares one state.
 
+  **Right-click any row** for the parts of the Streams take-row menu that make
+  sense for a finished broadcast: **▶ Open file**, **⏵ Play local recording**,
+  **▷ Play VOD** and **🌐 Open VOD webpage** (both re-resolve the URL live, so
+  they work even on a broadcast that was never captured locally), **💬 Chat
+  replay**, **📂 Open folder**, **📋 Copy file path**, **📄 Properties…**, and
+  **📺 Show in Streams** to jump to that channel. Rolling recordings also get
+  their Keep/Unkeep here, so you don't have to scroll back up to the section
+  for it. Opening or playing a broadcast advances it to *Started*, same as
+  from Streams. Anything to do with managing a live capture — start/stop,
+  re-remux, backfill, recovery, acknowledging a failure — deliberately stays
+  in 📺 Streams. On a broadcast split into several takes by a reconnect, file
+  actions use the newest take that still has a file and VOD actions the newest
+  with a platform stream id; per-take precision is on the Streams take rows.
+
   At the top sits the **🕰 Rolling recordings** section — see below.
 
 ### Rolling recordings 🕰

@@ -164,6 +164,207 @@ fn non_zero(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
 }
 
+/// Every take of a broadcast whose rolling countdown (or Keep) can still be
+/// toggled — an already-expired take is excluded, since its file is gone and
+/// nothing can bring it back.
+fn still_rolling_take_ids(g: &StreamGroup) -> Vec<i64> {
+    g.takes
+        .iter()
+        .filter(|t| t.rolling.ttl_secs > 0 && t.rolling.expired_at == 0)
+        .map(|t| t.id)
+        .collect()
+}
+
+/// What a Backlog row's right-click menu picked. Collected during render and
+/// applied after the table's borrow of `self` ends, same shape as
+/// `StreamsOut`.
+#[derive(Default)]
+pub(super) struct BacklogPick {
+    /// Open this file with the OS handler.
+    pub(super) open_path: Option<std::path::PathBuf>,
+    /// Open this file's containing folder.
+    pub(super) open_folder: Option<std::path::PathBuf>,
+    /// Copy this text to the clipboard.
+    pub(super) copy_text: Option<String>,
+    /// Play this local file in the configured media player.
+    pub(super) play_local: Option<std::path::PathBuf>,
+    /// Resolve + play this take's VOD (`ManualCommand::PlayVodNow`).
+    pub(super) play_vod: Option<i64>,
+    /// Resolve + open this take's VOD webpage.
+    pub(super) open_vod_webpage: Option<i64>,
+    /// Open this take's 📄 Properties window.
+    pub(super) properties: Option<i64>,
+    /// Open the chat replay for `(monitor id, recording id)`.
+    pub(super) chat: Option<(i64, i64)>,
+    /// Switch to 📺 Streams with this monitor selected.
+    pub(super) show_in_streams: Option<i64>,
+    /// Keep (`true`) / Unkeep (`false`) the listed takes — every still-rolling
+    /// take of the clicked broadcast, collected at click time.
+    pub(super) rolling: Option<(bool, Vec<i64>)>,
+    /// Advance this broadcast to "started" because it was just opened/played.
+    pub(super) mark_started: Option<(String, i64)>,
+}
+
+/// The right-click menu for a Backlog row — the parts of the Streams take-row
+/// menu that make sense for a finished broadcast you're deciding whether to
+/// watch. Everything to do with live capture (start/stop, re-remux, backfill,
+/// recovery, acknowledging failures) deliberately stays in 📺 Streams, which is
+/// where you go to manage a capture rather than to catch up on one.
+///
+/// A broadcast can have several takes (a reconnect). File actions target the
+/// **newest take that still has a file**, and VOD actions the newest take with
+/// a platform stream id — for the overwhelmingly common single-take broadcast
+/// these are the same take, and for a split one "the last piece" is the useful
+/// default. Per-take precision lives on the Streams take rows.
+fn backlog_row_menu(
+    ui: &mut egui::Ui,
+    mid: i64,
+    g: &StreamGroup,
+    media_player: &str,
+    fs_probes: &mut FsProbes,
+    rolling: GroupRolling,
+    pick: &mut BacklogPick,
+) {
+    ui.set_min_width(200.0);
+    let with_file = g
+        .takes
+        .iter()
+        .rev()
+        .find(|t| !t.output_path.is_empty() && fs_probes.is_file(std::path::Path::new(&t.output_path)));
+    let file = with_file.map(|t| std::path::PathBuf::from(&t.output_path));
+    let file_ok = file.is_some();
+
+    if ui
+        .add_enabled(file_ok, egui::Button::new("▶  Open file"))
+        .on_hover_text("Open the recording with your system's default handler.")
+        .on_disabled_hover_text("No file on disk for this broadcast.")
+        .clicked()
+    {
+        pick.open_path = file.clone();
+        pick.mark_started = Some((g.key.clone(), mid));
+        ui.close();
+    }
+    let player_ok = file_ok && !media_player.is_empty();
+    if ui
+        .add_enabled(player_ok, egui::Button::new("⏵  Play local recording"))
+        .on_hover_text("Open the recording in the configured media player.")
+        .on_disabled_hover_text(if media_player.is_empty() {
+            "Set a media player in Settings → Defaults first"
+        } else {
+            "No file on disk for this broadcast."
+        })
+        .clicked()
+    {
+        pick.play_local = file.clone();
+        pick.mark_started = Some((g.key.clone(), mid));
+        ui.close();
+    }
+    // Both VOD actions re-resolve the URL live, so they work on a broadcast
+    // that was never captured at all — hence keyed on `stream_id`, not on
+    // having a file.
+    let vod_take = g.takes.iter().rev().find(|t| t.stream_id.is_some() && !t.is_active());
+    if let Some(t) = vod_take {
+        ui.separator();
+        if ui
+            .button("▷  Play VOD")
+            .on_hover_text(
+                "Play this broadcast's VOD in the media player — the platform's published VOD \
+                 if available, else (Twitch) reconstructed from CDN segments. Works even if it \
+                 was never recorded locally. No-ops quietly if nothing resolves.",
+            )
+            .clicked()
+        {
+            pick.play_vod = Some(t.id);
+            pick.mark_started = Some((g.key.clone(), mid));
+            ui.close();
+        }
+        if ui
+            .button("🌐  Open VOD webpage")
+            .on_hover_text(
+                "Open this broadcast's VOD page in your browser — resolved the same way as \
+                 \"Play VOD\", so it works before any download or recovery has run. No-ops \
+                 quietly if nothing resolves.",
+            )
+            .clicked()
+        {
+            pick.open_vod_webpage = Some(t.id);
+            ui.close();
+        }
+    }
+    ui.separator();
+    if let Some(t) = g.takes.iter().rev().find(|t| !t.chat_path.is_empty())
+        && ui.button("💬  Chat replay").clicked()
+    {
+        pick.chat = Some((mid, t.id));
+        ui.close();
+    }
+    if ui
+        .add_enabled(file_ok, egui::Button::new("📂  Open folder"))
+        .on_disabled_hover_text("No file on disk for this broadcast.")
+        .clicked()
+    {
+        pick.open_folder = file.as_deref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        ui.close();
+    }
+    if ui
+        .add_enabled(file_ok, egui::Button::new("📋  Copy file path"))
+        .on_disabled_hover_text("No file on disk for this broadcast.")
+        .clicked()
+    {
+        pick.copy_text = with_file.map(|t| t.output_path.clone());
+        ui.close();
+    }
+    // Rolling controls here as well as in the section above: once you've
+    // scrolled into the main grid, having to scroll back up to keep something
+    // is exactly the friction that makes people not bother.
+    match rolling {
+        GroupRolling::Rolling { .. } => {
+            ui.separator();
+            if ui
+                .button("📌  Keep (stop auto-deleting)")
+                .on_hover_text(
+                    "This is a rolling recording — keep it and it becomes a normal archived \
+                     stream instead of being deleted when its time runs out.",
+                )
+                .clicked()
+            {
+                pick.rolling = Some((true, still_rolling_take_ids(g)));
+                ui.close();
+            }
+        }
+        GroupRolling::Kept => {
+            ui.separator();
+            if ui
+                .button("↩  Unkeep (resume auto-delete)")
+                .on_hover_text(
+                    "Put this back in the rolling set. The countdown restarts from now, so it \
+                     won't be deleted immediately.",
+                )
+                .clicked()
+            {
+                pick.rolling = Some((false, still_rolling_take_ids(g)));
+                ui.close();
+            }
+        }
+        _ => {}
+    }
+    ui.separator();
+    if let Some(t) = g.takes.last()
+        && ui.button("📄  Properties…").clicked()
+    {
+        pick.properties = Some(t.id);
+        ui.close();
+    }
+    if ui
+        .button("📺  Show in Streams")
+        .on_hover_text("Switch to the Streams view with this channel selected.")
+        .clicked()
+    {
+        pick.show_in_streams = Some(mid);
+        ui.close();
+    }
+}
+
 /// A broadcast's rolling state, rolled up from its takes.
 ///
 /// Rolling-ness is per *take* (it's a per-file TTL), but every take of one
@@ -658,6 +859,11 @@ impl StreamArchiverApp {
         let mut set_state: Option<(String, i64, &'static str)> = None;
         let mut want_reorder = false;
         let mut open_chat: Option<(i64, i64)> = None;
+        let mut pick = BacklogPick::default();
+        let media_player = self.settings.media_player_path.trim().to_string();
+        // Taken out of `self` for the table closure, which borrows `self.rows`
+        // immutably at the same time.
+        let fs_probes = self.fs_probes.clone();
 
         egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
             ui.style_mut().interaction.selectable_labels = false;
@@ -717,6 +923,17 @@ impl StreamArchiverApp {
                             );
                         });
                     }
+                    tr.response().context_menu(|ui| {
+                        backlog_row_menu(
+                            ui,
+                            mid,
+                            g,
+                            &media_player,
+                            &mut fs_probes.lock().unwrap(),
+                            group_rolling(g),
+                            &mut pick,
+                        );
+                    });
                 });
             });
         });
@@ -746,9 +963,75 @@ impl StreamArchiverApp {
             let _ = self.core.store.set_stream_watch_state(&key, mid, state);
             self.reload_history();
         }
-        if let Some((mid, rid)) = open_chat {
+        if let Some((mid, rid)) = open_chat.or(pick.chat) {
             let ctx = ui.ctx().clone();
             self.open_chat_popup(mid, Some(rid), &ctx);
+        }
+        self.apply_backlog_pick(ui, pick, now);
+    }
+
+    /// Apply one Backlog row-menu pick, after the table has released `self`.
+    /// Each arm is the same dispatch the equivalent Streams take-row action
+    /// uses (`ManualCommand`s, `crate::platform` openers, the shared
+    /// watch-state advance) — the menu is a different entry point to the same
+    /// actions, not a reimplementation of them.
+    fn apply_backlog_pick(&mut self, ui: &egui::Ui, pick: BacklogPick, now: i64) {
+        if let Some((key, mid)) = pick.mark_started {
+            self.mark_broadcast_started(&key, mid);
+            self.reload_history();
+        }
+        if let Some(p) = pick.open_path {
+            crate::platform::open_path(&p);
+        }
+        if let Some(p) = pick.open_folder {
+            crate::platform::open_path(&p);
+        }
+        if let Some(t) = pick.copy_text {
+            ui.ctx().copy_text(t);
+        }
+        if let Some(p) = pick.play_local {
+            let player = self.settings.media_player_path.trim().to_string();
+            let target = StreamTarget::Finished(p.clone());
+            if !player.is_empty() {
+                let _ = build_player_command(&player, &target).spawn();
+            } else {
+                crate::platform::open_path(&p);
+            }
+        }
+        if let Some(rid) = pick.play_vod {
+            self.core.manual(ManualCommand::PlayVodNow(rid));
+            self.status = "Resolving VOD to play…".into();
+        }
+        if let Some(rid) = pick.open_vod_webpage {
+            self.core.manual(ManualCommand::OpenVodWebpage(rid));
+            self.status = "Resolving VOD webpage…".into();
+        }
+        if let Some(rid) = pick.properties {
+            // Notes come from the flat history list this view already loaded —
+            // Streams reads the same field out of its own per-monitor cache.
+            let notes = self
+                .history_all
+                .iter()
+                .find(|r| r.id == rid)
+                .map(|r| r.notes.clone())
+                .unwrap_or_default();
+            self.open_recording_properties(rid, notes);
+        }
+        if let Some(mid) = pick.show_in_streams {
+            self.switch_view(View::Streams);
+            self.selected_monitor = Some(mid);
+        }
+        if let Some((keep, ids)) = pick.rolling {
+            // The menu acts on the broadcast, so every still-rolling take of it
+            // moves together — same rule as the section's buttons.
+            for id in ids {
+                let _ = if keep {
+                    self.core.store.keep_rolling_recording(id, now)
+                } else {
+                    self.core.store.unkeep_rolling_recording(id, now)
+                };
+            }
+            self.reload_history();
         }
     }
 
