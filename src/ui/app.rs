@@ -853,6 +853,7 @@ impl StreamArchiverApp {
                 },
             },
             backlog_filters: vec![String::new(); BACKLOG_COLUMNS.len()],
+            backlog_show_kept: false,
             reorder_columns: None,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),

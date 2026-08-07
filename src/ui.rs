@@ -2249,6 +2249,10 @@ pub struct StreamArchiverApp {
     /// than a mode of Streams (Streams is a tree grouped under channels).
     backlog_sort: SortState,
     backlog_filters: Vec<String>,
+    /// Backlog's 🕰 Rolling recordings section: also list broadcasts already
+    /// kept, so Unkeep is reachable there. Session-only — the section is about
+    /// what's at risk right now, and that's what it should open showing.
+    backlog_show_kept: bool,
     /// Backing state for the "⇕ Reorder columns…" window (`None` = closed) —
     /// a working copy of one table's entries, only written back + persisted
     /// (and only forcing one table reset, not one per intermediate move) when

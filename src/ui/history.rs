@@ -4,6 +4,7 @@
 //! take/file — see `crate::store::watch` for the schema.
 
 use super::*;
+use crate::models::RollingState;
 
 /// The four watch states, in display order, paired with their row/filter label.
 pub(super) const WATCH_STATES: [(&str, &str); 4] = [
@@ -161,6 +162,59 @@ fn channel_label(rows: &[MonitorWithChannel], mid: i64) -> (String, Option<Platf
 /// as a column of noughts.
 fn non_zero(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
+}
+
+/// A broadcast's rolling state, rolled up from its takes.
+///
+/// Rolling-ness is per *take* (it's a per-file TTL), but every take of one
+/// broadcast comes from the same instance under the same settings, so in
+/// practice they share a TTL and expire together — and Keep is far more useful
+/// as "keep this broadcast" than as "keep take 2 of 3". The soonest deadline
+/// among the still-counting takes is what the row shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GroupRolling {
+    /// No take of this broadcast is (or ever was) a rolling recording.
+    None,
+    /// At least one take is still counting down. `deadline` is `None` while a
+    /// take is still recording.
+    Rolling { deadline: Option<i64> },
+    /// Every rolling take was kept — an ordinary archived broadcast that
+    /// happens to have come from a rolling recording.
+    Kept,
+    /// Every rolling take has been swept; the media is gone, the history isn't.
+    Expired,
+}
+
+pub(super) fn group_rolling(g: &StreamGroup) -> GroupRolling {
+    let mut counting: Vec<Option<i64>> = Vec::new();
+    let (mut kept, mut expired) = (false, false);
+    for t in &g.takes {
+        match t.rolling.state(t.ended_at) {
+            RollingState::None => {}
+            RollingState::Rolling { deadline } => counting.push(deadline),
+            RollingState::Kept { .. } => kept = true,
+            RollingState::Expired { .. } => expired = true,
+        }
+    }
+    if !counting.is_empty() {
+        // A take with no deadline yet (still recording) wins over any dated
+        // sibling: "still going" is the honest answer for the broadcast.
+        let deadline = if counting.iter().any(Option::is_none) {
+            None
+        } else {
+            counting.iter().flatten().copied().min()
+        };
+        return GroupRolling::Rolling { deadline };
+    }
+    // Nothing is counting down any more. Kept wins over expired: a broadcast
+    // with one kept take still has media on disk.
+    if kept {
+        GroupRolling::Kept
+    } else if expired {
+        GroupRolling::Expired
+    } else {
+        GroupRolling::None
+    }
 }
 
 /// Draw one Backlog cell. Column order is driven by the user's persisted
@@ -327,6 +381,190 @@ impl StreamArchiverApp {
         ]
     }
 
+    /// The 🕰 Rolling recordings section at the top of Backlog: every broadcast
+    /// still counting down towards auto-deletion, soonest first, with its
+    /// remaining time and a **Keep** button. Ticking "Show kept" also lists the
+    /// ones already rescued, so **Unkeep** is reachable from here rather than
+    /// only from the Streams take row.
+    ///
+    /// Uses the same columns (and the same user arrangement) as the main grid
+    /// below it, with TTL + the button prepended — this is the same list seen
+    /// through a different lens, not a different list.
+    ///
+    /// Returns the actions the caller applies after the borrow ends.
+    fn backlog_rolling_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        groups: &[(i64, StreamGroup)],
+        col_order: &[usize],
+        now: i64,
+    ) -> Vec<(i64, bool)> {
+        use egui_extras::{Column, TableBuilder};
+        let mut acts: Vec<(i64, bool)> = Vec::new(); // (recording id, keep?)
+
+        // Soonest-expiring first: this is a countdown list, so recency (the
+        // main grid's order) is the wrong axis entirely.
+        let mut rolling: Vec<(i64, &StreamGroup, GroupRolling)> = groups
+            .iter()
+            .map(|(mid, g)| (*mid, g, group_rolling(g)))
+            .filter(|(_, _, r)| {
+                matches!(r, GroupRolling::Rolling { .. })
+                    || (self.backlog_show_kept && matches!(r, GroupRolling::Kept))
+            })
+            .collect();
+        rolling.sort_by_key(|(_, _, r)| match r {
+            // Still-recording takes have no deadline yet — they sort last, not
+            // first, since nothing is at risk until they finish.
+            GroupRolling::Rolling { deadline } => (0, deadline.unwrap_or(i64::MAX)),
+            _ => (1, i64::MAX),
+        });
+        let counting = rolling.iter().filter(|(_, _, r)| matches!(r, GroupRolling::Rolling { .. })).count();
+        if counting == 0 && !self.backlog_show_kept {
+            return acts;
+        }
+        let soonest = rolling
+            .iter()
+            .filter_map(|(_, _, r)| match r {
+                GroupRolling::Rolling { deadline } => *deadline,
+                _ => None,
+            })
+            .min();
+        let header = match soonest {
+            Some(d) => format!("🕰  Rolling recordings ({counting}) — next in {}", crate::rolling::fmt_remaining(d - now)),
+            None => format!("🕰  Rolling recordings ({counting})"),
+        };
+
+        egui::CollapsingHeader::new(header)
+            .id_salt("backlog_rolling_section")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak(
+                        "These files are deleted automatically when their time runs out. \
+                         Keep one to make it a normal archived stream — its history row \
+                         survives either way, only the video goes.",
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.backlog_show_kept, "Show kept")
+                            .on_hover_text(
+                                "Also list broadcasts you've already kept, so you can Unkeep \
+                                 one (which restarts its countdown from now, never from when \
+                                 it was recorded).",
+                            );
+                    });
+                });
+                if rolling.is_empty() {
+                    ui.weak("Nothing rolling right now.");
+                    return;
+                }
+                egui::ScrollArea::both()
+                    .id_salt("backlog_rolling_scroll")
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.style_mut().interaction.selectable_labels = false;
+                        let mut tb = TableBuilder::new(ui)
+                            .id_salt("backlog_rolling_table")
+                            .striped(true)
+                            .resizable(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().at_least(72.0))
+                            .column(Column::auto().at_least(64.0));
+                        for &i in col_order {
+                            tb = tb.column(Column::auto().at_least(BACKLOG_COLUMNS[i].min_width));
+                        }
+                        tb.header(20.0, |mut h| {
+                            h.col(|ui| {
+                                ui.strong("Time left").on_hover_text(
+                                    "How long until this broadcast's file is deleted \
+                                     automatically. The clock starts when the recording ends, \
+                                     so a live one shows no countdown yet.",
+                                );
+                            });
+                            h.col(|ui| {
+                                ui.strong("").on_hover_text("Keep / Unkeep");
+                            });
+                            for &i in col_order {
+                                h.col(|ui| {
+                                    ui.strong(BACKLOG_COLUMNS[i].title)
+                                        .on_hover_text(BACKLOG_COLUMNS[i].tooltip);
+                                });
+                            }
+                        })
+                        .body(|mut body| {
+                            for (mid, g, state) in &rolling {
+                                body.row(24.0, |mut tr| {
+                                    tr.col(|ui| match state {
+                                        GroupRolling::Rolling { deadline: Some(d) } => {
+                                            let left = d - now;
+                                            let text = crate::rolling::fmt_remaining(left);
+                                            // Under a day is the point at which
+                                            // "I should decide about this" turns
+                                            // into "decide now".
+                                            if left < 86_400 {
+                                                ui.colored_label(grid::HL_ERROR_TEXT, text)
+                                            } else {
+                                                ui.label(text)
+                                            }
+                                            .on_hover_text(format!("Deleted automatically at {}", fmt_datetime_short(*d)));
+                                        }
+                                        GroupRolling::Rolling { deadline: None } => {
+                                            ui.weak("recording").on_hover_text(
+                                                "Still capturing — the countdown starts when it ends.",
+                                            );
+                                        }
+                                        _ => {
+                                            ui.weak("kept").on_hover_text("Not counting down.");
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        let keeping = matches!(state, GroupRolling::Rolling { .. });
+                                        let label = if keeping { "📌 Keep" } else { "↩ Unkeep" };
+                                        if ui
+                                            .button(label)
+                                            .on_hover_text(if keeping {
+                                                "Stop the countdown — this becomes a normal \
+                                                 archived stream (marked as kept from a rolling \
+                                                 recording)."
+                                            } else {
+                                                "Put it back in the rolling set. The countdown \
+                                                 restarts from now, so it won't be deleted \
+                                                 immediately."
+                                            })
+                                            .clicked()
+                                        {
+                                            for t in &g.takes {
+                                                if t.rolling.ttl_secs > 0 && t.rolling.expired_at == 0 {
+                                                    acts.push((t.id, keeping));
+                                                }
+                                            }
+                                        }
+                                    });
+                                    let (watch, _) = effective_watch_state(&self.history_watch, &g.key);
+                                    for &ci in col_order {
+                                        tr.col(|ui| {
+                                            backlog_cell(
+                                                ui,
+                                                BACKLOG_COLUMNS[ci].id,
+                                                *mid,
+                                                g,
+                                                watch,
+                                                now,
+                                                &self.rows,
+                                                &mut None,
+                                                &mut None,
+                                            );
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                    });
+            });
+        ui.separator();
+        acts
+    }
+
     /// 📥 Backlog: every broadcast across every channel, flat and newest-first,
     /// as a full grid (hide/show/reorder/resize/sort/filter per column, all
     /// persisted — see [`crate::grid_columns`]).
@@ -379,6 +617,31 @@ impl StreamArchiverApp {
             return;
         }
 
+        let mut sort = std::mem::take(&mut self.backlog_sort);
+        let mut filters = std::mem::take(&mut self.backlog_filters);
+        let mut entries = self.backlog_grid.entries.clone();
+        let col_order = grid_columns::effective_order(&BACKLOG_COLUMNS, &entries, |_| true);
+        let order_changed = self.backlog_grid.note_order(&col_order);
+
+        // The rolling section sits above the main grid and is deliberately NOT
+        // subject to the watch-state chips: a file about to be deleted has to
+        // be visible whether or not you've watched it. Rendered before the
+        // model below is built so it can still borrow `self` mutably.
+        let rolling_acts = self.backlog_rolling_section(ui, &groups, &col_order, now);
+        if !rolling_acts.is_empty() {
+            for (rec_id, keep) in rolling_acts {
+                let _ = if keep {
+                    self.core.store.keep_rolling_recording(rec_id, now)
+                } else {
+                    self.core.store.unkeep_rolling_recording(rec_id, now)
+                };
+            }
+            self.reload_history();
+            self.backlog_sort = sort;
+            self.backlog_filters = filters;
+            return;
+        }
+
         // Watch-state chips filter BEFORE the model is built, so a hidden state
         // can't be reached by column sorting either.
         let visible: Vec<(i64, &StreamGroup, &str)> = groups
@@ -392,11 +655,6 @@ impl StreamArchiverApp {
         let model: Vec<Vec<Cell>> =
             visible.iter().map(|(mid, g, state)| self.backlog_cells(*mid, g, state, now)).collect();
 
-        let mut sort = std::mem::take(&mut self.backlog_sort);
-        let mut filters = std::mem::take(&mut self.backlog_filters);
-        let mut entries = self.backlog_grid.entries.clone();
-        let col_order = grid_columns::effective_order(&BACKLOG_COLUMNS, &entries, |_| true);
-        let order_changed = self.backlog_grid.note_order(&col_order);
         let mut set_state: Option<(String, i64, &'static str)> = None;
         let mut want_reorder = false;
         let mut open_chat: Option<(i64, i64)> = None;
@@ -674,6 +932,63 @@ mod tests {
             chat_path: String::new(),
             rolling: crate::models::Rolling::default(),
         }
+    }
+
+    /// A finished broadcast made of `takes`, for the rollup tests below.
+    fn group(takes: Vec<Recording>) -> StreamGroup {
+        StreamGroup {
+            key: "m1:s1".into(),
+            stream_id: Some("s1".into()),
+            went_live_at: Some(0),
+            went_live_approx: false,
+            takes,
+        }
+    }
+
+    #[test]
+    fn group_rolling_rolls_takes_up_to_one_broadcast_state() {
+        use crate::models::Rolling;
+        let ended = |ttl: i64, kept: i64, expired: i64| {
+            let mut r = rec("C:/out/a.mkv");
+            r.ended_at = Some(1_000);
+            r.rolling = Rolling { ttl_secs: ttl, from: 0, kept_at: kept, expired_at: expired };
+            r
+        };
+
+        // Nothing rolling at all.
+        assert!(matches!(group_rolling(&group(vec![rec("C:/out/a.mkv")])), GroupRolling::None));
+
+        // One counting-down take makes the whole broadcast rolling, and the
+        // SOONEST deadline is the one that matters (that's when the first file
+        // goes).
+        let mut early = ended(60, 0, 0);
+        early.ended_at = Some(100);
+        let late = ended(60, 0, 0); // ends at 1000
+        let g = group(vec![early, late]);
+        assert!(matches!(group_rolling(&g), GroupRolling::Rolling { deadline: Some(160) }));
+
+        // A still-recording take wins over any dated sibling: "still going" is
+        // the honest answer for the broadcast.
+        let mut live = ended(60, 0, 0);
+        live.ended_at = None;
+        let g = group(vec![ended(60, 0, 0), live]);
+        assert!(matches!(group_rolling(&g), GroupRolling::Rolling { deadline: None }));
+
+        // All kept → Kept; all expired → Expired; a mix keeps the broadcast
+        // "kept", since one kept take still means media on disk.
+        assert!(matches!(group_rolling(&group(vec![ended(60, 5, 0)])), GroupRolling::Kept));
+        assert!(matches!(group_rolling(&group(vec![ended(60, 0, 9)])), GroupRolling::Expired));
+        assert!(matches!(
+            group_rolling(&group(vec![ended(60, 5, 0), ended(60, 0, 9)])),
+            GroupRolling::Kept
+        ));
+
+        // One counting take outranks kept/expired siblings — something is still
+        // at risk, so the row belongs in the rolling section.
+        assert!(matches!(
+            group_rolling(&group(vec![ended(60, 5, 0), ended(60, 0, 0)])),
+            GroupRolling::Rolling { .. }
+        ));
     }
 
     #[test]
