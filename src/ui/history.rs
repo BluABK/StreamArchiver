@@ -430,6 +430,10 @@ fn backlog_cell(
     watch_state: &str,
     now: i64,
     rows: &[MonitorWithChannel],
+    // Small avatar per monitor id for the Channel cell — see
+    // [`StreamArchiverApp::backlog_avatars`]. Missing entry = no icon on disk
+    // (yet), which just draws the name on its own.
+    avatars: &HashMap<i64, egui::TextureHandle>,
     set_state: &mut Option<(String, i64, &'static str)>,
     open_chat: &mut Option<(i64, i64)>,
 ) {
@@ -457,6 +461,18 @@ fn backlog_cell(
         }
         "channel" => {
             let (name, _) = channel_label(rows, mid);
+            // The same 18 px face the 📺 Streams tree puts on a row (see
+            // `tree_name`): a flat cross-channel list is far quicker to scan by
+            // picture than by reading every name.
+            if let Some(tex) = avatars.get(&mid) {
+                let resp = ui.add(
+                    egui::Image::from_texture(tex)
+                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                        .corner_radius(egui::CornerRadius::same(3)),
+                );
+                queue_alt_image_preview(ui.ctx(), &resp, tex);
+                ui.add_space(3.0);
+            }
             ui.label(egui::RichText::new(&name).strong()).on_hover_text(name);
         }
         "title" => {
@@ -547,6 +563,82 @@ impl StreamArchiverApp {
         self.history_loaded = true;
     }
 
+    /// Small avatars for Backlog's **Channel** column, keyed by monitor id.
+    ///
+    /// A Backlog row is one broadcast by one capture instance, so that
+    /// instance's own account icon is the honest face to put on it; when the
+    /// platform has no asset fetcher (or nothing has been fetched yet) it falls
+    /// back to the container's chosen-platform avatar — the one 📺 Streams
+    /// draws on the channel row.
+    ///
+    /// Resolution goes through the very `*_icons_small` caches Streams uses, so
+    /// opening Backlog without ever opening Streams costs one disk load per
+    /// instance and nothing per frame afterwards, and the events that clear
+    /// those caches (asset fetch completed, channel renamed) re-resolve both
+    /// views together.
+    fn backlog_avatars(
+        &mut self,
+        ctx: &egui::Context,
+        groups: &[(i64, StreamGroup)],
+    ) -> HashMap<i64, egui::TextureHandle> {
+        let mids: HashSet<i64> = groups.iter().map(|(mid, _)| *mid).collect();
+
+        // Resolve what isn't cached yet — normally nothing after the first
+        // frame. Cloned out of `self.rows` first so the cache inserts below
+        // don't collide with the borrow that produced them.
+        let missing: Vec<MonitorWithChannel> = self
+            .rows
+            .iter()
+            .filter(|r| mids.contains(&r.monitor.id) && !self.instance_icons_small.contains_key(&r.monitor.id))
+            .cloned()
+            .collect();
+        for row in &missing {
+            let tex = resolve_instance_icon_small(row, ctx);
+            self.instance_icons_small.insert(row.monitor.id, tex);
+        }
+
+        // Container fallback, only for instances whose own account came up empty.
+        let need_channel: Vec<(Channel, Vec<AssetAccount>)> = {
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut out = Vec::new();
+            for r in &self.rows {
+                let cid = r.channel.id;
+                if !mids.contains(&r.monitor.id)
+                    || self.instance_icons_small.get(&r.monitor.id).is_some_and(|t| t.is_some())
+                    || self.channel_icons_small.contains_key(&cid)
+                    || !seen.insert(cid)
+                {
+                    continue;
+                }
+                let mons: Vec<&MonitorWithChannel> =
+                    self.rows.iter().filter(|m| m.channel.id == cid).collect();
+                out.push((r.channel.clone(), channel_asset_accounts(&mons)));
+            }
+            out
+        };
+        for (channel, accounts) in &need_channel {
+            let tex = resolve_channel_icon_small(channel, accounts, ctx);
+            self.channel_icons_small.insert(channel.id, tex);
+        }
+
+        let mut out = HashMap::new();
+        for r in &self.rows {
+            let mid = r.monitor.id;
+            if !mids.contains(&mid) {
+                continue;
+            }
+            let tex = self
+                .instance_icons_small
+                .get(&mid)
+                .and_then(|o| o.clone())
+                .or_else(|| self.channel_icons_small.get(&r.channel.id).and_then(|o| o.clone()));
+            if let Some(t) = tex {
+                out.insert(mid, t);
+            }
+        }
+        out
+    }
+
     /// One [`Cell`] per [`BACKLOG_COLUMNS`] entry for one broadcast — the
     /// sort/filter model `ordered_rows` consumes. Kept next to the row renderer
     /// so the two can't drift out of column order.
@@ -598,6 +690,7 @@ impl StreamArchiverApp {
         ui: &mut egui::Ui,
         groups: &[(i64, StreamGroup)],
         col_order: &[usize],
+        avatars: &HashMap<i64, egui::TextureHandle>,
         now: i64,
     ) -> Vec<(i64, bool)> {
         use egui_extras::{Column, TableBuilder};
@@ -752,6 +845,7 @@ impl StreamArchiverApp {
                                                 watch,
                                                 now,
                                                 &self.rows,
+                                                avatars,
                                                 &mut None,
                                                 &mut None,
                                             );
@@ -828,7 +922,11 @@ impl StreamArchiverApp {
         // subject to the watch-state chips: a file about to be deleted has to
         // be visible whether or not you've watched it. Rendered before the
         // model below is built so it can still borrow `self` mutably.
-        let rolling_acts = self.backlog_rolling_section(ui, &groups, &col_order, now);
+        // Resolved before either table renders — both draw the same faces, and
+        // this is the last thing here that needs `&mut self`.
+        let avatars = self.backlog_avatars(ui.ctx(), &groups);
+
+        let rolling_acts = self.backlog_rolling_section(ui, &groups, &col_order, &avatars, now);
         if !rolling_acts.is_empty() {
             for (rec_id, keep) in rolling_acts {
                 let _ = if keep {
@@ -918,6 +1016,7 @@ impl StreamArchiverApp {
                                 state,
                                 now,
                                 &self.rows,
+                                &avatars,
                                 &mut set_state,
                                 &mut open_chat,
                             );

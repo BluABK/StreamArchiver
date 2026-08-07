@@ -2729,7 +2729,11 @@ newest 500 broadcasts by default — **⬇ Load more** raises the cap):
   hide/show, resize, reorder and sort like every other table, and it defaults
   to **newest first, flat across every channel** — which is exactly why it
   isn't just a mode of 📺 Streams, where rows are grouped under channel
-  containers instead.
+  containers instead. The Channel cell carries the same small profile picture
+  as the Streams tree (the capturing instance's account, falling back to the
+  channel's own when that account has no icon yet) — hold **Alt** over one for
+  a full-size preview. A flat list of every channel at once is much faster to
+  scan by face than by name.
 
   Every broadcast has a watch state: **Unwatched** (default) → **Started** →
   **Skipped**/**Watched**. Opening a finished take (▶/⏵, either the inline
