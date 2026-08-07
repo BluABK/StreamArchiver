@@ -755,6 +755,32 @@ pub(super) const VIDEO_COLUMNS: [GridCol; 10] = [
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 pub(super) const VIDEO_COLS: usize = 9;
 
+/// The 📥 Backlog columns, in DEFAULT display order — one row per *broadcast*
+/// (a `StreamGroup`), flat and newest-first across every channel.
+///
+/// Deliberately not the Streams columns: Streams is a tree grouped under
+/// channel containers and its rows are monitors, so its per-instance columns
+/// (On/Auto/Tool/Detection/Polled/Next stream/Added) are meaningless here.
+/// What Backlog needs is "what was this broadcast, and have I watched it" —
+/// hence Watch + the recording-shaped columns, and nothing about live state.
+/// Each `id` is a stable persistence key: never reuse or change one once
+/// shipped.
+pub(super) const BACKLOG_COLUMNS: [GridCol; 13] = [
+    GridCol { id: "watch",     title: "Watch",   tooltip: "Watch state for this broadcast: ◻ Unwatched, ▶ Started, ⏭ Skipped, ✔ Watched. Playing a take (or tuning into the channel live) advances Unwatched/Skipped to Started automatically; it never downgrades one you already marked. State belongs to the BROADCAST, so a reconnect that produced several takes shares one.", min_width: 130.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "platform",  title: "Plat",    tooltip: "Source platform of the channel this broadcast came from.", min_width: 46.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "channel",   title: "Channel", tooltip: "Which channel broadcast this. Click a row to select that channel in 📺 Streams.", min_width: 120.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "title",     title: "Title",   tooltip: "The broadcast's title (the newest take's logged title). Truncated — hover for the full text.", min_width: 100.0, initial: 260.0, sortable: true, stretch: false },
+    GridCol { id: "game",      title: "Game",    tooltip: "The broadcast's game / category (the newest take's logged value). Truncated — hover for the full name.", min_width: 70.0, initial: 120.0, sortable: true, stretch: false },
+    GridCol { id: "went_live", title: "Went Live", tooltip: "When the stream went live on the platform (a trailing \"~\" means it's our approximate time).", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "started",   title: "Started", tooltip: "When recording started.", min_width: 92.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "duration",  title: "Duration", tooltip: "How much was captured, summed across every take of this broadcast.", min_width: 56.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "size",      title: "Size",    tooltip: "Total size on disk of this broadcast's takes. Blank once the files are gone (e.g. an expired rolling recording, or a manual delete) — the history row survives either way.", min_width: 62.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "chat",      title: "💬",      tooltip: "A chat log was captured for this broadcast. Click to open the chat replay.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "changes",   title: "✏",       tooltip: "Title / game-category changes logged during the broadcast.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "ads",       title: "📢",      tooltip: "Ad breaks detected during the broadcast; each is a hard cut. Hover for count + total time.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "status",    title: "●",       tooltip: "Rolled-up capture status for the broadcast: ⏺ recording, ✔ completed, ⚠ failed, ⚡ aborted.", min_width: 26.0, initial: 0.0, sortable: true, stretch: true },
+];
+
 /// Background "Active tasks" columns (no sort/filter — hide/reorder only).
 pub(super) const BG_ACTIVE_COLUMNS: [GridCol; 5] = [
     GridCol { id: "channel", title: "Channel / Label", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
@@ -816,6 +842,7 @@ pub(super) fn columns_for(table: GridTableId) -> &'static [GridCol] {
         GridTableId::BgRecent => &BG_RECENT_COLUMNS,
         GridTableId::Processes => &PROCESSES_COLUMNS,
         GridTableId::Issues => &ISSUES_COLUMNS,
+        GridTableId::Backlog => &BACKLOG_COLUMNS,
     }
 }
 
@@ -830,6 +857,7 @@ pub(super) fn table_display_name(table: GridTableId) -> &'static str {
         GridTableId::BgRecent => "Background (Recent)",
         GridTableId::Processes => "Processes",
         GridTableId::Issues => "Issues",
+        GridTableId::Backlog => "Backlog",
     }
 }
 

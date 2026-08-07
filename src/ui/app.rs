@@ -527,6 +527,8 @@ impl StreamArchiverApp {
         let bg_recent_grid = GridState::load(&core.store, GridTableId::BgRecent, &BG_RECENT_COLUMNS);
         let processes_grid = GridState::load(&core.store, GridTableId::Processes, &PROCESSES_COLUMNS);
         let issues_grid = GridState::load(&core.store, GridTableId::Issues, &ISSUES_COLUMNS);
+        let backlog_grid = GridState::load(&core.store, GridTableId::Backlog, &BACKLOG_COLUMNS);
+        let backlog_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Backlog);
         let settings_tab = SettingsTab::from_id(&setting_or_empty(&core, K_SETTINGS_TAB));
 
         let mut app = StreamArchiverApp {
@@ -832,6 +834,25 @@ impl StreamArchiverApp {
             bg_show_gate_queue: false,
             processes_grid,
             issues_grid,
+            backlog_grid,
+            backlog_sort: SortState {
+                keys: {
+                    let resolved: Vec<SortLevel> =
+                        grid_columns::resolve_sort(&BACKLOG_COLUMNS, &backlog_sort_persisted)
+                            .into_iter()
+                            .map(|(col, ascending)| SortLevel { col, ascending })
+                            .collect();
+                    // Nothing persisted yet → newest broadcast first, the whole
+                    // point of this view. `started` is index 6 of BACKLOG_COLUMNS.
+                    if resolved.is_empty() {
+                        let started = BACKLOG_COLUMNS.iter().position(|c| c.id == "started").unwrap_or(0);
+                        vec![SortLevel { col: started, ascending: false }]
+                    } else {
+                        resolved
+                    }
+                },
+            },
+            backlog_filters: vec![String::new(); BACKLOG_COLUMNS.len()],
             reorder_columns: None,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),

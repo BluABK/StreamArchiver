@@ -111,16 +111,18 @@ pub enum GridTableId {
     BgRecent,
     Processes,
     Issues,
+    Backlog,
 }
 
 impl GridTableId {
-    pub const ALL: [GridTableId; 6] = [
+    pub const ALL: [GridTableId; 7] = [
         GridTableId::Streams,
         GridTableId::Videos,
         GridTableId::BgActive,
         GridTableId::BgRecent,
         GridTableId::Processes,
         GridTableId::Issues,
+        GridTableId::Backlog,
     ];
 
     /// Stable string key: used as the map key inside `K_GRID_COLUMNS` /
@@ -133,6 +135,7 @@ impl GridTableId {
             GridTableId::BgRecent => "bg_recent_table",
             GridTableId::Processes => "processes_table",
             GridTableId::Issues => "issues_table",
+            GridTableId::Backlog => "backlog_table",
         }
     }
 }

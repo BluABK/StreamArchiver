@@ -819,6 +819,8 @@ impl StreamArchiverApp {
             grid_columns::load_columns(&self.core.store, GridTableId::Processes, &PROCESSES_COLUMNS);
         self.issues_grid.entries =
             grid_columns::load_columns(&self.core.store, GridTableId::Issues, &ISSUES_COLUMNS);
+        self.backlog_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::Backlog, &BACKLOG_COLUMNS);
     }
     pub(super) fn stats_view(&mut self, ui: &mut egui::Ui) {
         use crate::schedule_ocr::load_ocr_stats;

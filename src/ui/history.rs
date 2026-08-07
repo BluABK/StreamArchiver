@@ -157,6 +157,125 @@ fn channel_label(rows: &[MonitorWithChannel], mid: i64) -> (String, Option<Platf
     }
 }
 
+/// `""` for zero, the number otherwise — count columns read better blank than
+/// as a column of noughts.
+fn non_zero(n: i64) -> String {
+    if n > 0 { n.to_string() } else { String::new() }
+}
+
+/// Draw one Backlog cell. Column order is driven by the user's persisted
+/// arrangement, so this dispatches on the column **id**, never on an index —
+/// exactly like the Streams/Videos row renderers.
+#[allow(clippy::too_many_arguments)]
+fn backlog_cell(
+    ui: &mut egui::Ui,
+    id: &str,
+    mid: i64,
+    g: &StreamGroup,
+    watch_state: &str,
+    now: i64,
+    rows: &[MonitorWithChannel],
+    set_state: &mut Option<(String, i64, &'static str)>,
+    open_chat: &mut Option<(i64, i64)>,
+) {
+    match id {
+        "watch" => {
+            // The four states as one exclusive strip — clicking any of them
+            // sets it directly, which is what a to-do list needs (the
+            // auto-advance on play only ever moves you forward).
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (s, label) in WATCH_STATES {
+                if ui
+                    .selectable_label(watch_state == s, label)
+                    .on_hover_text(format!("Mark this broadcast \"{s}\""))
+                    .clicked()
+                {
+                    *set_state = Some((g.key.clone(), mid, s));
+                }
+            }
+        }
+        "platform" => {
+            let (_, platform) = channel_label(rows, mid);
+            if let Some(p) = platform {
+                ui.weak(p.label()).on_hover_text(p.label());
+            }
+        }
+        "channel" => {
+            let (name, _) = channel_label(rows, mid);
+            ui.label(egui::RichText::new(&name).strong()).on_hover_text(name);
+        }
+        "title" => {
+            let t = g.title();
+            if !t.is_empty() {
+                ui.label(t).on_hover_text(t);
+            }
+        }
+        "game" => {
+            let c = g.category();
+            if !c.is_empty() {
+                ui.weak(c).on_hover_text(c);
+            }
+        }
+        "went_live" => {
+            if let Some(t) = g.went_live_at {
+                ts_label(ui, t);
+                if g.went_live_approx {
+                    ui.weak("~").on_hover_text("Approximate — our own first-seen time, not the platform's.");
+                }
+            }
+        }
+        "started" => ts_label(ui, g.started_at()),
+        "duration" => {
+            ui.label(fmt_duration(g.captured_secs(now)));
+        }
+        "size" => {
+            let bytes: i64 = g.takes.iter().map(|t| t.bytes).sum();
+            if bytes > 0 {
+                ui.label(fmt_bytes(bytes));
+            } else {
+                ui.weak("—").on_hover_text(
+                    "No file on disk for this broadcast — never captured, or the media has since \
+                     been deleted (manually, or by a rolling recording expiring). The history row \
+                     stays either way.",
+                );
+            }
+        }
+        "chat" => {
+            // The take that actually has the sidecar, so the popup opens the
+            // right one on a multi-take broadcast.
+            if let Some(t) = g.takes.iter().find(|t| !t.chat_path.is_empty())
+                && ui
+                    .button("💬")
+                    .on_hover_text("Open the chat replay for this broadcast")
+                    .clicked()
+            {
+                *open_chat = Some((mid, t.id));
+            }
+        }
+        "changes" => {
+            let n = g.meta_change_count();
+            if n > 0 {
+                ui.label(format!("✏{n}"))
+                    .on_hover_text(format!("{n} title/category change(s) logged during this broadcast"));
+            }
+        }
+        "ads" => {
+            let n = g.ad_count();
+            if n > 0 {
+                ui.label(format!("📢{n}")).on_hover_text(format!(
+                    "{n} ad break(s), {} total",
+                    fmt_duration(g.ad_secs())
+                ));
+            }
+        }
+        "status" => {
+            let (icon, color) = state_icon_ack(g.status(), g.takes.last().is_some_and(|t| t.err_ack));
+            ui.colored_label(color, icon).on_hover_text(g.status());
+        }
+        _ => {}
+    }
+}
+
 impl StreamArchiverApp {
     /// Loads `history_all`/`history_watch` once; call at the top of both
     /// views. `reload_history` forces a refresh (e.g. after "Load more").
@@ -173,11 +292,56 @@ impl StreamArchiverApp {
         self.history_loaded = true;
     }
 
+    /// One [`Cell`] per [`BACKLOG_COLUMNS`] entry for one broadcast — the
+    /// sort/filter model `ordered_rows` consumes. Kept next to the row renderer
+    /// so the two can't drift out of column order.
+    fn backlog_cells(
+        &self,
+        mid: i64,
+        g: &StreamGroup,
+        watch_state: &str,
+        now: i64,
+    ) -> Vec<Cell> {
+        let (name, platform) = channel_label(&self.rows, mid);
+        let bytes: i64 = g.takes.iter().map(|t| t.bytes).sum();
+        let has_chat = g.takes.iter().any(|t| !t.chat_path.is_empty());
+        let watch_label = WATCH_STATES
+            .iter()
+            .find(|(s, _)| *s == watch_state)
+            .map(|(_, l)| *l)
+            .unwrap_or("");
+        vec![
+            Cell::text(watch_label),
+            Cell::text(platform.map(|p| p.label().to_string()).unwrap_or_default()),
+            Cell::text(name),
+            Cell::text(g.title()),
+            Cell::text(g.category()),
+            Cell::num(g.went_live_at.unwrap_or(0) as f64, fmt_datetime_short(g.went_live_at.unwrap_or(0))),
+            Cell::num(g.started_at() as f64, fmt_datetime_short(g.started_at())),
+            Cell::num(g.captured_secs(now) as f64, fmt_duration(g.captured_secs(now))),
+            Cell::num(bytes as f64, if bytes > 0 { fmt_bytes(bytes) } else { String::new() }),
+            Cell::num(has_chat as i64 as f64, if has_chat { "💬".into() } else { String::new() }),
+            Cell::num(g.meta_change_count() as f64, non_zero(g.meta_change_count())),
+            Cell::num(g.ad_count() as f64, non_zero(g.ad_count())),
+            Cell::text(g.status()),
+        ]
+    }
+
+    /// 📥 Backlog: every broadcast across every channel, flat and newest-first,
+    /// as a full grid (hide/show/reorder/resize/sort/filter per column, all
+    /// persisted — see [`crate::grid_columns`]).
+    ///
+    /// This can't just be a mode of 📺 Streams: that view is a *tree* grouped
+    /// under channel containers, and the whole point here is the opposite
+    /// ordering — one flat list sorted by recency, so "what should I catch up
+    /// on next" is the first thing on screen.
     pub(super) fn backlog_view(&mut self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
         self.ensure_history_loaded();
+        let now = now_unix();
         let groups = flat_stream_groups(&self.history_all);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Show:");
             for (state, label) in WATCH_STATES {
                 let on = self.backlog_show_states.contains(state);
@@ -195,10 +359,14 @@ impl StreamArchiverApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button("⟳ Refresh")
-                    .on_hover_text("Reload from the database")
+                    .button("⬇ Load more (+500)")
+                    .on_hover_text("Raise the load cap and re-query for older broadcasts")
                     .clicked()
                 {
+                    self.history_load_limit += 500;
+                    self.reload_history();
+                }
+                if ui.button("⟳ Refresh").on_hover_text("Reload from the database").clicked() {
                     self.reload_history();
                 }
             });
@@ -211,44 +379,118 @@ impl StreamArchiverApp {
             return;
         }
 
-        let mut set_state: Option<(String, i64, &'static str)> = None;
-        let mut shown = 0usize;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (mid, g) in &groups {
+        // Watch-state chips filter BEFORE the model is built, so a hidden state
+        // can't be reached by column sorting either.
+        let visible: Vec<(i64, &StreamGroup, &str)> = groups
+            .iter()
+            .map(|(mid, g)| {
                 let (state, _) = effective_watch_state(&self.history_watch, &g.key);
-                if !self.backlog_show_states.contains(state) {
-                    continue;
-                }
-                shown += 1;
-                let (name, platform) = channel_label(&self.rows, *mid);
-                ui.horizontal(|ui| {
-                    ui.set_min_width(220.0);
-                    ui.label(egui::RichText::new(&name).strong());
-                    if let Some(p) = platform {
-                        ui.weak(format!("{p:?}"));
-                    }
-                    ts_label(ui, g.started_at());
-                    ui.label(fmt_duration(g.captured_secs(now_unix())));
-                    let (icon, color) = state_icon_ack(g.status(), g.takes.last().is_some_and(|t| t.err_ack));
-                    ui.colored_label(color, icon);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for (s, label) in WATCH_STATES {
-                            if ui.selectable_label(state == s, label).clicked() {
-                                set_state = Some((g.key.clone(), *mid, s));
-                            }
+                (*mid, g, state)
+            })
+            .filter(|(_, _, state)| self.backlog_show_states.contains(*state))
+            .collect();
+        let model: Vec<Vec<Cell>> =
+            visible.iter().map(|(mid, g, state)| self.backlog_cells(*mid, g, state, now)).collect();
+
+        let mut sort = std::mem::take(&mut self.backlog_sort);
+        let mut filters = std::mem::take(&mut self.backlog_filters);
+        let mut entries = self.backlog_grid.entries.clone();
+        let col_order = grid_columns::effective_order(&BACKLOG_COLUMNS, &entries, |_| true);
+        let order_changed = self.backlog_grid.note_order(&col_order);
+        let mut set_state: Option<(String, i64, &'static str)> = None;
+        let mut want_reorder = false;
+        let mut open_chat: Option<(i64, i64)> = None;
+
+        egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+            ui.style_mut().interaction.selectable_labels = false;
+            let mut tb = TableBuilder::new(ui)
+                .id_salt(GridTableId::Backlog.key())
+                .striped(true)
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            if order_changed {
+                tb.reset();
+            }
+            for &i in &col_order {
+                let c = &BACKLOG_COLUMNS[i];
+                let seed = self.backlog_grid.widths.get(c.id);
+                let col = if c.stretch {
+                    Column::remainder().at_least(c.min_width)
+                } else if order_changed && let Some(w) = seed {
+                    Column::auto_with_initial_suggestion(w).at_least(c.min_width)
+                } else if c.initial > 0.0 {
+                    Column::initial(c.initial).at_least(c.min_width).clip(true)
+                } else {
+                    Column::auto().at_least(c.min_width)
+                };
+                tb = tb.column(col);
+            }
+            let table = tb.header(46.0, |mut header| {
+                for &i in &col_order {
+                    let c = &BACKLOG_COLUMNS[i];
+                    let (rect, _) = header.col(|ui| {
+                        if grid_header_cell(
+                            ui, GridTableId::Backlog, i, c, true, &mut sort, &mut filters[i],
+                            &mut entries, &BACKLOG_COLUMNS, |_| false,
+                        ) {
+                            want_reorder = true;
                         }
                     });
+                    self.backlog_grid.widths.note(c.id, rect.width());
+                }
+            });
+            table.body(|body| {
+                let order = ordered_rows(&model, &sort, &filters);
+                body.rows(24.0, order.len(), |mut tr| {
+                    let (mid, g, state) = visible[order[tr.index()]];
+                    for &ci in &col_order {
+                        tr.col(|ui| {
+                            backlog_cell(
+                                ui,
+                                BACKLOG_COLUMNS[ci].id,
+                                mid,
+                                g,
+                                state,
+                                now,
+                                &self.rows,
+                                &mut set_state,
+                                &mut open_chat,
+                            );
+                        });
+                    }
                 });
-                ui.separator();
-            }
-            if shown == 0 {
-                ui.weak("Nothing matches the current filter — all caught up!");
-            }
+            });
         });
 
+        // Persist only on an actual change, so an untouched view doesn't write
+        // the settings row every frame.
+        if sort != self.backlog_sort {
+            let keys: Vec<(usize, bool)> = sort.keys.iter().map(|l| (l.col, l.ascending)).collect();
+            let persisted = grid_columns::unresolve_sort(&BACKLOG_COLUMNS, &keys);
+            grid_columns::save_sort(&self.core.store, GridTableId::Backlog, &persisted);
+        }
+        self.backlog_sort = sort;
+        self.backlog_filters = filters;
+        if want_reorder {
+            self.reorder_columns = Some(Arc::new(Mutex::new(ReorderColumnsState {
+                table: GridTableId::Backlog,
+                draft: entries.clone(),
+                apply: false,
+                cancel: false,
+            })));
+        }
+        if entries != self.backlog_grid.entries {
+            self.backlog_grid.entries = entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::Backlog, &self.backlog_grid.entries);
+        }
         if let Some((key, mid, state)) = set_state {
             let _ = self.core.store.set_stream_watch_state(&key, mid, state);
             self.reload_history();
+        }
+        if let Some((mid, rid)) = open_chat {
+            let ctx = ui.ctx().clone();
+            self.open_chat_popup(mid, Some(rid), &ctx);
         }
     }
 

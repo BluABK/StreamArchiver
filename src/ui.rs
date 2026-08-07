@@ -2243,6 +2243,12 @@ pub struct StreamArchiverApp {
     bg_show_gate_queue: bool,
     processes_grid: GridState,
     issues_grid: GridState,
+    backlog_grid: GridState,
+    /// Sort + per-column filters for the 📥 Backlog table. Defaults to
+    /// newest-first, which is the whole reason Backlog is its own view rather
+    /// than a mode of Streams (Streams is a tree grouped under channels).
+    backlog_sort: SortState,
+    backlog_filters: Vec<String>,
     /// Backing state for the "⇕ Reorder columns…" window (`None` = closed) —
     /// a working copy of one table's entries, only written back + persisted
     /// (and only forcing one table reset, not one per intermediate move) when
