@@ -3833,6 +3833,35 @@ impl StreamArchiverApp {
                                     );
                                 ui.end_row();
 
+                                ui.label("Rolling recordings");
+                                ui.horizontal(|ui| {
+                                    tristate_combo(ui, "form_rolling", &mut s.rolling)
+                                        .on_hover_text(
+                                            "Treat this instance's captures as rolling: each one is \
+                                             automatically deleted a set time after it finishes, \
+                                             unless you press Keep on it (📥 Backlog → Rolling \
+                                             recordings). The take's history row always survives — \
+                                             title, stats, chat log, chapters and notes are kept, \
+                                             only the video file goes, using the deletion method \
+                                             above. Inherit follows the channel, then the global \
+                                             default. Only captures started AFTER this is turned on \
+                                             are affected; nothing already recorded is put at risk.",
+                                        );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut s.rolling_ttl_hours)
+                                            .hint_text("hours")
+                                            .desired_width(60.0),
+                                    )
+                                    .on_hover_text(
+                                        "How many hours a rolling capture's file survives after the \
+                                         recording ends. Empty inherits the channel, then the \
+                                         global default. Each take freezes the value in force when \
+                                         it started, so changing this never re-times takes you \
+                                         already have.",
+                                    );
+                                });
+                                ui.end_row();
+
                                 ui.label("Embed chapters");
                                 tristate_combo(ui, "form_chapters_enabled", &mut s.chapters_enabled)
                                     .on_hover_text(

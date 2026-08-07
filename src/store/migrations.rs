@@ -1709,7 +1709,29 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 87)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 87);
+        if version < 88 {
+            // Rolling recordings (see `crate::rolling` and
+            // `crate::models::Rolling`): a take captured while its instance was
+            // in rolling mode carries the resolved TTL frozen onto it, and its
+            // file is disposed of once that elapses unless the user kept it.
+            //
+            // All four default to 0, i.e. "not a rolling recording", so every
+            // existing take is untouched and nothing starts expiring because of
+            // this migration. Turning the feature on later only affects takes
+            // captured after that — the TTL is stamped at capture start, never
+            // re-resolved.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN rolling_ttl_secs INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE recording ADD COLUMN rolling_from INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE recording ADD COLUMN rolling_kept_at INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE recording ADD COLUMN rolling_expired_at INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS idx_recording_rolling
+                     ON recording(rolling_ttl_secs)
+                     WHERE rolling_ttl_secs > 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 88)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 88);
         Ok(())
     }
 }

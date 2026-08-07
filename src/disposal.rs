@@ -37,6 +37,15 @@ pub const K_TRASH_DEFAULT_ROOT: &str = "disposal_trash_default_root";
 /// Global default: what happens to the head/live parts once `full.mkv` lands.
 pub const K_JOIN_CLEANUP: &str = "join_cleanup";
 pub const K_GAP_SPLICE_CLEANUP: &str = "gap_splice_cleanup";
+/// Global default: is a capture a *rolling recording* (auto-deleted after its
+/// TTL unless kept)? `"1"`/`"0"`, default off. See [`crate::rolling`].
+pub const K_ROLLING_ENABLED: &str = "rolling_enabled";
+/// Global default rolling TTL, in seconds.
+pub const K_ROLLING_TTL_SECS: &str = "rolling_ttl_secs";
+/// Built-in rolling TTL when nothing overrides it: one week. Long enough that
+/// the default can't quietly eat a weekend's captures before anyone notices
+/// the feature is on.
+pub const DEFAULT_ROLLING_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// Per-channel scope-config map (`{channel_id -> DisposalScope}`).
 pub const K_CHANNEL_DISPOSAL_SCOPE: &str = "channel_disposal_scope";
 /// Per-monitor scope-config map (`{monitor_id -> DisposalScope}`).
@@ -203,13 +212,26 @@ pub struct DisposalScope {
     pub join_cleanup: Option<JoinCleanup>,
     #[serde(default)]
     pub gap_splice_cleanup: Option<GapSpliceCleanup>,
+    /// Rolling-recording mode: captures made here get a TTL and are
+    /// auto-deleted once it elapses unless kept. See [`crate::rolling`].
+    #[serde(default)]
+    pub rolling: Option<bool>,
+    /// How long a rolling capture's file lives, in seconds. Overridable
+    /// independently of [`Self::rolling`], so a channel can switch the mode on
+    /// while one of its instances keeps its own retention.
+    #[serde(default)]
+    pub rolling_ttl_secs: Option<i64>,
 }
 
 impl DisposalScope {
     /// True when this scope overrides nothing — persisted as a removal so the
     /// map only holds real overrides.
     pub fn is_inherit(&self) -> bool {
-        self.method.is_none() && self.join_cleanup.is_none() && self.gap_splice_cleanup.is_none()
+        self.method.is_none()
+            && self.join_cleanup.is_none()
+            && self.gap_splice_cleanup.is_none()
+            && self.rolling.is_none()
+            && self.rolling_ttl_secs.is_none()
     }
 }
 
@@ -320,6 +342,64 @@ pub fn effective_method_from(
         .and_then(|s| s.method)
         .or_else(|| channel_scope.and_then(|s| s.method))
         .unwrap_or(global)
+}
+
+/// The rolling TTL a capture starting on this monitor should be stamped with,
+/// or `None` when rolling mode is off for it.
+///
+/// The two fields resolve **independently** down the monitor → channel →
+/// global chain: a channel can turn rolling on while one instance overrides
+/// only the retention (or vice versa). A non-positive TTL is treated as "off"
+/// rather than "expire immediately" — a 0 there is far more likely to be an
+/// empty settings field than a request to delete every capture the moment it
+/// finishes.
+pub fn effective_rolling_from(
+    global_on: bool,
+    global_ttl_secs: i64,
+    channel_scope: Option<&DisposalScope>,
+    monitor_scope: Option<&DisposalScope>,
+) -> Option<i64> {
+    let on = monitor_scope
+        .and_then(|s| s.rolling)
+        .or_else(|| channel_scope.and_then(|s| s.rolling))
+        .unwrap_or(global_on);
+    if !on {
+        return None;
+    }
+    let ttl = monitor_scope
+        .and_then(|s| s.rolling_ttl_secs)
+        .or_else(|| channel_scope.and_then(|s| s.rolling_ttl_secs))
+        .unwrap_or(global_ttl_secs);
+    (ttl > 0).then_some(ttl)
+}
+
+/// Store-hitting sibling of [`effective_rolling_from`] — called once at
+/// capture start (`Supervisor::insert_recording_row`) and frozen onto the take.
+pub fn effective_rolling(store: &Store, channel_id: i64, monitor_id: i64) -> Option<i64> {
+    let ch = load_channel_disposal_scope(store, channel_id);
+    let mon = load_monitor_disposal_scope(store, monitor_id);
+    effective_rolling_from(
+        global_rolling_enabled(store),
+        global_rolling_ttl_secs(store),
+        Some(&ch),
+        Some(&mon),
+    )
+}
+
+/// Global "rolling recordings" switch (`app_settings`), default **off**.
+pub fn global_rolling_enabled(store: &Store) -> bool {
+    store.get_setting(K_ROLLING_ENABLED).ok().flatten().as_deref() == Some("1")
+}
+
+/// Global rolling TTL in seconds, defaulting to [`DEFAULT_ROLLING_TTL_SECS`].
+pub fn global_rolling_ttl_secs(store: &Store) -> i64 {
+    store
+        .get_setting(K_ROLLING_TTL_SECS)
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_ROLLING_TTL_SECS)
 }
 
 pub fn effective_join_cleanup_from(
@@ -883,7 +963,7 @@ mod tests {
         let s = DisposalScope {
             method: Some(DisposalMethod::Trash),
             join_cleanup: Some(JoinCleanup::Both),
-            gap_splice_cleanup: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"trash\"") && json.contains("\"both\""), "{json}");
@@ -896,12 +976,12 @@ mod tests {
         let ch = DisposalScope {
             method: Some(DisposalMethod::Delete),
             join_cleanup: None,
-            gap_splice_cleanup: None,
+            ..Default::default()
         };
         let mon = DisposalScope {
             method: Some(DisposalMethod::Trash),
             join_cleanup: Some(JoinCleanup::Head),
-            gap_splice_cleanup: None,
+            ..Default::default()
         };
         assert_eq!(
             effective_method_from(DisposalMethod::Recycle, Some(&ch), Some(&mon)),
@@ -924,9 +1004,70 @@ mod tests {
     }
 
     #[test]
+    fn rolling_on_off_and_ttl_resolve_independently() {
+        const WEEK: i64 = 7 * 24 * 3600;
+        const DAY: i64 = 24 * 3600;
+
+        // Everything inherits: the global switch decides, with the global TTL.
+        assert_eq!(effective_rolling_from(false, WEEK, None, None), None);
+        assert_eq!(effective_rolling_from(true, WEEK, None, None), Some(WEEK));
+
+        // A channel can turn it ON over a global "off" — and an instance can
+        // then override only the TTL, without restating the switch.
+        let ch_on = DisposalScope { rolling: Some(true), ..Default::default() };
+        let mon_ttl = DisposalScope { rolling_ttl_secs: Some(DAY), ..Default::default() };
+        assert_eq!(effective_rolling_from(false, WEEK, Some(&ch_on), None), Some(WEEK));
+        assert_eq!(
+            effective_rolling_from(false, WEEK, Some(&ch_on), Some(&mon_ttl)),
+            Some(DAY),
+            "instance TTL wins while the channel's switch still applies"
+        );
+
+        // …and an instance can turn it OFF again over a channel that has it on.
+        let mon_off = DisposalScope { rolling: Some(false), ..Default::default() };
+        assert_eq!(effective_rolling_from(true, WEEK, Some(&ch_on), Some(&mon_off)), None);
+        // A TTL override on an instance that isn't rolling changes nothing.
+        assert_eq!(
+            effective_rolling_from(
+                false,
+                WEEK,
+                None,
+                Some(&DisposalScope { rolling_ttl_secs: Some(DAY), ..Default::default() })
+            ),
+            None
+        );
+
+        // A non-positive TTL reads as "off", never "expire immediately" — a 0
+        // here is overwhelmingly likely to be an empty settings field.
+        assert_eq!(effective_rolling_from(true, 0, None, None), None);
+        assert_eq!(
+            effective_rolling_from(
+                true,
+                WEEK,
+                None,
+                Some(&DisposalScope { rolling_ttl_secs: Some(0), ..Default::default() })
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rolling_fields_survive_scope_json_and_count_as_overrides() {
+        let s = DisposalScope { rolling: Some(true), rolling_ttl_secs: Some(3600), ..Default::default() };
+        assert!(!s.is_inherit(), "a rolling-only scope must persist, not be dropped as empty");
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<DisposalScope>(&json).unwrap(), s);
+        // Pre-v88 blobs have neither field and must still deserialize as inherit.
+        let old = r#"{"method":"trash","join_cleanup":"both"}"#;
+        let parsed: DisposalScope = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.rolling, None);
+        assert_eq!(parsed.rolling_ttl_secs, None);
+    }
+
+    #[test]
     fn trigger_override_beats_monitor_and_channel_but_only_for_a_trigger_started_take() {
-        let ch = DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None, gap_splice_cleanup: None };
-        let mon = DisposalScope { method: Some(DisposalMethod::Recycle), join_cleanup: None, gap_splice_cleanup: None };
+        let ch = DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None, ..Default::default() };
+        let mon = DisposalScope { method: Some(DisposalMethod::Recycle), join_cleanup: None, ..Default::default() };
         let mut rule = crate::triggers::TriggerRule { pattern: "karaoke".into(), ..Default::default() };
 
         // No trigger context at all: falls through to the normal chain exactly
@@ -969,7 +1110,7 @@ mod tests {
         save_monitor_disposal_scope(
             &store,
             mid,
-            &DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None, gap_splice_cleanup: None },
+            &DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None, ..Default::default() },
         )
         .unwrap();
         // A normal (non-trigger-started) take just uses the monitor override.
@@ -1004,7 +1145,7 @@ mod tests {
         save_monitor_disposal_scope(
             &store,
             1,
-            &DisposalScope { method: None, join_cleanup: Some(JoinCleanup::Keep), gap_splice_cleanup: None },
+            &DisposalScope { method: None, join_cleanup: Some(JoinCleanup::Keep), ..Default::default() },
         )
         .unwrap();
         assert_eq!(effective_join_cleanup(&store, 1, 1), JoinCleanup::Keep);

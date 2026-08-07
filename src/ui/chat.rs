@@ -4839,6 +4839,7 @@ mod tests {
             chapters_json: String::new(),
             chapters_attempts: 0,
             chat_path: String::new(),
+            rolling: crate::models::Rolling::default(),
         }
     }
 

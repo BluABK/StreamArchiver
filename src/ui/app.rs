@@ -359,6 +359,14 @@ impl StreamArchiverApp {
             disposal_method: crate::disposal::global_method(&core.store),
             disposal_trash_dirs: setting_or_empty(&core, crate::disposal::K_TRASH_DIRS),
             disposal_trash_default_root: setting_or_empty(&core, crate::disposal::K_TRASH_DEFAULT_ROOT),
+            rolling_enabled: crate::disposal::global_rolling_enabled(&core.store),
+            rolling_ttl_hours: crate::rolling::secs_to_hours_field(
+                core.store
+                    .get_setting(crate::disposal::K_ROLLING_TTL_SECS)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.trim().parse::<i64>().ok()),
+            ),
             trigger_rules: crate::triggers::load_global_rules(&core.store),
             trigger_block_rules: crate::triggers::load_global_block_rules(&core.store),
             trigger_disposal_default: crate::disposal::global_trigger_disposal_default(&core.store),
@@ -1505,6 +1513,8 @@ impl StreamArchiverApp {
             // No per-channel/instance gap-splice-cleanup override UI yet —
             // always inherits the global setting for now.
             gap_splice_cleanup: None,
+            rolling: form.rolling,
+            rolling_ttl_secs: crate::rolling::hours_field_to_secs(&form.rolling_ttl_hours),
         };
         let primary_pin = form.primary_pin;
         let chapters_scope = crate::chapters::ChaptersScope {
@@ -1856,6 +1866,12 @@ impl StreamArchiverApp {
         let discord_on = s.discord_schedule && !s.discord_token.trim().is_empty();
         // Persist the browser + optional profile as one `browser:profile` value.
         let cookies_value = compose_browser_profile(&s.cookies_browser, &s.cookies_profile);
+        // Rolling TTL is typed in hours and stored in seconds. An empty/garbage
+        // field persists as "" so `global_rolling_ttl_secs` falls back to the
+        // built-in default rather than reading it as "expire immediately".
+        let rolling_ttl_secs = crate::rolling::hours_field_to_secs(&s.rolling_ttl_hours)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         let pairs = [
             (K_TWITCH_ID, s.twitch_client_id.trim()),
             (K_TWITCH_SECRET, s.twitch_client_secret.trim()),
@@ -1991,6 +2007,8 @@ impl StreamArchiverApp {
             (crate::disposal::K_DISPOSAL_METHOD, s.disposal_method.as_str()),
             (crate::disposal::K_TRASH_DIRS, s.disposal_trash_dirs.trim()),
             (crate::disposal::K_TRASH_DEFAULT_ROOT, s.disposal_trash_default_root.trim()),
+            (crate::disposal::K_ROLLING_ENABLED, if s.rolling_enabled { "1" } else { "0" }),
+            (crate::disposal::K_ROLLING_TTL_SECS, &rolling_ttl_secs),
             (crate::db_backup::K_ENABLED, if s.db_backup_enabled { "1" } else { "0" }),
             (crate::db_backup::K_INTERVAL_HOURS, s.db_backup_interval_hours.trim()),
             (crate::db_backup::K_RETENTION_COUNT, s.db_backup_retention_count.trim()),
@@ -2263,6 +2281,8 @@ impl StreamArchiverApp {
                         let dsc = crate::disposal::load_monitor_disposal_scope(&self.core.store, self.rows[idx].monitor.id);
                         mf.join_cleanup = dsc.join_cleanup;
                         mf.disposal_method = dsc.method;
+                        mf.rolling = dsc.rolling;
+                        mf.rolling_ttl_hours = crate::rolling::secs_to_hours_field(dsc.rolling_ttl_secs);
                         mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
                         let mchsc = crate::chapters::load_monitor_chapters_scope(&self.core.store, self.rows[idx].monitor.id);
                         mf.chapters_enabled = mchsc.enabled;

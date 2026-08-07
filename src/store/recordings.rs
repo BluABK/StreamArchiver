@@ -1244,78 +1244,20 @@ impl Store {
     }
 
     /// All recording takes for a monitor (oldest first), for the history tree.
+    ///
+    /// Shares [`Self::RECORDING_FULL_COLUMNS`] / [`Self::map_recording_row`]
+    /// with the single-row lookups: this used to carry its own byte-identical
+    /// copy of both, which promptly went stale the first time a column was
+    /// added (the rolling ones) — the Streams grid silently read defaults while
+    /// `get_recording` read the truth.
     pub fn recordings_for_monitor(&self, monitor_id: i64) -> Result<Vec<crate::models::Recording>> {
         let conn = self.db();
-        let mut stmt = conn.prepare(
-            "SELECT id, monitor_id, started_at, ended_at, status, bytes, exit_code,
-                    COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
-                    (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = recording.id),
-                    COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0),
-                    (SELECT COUNT(*) FROM stream_meta_change smc
-                     WHERE smc.recording_id = recording.id AND smc.old_value != ''),
-                    COALESCE(log_excerpt, ''),
-                    COALESCE((SELECT new_value FROM stream_meta_change smc
-                              WHERE smc.recording_id = recording.id AND smc.kind = 'title'
-                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
-                    COALESCE((SELECT new_value FROM stream_meta_change smc
-                              WHERE smc.recording_id = recording.id AND smc.kind = 'category'
-                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
-                    take_group, COALESCE(notes, ''),
-                    vod_id, vod_state, vod_muted_secs,
-                    recovery_state, recovered_path,
-                    vod_dl_state, vod_dl_path, vod_dl_video_id,
-                    backfill_path, full_path, COALESCE(trigger_info, ''),
-                    head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-                    gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
-                    COALESCE(chapters_json, ''), chapters_attempts, chat_path
-             FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
+            Self::RECORDING_FULL_COLUMNS
+        ))?;
         let rows = stmt
-            .query_map(params![monitor_id], |r| {
-                Ok(crate::models::Recording {
-                    id: r.get(0)?,
-                    monitor_id: r.get(1)?,
-                    started_at: r.get(2)?,
-                    ended_at: r.get(3)?,
-                    status: r.get(4)?,
-                    bytes: r.get(5)?,
-                    exit_code: r.get(6)?,
-                    output_path: r.get(7)?,
-                    went_live_at: r.get(8)?,
-                    went_live_approx: r.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
-                    lost_secs: r.get(10)?,
-                    stream_id: r.get(11)?,
-                    take_group: r.get(18)?,
-                    ad_count: r.get(12)?,
-                    ad_secs: r.get(13)?,
-                    meta_change_count: r.get(14)?,
-                    title: r.get(16)?,
-                    category: r.get(17)?,
-                    log_excerpt: r.get(15)?,
-                    notes: r.get(19)?,
-                    vod_id: r.get(20)?,
-                    vod_state: r.get(21)?,
-                    vod_muted_secs: r.get(22)?,
-                    recovery_state: r.get(23)?,
-                    recovered_path: r.get(24)?,
-                    vod_dl_state: r.get(25)?,
-                    vod_dl_path: r.get(26)?,
-                    vod_dl_video_id: r.get(27)?,
-                    backfill_path: r.get(28)?,
-                    full_path: r.get(29)?,
-                    trigger_info: r.get(30)?,
-                    head_backfill_state: r.get(31)?,
-                    trigger_rule_json: r.get(32)?,
-                    vod_views: r.get(33)?,
-                    gap_splice_state: r.get(34)?,
-                    err_ack: r.get::<_, i64>(35)? != 0,
-                    sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
-                    chapters_state: r.get(37)?,
-                    chapters_json: r.get(38)?,
-                    chapters_attempts: r.get(39)?,
-                    chat_path: r.get(40)?,
-                })
-            })?
+            .query_map(params![monitor_id], Self::map_recording_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1342,7 +1284,8 @@ impl Store {
             backfill_path, full_path, COALESCE(trigger_info, ''),
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
             gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
-            COALESCE(chapters_json, ''), chapters_attempts, chat_path";
+            COALESCE(chapters_json, ''), chapters_attempts, chat_path,
+            rolling_ttl_secs, rolling_from, rolling_kept_at, rolling_expired_at";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -1387,6 +1330,12 @@ impl Store {
             chapters_json: r.get(38)?,
             chapters_attempts: r.get(39)?,
             chat_path: r.get(40)?,
+            rolling: crate::models::Rolling {
+                ttl_secs: r.get(41)?,
+                from: r.get(42)?,
+                kept_at: r.get(43)?,
+                expired_at: r.get(44)?,
+            },
         })
     }
 
@@ -1621,6 +1570,7 @@ impl Store {
                     chapters_json: String::new(),
                     chapters_attempts: 0,
                     chat_path: String::new(),
+                    rolling: crate::models::Rolling::default(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1690,6 +1640,7 @@ impl Store {
                     chapters_json: String::new(),
                     chapters_attempts: 0,
                     chat_path: String::new(),
+                    rolling: crate::models::Rolling::default(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1782,6 +1733,7 @@ impl Store {
                     chapters_json: String::new(),
                     chapters_attempts: 0,
                     chat_path: String::new(),
+                    rolling: crate::models::Rolling::default(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1867,6 +1819,7 @@ impl Store {
                     chapters_json: String::new(),
                     chapters_attempts: 0,
                     chat_path: String::new(),
+                    rolling: crate::models::Rolling::default(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1932,6 +1885,7 @@ impl Store {
                     chapters_json: String::new(),
                     chapters_attempts: 0,
                     chat_path: String::new(),
+                    rolling: crate::models::Rolling::default(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2135,6 +2089,7 @@ impl Store {
                     chapters_json: String::new(),
                     chapters_attempts: 0,
                     chat_path: String::new(),
+                    rolling: crate::models::Rolling::default(),
                     trigger_rule_json: String::new(),
                 })
             })?

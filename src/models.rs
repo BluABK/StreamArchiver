@@ -2697,6 +2697,80 @@ pub fn group_thousands(n: i64) -> String {
     out.chars().rev().collect()
 }
 
+/// A take's *rolling recording* bookkeeping (schema v88) — the four
+/// `recording.rolling_*` columns, grouped so the rest of [`Recording`]'s
+/// partial constructors only need one `Default::default()` line.
+///
+/// A rolling take is one captured while its instance was in rolling mode: its
+/// file is auto-deleted once the TTL elapses unless the user pressed **Keep**.
+/// The TTL is resolved from the instance/channel/global chain and **frozen
+/// here at capture start** (exactly like `trigger_rule_json`), so turning the
+/// setting on never puts already-recorded takes at risk, and turning it off
+/// never silently rescues takes already counting down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rolling {
+    /// Seconds this take's file lives once the capture ends. `0` = not a
+    /// rolling recording at all (every pre-v88 row, and every take made while
+    /// rolling mode was off).
+    pub ttl_secs: i64,
+    /// When the countdown started, or `0` for "count from `ended_at`" — which
+    /// is the normal case. Only **Unkeep** writes this, restarting the clock
+    /// rather than resuming it: otherwise un-keeping anything already older
+    /// than the TTL would delete it on the next sweep, seconds later, which is
+    /// a nasty surprise for something that reads like an undo.
+    pub from: i64,
+    /// When the user pressed Keep. `>0` = no longer rolling; the take is an
+    /// ordinary archived stream that happens to have come from a rolling
+    /// recording.
+    pub kept_at: i64,
+    /// When the sweep disposed of the file. `>0` = expired; the history row
+    /// (title, stats, chat log, chapters, notes) survives, only the media is
+    /// gone — see [`crate::rolling`].
+    pub expired_at: i64,
+}
+
+/// What [`Rolling`] means for one take right now. Derived rather than stored so
+/// the sweep and the UI can't drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RollingState {
+    /// Not a rolling recording (or pre-v88).
+    None,
+    /// Counting down. `deadline` is `None` while the capture is still running
+    /// — the clock only starts when the take ends, so a long broadcast can
+    /// never expire mid-capture.
+    Rolling { deadline: Option<i64> },
+    /// Kept by the user at this time; will not be auto-deleted.
+    Kept { at: i64 },
+    /// Auto-deleted at this time; the history row was kept.
+    Expired { at: i64 },
+}
+
+impl Rolling {
+    /// This take's state, given its `ended_at` (`None` = still recording).
+    pub fn state(&self, ended_at: Option<i64>) -> RollingState {
+        if self.ttl_secs <= 0 {
+            return RollingState::None;
+        }
+        if self.expired_at > 0 {
+            return RollingState::Expired { at: self.expired_at };
+        }
+        if self.kept_at > 0 {
+            return RollingState::Kept { at: self.kept_at };
+        }
+        RollingState::Rolling { deadline: self.deadline(ended_at) }
+    }
+
+    /// When this take's file is due for disposal, or `None` while the capture
+    /// is still running (nothing to count from yet).
+    pub fn deadline(&self, ended_at: Option<i64>) -> Option<i64> {
+        if self.ttl_secs <= 0 {
+            return None;
+        }
+        let base = if self.from > 0 { Some(self.from) } else { ended_at };
+        base.map(|b| b + self.ttl_secs)
+    }
+}
+
 /// One recording attempt ("take") of a stream — a single capture-process run.
 /// Multiple takes (crash / network drop / manual stop+start) can belong to one
 /// broadcast; see [`group_recordings`].
@@ -2844,6 +2918,9 @@ pub struct Recording {
     /// `ui::chat::chat_file_candidates`), so this is an override, not a
     /// replacement.
     pub chat_path: String,
+    /// Rolling-recording bookkeeping — see [`Rolling`]. Default (all zeroes)
+    /// for every ordinary take.
+    pub rolling: Rolling,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -2958,6 +3035,7 @@ impl Recording {
             chapters_json: String::new(),
             chapters_attempts: 0,
             chat_path: String::new(),
+            rolling: crate::models::Rolling::default(),
         }
     }
 }

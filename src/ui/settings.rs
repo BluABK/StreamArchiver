@@ -2923,6 +2923,32 @@ impl StreamArchiverApp {
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                ui.checkbox(&mut self.settings.rolling_enabled, "Rolling recordings")
+                    .on_hover_text(
+                        "Global default: treat every capture as a rolling recording — \
+                         automatically deleted a set time after it finishes, unless you press \
+                         Keep on it in 📥 Backlog → Rolling recordings. The take's history row \
+                         always survives (title, stats, chat log, chapters and notes are kept); \
+                         only the video file goes, via the deletion method below. A channel or \
+                         an individual instance can override this. Only captures started AFTER \
+                         this is turned on are affected — nothing already recorded is put at \
+                         risk, and turning it back off doesn't rescue takes already counting \
+                         down (Keep those individually).",
+                    );
+                ui.label("Keep for (hours):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.rolling_ttl_hours)
+                        .hint_text("168")
+                        .desired_width(60.0),
+                )
+                .on_hover_text(
+                    "How long a rolling capture's file survives after its recording ends. \
+                     Blank = one week. Each take freezes the value in force when it started, \
+                     so changing this never re-times takes you already have.",
+                );
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
                 ui.label("Deleted media goes to:");
                 let v = &mut self.settings.disposal_method;
                 let before = *v;

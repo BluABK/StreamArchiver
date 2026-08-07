@@ -596,6 +596,12 @@ struct MonitorForm {
     /// from / saved to the monitor disposal scope map (`crate::disposal`).
     join_cleanup: Option<crate::disposal::JoinCleanup>,
     disposal_method: Option<crate::disposal::DisposalMethod>,
+    /// Rolling-recording overrides for this instance (`None`/empty = inherit
+    /// the channel/global default): whether its captures are auto-deleted
+    /// after a TTL unless kept, and how long that TTL is (in **hours**, as
+    /// typed — stored as seconds). See [`crate::rolling`].
+    rolling: Option<bool>,
+    rolling_ttl_hours: String,
     /// "Always show this instance's info on the channel row when it's live" —
     /// the strongest tier of `crate::platform_pref` (beats both the channel
     /// and global platform preference). Loaded from / saved to the monitor
@@ -692,6 +698,8 @@ impl MonitorForm {
             head_backfill_replace: None,
             join_cleanup: None,
             disposal_method: None,
+            rolling: None,
+            rolling_ttl_hours: String::new(),
             chapters_enabled: None,
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
@@ -755,6 +763,8 @@ impl MonitorForm {
             head_backfill_replace: None,
             join_cleanup: None,
             disposal_method: None,
+            rolling: None,
+            rolling_ttl_hours: String::new(),
             primary_pin: false,
             chapters_enabled: None,
             chapters_coalesce_secs: String::new(),
@@ -820,6 +830,8 @@ impl MonitorForm {
             head_backfill_replace: None,
             join_cleanup: None,
             disposal_method: None,
+            rolling: None,
+            rolling_ttl_hours: String::new(),
             chapters_enabled: None,
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
@@ -1259,6 +1271,13 @@ pub(crate) struct SettingsForm {
     /// `{drive}`-templated fallback trash root applied to any drive not
     /// explicitly listed in `disposal_trash_dirs`. Empty = no default.
     disposal_trash_default_root: String,
+    /// Global default for rolling-recording mode: are captures auto-deleted a
+    /// set time after they finish unless kept? Default **off**. See
+    /// [`crate::rolling`].
+    rolling_enabled: bool,
+    /// Global default rolling TTL in **hours** as typed; empty falls back to
+    /// [`crate::disposal::DEFAULT_ROLLING_TTL_SECS`] (one week).
+    rolling_ttl_hours: String,
     // --- Follow raid (global defaults for the 3-level chain) ---
     /// Does raiding out from a monitored channel ever trigger an auto-RECORD
     /// of the target? Default OFF — opt-in, unlike most toggles here, since
@@ -3208,6 +3227,8 @@ impl eframe::App for StreamArchiverApp {
                             head_backfill_replace: None,
                             join_cleanup: None,
                             disposal_method: None,
+                            rolling: None,
+                            rolling_ttl_hours: String::new(),
                             primary_platform_pref: None,
                             chapters_enabled: None,
                             chapters_coalesce_secs: String::new(),
@@ -3501,6 +3522,8 @@ impl eframe::App for StreamArchiverApp {
                 head_backfill_replace: None,
                 join_cleanup: None,
                 disposal_method: None,
+                rolling: None,
+                rolling_ttl_hours: String::new(),
                 primary_platform_pref: None,
                 chapters_enabled: None,
                 chapters_coalesce_secs: String::new(),

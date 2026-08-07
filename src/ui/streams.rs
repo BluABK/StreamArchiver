@@ -72,6 +72,12 @@ pub(super) struct ChannelForm {
     /// post-join parts cleanup, and how automatic media deletes are executed.
     pub(super) join_cleanup: Option<crate::disposal::JoinCleanup>,
     pub(super) disposal_method: Option<crate::disposal::DisposalMethod>,
+    /// Rolling-recording overrides for this channel (`None`/empty = inherit
+    /// global): whether its captures are auto-deleted after a TTL unless kept,
+    /// and how long that TTL is (in **hours** as typed, stored as seconds).
+    /// See [`crate::rolling`].
+    pub(super) rolling: Option<bool>,
+    pub(super) rolling_ttl_hours: String,
     /// Preferred platform when this channel has multiple instances
     /// simultaneously live (`None` = inherit the global default).
     pub(super) primary_platform_pref: Option<Platform>,
@@ -541,6 +547,35 @@ impl StreamArchiverApp {
                                     );
                                 ui.end_row();
 
+                                ui.label("Rolling recordings");
+                                ui.horizontal(|ui| {
+                                    tristate_combo(ui, "chform_rolling", &mut s.rolling)
+                                        .on_hover_text(
+                                            "Treat this channel's captures as rolling: each one is \
+                                             automatically deleted a set time after it finishes, \
+                                             unless you press Keep on it (📥 Backlog → Rolling \
+                                             recordings). The take's history row always survives — \
+                                             title, stats, chat log, chapters and notes are kept, \
+                                             only the video file goes, using the deletion method \
+                                             above. Inherit follows the global default, and an \
+                                             instance can override this again. Only captures \
+                                             started AFTER this is turned on are affected; nothing \
+                                             already recorded is put at risk.",
+                                        );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut s.rolling_ttl_hours)
+                                            .hint_text("hours")
+                                            .desired_width(60.0),
+                                    )
+                                    .on_hover_text(
+                                        "How many hours a rolling capture's file survives after the \
+                                         recording ends. Empty inherits the global default. Each \
+                                         take freezes the value in force when it started, so \
+                                         changing this never re-times takes you already have.",
+                                    );
+                                });
+                                ui.end_row();
+
                                 ui.label("Preferred platform when multiple live");
                                 platform_pref_combo(ui, "chform_platform_pref", &mut s.primary_platform_pref)
                                     .on_hover_text(
@@ -750,6 +785,8 @@ impl StreamArchiverApp {
                     // No per-channel/instance gap-splice-cleanup override UI
                     // yet — always inherits the global setting for now.
                     gap_splice_cleanup: None,
+                    rolling: f.rolling,
+                    rolling_ttl_secs: crate::rolling::hours_field_to_secs(&f.rolling_ttl_hours),
                 };
                 let chapters_scope = crate::chapters::ChaptersScope {
                     enabled: f.chapters_enabled,
@@ -2588,6 +2625,8 @@ impl StreamArchiverApp {
                     head_backfill_replace: hbsc.replace,
                     join_cleanup: dsc.join_cleanup,
                     disposal_method: dsc.method,
+                    rolling: dsc.rolling,
+                    rolling_ttl_hours: crate::rolling::secs_to_hours_field(dsc.rolling_ttl_secs),
                     primary_platform_pref: platform_pref,
                     chapters_enabled: chsc.enabled,
                     chapters_coalesce_secs,
