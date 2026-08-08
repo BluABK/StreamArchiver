@@ -129,6 +129,7 @@ impl StreamArchiverApp {
                 twitch_badge_dirs.clone(),
                 rewards.clone(),
                 ctx.clone(),
+                chat_vp_id(monitor_id),
             ));
         } else {
             *state.lock().unwrap() = ChatLoadState::NoFile;
@@ -345,7 +346,7 @@ impl StreamArchiverApp {
         self.heartbeat.set_context(format!("Chat: {}", popup.monitor_name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Chat);
         let title = format!("💬  Chat — {}", popup.monitor_name);
-        let vp_id = egui::ViewportId::from_hash_of(("chat_popup_vp", popup.monitor_id));
+        let vp_id = chat_vp_id(popup.monitor_id);
 
         // Whether the selected recording is still in progress (chat file is growing).
         let rec_active = popup.recording.as_ref().map_or(false, |r| r.ended_at.is_none());
@@ -691,6 +692,7 @@ impl StreamArchiverApp {
                                                 bdirs,
                                                 rewards,
                                                 ctx.clone(),
+                                                chat_vp_id(popup.monitor_id),
                                             ));
                                         }
                                     }
@@ -1926,12 +1928,22 @@ impl StreamArchiverApp {
                 bdirs,
                 rewards,
                 ctx.clone(),
+                vp_id,
             ));
         }
         // Keep the UI alive while a live recording is open so the next
         // interval check fires automatically.
+        //
+        // Both viewports, deliberately. The ROOT drives the reload itself —
+        // this whole function runs during the root's pass, so a root that
+        // isn't ticking never checks the interval. The CHILD needs waking
+        // separately because eframe repaints deferred viewports on their own
+        // schedule; without this the freshly-parsed messages only appear on
+        // the popup's next repaint from some unrelated cause.
         if rec_active {
-            ctx.request_repaint_after(std::time::Duration::from_secs(CHAT_RELOAD_SECS));
+            let tick = std::time::Duration::from_secs(CHAT_RELOAD_SECS);
+            ctx.request_repaint_after(tick);
+            ctx.request_repaint_after_for(tick, vp_id);
         }
 
         popup_arc.lock().unwrap().closed

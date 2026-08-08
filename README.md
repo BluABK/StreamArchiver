@@ -3664,6 +3664,15 @@ a system clock running fast is clamped to zero rather than shown as
 time-travel. A badly-set clock will still show up here as lag that isn't real,
 which the hover says.
 
+Putting that number on screen immediately earned its keep: it read **30+
+seconds behind** on a live channel, confirmed against Twitch's own chat side
+by side. The cause was that new messages parsed fine but never asked *the chat
+window* to redraw — each popup is its own OS window, and the background
+loader was waking the main window instead. So on a channel with no animated
+emotes and no Hype Train running, nothing was asking the chat window to
+repaint at all, and messages surfaced only when the mouse happened to cross
+it. Fixed, and the expected reading is now a couple of seconds.
+
 **Mentions are not affected by any of this** — a ping fires from the capture
 client the moment the message arrives, even though its row appears here a
 couple of seconds later.

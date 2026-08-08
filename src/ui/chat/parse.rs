@@ -309,6 +309,13 @@ pub(crate) async fn download_emoji_images(fetches: &[EmojiFetch], pace: Option<s
 /// background and is spliced in front (`loading_older` marks the gap). Then —
 /// when `fetch_emoji` — missing emoji images download once and upgrade the
 /// in-memory segments in place. Runs entirely off the UI thread.
+///
+/// `vp` is the chat window's own viewport, and it has to be passed explicitly:
+/// [`egui::Context::request_repaint`] repaints "the current viewport", which
+/// off the UI thread is always the ROOT one. Waking the root does not wake a
+/// deferred child, so parsed messages would sit in `state` unseen until
+/// something *else* repainted the popup — a mouse move, an animated emote, a
+/// Hype Train's 1 Hz tick. See [`tail_chat`] for what that cost.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) async fn load_chat(
     state: Arc<Mutex<ChatLoadState>>,
@@ -324,10 +331,11 @@ pub(in crate::ui) async fn load_chat(
     badge_dirs: Arc<TwitchBadgeDirs>,
     rewards: Arc<HashMap<String, crate::assets::RewardEntry>>,
     ctx: egui::Context,
+    vp: egui::ViewportId,
 ) {
     let Some(path) = path else {
         *state.lock().unwrap() = ChatLoadState::NoFile;
-        ctx.request_repaint();
+        ctx.request_repaint_of(vp);
         return;
     };
     // Phase 1: the file's tail — the newest messages show instantly instead of
@@ -338,12 +346,12 @@ pub(in crate::ui) async fn load_chat(
             Ok(Ok(off)) => off,
             Ok(Err(e)) => {
                 *state.lock().unwrap() = ChatLoadState::Error(e.to_string());
-                ctx.request_repaint();
+                ctx.request_repaint_of(vp);
                 return;
             }
             Err(e) => {
                 *state.lock().unwrap() = ChatLoadState::Error(e.to_string());
-                ctx.request_repaint();
+                ctx.request_repaint_of(vp);
                 return;
             }
         }
@@ -374,12 +382,12 @@ pub(in crate::ui) async fn load_chat(
             };
             log.apply_markers();
             *state.lock().unwrap() = ChatLoadState::Loaded(log);
-            ctx.request_repaint();
+            ctx.request_repaint_of(vp);
             chunk.fetches
         }
         Err(e) => {
             *state.lock().unwrap() = ChatLoadState::Error(e);
-            ctx.request_repaint();
+            ctx.request_repaint_of(vp);
             return;
         }
     };
@@ -426,7 +434,7 @@ pub(in crate::ui) async fn load_chat(
                 }
             }
         }
-        ctx.request_repaint();
+        ctx.request_repaint_of(vp);
     }
     // Phase 3: emoji downloads + in-place upgrade. Only one download pass runs
     // at a time (a concurrent tail reload just skips kicking off another).
@@ -436,13 +444,20 @@ pub(in crate::ui) async fn load_chat(
         download_emoji_images(&fetches, None).await;
         loading.store(false, Ordering::SeqCst);
         upgrade_pending_emotes(&state).await;
-        ctx.request_repaint();
+        ctx.request_repaint_of(vp);
     }
 }
 
 /// Incremental tail reload for a live recording: parse only the bytes appended
 /// since the last pass and push them onto the existing log. (The previous
 /// implementation re-parsed the entire file every few seconds.)
+///
+/// `vp` must be the chat window's viewport — see [`load_chat`]. Getting this
+/// wrong is invisible in testing and awful in use: a live window that nobody
+/// is touching, on a channel with no animated emotes and no Hype Train, has
+/// nothing else asking it to repaint, so new messages only surfaced when the
+/// pointer happened to cross the window. Measured at 30+ seconds behind live
+/// against Twitch's own chat side by side.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) async fn tail_chat(
     state: Arc<Mutex<ChatLoadState>>,
@@ -458,6 +473,7 @@ pub(in crate::ui) async fn tail_chat(
     badge_dirs: Arc<TwitchBadgeDirs>,
     rewards: Arc<HashMap<String, crate::assets::RewardEntry>>,
     ctx: egui::Context,
+    vp: egui::ViewportId,
 ) {
     let from = {
         match &*state.lock().unwrap() {
@@ -485,6 +501,7 @@ pub(in crate::ui) async fn tail_chat(
             badge_dirs,
         rewards,
             ctx,
+            vp,
         )
         .await;
         return;
@@ -526,13 +543,13 @@ pub(in crate::ui) async fn tail_chat(
                 }
             }
         }
-        ctx.request_repaint();
+        ctx.request_repaint_of(vp);
     }
     if fetch_emoji && !chunk.fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
         download_emoji_images(&chunk.fetches, None).await;
         loading.store(false, Ordering::SeqCst);
         upgrade_pending_emotes(&state).await;
-        ctx.request_repaint();
+        ctx.request_repaint_of(vp);
     }
 }
 

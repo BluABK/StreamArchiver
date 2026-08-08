@@ -742,6 +742,17 @@ pub(super) struct ChatPopup {
     pub(super) usercard_click: Option<UserCardClick>,
 }
 
+/// The deferred viewport one monitor's chat window lives in.
+///
+/// One function rather than an inline `from_hash_of` at each use, because two
+/// unrelated places depend on agreeing: the window is *declared* under this id,
+/// and background sidecar loads have to *wake* it by the same id. A mismatch
+/// wakes a viewport nothing draws — silently, and only on a live channel the
+/// user isn't touching, which is exactly how it went unnoticed.
+pub(in crate::ui) fn chat_vp_id(monitor_id: i64) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("chat_popup_vp", monitor_id))
+}
+
 // The window and its parts live in `src/ui/chat/`; this file keeps the
 // shared types every one of them needs. Each submodule is a pure move out
 // of what used to be one 5,000-line file — same items, same bodies.
@@ -1044,6 +1055,25 @@ mod tests {
         let cjk = "あいうえおかきくけこさしすせそたちつてと:";
         let job = paint_name_job(cjk, &paint, font);
         assert_eq!(job.text, cjk);
+    }
+
+    /// Each chat window must own a distinct viewport, and keep the id it has
+    /// always had.
+    ///
+    /// Both halves matter and neither is cosmetic. A shared id would put every
+    /// channel's chat in one OS window; a *changed* id would wake a viewport
+    /// nothing is drawing, which is precisely the bug that had the replay
+    /// sitting 30 s behind live — background loads were repainting the main
+    /// window instead of the popup, so nothing surfaced until the pointer
+    /// crossed it.
+    #[test]
+    fn every_chat_window_owns_a_distinct_stable_viewport() {
+        assert_ne!(chat_vp_id(7), chat_vp_id(8));
+        assert_eq!(chat_vp_id(7), chat_vp_id(7));
+        // The literal the windows were first declared under. Changing it moves
+        // every user's saved chat-window position, so it is pinned here rather
+        // than left to whatever `chat_vp_id` happens to hash today.
+        assert_eq!(chat_vp_id(7), egui::ViewportId::from_hash_of(("chat_popup_vp", 7_i64)));
     }
 
     /// Per-instance timestamp overrides, and the reason they are stored by
