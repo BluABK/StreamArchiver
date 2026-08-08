@@ -202,6 +202,9 @@ pub(in crate::ui) fn chat_info_cards(
     live_view: bool,
     now: i64,
 ) -> bool {
+    if popup.stats.is_empty() {
+        return false;
+    }
     // A train we haven't seen before, still running, re-opens this window's
     // collapse — the user asked to be shown a NEW train even after hiding the
     // last one. Checked here rather than at each of the three places that
@@ -230,7 +233,7 @@ pub(in crate::ui) fn chat_info_cards(
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.label(egui::RichText::new("Top supporters").weak().small());
                 let accent = ui.visuals().weak_text_color();
-                let mut entry = |ui: &mut egui::Ui, icon, name: &str, n: i64, hover: &str| {
+                let entry = |ui: &mut egui::Ui, icon, name: &str, n: i64, hover: &str| {
                     ui_icon(ui, icons, icon, 13.0, accent).on_hover_text(hover);
                     ui.label(format!("{name} ×{n}")).on_hover_text(hover);
                 };

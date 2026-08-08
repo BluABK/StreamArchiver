@@ -15,6 +15,26 @@ pub(in crate::ui) struct ChatAppearance {
     pub(in crate::ui) emote_pt: f32,
     pub(in crate::ui) ts_color: egui::Color32,
     pub(in crate::ui) text_color: egui::Color32,
+    /// Hash of the chosen chat font family's name. The family itself is
+    /// always [`crate::fonts::CHAT_FAMILY`] (registered even when no font is
+    /// picked, in which case it just mirrors the proportional stack), so this
+    /// exists purely to make a font change invalidate `layout_key` — the same
+    /// glyphs at the same point size are a different height in a different
+    /// face. `u64` rather than the name so this struct stays `Copy`.
+    pub(in crate::ui) font_id: u64,
+}
+
+/// The family the chat replay renders in. Always registered — with no user
+/// pick it mirrors the proportional stack, so this is safe unconditionally.
+pub(in crate::ui) fn chat_family() -> egui::FontFamily {
+    egui::FontFamily::Name(crate::fonts::CHAT_FAMILY.into())
+}
+
+/// Stable hash of a font family name, for [`ChatAppearance::font_id`].
+pub(in crate::ui) fn font_name_key(name: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(name, &mut h);
+    std::hash::Hasher::finish(&h)
 }
 
 impl ChatAppearance {
@@ -30,6 +50,7 @@ impl ChatAppearance {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&self.font_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.emote_pt.to_bits(), &mut h);
+        std::hash::Hash::hash(&self.font_id, &mut h);
         std::hash::Hasher::finish(&h)
     }
 }
@@ -83,6 +104,9 @@ pub(in crate::ui) fn render_chat_message(
         // Timestamp — monospace, sized/colored to match the message body
         // (Twitch's own popout renders both at the same size).
         ui.label(
+            // Monospace on purpose, and NOT the chat family: the bracketed
+            // stream-relative timestamp is a column, and a proportional face
+            // destroys the alignment that makes it scannable.
             egui::RichText::new(fmt_chat_ts(msg.timestamp_secs))
                 .monospace()
                 .size(appearance.font_pt)
@@ -96,6 +120,7 @@ pub(in crate::ui) fn render_chat_message(
             ui.label(
                 egui::RichText::new(&msg.text)
                     .italics()
+                    .font(egui::FontId::new(appearance.font_pt, chat_family()))
                     .color(weak),
             )
             .on_hover_text(
@@ -160,7 +185,7 @@ pub(in crate::ui) fn render_chat_message(
         let name_color = chat_username_color(msg, ui.visuals().panel_fill);
         let name_text = egui::RichText::new(format!("{}:", msg.author))
             .strong()
-            .size(appearance.font_pt)
+            .font(egui::FontId::new(appearance.font_pt, chat_family()))
             .color(name_color);
         let mut click: Option<UserCardClick> = None;
         if !msg.purge_key().is_empty() {
@@ -211,7 +236,12 @@ pub(in crate::ui) fn render_chat_message(
                         fallback_text.as_deref().unwrap_or(name)
                     }
                 };
-                ui.label(egui::RichText::new(t).strikethrough().weak().size(appearance.font_pt))
+                ui.label(
+                    egui::RichText::new(t)
+                        .strikethrough()
+                        .weak()
+                        .font(egui::FontId::new(appearance.font_pt, chat_family())),
+                )
                     .on_hover_text(reason);
             }
             ui.label(egui::RichText::new(format!("({reason})")).small().weak().italics());
@@ -227,7 +257,7 @@ pub(in crate::ui) fn render_chat_message(
                     // internal/leading/trailing whitespace verbatim.
                     ui.label(
                         egui::RichText::new(t.as_str())
-                            .size(appearance.font_pt)
+                            .font(egui::FontId::new(appearance.font_pt, chat_family()))
                             .color(appearance.text_color),
                     );
                 }

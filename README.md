@@ -3628,6 +3628,29 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**Pick your own fonts** — *Settings → Interface → Display* has two pickers,
+**App font** (the whole interface) and **Chat font** (the chat replay only),
+each listing every font installed on the machine with a live preview in that
+face and a **Reset**. They're independent: a display face for chat, something
+plainer for the UI, or vice versa.
+
+Neither pick *replaces* egui's bundled font — it goes in front of it — because
+the bundled font carries the UI icon glyphs used outside the chat window, and
+the system CJK/emoji fallbacks stay behind both, so a font with no Japanese
+coverage still renders a Japanese channel name. The chat gets its own
+registered font family for exactly this reason. Two caveats worth knowing:
+picking a face from a font *collection* (`.ttc`) loads its first face, so a
+specific weight of a collected family may come out as the regular one; and
+the bracketed stream-relative timestamp deliberately stays monospace whatever
+you pick, because it's a column and a proportional face destroys the
+alignment that makes it scannable.
+
+Changes apply immediately — the font atlas is rebuilt and every cached text
+layout is invalidated, which is why this is done exactly once per change and
+never per frame. The choice is stored by font *name*, not path, so it survives
+the font being reinstalled somewhere else; a name that no longer resolves
+falls back to the default rather than leaving the app unreadable.
+
 **Info cards above the log.** Twitch's popout puts its channel furniture in
 translucent rounded panels that sit *on* the chat rather than boxing it in,
 and the chat window now does the same: a **channel info** card (this

@@ -272,8 +272,18 @@ fn main() -> Result<()> {
         native_options,
         Box::new(move |cc| {
             // Add OS CJK/Unicode fallback fonts so non-Latin channel names (e.g.
-            // Japanese VTuber names, fullwidth 【】) render instead of tofu boxes.
-            fonts::install_unicode_fonts(&cc.egui_ctx);
+            // Japanese VTuber names, fullwidth 【】) render instead of tofu boxes,
+            // and install whichever UI/chat faces the user picked.
+            //
+            // The stored choice is installed HERE, not on the first frame:
+            // `StreamArchiverApp` seeds `installed_fonts` from the same
+            // settings, so applying it later would either be skipped entirely
+            // (the seed already claims it's installed) or show a visible flash
+            // of the default font on every launch.
+            fonts::install_fonts(&cc.egui_ctx, &fonts::FontChoice {
+                app: core_for_app.store.get_setting(ui::K_APP_FONT_FAMILY).ok().flatten().unwrap_or_default(),
+                chat: core_for_app.store.get_setting(ui::K_CHAT_FONT_FAMILY).ok().flatten().unwrap_or_default(),
+            });
             let (tray, ui_rx, ui_tx) = build_tray(cc.egui_ctx.clone())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             // OS shutdown/logoff: a hidden listener window flips the app into

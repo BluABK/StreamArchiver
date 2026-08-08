@@ -314,6 +314,9 @@ pub(super) struct ChatSettingsState {
     /// Feature switch for the channel-info card (top supporters, goals) —
     /// see [`K_CHAT_SHOW_INFO`].
     pub(super) show_channel_info: bool,
+    /// Chat font family by display name (`""` = follow the app font). See
+    /// [`K_CHAT_FONT_FAMILY`].
+    pub(super) chat_font: String,
 }
 
 impl ChatSettingsState {
@@ -365,6 +368,7 @@ impl ChatSettingsState {
             // put in it.
             show_hype_train: flag(K_CHAT_SHOW_HYPE, true),
             show_channel_info: flag(K_CHAT_SHOW_INFO, true),
+            chat_font: store.get_setting(K_CHAT_FONT_FAMILY).ok().flatten().unwrap_or_default(),
         }
     }
 }
@@ -688,6 +692,7 @@ mod tests {
             emote_pt: 24.0,
             ts_color: egui::Color32::WHITE,
             text_color: egui::Color32::WHITE,
+            font_id: font_name_key(""),
         };
         let key = base.layout_key();
         assert_eq!(ChatAppearance { font_pt: 14.0, ..base }.layout_key(), key, "same settings");
@@ -698,6 +703,13 @@ mod tests {
                 .layout_key(),
             key,
             "colours must not invalidate measured heights"
+        );
+        // A different face is a different height at the same point size, so
+        // the cache has to drop — this is the whole reason `font_id` exists.
+        assert_ne!(
+            ChatAppearance { font_id: font_name_key("Comic Sans MS"), ..base }.layout_key(),
+            key,
+            "font family"
         );
     }
 

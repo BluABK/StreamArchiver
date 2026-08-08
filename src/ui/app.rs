@@ -86,6 +86,13 @@ impl StreamArchiverApp {
         // Hype-train GQL confirmation defaults on; tuning blob for Settings.
         let hype_gql = crate::hype::gql_enabled(&core.store);
         let hype_tuning = crate::hype::load_tuning(&core.store);
+        // Read before `core` is moved into the struct. Seeded rather than
+        // defaulted so the first frame's `apply_font_settings` is a no-op —
+        // main.rs already installed this choice at startup.
+        let installed_fonts = crate::fonts::FontChoice {
+            app: setting_or_empty(&core, K_APP_FONT_FAMILY),
+            chat: setting_or_empty(&core, K_CHAT_FONT_FAMILY),
+        };
         // Do Not Disturb defaults off in both dimensions.
         let dnd_enabled =
             setting_or_empty(&core, crate::notifications::K_DND_ENABLED) == "1";
@@ -807,6 +814,9 @@ impl StreamArchiverApp {
             chat_popups: Vec::new(),
             platform_tex: None,
             ui_tex: None,
+            app_font: installed_fonts.app.clone(),
+            installed_fonts,
+            system_fonts: None,
             properties_popups: Vec::new(),
             instance_props_registry: Default::default(),
             user_props_popups: Vec::new(),

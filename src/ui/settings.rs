@@ -558,6 +558,68 @@ fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ce
     }
 }
 
+/// One font-family picker: a searchable dropdown of installed fonts, a live
+/// preview in the chosen face, and a reset. Returns `true` when `current`
+/// changed.
+///
+/// The reset button is not decoration — a user who picks a symbol font
+/// otherwise cannot read the UI well enough to change it back — and the
+/// preview is what stops them picking one by accident in the first place.
+fn font_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    current: &mut String,
+    fonts: &[crate::fonts::SystemFont],
+    hover: &str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label).on_hover_text(hover);
+        let shown = if current.is_empty() { "Default" } else { current.as_str() };
+        egui::ComboBox::from_id_salt(id).selected_text(shown).width(220.0).show_ui(ui, |ui| {
+            ui.set_max_height(320.0);
+            if ui.selectable_label(current.is_empty(), "Default").clicked() && !current.is_empty() {
+                current.clear();
+                changed = true;
+            }
+            ui.separator();
+            for f in fonts {
+                let sel = current.eq_ignore_ascii_case(&f.display);
+                if ui.selectable_label(sel, &f.display).clicked() && !sel {
+                    *current = f.display.clone();
+                    changed = true;
+                }
+            }
+        });
+        if !current.is_empty()
+            && ui.button("Reset").on_hover_text("Back to the bundled default font.").clicked()
+        {
+            current.clear();
+            changed = true;
+        }
+        if fonts.is_empty() {
+            ui.weak("(no installed fonts found)");
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        // Rendered in the very family this picker controls, so what you pick
+        // is what you see before committing the whole UI to it.
+        let family = if id == "chat_font" {
+            egui::FontFamily::Name(crate::fonts::CHAT_FAMILY.into())
+        } else {
+            egui::FontFamily::Proportional
+        };
+        ui.label(
+            egui::RichText::new("The quick brown fox — 0123 — あいう")
+                .font(egui::FontId::new(14.0, family))
+                .weak(),
+        );
+    });
+    changed
+}
+
 impl StreamArchiverApp {
     /// Whether a settings section should render: when the search box is empty, only
     /// the selected category tab's sections show; when searching, any section whose
@@ -1556,6 +1618,32 @@ impl StreamArchiverApp {
                     if self.show_actions { "1" } else { "0" },
                 );
             }
+
+            // Enumerated once, lazily — this is the only place either picker
+            // is drawn, and it's ~400 registry values plus an existence check
+            // each, which is cheap but not per-frame cheap.
+            let fonts = self
+                .system_fonts
+                .get_or_insert_with(crate::fonts::enumerate_system_fonts)
+                .clone();
+            let mut app_font = self.app_font.clone();
+            if font_picker(
+                ui,
+                "app_font",
+                "App font",
+                &mut app_font,
+                &fonts,
+                "Font family for the app's own interface. Your pick goes in FRONT of egui's \
+                 bundled default rather than replacing it, so the toolbar/button icon glyphs \
+                 keep working, and the system CJK/emoji fallbacks still cover anything the \
+                 font lacks. Note that a font collection (.ttc) loads its first face, so \
+                 picking a specific weight of a collected family may give you the regular \
+                 one. Applies immediately.",
+            ) {
+                self.app_font = app_font.clone();
+                let _ = self.core.store.set_setting(K_APP_FONT_FAMILY, &app_font);
+            }
+
             {
                 let mut cs = self.chat_settings.lock().unwrap();
                 if ui
@@ -1629,6 +1717,25 @@ impl StreamArchiverApp {
                         K_ANIMATE_EMOTES,
                         if cs.animate_emotes { "1" } else { "0" },
                     );
+                }
+                // Chat font lives beside the other chat settings so both this
+                // dialog and each window's ⚙ panel see the same shared state.
+                let mut chat_font = cs.chat_font.clone();
+                if font_picker(
+                    ui,
+                    "chat_font",
+                    "Chat font",
+                    &mut chat_font,
+                    &fonts,
+                    "Font family for the chat replay. The chat renders in its own registered \
+                     family, so this and the app font are independent, and either one still \
+                     falls back to the system CJK/emoji fonts for glyphs it lacks. The \
+                     bracketed stream-relative timestamp stays monospace regardless — it's a \
+                     column, and a proportional face destroys the alignment. Applies \
+                     immediately.",
+                ) {
+                    cs.chat_font = chat_font.clone();
+                    let _ = self.core.store.set_setting(K_CHAT_FONT_FAMILY, &chat_font);
                 }
                 if ui
                     .checkbox(&mut cs.show_hype_train, "Hype Train card in chat")

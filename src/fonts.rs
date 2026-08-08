@@ -1,6 +1,6 @@
-//! Install OS fonts that cover non-Latin glyphs (CJK, Hangul, fullwidth `【】`,
-//! emoji, historic scripts like Egyptian Hieroglyphs, etc.) as *fallbacks*
-//! behind egui's bundled default.
+//! Font stack: the user's chosen UI and chat faces, plus OS fonts that cover
+//! non-Latin glyphs (CJK, Hangul, fullwidth `【】`, emoji, historic scripts
+//! like Egyptian Hieroglyphs, etc.) as *fallbacks* behind them.
 //!
 //! egui's default font is Latin-only, so channel names like Japanese VTuber names
 //! (or `Nimi Nightmare【Phase Connect】`) — and the emoji chat viewers spam — otherwise
@@ -107,9 +107,106 @@ const FONT_GROUPS: &[&[&str]] = &[
     ],
 ];
 
-/// Append available system CJK/Unicode fonts as fallbacks. No-op (keeps the egui
-/// defaults) when none of the candidates are present.
-pub fn install_unicode_fonts(ctx: &egui::Context) {
+/// The named egui family the chat replay renders in, so the chat can use a
+/// different face from the rest of the app without either one losing the
+/// non-Latin fallbacks.
+pub const CHAT_FAMILY: &str = "chat";
+
+/// Which system fonts the user picked, by display name (`""` = the egui
+/// default). Kept as names rather than paths so the setting survives a font
+/// being reinstalled to a different file.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct FontChoice {
+    /// App-wide UI font.
+    pub app: String,
+    /// Chat replay font — see [`CHAT_FAMILY`].
+    pub chat: String,
+}
+
+impl FontChoice {
+    pub fn is_default(&self) -> bool {
+        self.app.is_empty() && self.chat.is_empty()
+    }
+}
+
+/// One installed font: what to show in the picker, and where its file is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemFont {
+    pub display: String,
+    pub path: std::path::PathBuf,
+}
+
+/// Strip the registry's type suffix from a font's registered name:
+/// `"Segoe UI Semibold (TrueType)"` → `"Segoe UI Semibold"`.
+fn clean_font_name(raw: &str) -> String {
+    raw.rsplit_once(" (").map(|(name, _)| name).unwrap_or(raw).trim().to_string()
+}
+
+/// Fonts installed on this machine, for the pickers in Settings.
+///
+/// Reads the registry rather than enumerating with GDI, because
+/// `FontData::from_owned` needs the font's **bytes from a file** —
+/// `EnumFontFamiliesExW` yields family names with no path, and getting the
+/// tables out of a selected `HFONT` via `GetFontData` is several times the
+/// code for the same result. `HKLM` covers machine-wide installs, `HKCU`
+/// per-user ones; a bare value is relative to the system font directory.
+///
+/// Enumerate once and cache — this is ~400 registry values plus a
+/// `Path::exists` each, which is cheap but not free enough to run per frame.
+#[cfg(windows)]
+pub fn enumerate_system_fonts() -> Vec<SystemFont> {
+    const SUBKEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
+    let sysdir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into()))
+        .join("Fonts");
+    let mut out: Vec<SystemFont> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for root in [windows_registry::LOCAL_MACHINE, windows_registry::CURRENT_USER] {
+        let Ok(key) = root.open(SUBKEY) else { continue };
+        let Ok(values) = key.values() else { continue };
+        for (name, value) in values {
+            // REG_SZ / REG_EXPAND_SZ only; anything else isn't a filename.
+            let Ok(file) = String::try_from(value) else { continue };
+            // Only what egui's font backend can actually parse.
+            let ext = std::path::Path::new(&file)
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "ttf" | "ttc" | "otf") {
+                continue;
+            }
+            let path = if std::path::Path::new(&file).is_absolute() {
+                std::path::PathBuf::from(&file)
+            } else {
+                sysdir.join(&file)
+            };
+            let display = clean_font_name(&name);
+            if display.is_empty() || !seen.insert(display.to_lowercase()) {
+                continue;
+            }
+            if !crate::iomon::fs::exists_sync(crate::iomon::Cat::Startup, &path) {
+                seen.remove(&display.to_lowercase());
+                continue;
+            }
+            out.push(SystemFont { display, path });
+        }
+    }
+    out.sort_by_key(|f| f.display.to_lowercase());
+    out
+}
+
+#[cfg(not(windows))]
+pub fn enumerate_system_fonts() -> Vec<SystemFont> {
+    // No picker off Windows yet — the fallback list below still applies.
+    Vec::new()
+}
+
+/// Install the fallback fonts, plus whichever faces the user picked.
+///
+/// Safe to call again at runtime: `ctx.set_fonts` rebuilds the atlas and
+/// invalidates every cached galley, which is exactly what a font change
+/// needs. It is NOT cheap, so the caller must only call it when the choice
+/// actually changed — see `StreamArchiverApp::apply_font_settings`.
+pub fn install_fonts(ctx: &egui::Context, choice: &FontChoice) {
     let mut fonts = egui::FontDefinitions::default();
     let mut added: Vec<String> = Vec::new();
 
@@ -129,18 +226,88 @@ pub fn install_unicode_fonts(ctx: &egui::Context) {
         }
     }
 
-    if added.is_empty() {
-        return;
+    // Resolve the user's picks to loaded font keys. A name that no longer
+    // resolves (font uninstalled) silently falls back to the default rather
+    // than leaving the app unusable.
+    let installed = (!choice.is_default())
+        .then(enumerate_system_fonts)
+        .unwrap_or_default();
+    let mut load_pick = |name: &str| -> Option<String> {
+        let font = installed.iter().find(|f| f.display.eq_ignore_ascii_case(name))?;
+        let key = format!("user:{}", font.path.display());
+        if !fonts.font_data.contains_key(&key) {
+            let bytes = crate::iomon::fs::read_sync(crate::iomon::Cat::Startup, &font.path)
+                .map_err(|e| tracing::warn!("font {name:?}: {e}"))
+                .ok()?;
+            fonts.font_data.insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+        }
+        Some(key)
+    };
+    let app_pick = (!choice.app.is_empty()).then(|| load_pick(&choice.app)).flatten();
+    let chat_pick = (!choice.chat.is_empty()).then(|| load_pick(&choice.chat)).flatten();
+
+    // The chat family is the user's chat face (if any), then everything the
+    // proportional family has — so a chat font with no CJK still renders a
+    // Japanese name, and the UI icon glyphs egui bundles stay reachable.
+    let mut chat_list: Vec<String> = Vec::new();
+    if let Some(k) = &chat_pick {
+        chat_list.push(k.clone());
+    }
+    chat_list.extend(
+        fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default(),
+    );
+
+    // The user's app font goes in FRONT of egui's default rather than
+    // replacing it: the default carries the UI icon glyphs still used outside
+    // the chat window, so dropping it would leave tofu all over Settings.
+    if let Some(k) = &app_pick {
+        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, k.clone());
     }
 
-    // Fallbacks: keep the default font primary, try these only for missing glyphs.
+    // Fallbacks: keep the primary font primary, try these only for missing glyphs.
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         let list = fonts.families.entry(family).or_default();
         for key in &added {
             list.push(key.clone());
         }
     }
+    chat_list.extend(added.iter().cloned());
+    chat_list.dedup();
+    fonts.families.insert(FontFamily::Name(CHAT_FAMILY.into()), chat_list);
 
     ctx.set_fonts(fonts);
-    tracing::info!("installed {} fallback font(s) for non-Latin glyphs", added.len());
+    tracing::info!(
+        app = %choice.app,
+        chat = %choice.chat,
+        "installed fonts ({} non-Latin fallback(s))",
+        added.len()
+    );
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry stores a font's name with its type in parentheses. The
+    /// picker shows and stores the cleaned name, so this is what a saved
+    /// setting is matched against on the next launch.
+    #[test]
+    fn font_names_lose_their_registry_type_suffix() {
+        assert_eq!(clean_font_name("Segoe UI (TrueType)"), "Segoe UI");
+        assert_eq!(clean_font_name("Yu Gothic Medium & Yu Gothic UI (TrueType)"),
+                   "Yu Gothic Medium & Yu Gothic UI");
+        assert_eq!(clean_font_name("Cambria & Cambria Math (TrueType)"), "Cambria & Cambria Math");
+        // A name with no suffix passes through untouched.
+        assert_eq!(clean_font_name("Arial"), "Arial");
+        // …including one that happens to contain a parenthesis mid-name.
+        assert_eq!(clean_font_name("Foo(Bar)"), "Foo(Bar)");
+    }
+
+    #[test]
+    fn a_default_choice_is_recognised_as_such() {
+        assert!(FontChoice::default().is_default());
+        assert!(!FontChoice { app: "Arial".into(), chat: String::new() }.is_default());
+        assert!(!FontChoice { app: String::new(), chat: "Arial".into() }.is_default());
+    }
 }

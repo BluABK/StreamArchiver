@@ -156,6 +156,17 @@ const K_CHAT_SHOW_HYPE: &str = "chat_show_hype_train";
 /// goals once those land) is available at all. Default on; the toolbar toggle
 /// is the per-window collapse, same shape as [`K_CHAT_SHOW_HYPE`].
 const K_CHAT_SHOW_INFO: &str = "chat_show_channel_info";
+/// App-wide UI font family, by its installed display name (`""` = egui's
+/// bundled default). Stored as a NAME, not a path, so the setting survives the
+/// font being reinstalled to a different file. The pick is inserted in FRONT
+/// of egui's default rather than replacing it — the default carries the UI
+/// icon glyphs still used outside the chat window. See [`crate::fonts`].
+pub(crate) const K_APP_FONT_FAMILY: &str = "app_font_family";
+/// Chat-replay font family, same shape as [`K_APP_FONT_FAMILY`] but for the
+/// chat window only — it renders in its own registered family
+/// ([`crate::fonts::CHAT_FAMILY`]) so the two can differ without either
+/// losing the non-Latin fallbacks.
+pub(crate) const K_CHAT_FONT_FAMILY: &str = "chat_font_family";
 /// Path to the media player binary used by "Play local recording (start)" on
 /// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
 /// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`
@@ -2161,6 +2172,19 @@ pub struct StreamArchiverApp {
     /// Chat/toolbar affordance icons, uploaded on first use (None until then).
     /// See [`UiTextures`] for why they aren't just emoji.
     ui_tex: Option<UiTextures>,
+    /// App-wide UI font family by display name (`""` = egui's bundled
+    /// default) — see [`K_APP_FONT_FAMILY`]. The chat's own font lives on the
+    /// shared `ChatSettingsState` instead, so each chat window sees a change
+    /// immediately.
+    app_font: String,
+    /// The font choice currently installed in egui. Compared against the live
+    /// settings each frame so a change (from either font picker) is applied
+    /// exactly once — `ctx.set_fonts` rebuilds the whole atlas and invalidates
+    /// every cached galley, so it must never run per frame.
+    installed_fonts: crate::fonts::FontChoice,
+    /// Installed system fonts for the pickers, enumerated once on first use
+    /// (~400 registry values plus an existence check each).
+    system_fonts: Option<Vec<crate::fonts::SystemFont>>,
     /// Which monitor's Properties window is open (None = closed).
     properties_popups: Vec<i64>,
     /// Deferred-viewport state for each open instance-Properties window,
@@ -2754,6 +2778,31 @@ impl StreamArchiverApp {
         self.inspector_window(ctx);
     }
 }
+impl StreamArchiverApp {
+    /// Re-install the egui font stack when either font picker has changed.
+    ///
+    /// Called every frame, but only *does* anything when the choice actually
+    /// differs from what is installed: `ctx.set_fonts` rebuilds the glyph
+    /// atlas and invalidates every cached galley, so running it per frame
+    /// would be ruinous. The comparison is two string compares.
+    ///
+    /// Reading the live values each frame (rather than having the pickers
+    /// signal a change) is deliberate: the chat font can be edited from a
+    /// deferred chat-window panel that has no `&mut self` to signal through,
+    /// and this way there is one place that decides, not two.
+    fn apply_font_settings(&mut self, ctx: &egui::Context) {
+        let want = crate::fonts::FontChoice {
+            app: self.app_font.clone(),
+            chat: self.chat_settings.lock().unwrap().chat_font.clone(),
+        };
+        if want == self.installed_fonts {
+            return;
+        }
+        crate::fonts::install_fonts(ctx, &want);
+        self.installed_fonts = want;
+    }
+}
+
 impl eframe::App for StreamArchiverApp {
     /// eframe's default is 30s, and egui state (scroll positions, window
     /// geometry) changes almost every interaction — so the default rewrites
@@ -2779,6 +2828,8 @@ impl eframe::App for StreamArchiverApp {
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         self.heartbeat.set_active(!minimized);
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+        self.apply_font_settings(ctx);
 
         // ── One-shot startup window-size self-heal ──────────────────────
         // A previous session that closed while minimized can leave a

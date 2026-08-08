@@ -3071,6 +3071,11 @@ pub struct Recording {
     /// (one Warnings row however many doomed attempts it takes), so it can
     /// only name one take — every later take of the same gated stream would
     /// otherwise look like an ordinary failure.
+    /// Read back through SQL rather than this field (the alert-badge map and
+    /// `finish_recording`'s suppression both query the column directly), but
+    /// carried on the struct so `get_recording` round-trips a take faithfully
+    /// and tests can assert on it.
+    #[allow(dead_code)]
     pub gated: bool,
 }
 

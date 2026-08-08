@@ -266,6 +266,7 @@ impl StreamArchiverApp {
                     emote_pt: cs.emote_pt,
                     ts_color: cs.ts_color,
                     text_color: cs.text_color,
+                    font_id: font_name_key(&cs.chat_font),
                 },
             )
         };
