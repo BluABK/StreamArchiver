@@ -38,18 +38,34 @@ fn assets_ever_fetched(asset_dir: &Path) -> bool {
     crate::iomon::fs::exists_sync(Cat::AssetCache, asset_dir.join(".assets_fetched_at"))
 }
 
-fn should_refetch_global_badges(platform_dir: &Path) -> bool {
-    let stamp = platform_dir.join("twitch").join(".global_badges_fetched_at");
-    match crate::iomon::fs::read_to_string_sync(Cat::AssetCache, &stamp) {
-        Ok(s) => s.trim().parse::<i64>().map(|t| now_unix() - t > 86_400).unwrap_or(true),
+/// How long a shared, channel-independent asset set (global badges, a
+/// provider's global emotes) stays fresh before it is refetched.
+const GLOBAL_ASSET_TTL_SECS: i64 = 86_400;
+
+/// True if `stamp` is missing, unreadable, unparseable, or older than
+/// [`GLOBAL_ASSET_TTL_SECS`] — i.e. refetch. Every failure mode says "refetch"
+/// deliberately: a corrupt stamp costs one extra fetch a day, whereas trusting
+/// it would wedge the asset set forever.
+fn global_asset_stale(stamp: &Path) -> bool {
+    match crate::iomon::fs::read_to_string_sync(Cat::AssetCache, stamp) {
+        Ok(s) => {
+            s.trim().parse::<i64>().map(|t| now_unix() - t > GLOBAL_ASSET_TTL_SECS).unwrap_or(true)
+        }
         Err(_) => true,
     }
 }
 
-fn write_global_badges_stamp(platform_dir: &Path) {
-    let dir = platform_dir.join("twitch");
-    let _ = crate::iomon::fs::create_dir_all_sync(Cat::AssetCache, &dir);
-    let _ = crate::iomon::fs::write_sync(Cat::AssetCache, dir.join(".global_badges_fetched_at"), now_unix().to_string());
+/// Mark a shared asset set fetched now. Callers write this **only on success**,
+/// so a failed fetch retries on the next pass instead of being blocked for a day.
+fn write_global_asset_stamp(stamp: &Path) {
+    if let Some(dir) = stamp.parent() {
+        let _ = crate::iomon::fs::create_dir_all_sync(Cat::AssetCache, dir);
+    }
+    let _ = crate::iomon::fs::write_sync(Cat::AssetCache, stamp, now_unix().to_string());
+}
+
+fn global_badges_stamp(platform_dir: &Path) -> PathBuf {
+    platform_dir.join("twitch").join(".global_badges_fetched_at")
 }
 
 // ---------- Core utility ----------
@@ -714,7 +730,7 @@ async fn fetch_twitch_badges(
     platform_dir: &Path,
 ) -> Result<()> {
     // Global badges are shared across all Twitch channels — fetch once per 24h.
-    if should_refetch_global_badges(platform_dir) {
+    if global_asset_stale(&global_badges_stamp(platform_dir)) {
         let global_dir = platform_dir.join("twitch").join("global_badges");
         crate::iomon::fs::create_dir_all(Cat::AssetCache, &global_dir).await?;
         match fetch_helix_badges(
@@ -726,7 +742,7 @@ async fn fetch_twitch_badges(
         )
         .await
         {
-            Ok(_) => write_global_badges_stamp(platform_dir),
+            Ok(_) => write_global_asset_stamp(&global_badges_stamp(platform_dir)),
             Err(e) => warn!("global Twitch badges: {e}"),
         }
     }
@@ -1533,6 +1549,223 @@ async fn fetch_7tv_emotes(
     Ok(())
 }
 
+// ---------- Third-party GLOBAL emote sets ----------
+
+/// One emote from a provider's global set: what to record, and where to get it.
+struct GlobalEmote {
+    entry: EmoteManifestEntry,
+    url: String,
+}
+
+/// Where a provider's global-emote manifest lives.
+///
+/// Beside the provider's shared image cache rather than under any channel:
+/// these emotes belong to nobody in particular and every channel's chat
+/// renders them, so filing them per-channel would mean N copies of one list
+/// that all say the same thing.
+pub(crate) fn global_emote_manifest(platform_dir: &Path, provider: &str) -> PathBuf {
+    platform_dir.join(provider).join("global.json")
+}
+
+fn global_emotes_stamp(platform_dir: &Path, provider: &str) -> PathBuf {
+    platform_dir.join(provider).join(".global_emotes_fetched_at")
+}
+
+/// 7TV's global set — the emotes every channel gets for free (`xdx`, `Clueless`,
+/// …), which is why they never appear in a channel's own `emote_set`.
+async fn seventv_global_emotes(client: &Client) -> Result<Vec<GlobalEmote>> {
+    let resp = client.get("https://7tv.io/v3/emote-sets/global").send().await?;
+    if !resp.status().is_success() {
+        bail!("7TV globals: {}", resp.status());
+    }
+    Ok(parse_7tv_global(&resp.json().await?))
+}
+
+fn parse_7tv_global(v: &serde_json::Value) -> Vec<GlobalEmote> {
+    let Some(emotes) = v["emotes"].as_array() else { return Vec::new() };
+    emotes
+        .iter()
+        .filter_map(|e| {
+            let id = e["id"].as_str()?;
+            let name = e["name"].as_str()?;
+            Some(GlobalEmote {
+                entry: EmoteManifestEntry {
+                    name: name.to_string(),
+                    id: id.to_string(),
+                    ext: "webp".to_string(),
+                    shared: true,
+                },
+                url: format!("https://cdn.7tv.app/emote/{id}/4x.webp"),
+            })
+        })
+        .collect()
+}
+
+async fn bttv_global_emotes(client: &Client) -> Result<Vec<GlobalEmote>> {
+    // Same shape as the channel fetch's private `BttvEmote`; `default` on the
+    // code for the same reason — one malformed emote must not abort the set.
+    #[derive(Deserialize)]
+    struct GlobalBttvEmote {
+        id: String,
+        #[serde(default)]
+        code: String,
+        #[serde(rename = "imageType")]
+        image_type: String,
+    }
+    let resp = client.get("https://api.betterttv.net/3/cached/emotes/global").send().await?;
+    if !resp.status().is_success() {
+        bail!("BTTV globals: {}", resp.status());
+    }
+    let emotes: Vec<GlobalBttvEmote> = resp.json().await?;
+    Ok(emotes
+        .into_iter()
+        .map(|e| GlobalEmote {
+            url: format!("https://cdn.betterttv.net/emote/{}/3x.{}", e.id, e.image_type),
+            entry: EmoteManifestEntry {
+                name: e.code,
+                id: e.id,
+                ext: e.image_type,
+                shared: true,
+            },
+        })
+        .collect())
+}
+
+/// FFZ's global set. The payload carries more sets than are actually on by
+/// default (`Emote Effects` and friends); `default_sets` names the ones a
+/// viewer with stock settings really sees, so only those are cached — anything
+/// else would render emotes in our replay that nobody saw on Twitch.
+async fn ffz_global_emotes(client: &Client) -> Result<Vec<GlobalEmote>> {
+    let resp = client.get("https://api.frankerfacez.com/v1/set/global").send().await?;
+    if !resp.status().is_success() {
+        bail!("FFZ globals: {}", resp.status());
+    }
+    Ok(parse_ffz_global(&resp.json().await?))
+}
+
+fn parse_ffz_global(v: &serde_json::Value) -> Vec<GlobalEmote> {
+    let Some(defaults) = v["default_sets"].as_array() else { return Vec::new() };
+    let mut out = Vec::new();
+    for set_id in defaults {
+        let key = match set_id.as_i64() {
+            Some(i) => i.to_string(),
+            None => continue,
+        };
+        let Some(emotes) = v["sets"][&key]["emoticons"].as_array() else { continue };
+        for e in emotes {
+            let (Some(id), Some(name)) = (e["id"].as_i64(), e["name"].as_str()) else { continue };
+            // Best available scale: 4 > 2 > 1.
+            let Some(raw) = e["urls"]["4"]
+                .as_str()
+                .or_else(|| e["urls"]["2"].as_str())
+                .or_else(|| e["urls"]["1"].as_str())
+            else {
+                continue;
+            };
+            // Protocol-relative (`//cdn…`) — keep both slashes, they are part
+            // of the authority.
+            let url =
+                if raw.starts_with("//") { format!("https:{raw}") } else { raw.to_string() };
+            out.push(GlobalEmote {
+                entry: EmoteManifestEntry {
+                    name: name.to_string(),
+                    id: id.to_string(),
+                    ext: ext_from_url(&url).unwrap_or("png").to_string(),
+                    shared: true,
+                },
+                url,
+            });
+        }
+    }
+    out
+}
+
+/// Download a provider's global set into its shared image cache and write the
+/// manifest. Returns how many emotes the manifest ended up listing.
+///
+/// Images land in the *same* `platform_dir/{provider}/emotes/` directory the
+/// channel fetchers use, keyed by id — so a channel that also carries a global
+/// emote costs no second copy on disk.
+async fn store_global_emotes(
+    client: &Client,
+    platform_dir: &Path,
+    provider: &str,
+    emotes: Vec<GlobalEmote>,
+) -> Result<usize> {
+    if emotes.is_empty() {
+        return Ok(0);
+    }
+    let dir = platform_dir.join(provider).join("emotes");
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, &dir).await?;
+    let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
+    for g in emotes {
+        if g.entry.name.trim().is_empty() {
+            continue;
+        }
+        let dest = dir.join(format!(
+            "{}_{}.{}",
+            g.entry.id,
+            sanitize_emote_name(&g.entry.name),
+            g.entry.ext
+        ));
+        let legacy = dir.join(format!("{}.{}", g.entry.id, g.entry.ext));
+        if !asset_present(&dest) && !asset_present(&legacy) {
+            if let Err(e) = download_image(client, &g.url, &dest).await {
+                warn!("{provider} global emote {}: {e}", g.entry.id);
+            } else {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+        // Recorded even if the download above failed: the map builder checks
+        // the file exists before using it, so a missing image is harmless,
+        // and keeping the entry means the next 24h pass retries that one
+        // emote instead of dropping it from the set entirely.
+        manifest.push(g.entry);
+    }
+    if manifest.is_empty() {
+        return Ok(0);
+    }
+    let json = serde_json::to_string(&manifest)?;
+    crate::iomon::fs::write(Cat::AssetCache, global_emote_manifest(platform_dir, provider), json)
+        .await?;
+    Ok(manifest.len())
+}
+
+/// Refresh the BTTV / FFZ / 7TV global emote sets (once per provider per 24h).
+///
+/// These are channel-independent — every Twitch chat renders them for every
+/// viewer — but nothing fetched them, so a global like 7TV's `xdx` showed up
+/// in the replay as the literal word while Twitch showed the picture.
+///
+/// Runs once per channel-asset pass, but the stamp means at most three HTTP
+/// requests a day across the whole app no matter how many channels are
+/// monitored. Written only when a set actually arrived, so a provider outage
+/// retries on the next pass rather than blanking those emotes for a day.
+async fn fetch_global_emotes(client: &Client, platform_dir: &Path) {
+    for provider in ["7tv", "bttv", "ffz"] {
+        let stamp = global_emotes_stamp(platform_dir, provider);
+        if !global_asset_stale(&stamp) {
+            continue;
+        }
+        let fetched = match provider {
+            "7tv" => seventv_global_emotes(client).await,
+            "bttv" => bttv_global_emotes(client).await,
+            _ => ffz_global_emotes(client).await,
+        };
+        match fetched {
+            Ok(emotes) => match store_global_emotes(client, platform_dir, provider, emotes).await {
+                Ok(0) => warn!("{provider} global emotes: provider returned none"),
+                Ok(n) => {
+                    write_global_asset_stamp(&stamp);
+                    tracing::debug!("{provider} global emotes: {n} cached");
+                }
+                Err(e) => warn!("{provider} global emotes: {e:#}"),
+            },
+            Err(e) => warn!("{provider} global emotes: {e:#}"),
+        }
+    }
+}
+
 // ---------- YouTube ----------
 
 /// Download YouTube channel icon and banner into `asset_dir/`.
@@ -1729,6 +1962,8 @@ pub fn load_reward_titles(
 /// - BTTV shared emotes → `platform_dir/bttv/emotes/` (global dedup)
 /// - FFZ emotes → `platform_dir/ffz/emotes/` + manifest `asset_dir/emotes/ffz.json`
 /// - 7TV emotes → `platform_dir/7tv/emotes/` + manifest `asset_dir/emotes/7tv.json`
+/// - BTTV/FFZ/7TV **global** emotes → the same shared per-provider caches +
+///   manifest `platform_dir/{provider}/global.json` (once per provider per 24h)
 /// - Broadcaster name colour → `asset_dir/name_color.txt` (Helix `chat/color`)
 /// Returns `true` if the channel icon/banner fetch succeeded (badges/emotes/colour
 /// are best-effort and don't affect the result). The 24h "fetched" stamp is written
@@ -1790,6 +2025,9 @@ pub async fn run_twitch_assets(
     if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("7TV ({broadcaster_id}): {e}");
     }
+    // Channel-independent, so it doesn't take a broadcaster_id and isn't gated
+    // on the channel fetches above succeeding — see `fetch_global_emotes`.
+    fetch_global_emotes(client, platform_dir).await;
     if !login.is_empty() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         match fetch_twitch_rewards(client, &login, asset_dir).await {
@@ -3002,6 +3240,93 @@ mod tests {
         assert!(empty.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seventv_globals_parse_into_cdn_urls() {
+        // Shape from the live `7tv.io/v3/emote-sets/global` payload.
+        let v = serde_json::json!({
+            "emotes": [
+                { "id": "01F6MZGCNG000255K4X1KTKGGZ", "name": "xdx" },
+                { "id": "01F6ME1BQ00007WV4YHDCJ6NDS" },          // no name
+                { "name": "orphan" },                             // no id
+            ]
+        });
+        let got = parse_7tv_global(&v);
+        assert_eq!(got.len(), 1, "entries missing an id or a name are unusable");
+        assert_eq!(got[0].entry.name, "xdx");
+        assert_eq!(got[0].entry.ext, "webp");
+        assert_eq!(got[0].url, "https://cdn.7tv.app/emote/01F6MZGCNG000255K4X1KTKGGZ/4x.webp");
+    }
+
+    #[test]
+    fn ffz_globals_take_only_the_default_sets() {
+        // FFZ ships more sets than a stock viewer sees. Caching the extras
+        // would render emotes in the replay that nobody watching Twitch saw.
+        let v = serde_json::json!({
+            "default_sets": [3],
+            "sets": {
+                "3": { "emoticons": [
+                    { "id": 9, "name": "ZreknarF", "urls": { "1": "//cdn.frankerfacez.com/emote/9/1", "4": "//cdn.frankerfacez.com/emote/9/4.webp" } },
+                ]},
+                "1539687": { "emoticons": [
+                    { "id": 723890, "name": "NotDefault", "urls": { "1": "//cdn.frankerfacez.com/emote/723890/1" } },
+                ]},
+            }
+        });
+        let got = parse_ffz_global(&v);
+        assert_eq!(got.iter().map(|g| g.entry.name.as_str()).collect::<Vec<_>>(), ["ZreknarF"]);
+        // Protocol-relative URLs must be made absolute, and the best scale wins.
+        assert_eq!(got[0].url, "https://cdn.frankerfacez.com/emote/9/4.webp");
+        assert_eq!(got[0].entry.ext, "webp");
+    }
+
+    #[test]
+    fn ffz_globals_fall_back_to_a_smaller_scale() {
+        let v = serde_json::json!({
+            "default_sets": [3],
+            "sets": { "3": { "emoticons": [
+                { "id": 9, "name": "OnlySmall", "urls": { "1": "https://cdn.frankerfacez.com/emote/9/1" } },
+            ]}}
+        });
+        let got = parse_ffz_global(&v);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].url, "https://cdn.frankerfacez.com/emote/9/1");
+        // No extension in the URL at all — PNG is FFZ's default.
+        assert_eq!(got[0].entry.ext, "png");
+    }
+
+    #[test]
+    fn global_asset_stamps_expire_and_fail_open() {
+        let dir = std::env::temp_dir().join(format!("sa_stamp_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let stamp = dir.join(".global_emotes_fetched_at");
+
+        assert!(global_asset_stale(&stamp), "a missing stamp must mean refetch");
+
+        write_global_asset_stamp(&stamp);
+        assert!(!global_asset_stale(&stamp), "just written — still fresh");
+
+        std::fs::write(&stamp, (now_unix() - GLOBAL_ASSET_TTL_SECS - 1).to_string()).unwrap();
+        assert!(global_asset_stale(&stamp), "past the TTL");
+
+        // Fail OPEN: a corrupt stamp costs one extra fetch a day, whereas
+        // trusting it would wedge the set forever.
+        std::fs::write(&stamp, b"not a timestamp").unwrap();
+        assert!(global_asset_stale(&stamp));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_emote_manifests_sit_beside_the_shared_image_cache() {
+        // The map builder reads this exact path; if the two ever disagreed,
+        // globals would silently stop resolving.
+        let plat = Path::new("C:").join("assets");
+        assert_eq!(
+            global_emote_manifest(&plat, "7tv"),
+            plat.join("7tv").join("global.json")
+        );
     }
 
     #[test]

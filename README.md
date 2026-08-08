@@ -4141,8 +4141,16 @@ generic palette).
 
 - **Twitch** (needs Twitch credentials — the same app/user token as detection):
   profile icon, offline banner, channel + global chat **badges**, first-party
-  **emotes**, plus third-party **BTTV / FFZ / 7TV** emotes (the channel's sets,
-  fetched from its Twitch broadcaster id), and the broadcaster's chosen chat
+  **emotes**, plus third-party **BTTV / FFZ / 7TV** emotes — both the channel's
+  own sets (fetched from its Twitch broadcaster id) and each provider's
+  **global** set, the emotes every Twitch channel gets for free (7TV's `xdx`,
+  BTTV's `catJAM`, and so on). Globals belong to no channel, so they're fetched
+  once per provider per day for the whole app rather than per channel; where a
+  channel aliases a global's code to an emote of its own, the channel's wins,
+  exactly as Twitch renders it. FFZ ships several global sets but only the ones
+  it marks as defaults are cached — the rest are opt-in on Twitch, and
+  rendering them here would show emotes nobody watching actually saw. Also
+  fetched: the broadcaster's chosen chat
   **name colour** (tints the channel's name in the Streams list and chat replay).
   First-party emotes are fetched per-channel, but any subscriber can use their
   sub emotes in ANY channel's chat — so the **chat replay** also falls back to
@@ -4827,7 +4835,11 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
     - (`posts\` and `schedule_src\` may still sit at the platform level for
       pre-migration downloads — their paths are recorded in the DB.)
   - `platform_assets\` — deduplicated shared emote images + global Twitch badges
-    (referenced by every channel, stored once).
+    (referenced by every channel, stored once). Each third-party provider also
+    keeps its **global emote set** here: `{bttv,ffz,7tv}\global.json` (the
+    manifest) next to a `.global_emotes_fetched_at` stamp, with the images in
+    the same `emotes\` folder the channel sets resolve into — so an emote that
+    is both global and in some channel's set is stored exactly once.
 
 ## CLI / diagnostics
 

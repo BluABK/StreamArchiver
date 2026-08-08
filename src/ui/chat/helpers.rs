@@ -155,6 +155,25 @@ pub(in crate::ui) fn build_emote_map(name: &str, account: &str) -> HashMap<Strin
     });
     // FFZ: always in the shared global cache.
     insert(load("ffz.json"), &|_| plat.join("ffz").join("emotes"));
+
+    // Each provider's GLOBAL set — the emotes every channel gets for free.
+    // Last on purpose: `insert` is first-wins, so a channel that aliases a
+    // global's code to its own emote keeps its own, exactly as Twitch shows
+    // it. Images live in the same shared per-provider cache the channel sets
+    // resolve into, so this only adds names, never a second copy on disk.
+    let load_global = |provider: &str| -> Vec<EmoteManifestEntry> {
+        crate::iomon::fs::read_to_string_sync(
+            crate::iomon::Cat::AssetCache,
+            crate::assets::global_emote_manifest(&plat, provider),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+    };
+    for provider in ["7tv", "bttv", "ffz"] {
+        let dir = plat.join(provider).join("emotes");
+        insert(load_global(provider), &|_| dir.clone());
+    }
     map
 }
 /// Truncate a label to at most `max` characters, appending `…` when shortened.
