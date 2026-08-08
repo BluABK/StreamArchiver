@@ -5216,6 +5216,7 @@ mod tests {
             chat_path: String::new(),
             rolling: crate::models::Rolling::default(),
             not_recorded_reason: String::new(),
+            gated: false,
         }
     }
 

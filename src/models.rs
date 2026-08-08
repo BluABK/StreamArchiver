@@ -3061,6 +3061,17 @@ pub struct Recording {
     /// backfill paths, which must not "recover" a broadcast that was skipped
     /// deliberately because a sibling already has it.
     pub not_recorded_reason: String,
+    /// This take captured nothing because the broadcast was subscriber-only /
+    /// members-only and the connected account isn't entitled to it (schema
+    /// v92). A state of the broadcast, not a capture fault: the grid renders
+    /// 🔒 rather than a red error, and `finish_recording` files no
+    /// `capture_failed` alert beside the 🔒 one.
+    ///
+    /// Per-take on purpose. The 🔒 alert itself is keyed by the *broadcast*
+    /// (one Warnings row however many doomed attempts it takes), so it can
+    /// only name one take — every later take of the same gated stream would
+    /// otherwise look like an ordinary failure.
+    pub gated: bool,
 }
 
 impl Recording {
@@ -3196,6 +3207,7 @@ impl Recording {
             chat_path: String::new(),
             rolling: crate::models::Rolling::default(),
             not_recorded_reason: String::new(),
+            gated: false,
         }
     }
 }

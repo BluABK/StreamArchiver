@@ -233,6 +233,40 @@ fn first_run_text(node: Option<&serde_json::Value>) -> String {
         .to_string()
 }
 
+/// Schema v92 repair: back-fill `recording.gated` and drop the "Capture
+/// failed" alerts the old behaviour filed on takes that were never ours to
+/// capture. Extracted from the migration so it can be tested against a
+/// hand-built damaged database.
+///
+/// Three steps:
+/// 1. The take each existing 🔒 alert names is gated by definition.
+/// 2. So is every other 0-byte failed take of that same broadcast — same
+///    stream, same entitlement, and those are exactly the takes that were
+///    wrongly reddened (the 🔒 alert is keyed by the broadcast and could name
+///    only the first of them). `bytes = 0` keeps this off any take that
+///    actually captured something.
+/// 3. Their `capture_failed` alerts were filed on a false premise; drop them,
+///    or the takes stay red and keep the 🚨 badge lit over a broadcast that
+///    was never ours to capture.
+fn repair_gated_takes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE recording SET gated = 1 WHERE id IN
+             (SELECT recording_id FROM capture_alert
+              WHERE kind = 'sub_only' AND recording_id IS NOT NULL);
+         UPDATE recording SET gated = 1
+          WHERE gated = 0 AND status = 'failed' AND bytes = 0
+            AND stream_id IS NOT NULL AND stream_id != ''
+            AND EXISTS (SELECT 1 FROM recording g
+                        WHERE g.gated = 1
+                          AND g.monitor_id = recording.monitor_id
+                          AND g.stream_id = recording.stream_id);
+         DELETE FROM capture_alert
+          WHERE kind = 'capture_failed'
+            AND recording_id IN (SELECT id FROM recording WHERE gated = 1);",
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub(super) fn migrate(&self) -> Result<()> {
         let conn = self.db();
@@ -1782,7 +1816,28 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 91)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 91);
+        if version < 92 {
+            // "This take captured nothing because the broadcast wasn't ours to
+            // capture." Per TAKE, deliberately: the 🔒 alert it files is keyed
+            // by the *broadcast* so a gated stream produces one Warnings row
+            // instead of one per doomed attempt, and that row can only carry a
+            // single `recording_id` — the first take's. Every take after it
+            // therefore looked uncovered, got a red `capture_failed` filed
+            // beside the lock, and rendered "⛔ capture error" (Mori Calliope's
+            // members-only stream, 2026-08-08: one 🔒 take and seven red ones,
+            // rolling the whole stream row up as a fault).
+            //
+            // The partial index keeps the badge lookup off a full scan of a
+            // table that only grows.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN gated INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS idx_recording_gated
+                     ON recording(id) WHERE gated = 1;",
+            )?;
+            repair_gated_takes(&conn)?;
+            conn.pragma_update(None, "user_version", 92)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 92);
         Ok(())
     }
 }
@@ -1952,6 +2007,75 @@ mod tests {
         assert_eq!(by_id(hit).trigger_info, "title ~ \"karaoke\"");
         assert_eq!(by_id(normal).trigger_info, "");
     }
+    /// The v92 repair, against the damage the old behaviour actually left:
+    /// one broadcast, several 0-byte failed takes, a single 🔒 alert naming
+    /// only the first, and a red "Capture failed" on each of the rest.
+    #[test]
+    fn migration_92_repairs_wrongly_reddened_gated_takes() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store
+            .upsert_channel("Mori", "https://youtube.com/@mori", Platform::YouTube)
+            .unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let take = |at: i64| {
+            let id = store
+                .insert_recording(mid, at, "C:/tmp/a.mkv", None, false, Some("s1"), None, "", "")
+                .unwrap();
+            store
+                .finish_recording(id, at + 10, 0, Some(1), "failed", "C:/tmp/a.mkv", "not live")
+                .unwrap();
+            id
+        };
+        let (t1, t2, t3) = (take(100), take(200), take(300));
+        // A take of a DIFFERENT broadcast that failed for its own reasons must
+        // not be swept up: it is the control for step 2's stream-id match.
+        let other = store
+            .insert_recording(mid, 400, "C:/tmp/b.mkv", None, false, Some("s2"), None, "", "")
+            .unwrap();
+        store
+            .finish_recording(other, 410, 0, Some(1), "failed", "C:/tmp/b.mkv", "not live")
+            .unwrap();
+        // The pre-v92 world: one 🔒 row for the broadcast, pinned to take one.
+        store
+            .upsert_capture_alert(&NewCaptureAlert {
+                kind: "sub_only".into(),
+                severity: "warning".into(),
+                source: "capture".into(),
+                take_key: "sub_only:s1".into(),
+                monitor_id: Some(mid),
+                recording_id: Some(t1),
+                channel: "Mori".into(),
+                count: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        // finish_recording already filed a capture_failed for every take.
+        let reds = |store: &Store| {
+            store
+                .list_capture_alerts(50)
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.kind == "capture_failed")
+                .filter_map(|a| a.recording_id)
+                .collect::<Vec<_>>()
+        };
+        let mut before = reds(&store);
+        before.sort();
+        assert_eq!(before, vec![t1, t2, t3, other], "every take got a red row");
+
+        // Re-running the repair on the migrated DB is what an upgrade does.
+        repair_gated_takes(&store.db()).unwrap();
+
+        for id in [t1, t2, t3] {
+            assert!(store.get_recording(id).unwrap().unwrap().gated, "take {id} is gated");
+        }
+        assert!(
+            !store.get_recording(other).unwrap().unwrap().gated,
+            "an unrelated failed take must not be marked gated"
+        );
+        assert_eq!(reds(&store), vec![other], "only the false reds were dropped");
+    }
+
     #[test]
     fn migration_54_trigger_rule_json_roundtrip() {
         let store = Store::open_in_memory().unwrap();

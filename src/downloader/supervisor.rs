@@ -3955,6 +3955,14 @@ progress_info: None,
             (true, _) => Gated::NoFallback,
         };
         if is_gated {
+            // Stamp the TAKE before finalizing it. The 🔒 alert below is keyed
+            // by the broadcast (one Warnings row however many attempts it
+            // takes), so it can name only one take — this flag is what lets
+            // `finish_recording` suppress the red `capture_failed` for every
+            // attempt, and the grid render 🔒 on every one of them.
+            if let Err(e) = self.store.set_recording_gated(rec_id) {
+                warn!(rec_id, "failed to mark take as gated: {e:#}");
+            }
             self.file_sub_only_alert(&row, monitor_id, rec_id, stream_id.as_deref());
             // Hand the broadcast to a CDN capture session: it archives from the
             // segments Twitch does serve, incrementally, and holds the monitor

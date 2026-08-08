@@ -452,6 +452,16 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a take as refused for lack of entitlement (see
+    /// [`crate::models::Recording::gated`]). Set by the supervisor before it
+    /// finalizes the take, so `finish_recording` can see it and skip the
+    /// `capture_failed` error the 🔒 alert already explains.
+    pub fn set_recording_gated(&self, rec_id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE recording SET gated = 1 WHERE id = ?1", params![rec_id])?;
+        Ok(())
+    }
+
     /// Point a take at the chat sidecar being written for it (see
     /// [`crate::models::Recording::chat_path`]). Persisted at spawn for EVERY
     /// chat producer (recorded takes and chat-only sessions alike) since the
@@ -564,16 +574,19 @@ impl Store {
         exit_code: Option<i64>,
         log_excerpt: &str,
     ) -> Result<()> {
-        // A `sub_only` row counts as covering the take even though it is only
-        // a WARNING. It is the whole explanation for the failure — the
-        // broadcast wasn't ours to capture — and adding "Capture failed" beside
-        // it says the opposite of the truth: it turns a known, expected state
-        // into a red fault, and the take row renders "⛔ capture error" instead
-        // of the 🔒 it earned.
+        // A gated take is covered by definition: its 🔒 alert IS the whole
+        // explanation for the failure — the broadcast wasn't ours to capture —
+        // and adding "Capture failed" beside it says the opposite of the truth,
+        // turning a known, expected state into a red fault.
+        //
+        // Read off the take's own `gated` flag, not off the 🔒 alert's
+        // `recording_id`: that alert is keyed by the broadcast, so it names
+        // only the FIRST doomed take, and every attempt after it would look
+        // uncovered here and file the error anyway.
         let covered: bool = self.db().query_row(
             "SELECT EXISTS(SELECT 1 FROM capture_alert
-                           WHERE recording_id = ?1
-                             AND (severity = 'error' OR kind = 'sub_only'))",
+                           WHERE recording_id = ?1 AND severity = 'error')
+                 OR EXISTS(SELECT 1 FROM recording WHERE id = ?1 AND gated = 1)",
             params![rec_id],
             |r| r.get(0),
         )?;
@@ -1646,7 +1659,7 @@ impl Store {
             gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
             COALESCE(chapters_json, ''), chapters_attempts, chat_path,
             rolling_ttl_secs, rolling_from, rolling_kept_at, rolling_expired_at,
-            COALESCE(not_recorded_reason, '')";
+            COALESCE(not_recorded_reason, ''), gated";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -1698,6 +1711,7 @@ impl Store {
                 expired_at: r.get(44)?,
             },
             not_recorded_reason: r.get(45)?,
+            gated: r.get::<_, i64>(46)? != 0,
         })
     }
 
@@ -1938,6 +1952,7 @@ impl Store {
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
                     not_recorded_reason: String::new(),
+                    gated: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2009,6 +2024,7 @@ impl Store {
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
                     not_recorded_reason: String::new(),
+                    gated: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2103,6 +2119,7 @@ impl Store {
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
                     not_recorded_reason: String::new(),
+                    gated: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2190,6 +2207,7 @@ impl Store {
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
                     not_recorded_reason: String::new(),
+                    gated: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2257,6 +2275,7 @@ impl Store {
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
                     not_recorded_reason: String::new(),
+                    gated: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2462,6 +2481,7 @@ impl Store {
                     chat_path: String::new(),
                     rolling: crate::models::Rolling::default(),
                     not_recorded_reason: String::new(),
+                    gated: false,
                     trigger_rule_json: String::new(),
                 })
             })?

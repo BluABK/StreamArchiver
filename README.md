@@ -2152,6 +2152,16 @@ broadcast rather than a fault in the capture. The 🔒 alert is the only one fil
 for it; the generic "Capture failed" error is deliberately suppressed so the two
 don't contradict each other.
 
+That suppression is per **take**, driven by a flag on the take itself (schema
+v92), not by the 🔒 alert. The alert is keyed by the *broadcast* — one Warnings
+row however many doomed attempts a gated stream takes, rather than a wall of
+them — so it can only name one take, and every attempt after the first used to
+look like an ordinary failure: a red error each, and a stream row rolled up as
+"⛔ capture error" with a single 🔒 take hidden among them. Upgrading to v92
+repairs existing takes: every 0-byte failed take of a broadcast already known
+gated is marked as such, and the "Capture failed" alerts filed against them on
+that false premise are dropped.
+
 ### Twitch VOD recovery (deleted & muted VODs)
 
 ![Recording context menu with Recover VOD / Download post-stream VOD / Backfill head](doc/screenshots/vod-recovery-menu.png)

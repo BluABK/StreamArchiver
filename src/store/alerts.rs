@@ -619,6 +619,8 @@ impl Store {
              FROM capture_alert WHERE recording_id IS NOT NULL
              GROUP BY recording_id"
         ))?;
+        // `gated` is folded in from the recording rows below, not taken from
+        // this column alone — see the loop after the query.
         let rows = st
             .query_map([], |r| {
                 let errors = r.get::<_, i64>(1)? != 0;
@@ -643,6 +645,19 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        // Being refused entitlement is a fact about the TAKE; the 🔒 alert that
+        // explains it is keyed by the BROADCAST, so it carries the id of only
+        // the first doomed attempt. Reading `gated` from the alert alone left
+        // every later take of the same stream unbadged — and, before the
+        // suppression moved off that same lookup, badged as a red capture
+        // error instead. Fold in the takes' own flag.
+        let mut st = conn.prepare("SELECT id FROM recording WHERE gated = 1")?;
+        let gated = st.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(st);
+        let mut rows = rows;
+        for id in gated {
+            rows.entry(id).or_default().gated = true;
+        }
         Ok(rows)
     }
 
@@ -978,6 +993,9 @@ mod tests {
             lost_segments: 0,
             last_line: "This YouTube broadcast is members-only…".into(),
         };
+        // Both halves of what the supervisor does for a refused take, in its
+        // order: stamp the take, then file the one 🔒 row for the broadcast.
+        store.set_recording_gated(rid).unwrap();
         store.upsert_capture_alert(&alert).unwrap();
 
         // Finalizing the failed take must NOT add a second, contradictory row.
@@ -994,6 +1012,29 @@ mod tests {
         let b = badges.get(&rid).expect("the take has a badge");
         assert!(b.gated);
         assert!(!b.errors, "a gated take is not an error state");
+
+        // The SECOND attempt at the same broadcast is where this used to fall
+        // apart: the 🔒 alert is keyed by the stream, so it still names take
+        // one, and take two looked like an ordinary failure — red error row,
+        // red take, red stream row (Mori Calliope, 2026-08-08: one 🔒 take and
+        // seven ⛔ ones). The per-take `gated` flag is what fixes it.
+        let rid2 = store
+            .insert_recording(mid, 200, "C:/tmp/b.mkv", None, false, Some("s1"), None, "", "")
+            .unwrap();
+        store.set_recording_gated(rid2).unwrap();
+        // Same broadcast, same take_key: the existing row just counts up, and
+        // keeps pointing at take one.
+        store.upsert_capture_alert(&alert).unwrap();
+        store
+            .finish_recording(rid2, 210, 0, Some(1), "failed", "C:/tmp/b.mkv", "ERROR: not live")
+            .unwrap();
+        let kinds: Vec<String> =
+            store.list_capture_alerts(10).unwrap().into_iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, vec!["sub_only".to_string()], "still one row for the broadcast");
+        let badges = store.alert_badges_by_recording().unwrap();
+        let b2 = badges.get(&rid2).expect("the second take has a badge too");
+        assert!(b2.gated, "every gated take wears the lock, not just the first");
+        assert!(!b2.errors);
     }
 
     #[test]
