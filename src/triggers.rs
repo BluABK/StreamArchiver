@@ -678,6 +678,28 @@ mod tests {
         assert!(load_channel_trigger_scope(&store, 7).is_inherit());
     }
 
+    /// Unticking a rule has to survive the round trip. `enabled` defaults to
+    /// TRUE on deserialize (old stored JSON predates the field), so a `false`
+    /// that failed to serialize would silently come back ticked — which is
+    /// exactly what a disabled rule looks like when it re-enables itself.
+    #[test]
+    fn a_disabled_rule_stays_disabled_across_a_save_and_load() {
+        let store = Store::open_in_memory().unwrap();
+        let mut off = rule(TriggerField::Title, false, "gdq");
+        off.enabled = false;
+        let scope = TriggerScope { mode: TriggerMode::Extend, rules: vec![off] };
+        save_monitor_trigger_scope(&store, 42, &scope).unwrap();
+
+        let back = load_monitor_trigger_scope(&store, 42);
+        assert_eq!(back, scope);
+        assert!(!back.rules[0].enabled, "the untick survived");
+        // A scope carrying rules is a real override, so it is stored rather
+        // than dropped as inert — the other way this could revert.
+        assert!(!scope.is_inherit());
+        // And it stays out of the effective list.
+        assert!(effective_rules(&store, 1, 42).is_empty());
+    }
+
     #[test]
     fn active_window_gates_matching_by_evaluation_time() {
         let rule = TriggerRule {

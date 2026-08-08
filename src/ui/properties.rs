@@ -1628,9 +1628,19 @@ impl StreamArchiverApp {
             block_dirty: false,
             closed: false,
         });
-        // Refreshed every call — same data the wrapper already just
-        // recomputed above, snapshotted in since the deferred closure can't
-        // reach `self`.
+        // Push the *display* data into the popup's state — the deferred
+        // closure runs on the child viewport's own pass and can't reach
+        // `self`.
+        //
+        // Deliberately NOT the edit drafts. This runs on every ROOT pass,
+        // but the popup's closure runs on the CHILD viewport's pass, so a
+        // click lands in `s` somewhere between two root passes — copying
+        // the app-side map back over `s` here wiped it before the
+        // read-back below ever saw it. That isn't a redraw quirk, it makes
+        // an edit impossible to land at all: untick a trigger rule and it
+        // ticks straight back. The drafts are seeded once by `get_or_init`
+        // and owned by the window until it closes; the read-back after the
+        // popup is what keeps the app-side map in step.
         {
             let mut s = popup_state.lock().unwrap();
             s.ch = ch.clone();
@@ -1644,9 +1654,6 @@ impl StreamArchiverApp {
             s.icon_tex = icon_tex;
             s.platform_tex = self.platform_tex.clone();
             s.provider_tex = self.provider_tex.clone();
-            s.scope_draft = self.instance_scope_drafts.get(&mid).cloned().unwrap_or_default();
-            s.trigger_draft = self.instance_trigger_drafts.get(&mid).cloned().unwrap_or_default();
-            s.block_draft = self.instance_block_drafts.get(&mid).cloned().unwrap_or_default();
             s.global_order = global_order;
             s.moderation = moderation;
         }
@@ -2394,9 +2401,19 @@ impl StreamArchiverApp {
             block_dirty: false,
             closed: false,
         });
-        // Refreshed every call — same data the wrapper already just
-        // recomputed above, snapshotted in since the deferred closure can't
-        // reach `self`.
+        // Push the *display* data into the popup's state — the deferred
+        // closure runs on the child viewport's own pass and can't reach
+        // `self`.
+        //
+        // Deliberately NOT the edit drafts. This runs on every ROOT pass,
+        // but the popup's closure runs on the CHILD viewport's pass, so a
+        // click lands in `s` somewhere between two root passes — copying
+        // the app-side map back over `s` here wiped it before the
+        // read-back below ever saw it. That isn't a redraw quirk, it makes
+        // an edit impossible to land at all: untick a trigger rule and it
+        // ticks straight back. The drafts are seeded once by `get_or_init`
+        // and owned by the window until it closes; the read-back after the
+        // popup is what keeps the app-side map in step.
         {
             let mut s = popup_state.lock().unwrap();
             s.ch = ch.clone();
@@ -2409,10 +2426,6 @@ impl StreamArchiverApp {
             s.about_latest = about_latest;
             s.platform_tex = self.platform_tex.clone();
             s.provider_tex = self.provider_tex.clone();
-            s.cfg_draft = self.channel_cfg_drafts.get(&cid).cloned().unwrap_or_default();
-            s.scope_draft = self.channel_scope_drafts.get(&cid).cloned().unwrap_or_default();
-            s.trigger_draft = self.channel_trigger_drafts.get(&cid).cloned().unwrap_or_default();
-            s.block_draft = self.channel_block_drafts.get(&cid).cloned().unwrap_or_default();
             s.global_order = global_order;
         }
 
