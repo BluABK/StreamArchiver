@@ -2818,6 +2818,14 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Current unix timestamp in MILLISECONDS. Used where a second's resolution
+/// would swamp the thing being measured — e.g. the chat replay's lag behind
+/// the live edge, which is itself only a few seconds.
+pub fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
 /// `1234567` → `"1,234,567"` (readout formatting for big counts).
 pub fn group_thousands(n: i64) -> String {
     let s = n.abs().to_string();

@@ -465,6 +465,76 @@ impl ChatSettingsState {
     }
 }
 
+/// How far behind the live chat this window is, and how fresh that answer is.
+///
+/// Sampled ONLY when new messages actually land, never per frame. Age of the
+/// newest message looks like lag but isn't: on a quiet chat it just counts up
+/// while nothing is wrong. What we can honestly measure is "when a message
+/// reached this window, how old was it" — so that is what this records.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ChatLag {
+    /// Milliseconds between Twitch stamping the newest message and this
+    /// window having it. `None` until the first batch arrives.
+    pub(super) ms: Option<i64>,
+    /// Message count at the last sample, to notice the next batch.
+    pub(super) at_count: usize,
+    /// When that sample was taken, so a stale one can be shown as such
+    /// rather than presented as current.
+    pub(super) sampled_at: Option<std::time::Instant>,
+}
+
+/// A lag sample older than this is stale — chat has simply been quiet, and
+/// the number says nothing about right now.
+pub(super) const CHAT_LAG_STALE_SECS: u64 = 30;
+
+impl ChatLag {
+    /// Note the log's current state, sampling if new messages arrived.
+    ///
+    /// `newest_ms` is the newest message's `tmi-sent-ts`. A non-positive
+    /// value (a pre-feature log with no absolute time) records nothing —
+    /// better no number than a wrong one.
+    pub(super) fn observe(&mut self, count: usize, newest_ms: f64, now_ms: i64) {
+        if count == self.at_count || count == 0 {
+            return;
+        }
+        self.at_count = count;
+        if newest_ms <= 0.0 {
+            return;
+        }
+        // Clamped at zero: this compares OUR clock against Twitch's, and a
+        // machine running fast would otherwise report a negative lag.
+        self.ms = Some((now_ms - newest_ms as i64).max(0));
+        self.sampled_at = Some(std::time::Instant::now());
+    }
+
+    /// `(text, stale)` for the status row, or `None` when nothing has been
+    /// measured yet.
+    pub(super) fn label(&self) -> Option<(String, bool)> {
+        let ms = self.ms?;
+        let stale = self
+            .sampled_at
+            .is_none_or(|t| t.elapsed().as_secs() >= CHAT_LAG_STALE_SECS);
+        let secs = ms as f64 / 1000.0;
+        let text = if secs < 1.0 {
+            "under 1s behind".to_string()
+        } else if secs < 60.0 {
+            format!("{secs:.1}s behind")
+        } else {
+            format!("{}m behind", (secs / 60.0).round() as i64)
+        };
+        Some((text, stale))
+    }
+}
+
+/// What the lag figure means, in full. Long because every part of it is a
+/// question someone will ask on seeing the number.
+pub(super) const CHAT_LAG_HOVER: &str =
+    "How far behind the live chat this window is: when the newest messages arrived, this is      how old Twitch said they were.
+
+     The replay reads a file rather than holding its own connection — chat is captured by      an IRC client that buffers to disk every 2s, and this window re-reads that file every      3s — so a couple of seconds is normal and unavoidable without changing that design.      Notifications do NOT go through this path: a mention pings from the capture client      immediately, even though its row shows up here a moment later.
+
+     Measured only when new messages land, so a quiet chat shows the last real      measurement rather than counting up. It compares this machine's clock against      Twitch's, so a badly-set system clock will show here as lag that isn't real.";
+
 /// The chat window's send bar. See [`crate::chat_send`] for the transport and
 /// the rate policy; this is only what the window needs to draw and drive it.
 pub(super) struct SendBar {
@@ -573,6 +643,8 @@ pub(super) struct ChatPopup {
     /// User ids already asked about — including ones with NO paint, so a miss
     /// isn't re-requested every few minutes.
     pub(super) paints_asked: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// How far behind the live chat this window is — see [`ChatLag`].
+    pub(super) lag: ChatLag,
     /// When the last paint fetch ran, so the sweep is coalesced rather than
     /// firing on every 3s tail tick.
     pub(super) paints_checked: Option<std::time::Instant>,
@@ -1028,6 +1100,76 @@ mod tests {
         let ch = egui::Color32::from_rgb(9, 9, 9);
         assert_eq!(GoalColor::Channel.resolve(ch), ch);
         assert_eq!(GoalColor::Fixed(c).resolve(ch), c);
+    }
+
+    /// The distinction the whole indicator rests on: a chat nobody is talking
+    /// in is not a chat we are behind on. Sampling only when the message
+    /// count moves is what keeps those apart.
+    #[test]
+    fn lag_samples_only_when_new_messages_arrive() {
+        let mut lag = ChatLag::default();
+        // 10:00:00.000 exactly, in unix ms.
+        let t0 = 1_786_000_000_000i64;
+
+        // Nothing measured yet.
+        assert!(lag.label().is_none());
+
+        // Two messages land, the newest stamped 2.4s ago.
+        lag.observe(2, (t0 - 2_400) as f64, t0);
+        assert_eq!(lag.ms, Some(2_400));
+        assert_eq!(lag.label().map(|(t, _)| t), Some("2.4s behind".to_string()));
+
+        // Twenty seconds pass with NO new messages. The reading must not
+        // drift upward — nothing is wrong, chat is just quiet.
+        lag.observe(2, (t0 - 2_400) as f64, t0 + 20_000);
+        assert_eq!(lag.ms, Some(2_400), "a quiet chat is not a lagging one");
+
+        // A new message arrives, this one fresher.
+        lag.observe(3, (t0 + 20_000 - 900) as f64, t0 + 20_000);
+        assert_eq!(lag.ms, Some(900));
+        assert_eq!(lag.label().map(|(t, _)| t), Some("under 1s behind".to_string()));
+    }
+
+    /// A machine whose clock runs ahead of Twitch's would otherwise report a
+    /// negative lag, and a log with no absolute time has nothing to measure.
+    #[test]
+    fn lag_refuses_to_invent_a_number() {
+        let t0 = 1_786_000_000_000i64;
+
+        // Clock skew: the "newest" message is stamped in our future.
+        let mut lag = ChatLag::default();
+        lag.observe(1, (t0 + 5_000) as f64, t0);
+        assert_eq!(lag.ms, Some(0), "clamped, never negative");
+
+        // A pre-feature log carries no absolute time at all.
+        let mut lag = ChatLag::default();
+        lag.observe(1, 0.0, t0);
+        assert_eq!(lag.ms, None);
+        assert!(lag.label().is_none(), "no number beats a wrong number");
+
+        // An empty log measures nothing.
+        let mut lag = ChatLag::default();
+        lag.observe(0, 0.0, t0);
+        assert_eq!(lag.ms, None);
+    }
+
+    #[test]
+    fn lag_reads_naturally_at_every_scale() {
+        let mut lag = ChatLag::default();
+        let t0 = 1_786_000_000_000i64;
+        for (ago_ms, want) in [
+            (0i64, "under 1s behind"),
+            (999, "under 1s behind"),
+            (1_000, "1.0s behind"),
+            (3_450, "3.5s behind"),
+            (59_000, "59.0s behind"),
+            (90_000, "2m behind"),
+        ] {
+            // A fresh counter each time so every sample is "new".
+            lag = ChatLag { at_count: 0, ..lag };
+            lag.observe(1, (t0 - ago_ms) as f64, t0);
+            assert_eq!(lag.label().map(|(t, _)| t), Some(want.to_string()), "{ago_ms}ms");
+        }
     }
 
     /// The height cache is keyed on everything that changes how tall a row

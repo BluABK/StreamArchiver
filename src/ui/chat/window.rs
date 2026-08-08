@@ -153,6 +153,7 @@ impl StreamArchiverApp {
             // Seeded from disk: most chatters have no paint, and without
             // remembering the misses every reopen would re-ask 7TV about
             // every unpainted regular in the channel.
+            lag: Default::default(),
             paints: Arc::new(Mutex::new(paint_cache.paints)),
             paints_asked: Arc::new(Mutex::new(paint_cache.asked.into_iter().collect())),
             paints_checked: None,
@@ -1460,8 +1461,40 @@ impl StreamArchiverApp {
                                 popup.filter_cache.as_ref().map(|(_, _, _, v)| v.as_slice());
                             let count = filtered.map_or(n, |v| v.len());
 
+                            // Lag is only meaningful while the broadcast is
+                            // still running; a finished take is not behind
+                            // anything. Sampled here rather than per frame —
+                            // see `ChatLag::observe`.
+                            if rec_active {
+                                popup.lag.observe(
+                                    log.messages.len(),
+                                    log.messages.last().map(|m| m.ts_unix_ms).unwrap_or(0.0),
+                                    crate::models::now_unix_ms(),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.weak(format!("{count} messages"));
+                                if let Some((text, stale)) =
+                                    rec_active.then(|| popup.lag.label()).flatten()
+                                {
+                                    ui.weak("·");
+                                    let c = if stale {
+                                        ui.visuals().weak_text_color()
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    ui_icon(ui, Some(&ui_tex), ICON_CLOCK, 11.0, c);
+                                    ui.colored_label(
+                                        c,
+                                        egui::RichText::new(if stale {
+                                            format!("{text} (chat quiet)")
+                                        } else {
+                                            text
+                                        })
+                                        .small(),
+                                    )
+                                    .on_hover_text(CHAT_LAG_HOVER);
+                                }
                                 if log.loading_older {
                                     throttled_spinner(ui);
                                     ui.weak("loading older messages…");

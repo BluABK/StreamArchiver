@@ -3648,6 +3648,26 @@ re-asking about every unpainted regular on each reopen would be the bulk of
 the traffic. Never per message. Toggle in *Settings → Interface → Display*;
 any failure leaves usernames rendering exactly as they did before.
 
+**How far behind you are is shown, not guessed at.** While a broadcast is
+live, the message-count line reads `2,289 messages · 🕒 2.4s behind` — when the
+newest messages arrived, that is how old Twitch said they were. The lag is
+real and structural: this window reads a *file* rather than holding its own
+connection, and chat is captured by an IRC client that buffers to disk every
+2 s while the window re-reads it every 3 s.
+
+Two things the number deliberately does **not** do. It isn't the age of the
+newest message — that would climb steadily on a quiet chat while nothing was
+actually wrong — so it's sampled only when new messages land, and a reading
+older than 30 s is marked *(chat quiet)* rather than presented as current.
+And it's never negative: it compares this machine's clock against Twitch's, so
+a system clock running fast is clamped to zero rather than shown as
+time-travel. A badly-set clock will still show up here as lag that isn't real,
+which the hover says.
+
+**Mentions are not affected by any of this** — a ping fires from the capture
+client the moment the message arrives, even though its row appears here a
+couple of seconds later.
+
 A chat sidecar is created **as soon as the logger joins**, empty, rather than
 on the first message — so a quiet stream still has a chat log you can open
 (and send the first message from) instead of *"No chat log file found for this
