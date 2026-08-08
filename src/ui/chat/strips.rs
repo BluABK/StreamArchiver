@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// Twitch's Hype Train accent, shared by the strip's icon and its progress
+/// bar — the same pink the Channel Stats event plot gives `hype_train` rows,
+/// so one broadcast reads the same in both views.
+pub(in crate::ui) const HYPE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x40, 0x81);
+
 /// The most recent Hype Train for a broadcast, everything the chat replay
 /// needs to draw a Twitch-style progress bar (or, once it's over, a static
 /// reached-level summary) — see [`load_broadcast_stats`]'s doc for where

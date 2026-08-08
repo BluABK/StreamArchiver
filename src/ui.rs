@@ -2148,6 +2148,9 @@ pub struct StreamArchiverApp {
     chat_popups: Vec<Arc<Mutex<ChatPopup>>>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
+    /// Chat/toolbar affordance icons, uploaded on first use (None until then).
+    /// See [`UiTextures`] for why they aren't just emoji.
+    ui_tex: Option<UiTextures>,
     /// Which monitor's Properties window is open (None = closed).
     properties_popups: Vec<i64>,
     /// Deferred-viewport state for each open instance-Properties window,

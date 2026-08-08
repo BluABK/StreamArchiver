@@ -806,6 +806,7 @@ impl StreamArchiverApp {
             save_preset_dialog: None,
             chat_popups: Vec::new(),
             platform_tex: None,
+            ui_tex: None,
             properties_popups: Vec::new(),
             instance_props_registry: Default::default(),
             user_props_popups: Vec::new(),

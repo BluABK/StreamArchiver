@@ -101,6 +101,168 @@ impl ProviderTextures {
     }
 }
 
+/// Chat/toolbar affordance icons, rasterized from `assets/ui/*.svg` to 48×48
+/// straight-alpha RGBA at build time (see `decode_ui_icons` in build.rs).
+///
+/// They exist because egui rasterizes glyph OUTLINES and ignores COLR/CPAL
+/// (see [`crate::fonts`]), so the emoji these replace — 🔍 ⚙ 👥 🎁 💎 🚂 —
+/// all rendered as flat monochrome silhouettes. The sources are pure white
+/// with an alpha channel and are tinted at draw time, so one asset covers
+/// both themes and every hover/active state.
+pub(super) const UI_ICON_SRC: usize = 48;
+
+/// One icon: the name of its build-time buffer, and the emoji it replaces.
+///
+/// The glyph is kept deliberately. It is the fallback when [`UiTextures`]
+/// hasn't been loaded (a code path that renders before the first
+/// `ctx.load_texture`, or a headless test), and keeping the two side by side
+/// means the hover text, the icon and its stand-in can't drift apart.
+pub(super) struct UiIcon {
+    pub(super) tex: fn(&UiTextures) -> &egui::TextureHandle,
+    pub(super) glyph: &'static str,
+}
+
+/// Declares the texture struct, its one-shot loader, and a `UiIcon` constant
+/// per entry — so an icon is added by naming its file and its stand-in glyph
+/// in one place, and `include_bytes!` fails the build if `decode_ui_icons`
+/// in build.rs didn't emit it.
+macro_rules! ui_icons {
+    ($($konst:ident, $field:ident => $file:literal, $glyph:literal;)+) => {
+        /// GPU textures for the UI icons, uploaded once and cheaply cloned
+        /// (each `TextureHandle` is reference-counted).
+        #[derive(Clone)]
+        pub(super) struct UiTextures {
+            $(pub(super) $field: egui::TextureHandle,)+
+        }
+
+        impl UiTextures {
+            pub(super) fn load(ctx: &egui::Context) -> UiTextures {
+                let mk = |name: &str, rgba: &[u8]| {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [UI_ICON_SRC, UI_ICON_SRC],
+                        rgba,
+                    );
+                    ctx.load_texture(format!("ui_{name}"), image, egui::TextureOptions::LINEAR)
+                };
+                UiTextures {
+                    $($field: mk(
+                        $file,
+                        include_bytes!(concat!(env!("OUT_DIR"), "/ui_", $file, ".rgba")),
+                    ),)+
+                }
+            }
+        }
+
+        $(pub(super) const $konst: UiIcon = UiIcon {
+            tex: |t: &UiTextures| &t.$field,
+            glyph: $glyph,
+        };)+
+    };
+}
+
+ui_icons! {
+    ICON_SEARCH,   search   => "search",   "🔍";
+    ICON_CLOSE,    close    => "close",    "✕";
+    ICON_SETTINGS, settings => "settings", "⚙";
+    ICON_USER,     user     => "user",     "👤";
+    ICON_USERS,    users    => "users",    "👥";
+    ICON_BELL,     bell     => "bell",     "🔔";
+    ICON_GIFT,     gift     => "gift",     "🎁";
+    ICON_GEM,      gem      => "gem",      "💎";
+    ICON_TRAIN,    train    => "train",    "🚂";
+    ICON_INFO,     info     => "info",     "ℹ";
+    ICON_REPLY,    reply    => "reply",    "↩";
+}
+
+/// Draw one icon at `size` px, tinted `color`. Falls back to the icon's emoji
+/// glyph when the textures aren't loaded.
+pub(super) fn ui_icon(
+    ui: &mut egui::Ui,
+    tex: Option<&UiTextures>,
+    icon: UiIcon,
+    size: f32,
+    color: egui::Color32,
+) -> egui::Response {
+    match tex {
+        Some(t) => ui.add(
+            egui::Image::new((icon.tex)(t))
+                .fit_to_exact_size(egui::vec2(size, size))
+                .tint(color),
+        ),
+        None => ui.label(egui::RichText::new(icon.glyph).size(size).color(color)),
+    }
+}
+
+/// An icon button. Tints with the widget state so it lights up on hover the
+/// way a text button does, instead of sitting there inert.
+pub(super) fn icon_button(
+    ui: &mut egui::Ui,
+    tex: Option<&UiTextures>,
+    icon: UiIcon,
+    size: f32,
+    hover: &str,
+) -> egui::Response {
+    let Some(t) = tex else {
+        return ui.button(icon.glyph).on_hover_text(hover);
+    };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(size + 8.0, size + 6.0),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let vis = ui.style().interact(&resp);
+        if resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 4.0, vis.weak_bg_fill);
+        }
+        let icon_rect =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(size, size));
+        egui::Image::new((icon.tex)(t))
+            .tint(vis.fg_stroke.color)
+            .paint_at(ui, icon_rect);
+    }
+    resp.on_hover_text(hover)
+}
+
+/// An icon toggle — [`icon_button`] with an on/off state that paints the
+/// selection background, matching `egui::Ui::toggle_value`.
+pub(super) fn icon_toggle(
+    ui: &mut egui::Ui,
+    on: &mut bool,
+    tex: Option<&UiTextures>,
+    icon: UiIcon,
+    size: f32,
+    hover: &str,
+) -> egui::Response {
+    let Some(t) = tex else {
+        let mut resp = ui.selectable_label(*on, icon.glyph).on_hover_text(hover);
+        if resp.clicked() {
+            *on = !*on;
+            resp.mark_changed();
+        }
+        return resp;
+    };
+    let (rect, mut resp) = ui.allocate_exact_size(
+        egui::vec2(size + 8.0, size + 6.0),
+        egui::Sense::click(),
+    );
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let vis = ui.style().interact_selectable(&resp, *on);
+        if *on || resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 4.0, vis.weak_bg_fill);
+        }
+        let icon_rect =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(size, size));
+        egui::Image::new((icon.tex)(t))
+            .tint(vis.fg_stroke.color)
+            .paint_at(ui, icon_rect);
+    }
+    resp.on_hover_text(hover)
+}
+
 /// Which emote provider the emote viewer is showing. Twitch is first-party
 /// (directory-listed, opaque ids, no codes); the rest read their JSON manifests.
 #[derive(Clone, Copy, PartialEq, Eq)]

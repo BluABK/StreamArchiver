@@ -248,6 +248,9 @@ impl StreamArchiverApp {
         // The emote cache is shared (Arc<Mutex>), so the closure can use a clone
         // without borrowing `self`. Copy the render toggles out too.
         let anim_cache = self.emote_anim.clone();
+        // Uploaded on first use and refcounted, so this clone is free. Moved
+        // into the closure because the deferred render can't borrow `self`.
+        let ui_tex = self.ui_tex.get_or_insert_with(|| UiTextures::load(ctx)).clone();
         let (render_emotes, animate_emotes, appearance) = {
             let cs = self.chat_settings.lock().unwrap();
             (
@@ -411,22 +414,29 @@ impl StreamArchiverApp {
                         }
 
                         // Search filter
-                        ui.label("🔍");
+                        ui_icon(ui, Some(&ui_tex), ICON_SEARCH, 14.0, ui.visuals().weak_text_color());
                         ui.add(
                             egui::TextEdit::singleline(&mut popup.search)
                                 .hint_text("Filter…")
                                 .desired_width(150.0),
                         );
-                        if !popup.search.is_empty() && ui.small_button("✕").clicked() {
+                        if !popup.search.is_empty()
+                            && icon_button(ui, Some(&ui_tex), ICON_CLOSE, 12.0, "Clear the filter.")
+                                .clicked()
+                        {
                             popup.search.clear();
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.toggle_value(&mut popup.full_view, "View full");
-                            if ui
-                                .button("⚙")
-                                .on_hover_text("Chat appearance: font size and colors")
-                                .clicked()
+                            if icon_button(
+                                ui,
+                                Some(&ui_tex),
+                                ICON_SETTINGS,
+                                16.0,
+                                "Chat appearance: font size and colors",
+                            )
+                            .clicked()
                             {
                                 popup.show_appearance = !popup.show_appearance;
                                 if popup.show_appearance {
@@ -437,10 +447,16 @@ impl StreamArchiverApp {
                                     popup.text_color_hex = hex_color_string(tx);
                                 }
                             }
-                            if ui
-                                .button("👥")
-                                .on_hover_text("Users in chat (from this log)")
-                                .clicked()
+                            let mut users_open = popup.users_panel.is_some();
+                            if icon_toggle(
+                                ui,
+                                &mut users_open,
+                                Some(&ui_tex),
+                                ICON_USERS,
+                                16.0,
+                                "Users in chat (from this log)",
+                            )
+                            .changed()
                             {
                                 popup.users_panel = if popup.users_panel.is_some() {
                                     None
@@ -661,7 +677,15 @@ impl StreamArchiverApp {
                                     };
                                     if !avatar_drawn {
                                         ui.allocate_ui(egui::vec2(64.0, 64.0), |ui| {
-                                            ui.centered_and_justified(|ui| ui.weak("👤"));
+                                            ui.centered_and_justified(|ui| {
+                                                ui_icon(
+                                                    ui,
+                                                    Some(&ui_tex),
+                                                    ICON_USER,
+                                                    40.0,
+                                                    ui.visuals().weak_text_color(),
+                                                )
+                                            });
                                         });
                                     }
                                     ui.vertical(|ui| {
@@ -823,10 +847,16 @@ impl StreamArchiverApp {
                                     };
                                     let highlighted =
                                         popup.highlight_login.as_deref() == Some(key.as_str());
-                                    if ui
-                                        .selectable_label(highlighted, "🔔")
-                                        .on_hover_text("Highlight messages of this user")
-                                        .clicked()
+                                    let mut hl = highlighted;
+                                    if icon_toggle(
+                                        ui,
+                                        &mut hl,
+                                        Some(&ui_tex),
+                                        ICON_BELL,
+                                        16.0,
+                                        "Highlight messages of this user",
+                                    )
+                                    .changed()
                                     {
                                         popup.highlight_login =
                                             if highlighted { None } else { Some(key.clone()) };
@@ -982,12 +1012,17 @@ impl StreamArchiverApp {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 10.0;
                                     ui.label(egui::RichText::new("Top supporters:").weak());
+                                    let accent = ui.visuals().weak_text_color();
                                     for (name, n) in &popup.stats.top_gifters {
-                                        ui.label(format!("🎁 {name} ×{n}"))
+                                        ui_icon(ui, Some(&ui_tex), ICON_GIFT, 13.0, accent)
+                                            .on_hover_text("Gift subs given this broadcast");
+                                        ui.label(format!("{name} ×{n}"))
                                             .on_hover_text("Gift subs given this broadcast");
                                     }
                                     for (name, n) in &popup.stats.top_cheerers {
-                                        ui.label(format!("💎 {name} ×{n}"))
+                                        ui_icon(ui, Some(&ui_tex), ICON_GEM, 13.0, accent)
+                                            .on_hover_text("Bits cheered this broadcast");
+                                        ui.label(format!("{name} ×{n}"))
                                             .on_hover_text("Bits cheered this broadcast");
                                     }
                                 });
@@ -1009,7 +1044,7 @@ impl StreamArchiverApp {
                                     let frac = (train.total as f32 / train.goal as f32).clamp(0.0, 1.0);
                                     let remaining = (train.expires_at - now).max(0);
                                     ui.horizontal(|ui| {
-                                        ui.label("🚂");
+                                        ui_icon(ui, Some(&ui_tex), ICON_TRAIN, 15.0, HYPE_COLOR);
                                         ui.add(
                                             egui::ProgressBar::new(frac)
                                                 .text(format!(
@@ -1020,7 +1055,7 @@ impl StreamArchiverApp {
                                                     remaining / 60,
                                                     remaining % 60,
                                                 ))
-                                                .fill(egui::Color32::from_rgb(0x2e, 0xa0, 0x43))
+                                                .fill(HYPE_COLOR)
                                                 .desired_width(ui.available_width() - 24.0),
                                         )
                                         .on_hover_text(
@@ -1031,7 +1066,7 @@ impl StreamArchiverApp {
                                     });
                                 } else {
                                     ui.horizontal(|ui| {
-                                        ui.label("🚂");
+                                        ui_icon(ui, Some(&ui_tex), ICON_TRAIN, 15.0, HYPE_COLOR);
                                         ui.label(&train.detail).on_hover_text(
                                             "This broadcast's most recent Hype Train — the last \
                                              confirmed poll before it ended (or a chat-inferred \
@@ -1210,6 +1245,7 @@ impl StreamArchiverApp {
                                                         animate_emotes,
                                                         now,
                                                         &mut decode_misses,
+                                                        Some(&ui_tex),
                                                         ctx,
                                                         &appearance,
                                                     )

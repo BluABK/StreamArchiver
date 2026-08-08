@@ -3628,6 +3628,17 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**The chat window's affordances are real icons, not emoji.** egui rasterizes
+glyph *outlines* and ignores a font's colour tables (COLR/CPAL), so every 🔍
+⚙ 👥 🎁 💎 🚂 rendered as a flat monochrome silhouette — and as tofu on a
+system without an emoji font at all. They are now SVGs (`assets/ui/*.svg`),
+rasterized to RGBA at build time by the same `build.rs` pass that handles the
+platform favicons and provider logos, so no SVG decoder ships in the binary.
+The sources are pure white with an alpha channel and are **tinted at draw
+time**, so a single asset covers both themes and every hover/pressed state.
+Each icon keeps its original emoji as a declared fallback next to it in the
+table, for any path that renders before the textures are uploaded.
+
 A **⚙** button on the chat window's toolbar opens **Chat Appearance**: an
 exact point-size field for the timestamp/message/username text (not a preset
 slider), a separate pixel-size field for emotes/emoji (independent of the

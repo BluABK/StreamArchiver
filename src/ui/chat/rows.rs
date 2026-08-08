@@ -74,6 +74,7 @@ pub(in crate::ui) fn render_chat_message(
     animate: bool,
     now: f64,
     misses: &mut Vec<std::path::PathBuf>,
+    icons: Option<&UiTextures>,
     ctx: &egui::Context,
     appearance: &ChatAppearance,
 ) -> Option<UserCardClick> {
@@ -90,10 +91,12 @@ pub(in crate::ui) fn render_chat_message(
         // System notice (moderation marker: mode change, timeout/ban, clear)
         // — muted ℹ line, no author/badges.
         if msg.system {
+            let weak = ui.visuals().weak_text_color();
+            ui_icon(ui, icons, ICON_INFO, appearance.font_pt, weak);
             ui.label(
-                egui::RichText::new(format!("ℹ {}", msg.text))
+                egui::RichText::new(&msg.text)
                     .italics()
-                    .color(ui.visuals().weak_text_color()),
+                    .color(weak),
             )
             .on_hover_text(
                 "Moderation/room event captured live from Twitch chat while recording",
@@ -191,12 +194,11 @@ pub(in crate::ui) fn render_chat_message(
         }
         // Reply-thread prefix (Twitch): who this message answers.
         if !msg.reply_to.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("↩ {}", msg.reply_to))
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            )
-            .on_hover_text("This message is a reply in a thread");
+            let weak = ui.visuals().weak_text_color();
+            ui_icon(ui, icons, ICON_REPLY, appearance.font_pt * 0.85, weak)
+                .on_hover_text("This message is a reply in a thread");
+            ui.label(egui::RichText::new(&msg.reply_to).small().color(weak))
+                .on_hover_text("This message is a reply in a thread");
         }
         // A moderator-struck message: the archived original renders
         // struck-through (live chat hides it; the archive keeps receipts).

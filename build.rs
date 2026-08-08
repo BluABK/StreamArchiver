@@ -45,6 +45,7 @@ fn main() {
 
     decode_platform_icons();
     decode_provider_logos();
+    decode_ui_icons();
     generate_help_images();
 
     // Embed a Windows application manifest requesting Common Controls v6 (required
@@ -109,36 +110,71 @@ fn decode_platform_icons() {
 /// the square canvas. Rasterizing at build time keeps the SVG stack (resvg/usvg/
 /// tiny-skia) out of the shipped binary, mirroring `decode_platform_icons`.
 fn decode_provider_logos() {
-    use resvg::{tiny_skia, usvg};
     // Must match `LOGO_SRC` in src/ui.rs: it reads these buffers as `SIZE×SIZE` RGBA
     // and `ColorImage::from_rgba_unmultiplied` panics at startup if the dims disagree.
     const SIZE: u32 = 64;
     let out = PathBuf::from(env_or("OUT_DIR", "."));
     for name in ["7tv", "bttv"] {
-        let src = format!("assets/emote/{name}.svg");
-        println!("cargo:rerun-if-changed={src}");
-        let svg = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {src}: {e}"));
-        let tree = usvg::Tree::from_str(&svg, &usvg::Options::default())
-            .unwrap_or_else(|e| panic!("parse {src}: {e}"));
-        let ts = tree.size();
-        // Aspect-fit the SVG's natural size into the square canvas, centered.
-        let scale = (SIZE as f32 / ts.width()).min(SIZE as f32 / ts.height());
-        let tx = (SIZE as f32 - ts.width() * scale) / 2.0;
-        let ty = (SIZE as f32 - ts.height() * scale) / 2.0;
-        let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(tx, ty);
-        let mut pixmap =
-            tiny_skia::Pixmap::new(SIZE, SIZE).unwrap_or_else(|| panic!("alloc pixmap for {src}"));
-        resvg::render(&tree, transform, &mut pixmap.as_mut());
-        // tiny-skia stores premultiplied alpha; egui's `from_rgba_unmultiplied`
-        // expects straight alpha, so demultiply each pixel.
-        let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-        for px in pixmap.pixels() {
-            let c = px.demultiply();
-            rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
-        }
+        let rgba = rasterize_svg(&format!("assets/emote/{name}.svg"), SIZE);
         std::fs::write(out.join(format!("logo_{name}.rgba")), &rgba)
             .unwrap_or_else(|e| panic!("write logo_{name}.rgba: {e}"));
     }
+}
+
+/// Rasterize the chat/toolbar UI icons (`assets/ui/<name>.svg`) the same way,
+/// to `OUT_DIR/ui_<name>.rgba`.
+///
+/// These exist because egui rasterizes glyph OUTLINES and ignores COLR/CPAL
+/// (see `src/fonts.rs`), so every emoji the UI used as an affordance — 🔍 ⚙
+/// 👥 🎁 💎 🚂 — rendered as a flat monochrome silhouette. The sources are
+/// pure white with an alpha channel; the app tints them at draw time, so one
+/// asset serves both themes and every hover/active state.
+fn decode_ui_icons() {
+    // Must match `UI_ICON_SRC` in src/ui/assets_helpers.rs — `from_rgba_unmultiplied`
+    // panics at startup if the dims disagree. Rasterized well above the ~16px
+    // draw size so a large chat font doesn't scale up a blurry icon.
+    const SIZE: u32 = 48;
+    let out = PathBuf::from(env_or("OUT_DIR", "."));
+    for name in UI_ICONS {
+        let rgba = rasterize_svg(&format!("assets/ui/{name}.svg"), SIZE);
+        std::fs::write(out.join(format!("ui_{name}.rgba")), &rgba)
+            .unwrap_or_else(|e| panic!("write ui_{name}.rgba: {e}"));
+    }
+}
+
+/// Every icon `decode_ui_icons` emits. Kept in step with `UI_ICONS` in
+/// src/ui/assets_helpers.rs — that side `include_bytes!`es each one by name,
+/// so a mismatch is a compile error rather than a silent miss.
+const UI_ICONS: [&str; 11] = [
+    "bell", "close", "gem", "gift", "info", "reply", "search", "settings", "train", "user", "users",
+];
+
+/// Render one SVG aspect-fit into a `size × size` straight-alpha RGBA buffer.
+/// Rasterizing at build time keeps the SVG stack (resvg/usvg/tiny-skia) out of
+/// the shipped binary, mirroring `decode_platform_icons`.
+fn rasterize_svg(src: &str, size: u32) -> Vec<u8> {
+    use resvg::{tiny_skia, usvg};
+    println!("cargo:rerun-if-changed={src}");
+    let svg = std::fs::read_to_string(src).unwrap_or_else(|e| panic!("read {src}: {e}"));
+    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default())
+        .unwrap_or_else(|e| panic!("parse {src}: {e}"));
+    let ts = tree.size();
+    // Aspect-fit the SVG's natural size into the square canvas, centered.
+    let scale = (size as f32 / ts.width()).min(size as f32 / ts.height());
+    let tx = (size as f32 - ts.width() * scale) / 2.0;
+    let ty = (size as f32 - ts.height() * scale) / 2.0;
+    let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(tx, ty);
+    let mut pixmap =
+        tiny_skia::Pixmap::new(size, size).unwrap_or_else(|| panic!("alloc pixmap for {src}"));
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    // tiny-skia stores premultiplied alpha; egui's `from_rgba_unmultiplied`
+    // expects straight alpha, so demultiply each pixel.
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for px in pixmap.pixels() {
+        let c = px.demultiply();
+        rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    rgba
 }
 
 /// Embed every `doc/screenshots/*.png` for the in-app Help view: write
