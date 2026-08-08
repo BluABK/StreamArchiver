@@ -80,7 +80,7 @@ impl StreamArchiverApp {
         // This broadcast's top-supporters leaderboard + Hype Train summary —
         // local DB query, no network. Twitch-only (subgift/bits/hype_train
         // are all Twitch chat-event kinds).
-        let (top_gifters, top_cheerers, hype_train) = if platform == Some(Platform::Twitch) {
+        let stats = if platform == Some(Platform::Twitch) {
             rec.as_ref()
                 .map(|r| {
                     let since = r.went_live_at.unwrap_or(r.started_at);
@@ -89,7 +89,7 @@ impl StreamArchiverApp {
                 })
                 .unwrap_or_default()
         } else {
-            Default::default()
+            BroadcastStats::default()
         };
 
         let (fetch_unknown_emotes, render_emotes) = {
@@ -132,9 +132,7 @@ impl StreamArchiverApp {
             text_color_hex: String::new(),
             user_card: None,
             users_panel: None,
-            top_gifters,
-            top_cheerers,
-            hype_train,
+            stats,
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
@@ -377,17 +375,14 @@ impl StreamArchiverApp {
                                             // A different recording is a different
                                             // broadcast — its leaderboard/Hype Train
                                             // history is scoped to its own time span.
-                                            let (top_gifters, top_cheerers, hype_train) = if popup.is_twitch {
+                                            popup.stats = if popup.is_twitch {
                                                 let since = start_ts;
                                                 let until =
                                                     new_rec.ended_at.unwrap_or_else(crate::models::now_unix);
                                                 load_broadcast_stats(&shared.core.store, popup.monitor_id, since, until)
                                             } else {
-                                                (Vec::new(), Vec::new(), None)
+                                                BroadcastStats::default()
                                             };
-                                            popup.top_gifters = top_gifters;
-                                            popup.top_cheerers = top_cheerers;
-                                            popup.hype_train = hype_train;
                                             popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
@@ -981,25 +976,24 @@ impl StreamArchiverApp {
                     // follow/viewer-count data available to us), and the
                     // Hype Train bar reflects this app's own periodic
                     // (~60s) Twitch poll, not a smooth animated countdown.
-                    if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() || popup.hype_train.is_some()
-                    {
+                    if !popup.stats.is_empty() {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
-                            if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() {
+                            if !popup.stats.top_gifters.is_empty() || !popup.stats.top_cheerers.is_empty() {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 10.0;
                                     ui.label(egui::RichText::new("Top supporters:").weak());
-                                    for (name, n) in &popup.top_gifters {
+                                    for (name, n) in &popup.stats.top_gifters {
                                         ui.label(format!("🎁 {name} ×{n}"))
                                             .on_hover_text("Gift subs given this broadcast");
                                     }
-                                    for (name, n) in &popup.top_cheerers {
+                                    for (name, n) in &popup.stats.top_cheerers {
                                         ui.label(format!("💎 {name} ×{n}"))
                                             .on_hover_text("Bits cheered this broadcast");
                                     }
                                 });
                             }
-                            if let Some(train) = &popup.hype_train {
-                                if !popup.top_gifters.is_empty() || !popup.top_cheerers.is_empty() {
+                            if let Some(train) = &popup.stats.hype_train {
+                                if !popup.stats.top_gifters.is_empty() || !popup.stats.top_cheerers.is_empty() {
                                     ui.separator();
                                 }
                                 // `goal`/`expires_at` are only populated (v86+) for a
@@ -1131,11 +1125,16 @@ impl StreamArchiverApp {
                                 .stick_to_bottom(stick)
                                 .show_viewport(ui, |ui, viewport| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
-                                    // Wrapping depends on width — a resize
-                                    // re-measures everything.
+                                    // Wrapping depends on width, and row height
+                                    // on the appearance settings — either
+                                    // changing re-measures everything. See
+                                    // `ChatLog::measured_key`.
                                     let w = ui.available_width();
-                                    if (w - log.measured_width).abs() > 0.5 {
-                                        log.measured_width = w;
+                                    let key = (w, appearance.layout_key());
+                                    if (w - log.measured_key.0).abs() > 0.5
+                                        || key.1 != log.measured_key.1
+                                    {
+                                        log.measured_key = key;
                                         for h in &mut log.row_heights {
                                             *h = CHAT_ROW_EST;
                                         }
@@ -1404,15 +1403,12 @@ impl StreamArchiverApp {
             // indexed local query — naturally empty for a non-Twitch monitor
             // (those event kinds are only ever written by the Twitch chat
             // parser), so no separate platform check is needed here.
-            let (top_gifters, top_cheerers, hype_train) = load_broadcast_stats(
+            p.stats = load_broadcast_stats(
                 &self.core.store,
                 p.monitor_id,
                 start_ts,
                 crate::models::now_unix(),
             );
-            p.top_gifters = top_gifters;
-            p.top_cheerers = top_cheerers;
-            p.hype_train = hype_train;
             if errored {
                 p.error_retries = p.error_retries.saturating_add(1);
             }

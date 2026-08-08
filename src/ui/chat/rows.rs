@@ -17,6 +17,23 @@ pub(in crate::ui) struct ChatAppearance {
     pub(in crate::ui) text_color: egui::Color32,
 }
 
+impl ChatAppearance {
+    /// Everything here that changes how tall a row comes out, folded into one
+    /// value. Colours are deliberately excluded — recolouring text cannot
+    /// change its height, and including them would throw away the whole
+    /// height cache every time the colour picker moves a pixel.
+    ///
+    /// Any future field that affects layout (font family, timestamp format,
+    /// paints) MUST be folded in here, or rows keep their stale measured
+    /// heights and the virtualized list scrolls to the wrong place.
+    pub(in crate::ui) fn layout_key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&self.font_pt.to_bits(), &mut h);
+        std::hash::Hash::hash(&self.emote_pt.to_bits(), &mut h);
+        std::hash::Hasher::finish(&h)
+    }
+}
+
 /// A username click in the chat replay — everything the usercard needs to
 /// build its local-only fields immediately; the live Twitch lookup (avatar/
 /// account-created date) is fetched separately, keyed by `user_id`. Also

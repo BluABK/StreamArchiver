@@ -361,7 +361,7 @@ pub(in crate::ui) async fn load_chat(
             let mut log = ChatLog {
                 messages: chunk.messages,
                 row_heights: Vec::new(),
-                measured_width: 0.0,
+                measured_key: (0.0, 0),
                 parsed_to: chunk.parsed_to,
                 loading_older: head_end > 0,
                 markers: chunk.markers,

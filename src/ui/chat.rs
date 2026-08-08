@@ -148,9 +148,12 @@ pub(super) struct ChatLog {
     /// Measured row heights, parallel to `messages` (estimates until a row has
     /// actually been drawn once). Drives the virtualized scroll offsets.
     pub(super) row_heights: Vec<f32>,
-    /// The width `row_heights` was measured at — a resize changes wrapping, so
-    /// the cache resets to estimates.
-    pub(super) measured_width: f32,
+    /// What `row_heights` was measured under: `(width, appearance key)`. A
+    /// resize changes wrapping, and so does anything in [`ChatAppearance`] —
+    /// font size, font family, timestamp format. Either changing while the
+    /// cache still holds the old heights means wrong scroll offsets and a
+    /// jumping scrollbar, so both reset the cache to estimates.
+    pub(super) measured_key: (f32, u64),
     /// Byte offset just past the last fully-parsed line of the chat file; the
     /// live tail reload resumes here instead of re-parsing the whole file.
     pub(super) parsed_to: u64,
@@ -400,17 +403,12 @@ pub(super) struct ChatPopup {
     /// The 👥 Users-in-chat panel, if open — `None` when closed (the panel
     /// content isn't kept around while hidden).
     pub(super) users_panel: Option<UsersPanelState>,
-    /// Top gift-sub contributors for this broadcast (display name, total
-    /// gifted), from `store::stream_event`. Local DB only, no network.
-    /// Computed once on popup-open/recording-switch, refreshed on the same
-    /// cadence as the live tail-reload while the recording is still going.
-    pub(super) top_gifters: Vec<(String, i64)>,
-    /// Top bits contributors for this broadcast (display name, total bits).
-    pub(super) top_cheerers: Vec<(String, i64)>,
-    /// This broadcast's most recent Hype Train, if any — see
-    /// [`HypeTrainDisplay`]'s doc. A long broadcast may have had several;
-    /// only the latest is kept (see `load_broadcast_stats`'s doc for why).
-    pub(super) hype_train: Option<HypeTrainDisplay>,
+    /// What the info strips above the message list draw — top supporters and
+    /// the most recent Hype Train, from `store::stream_event`. Local DB only,
+    /// no network. Computed once on popup-open/recording-switch, refreshed on
+    /// the same cadence as the live tail-reload while the recording is still
+    /// going. See [`BroadcastStats`].
+    pub(super) stats: BroadcastStats,
     /// When the popup last triggered a background re-read of the chat file.
     /// Used to tail a live recording: the file is re-parsed every few seconds
     /// while `recording.ended_at` is `None`.
@@ -578,12 +576,42 @@ mod tests {
             .upsert_hype_train_event(mid, 105, "s1", "train1", 4200, "level 3 · 4,200 pts (confirmed)", 5000, 400, 3)
             .unwrap();
 
-        let (gifters, cheerers, train) = load_broadcast_stats(&store, mid, 0, 200);
-        assert_eq!(gifters, vec![("Alice".to_string(), 5), ("Bob".to_string(), 2)]);
-        assert_eq!(cheerers, vec![("Alice".to_string(), 300)]);
-        let train = train.expect("latest train present");
+        let stats = load_broadcast_stats(&store, mid, 0, 200);
+        assert!(!stats.is_empty());
+        assert_eq!(stats.top_gifters, vec![("Alice".to_string(), 5), ("Bob".to_string(), 2)]);
+        assert_eq!(stats.top_cheerers, vec![("Alice".to_string(), 300)]);
+        let train = stats.hype_train.expect("latest train present");
         assert_eq!(train.detail, "level 3 · 4,200 pts (confirmed)");
         assert_eq!((train.level, train.total, train.goal, train.expires_at), (3, 4200, 5000, 400));
+
+        // A monitor with no events at all collapses the strips entirely
+        // rather than drawing an empty card.
+        let empty_mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        assert!(load_broadcast_stats(&store, empty_mid, 0, 200).is_empty());
+    }
+
+    /// The height cache is keyed on everything that changes how tall a row
+    /// comes out. Colours deliberately are not: recolouring text can't resize
+    /// it, and folding them in would dump the whole cache on every drag of the
+    /// colour picker.
+    #[test]
+    fn layout_key_tracks_sizes_and_ignores_colors() {
+        let base = ChatAppearance {
+            font_pt: 14.0,
+            emote_pt: 24.0,
+            ts_color: egui::Color32::WHITE,
+            text_color: egui::Color32::WHITE,
+        };
+        let key = base.layout_key();
+        assert_eq!(ChatAppearance { font_pt: 14.0, ..base }.layout_key(), key, "same settings");
+        assert_ne!(ChatAppearance { font_pt: 20.0, ..base }.layout_key(), key, "font size");
+        assert_ne!(ChatAppearance { emote_pt: 40.0, ..base }.layout_key(), key, "emote size");
+        assert_eq!(
+            ChatAppearance { ts_color: egui::Color32::RED, text_color: egui::Color32::BLUE, ..base }
+                .layout_key(),
+            key,
+            "colours must not invalidate measured heights"
+        );
     }
 
     fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {
@@ -635,7 +663,7 @@ mod tests {
                 },
             ],
             row_heights: Vec::new(),
-            measured_width: 0.0,
+            measured_key: (0.0, 0),
             parsed_to: 0,
             loading_older: false,
             markers: Vec::new(),
@@ -695,7 +723,7 @@ mod tests {
         let mut log = ChatLog {
             messages: msgs,
             row_heights: Vec::new(),
-            measured_width: 0.0,
+            measured_key: (0.0, 0),
             parsed_to: 0,
             loading_older: false,
             markers,
@@ -739,7 +767,7 @@ mod tests {
                 notice_msg,
             ],
             row_heights: Vec::new(),
-            measured_width: 0.0,
+            measured_key: (0.0, 0),
             parsed_to: 0,
             loading_older: false,
             markers: vec![marker.unwrap(), purge.unwrap()],

@@ -19,6 +19,25 @@ pub(in crate::ui) struct HypeTrainDisplay {
     pub(in crate::ui) expires_at: i64,
 }
 
+/// Everything the info strips above the message list draw, loaded in one
+/// pass. A struct rather than a tuple because it is about to grow a fourth
+/// member (creator goals) and a 4-wide anonymous tuple threaded through
+/// three call sites is how fields get silently swapped.
+#[derive(Default)]
+pub(in crate::ui) struct BroadcastStats {
+    pub(in crate::ui) top_gifters: Vec<(String, i64)>,
+    pub(in crate::ui) top_cheerers: Vec<(String, i64)>,
+    pub(in crate::ui) hype_train: Option<HypeTrainDisplay>,
+}
+
+impl BroadcastStats {
+    /// Nothing to show — the strips collapse entirely rather than drawing an
+    /// empty card.
+    pub(in crate::ui) fn is_empty(&self) -> bool {
+        self.top_gifters.is_empty() && self.top_cheerers.is_empty() && self.hype_train.is_none()
+    }
+}
+
 /// This broadcast's top-supporters leaderboard (gift subs / bits, top 5
 /// each) and its most recent Hype Train, from the locally-recorded
 /// `stream_event` history — purely local DB query, no network, no new
@@ -33,22 +52,23 @@ pub(in crate::ui) fn load_broadcast_stats(
     monitor_id: i64,
     since: i64,
     until: i64,
-) -> (Vec<(String, i64)>, Vec<(String, i64)>, Option<HypeTrainDisplay>) {
+) -> BroadcastStats {
     let events = store.stream_events_for_monitor_range(monitor_id, since, until).unwrap_or_default();
-    let top_gifters = crate::ui::channel_stats::top_contributors(&events, "subgift", 5);
-    let top_cheerers = crate::ui::channel_stats::top_contributors(&events, "bits", 5);
-    let hype_train = events
-        .iter()
-        .filter(|e| e.kind == "hype_train")
-        .max_by_key(|e| e.at)
-        .map(|e| HypeTrainDisplay {
-            detail: e.detail.clone(),
-            level: e.level,
-            total: e.amount,
-            goal: e.goal,
-            expires_at: e.expires_at,
-        });
-    (top_gifters, top_cheerers, hype_train)
+    BroadcastStats {
+        top_gifters: crate::ui::channel_stats::top_contributors(&events, "subgift", 5),
+        top_cheerers: crate::ui::channel_stats::top_contributors(&events, "bits", 5),
+        hype_train: events
+            .iter()
+            .filter(|e| e.kind == "hype_train")
+            .max_by_key(|e| e.at)
+            .map(|e| HypeTrainDisplay {
+                detail: e.detail.clone(),
+                level: e.level,
+                total: e.amount,
+                goal: e.goal,
+                expires_at: e.expires_at,
+            }),
+    }
 }
 
 /// Role section a Twitch chatter is grouped under in the Users-in-chat
