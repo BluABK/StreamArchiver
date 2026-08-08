@@ -163,6 +163,7 @@ macro_rules! ui_icons {
 ui_icons! {
     ICON_SEARCH,   search   => "search",   "🔍";
     ICON_CLOSE,    close    => "close",    "✕";
+    ICON_CLOCK,    clock    => "clock",    "🕒";
     ICON_SETTINGS, settings => "settings", "⚙";
     ICON_USER,     user     => "user",     "👤";
     ICON_USERS,    users    => "users",    "👥";

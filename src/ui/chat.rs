@@ -78,7 +78,20 @@ pub(super) struct ChatMessage {
     pub(super) deleted: Option<String>,
     /// System notice line (chat-mode change, role change, timeout/ban
     /// announcement) — renders as a muted ℹ line, no author.
+    ///
+    /// Kept alongside `notice` for now: `ChatLog::apply_markers` and four
+    /// construction sites key off it, and retiring it in the same change that
+    /// introduces `notice` would mean touching all of them at once.
     pub(super) system: bool,
+    /// Absolute send time (unix milliseconds), for the wall-clock timestamp
+    /// mode. `0.0` on pre-feature logs that only ever stored an offset — the
+    /// renderer then falls back to the stream-relative form.
+    pub(super) ts_unix_ms: f64,
+    /// Why this row is not an ordinary message, if it isn't. Drives both the
+    /// row's accent colour ([`row_decor`]) and what gets drawn inside it.
+    /// `Box`ed to keep `ChatMessage` small — it's cloned in several places
+    /// and the overwhelming majority of rows have no notice at all.
+    pub(super) notice: Option<Box<ChatNotice>>,
     /// Display name this message replies to (Twitch reply threads) — rendered
     /// as a small "↩ name" prefix. Empty when not a reply / pre-feature logs.
     pub(super) reply_to: String,
@@ -317,6 +330,8 @@ pub(super) struct ChatSettingsState {
     /// Chat font family by display name (`""` = follow the app font). See
     /// [`K_CHAT_FONT_FAMILY`].
     pub(super) chat_font: String,
+    /// Wall-clock vs stream-relative timestamps — see [`ChatTsMode`].
+    pub(super) ts_mode: ChatTsMode,
 }
 
 impl ChatSettingsState {
@@ -369,6 +384,9 @@ impl ChatSettingsState {
             show_hype_train: flag(K_CHAT_SHOW_HYPE, true),
             show_channel_info: flag(K_CHAT_SHOW_INFO, true),
             chat_font: store.get_setting(K_CHAT_FONT_FAMILY).ok().flatten().unwrap_or_default(),
+            ts_mode: ChatTsMode::parse(
+                store.get_setting(K_CHAT_TS_MODE).ok().flatten().unwrap_or_default().as_str(),
+            ),
         }
     }
 }
@@ -681,6 +699,107 @@ mod tests {
         assert_eq!(fmt_ago(3_900), "1h 5m ago");
     }
 
+    /// Both timestamp formats are always available: whichever isn't shown is
+    /// on the hover, so the common one-off "what offset was that?" never
+    /// needs the toggle at all.
+    #[test]
+    fn timestamp_modes_each_show_the_other_on_hover() {
+        let mut m = plain_msg(2410.0, "bob", "id1", "hi");
+        // 2026-08-08T17:30:00Z, as unix ms.
+        m.ts_unix_ms = 1_786_296_600_000.0;
+        let clock = fmt_chat_clock(m.ts_unix_ms).expect("absolute time present");
+
+        let (shown, hover) = fmt_chat_ts_mode(&m, ChatTsMode::StreamRelative);
+        assert_eq!(shown, "[00:40:10]");
+        assert_eq!(hover, clock, "relative mode hovers the wall clock");
+
+        let (shown, hover) = fmt_chat_ts_mode(&m, ChatTsMode::WallClock);
+        assert_eq!(shown, clock);
+        assert_eq!(hover, "[00:40:10] into the broadcast");
+    }
+
+    /// A pre-feature log has no absolute time. Wall-clock mode must fall back
+    /// to the relative form rather than leaving the column blank.
+    #[test]
+    fn wall_clock_falls_back_when_the_log_has_no_absolute_time() {
+        let m = plain_msg(2410.0, "bob", "id1", "hi");
+        assert_eq!(m.ts_unix_ms, 0.0);
+        assert_eq!(fmt_chat_clock(0.0), None);
+        let (shown, hover) = fmt_chat_ts_mode(&m, ChatTsMode::WallClock);
+        assert_eq!(shown, "[00:40:10]");
+        assert!(hover.contains("No wall-clock time"));
+    }
+
+    #[test]
+    fn timestamp_mode_round_trips_through_its_setting() {
+        for m in [ChatTsMode::StreamRelative, ChatTsMode::WallClock] {
+            assert_eq!(ChatTsMode::parse(m.as_str()), m);
+        }
+        // Unknown / unset falls back to the archive-friendly default.
+        assert_eq!(ChatTsMode::parse(""), ChatTsMode::StreamRelative);
+        assert_eq!(ChatTsMode::parse("nonsense"), ChatTsMode::StreamRelative);
+    }
+
+    /// Every notice kind gets an accent; an ordinary message gets none. The
+    /// explicit "highlight this chatter" pick outranks the message's own kind
+    /// — it was asked for, and losing it behind a sub notice would defeat the
+    /// point of asking.
+    #[test]
+    fn row_decor_accents_notices_and_lets_an_explicit_highlight_win() {
+        let v = egui::Visuals::dark();
+        let with = |n: Option<ChatNotice>| {
+            let mut m = plain_msg(1.0, "bob", "id1", "hi");
+            m.notice = n.map(Box::new);
+            m
+        };
+
+        assert!(row_decor(&with(None), false, &v).accent.is_none(), "ordinary message");
+        // A muted room event stays muted: an accent bar would give it more
+        // weight than a sub, which it does not deserve.
+        assert!(row_decor(&with(Some(ChatNotice::System)), false, &v).accent.is_none());
+
+        for n in [
+            ChatNotice::FirstMessage,
+            ChatNotice::Redemption { reward: None, reward_id: "r".into(), cost: None },
+            ChatNotice::Sub { system_msg: "subbed".into() },
+            ChatNotice::Raid { system_msg: "raided".into() },
+            ChatNotice::Announce { system_msg: "listen up".into() },
+            ChatNotice::WatchStreak { system_msg: "streak".into() },
+        ] {
+            assert!(row_decor(&with(Some(n.clone())), false, &v).accent.is_some(), "{n:?}");
+        }
+
+        let sub = with(Some(ChatNotice::Sub { system_msg: "subbed".into() }));
+        assert_eq!(
+            row_decor(&sub, true, &v).accent,
+            Some(v.selection.bg_fill),
+            "an explicit highlight outranks the notice kind"
+        );
+    }
+
+    /// Only the kinds that REPLACE a message have a headline; the ones that
+    /// merely decorate one must not, or the row would render Twitch's copy
+    /// where the user's own message belongs.
+    #[test]
+    fn only_event_notices_have_a_headline() {
+        assert_eq!(
+            notice_headline(&ChatNotice::Sub { system_msg: "Bob subscribed".into() }),
+            Some("Bob subscribed")
+        );
+        assert_eq!(notice_headline(&ChatNotice::FirstMessage), None);
+        assert_eq!(
+            notice_headline(&ChatNotice::Redemption {
+                reward: Some("Hydrate!".into()),
+                reward_id: "r".into(),
+                cost: Some(50),
+            }),
+            None
+        );
+        assert_eq!(notice_headline(&ChatNotice::System), None);
+        // An event whose system-msg tag was missing has nothing to say.
+        assert_eq!(notice_headline(&ChatNotice::Raid { system_msg: String::new() }), None);
+    }
+
     /// The height cache is keyed on everything that changes how tall a row
     /// comes out. Colours deliberately are not: recolouring text can't resize
     /// it, and folding them in would dump the whole cache on every drag of the
@@ -693,6 +812,7 @@ mod tests {
             ts_color: egui::Color32::WHITE,
             text_color: egui::Color32::WHITE,
             font_id: font_name_key(""),
+            ts_mode: ChatTsMode::StreamRelative,
         };
         let key = base.layout_key();
         assert_eq!(ChatAppearance { font_pt: 14.0, ..base }.layout_key(), key, "same settings");
@@ -703,6 +823,13 @@ mod tests {
                 .layout_key(),
             key,
             "colours must not invalidate measured heights"
+        );
+        // `[00:40:10]` and `19:30` are different widths, so a long message
+        // wraps at a different point and the row is a different height.
+        assert_ne!(
+            ChatAppearance { ts_mode: ChatTsMode::WallClock, ..base }.layout_key(),
+            key,
+            "timestamp mode"
         );
         // A different face is a different height at the same point size, so
         // the cache has to drop — this is the whole reason `font_id` exists.
@@ -716,6 +843,8 @@ mod tests {
     fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {
         ChatMessage {
             timestamp_secs: ts,
+            ts_unix_ms: 0.0,
+            notice: None,
             author: login.to_string(),
             text: text.to_string(),
             segments: vec![ChatSegment::Text(text.to_string())],

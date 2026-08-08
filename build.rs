@@ -145,8 +145,9 @@ fn decode_ui_icons() {
 /// Every icon `decode_ui_icons` emits. Kept in step with `UI_ICONS` in
 /// src/ui/assets_helpers.rs — that side `include_bytes!`es each one by name,
 /// so a mismatch is a compile error rather than a silent miss.
-const UI_ICONS: [&str; 11] = [
-    "bell", "close", "gem", "gift", "info", "reply", "search", "settings", "train", "user", "users",
+const UI_ICONS: [&str; 12] = [
+    "bell", "clock", "close", "gem", "gift", "info", "reply", "search", "settings", "train",
+    "user", "users",
 ];
 
 /// Render one SVG aspect-fit into a `size × size` straight-alpha RGBA buffer.

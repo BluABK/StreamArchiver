@@ -699,6 +699,14 @@ pub(in crate::ui) fn yt_action_to_msg(
         .unwrap_or_default();
     Some(ChatMessage {
         timestamp_secs: ts_secs,
+        // YouTube always stamps an absolute time, even when the replay also
+        // carries a relative offset.
+        ts_unix_ms: r["timestampUsec"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|us| us / 1000.0)
+            .unwrap_or(0.0),
+        notice: None,
         author,
         text,
         segments,
@@ -727,8 +735,11 @@ pub(in crate::ui) fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Opti
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let kind = v["marker"].as_str()?;
     let ts_secs = (v["ts"].as_f64().unwrap_or(0.0) - start_ms) / 1000.0;
+    let ts_unix_ms = v["ts"].as_f64().unwrap_or(0.0);
     let notice = |text: String| ChatMessage {
         timestamp_secs: ts_secs,
+        ts_unix_ms,
+        notice: Some(Box::new(ChatNotice::System)),
         author: String::new(),
         segments: vec![ChatSegment::Text(text.clone())],
         text,
@@ -847,6 +858,10 @@ pub(in crate::ui) fn parse_twitch_chat_line(
     };
     Some(ChatMessage {
         timestamp_secs: (ts_ms - start_ms) / 1000.0,
+        // The sidecar's `ts` is unix milliseconds; `start_ms` only converts it
+        // to a stream-relative offset.
+        ts_unix_ms: ts_ms,
+        notice: None,
         author,
         text,
         segments,

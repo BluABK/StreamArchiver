@@ -22,6 +22,154 @@ pub(in crate::ui) struct ChatAppearance {
     /// glyphs at the same point size are a different height in a different
     /// face. `u64` rather than the name so this struct stays `Copy`.
     pub(in crate::ui) font_id: u64,
+    pub(in crate::ui) ts_mode: ChatTsMode,
+}
+
+/// Which clock the chat replay's timestamps show.
+///
+/// Both are genuinely useful and the right one depends on what you're doing,
+/// which is why this is a one-click toolbar toggle rather than a setting
+/// buried in a panel: while watching live you want the wall clock, and to
+/// seek the local recording you want the offset from its start.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub(in crate::ui) enum ChatTsMode {
+    /// `[00:40:10]` — seconds since the broadcast started. The default,
+    /// because this is an archive tool and it's what lets you scrub to a
+    /// moment in the recording.
+    #[default]
+    StreamRelative,
+    /// `19:30` — local wall-clock time, as Twitch's own popout shows.
+    WallClock,
+}
+
+impl ChatTsMode {
+    pub(in crate::ui) fn parse(s: &str) -> ChatTsMode {
+        match s {
+            "clock" => ChatTsMode::WallClock,
+            _ => ChatTsMode::StreamRelative,
+        }
+    }
+    pub(in crate::ui) fn as_str(self) -> &'static str {
+        match self {
+            ChatTsMode::WallClock => "clock",
+            ChatTsMode::StreamRelative => "relative",
+        }
+    }
+}
+
+/// Wall-clock `HH:MM` for a message, in local time. `None` when the message
+/// carries no absolute time (pre-feature logs, where the sidecar only ever
+/// stored an offset).
+pub(in crate::ui) fn fmt_chat_clock(ts_unix_ms: f64) -> Option<String> {
+    (ts_unix_ms > 0.0)
+        .then(|| chrono::DateTime::from_timestamp_millis(ts_unix_ms as i64))
+        .flatten()
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+}
+
+/// The timestamp to draw, and the OTHER format as hover text.
+///
+/// Showing both costs nothing and answers the common one-off question ("what
+/// offset was that at?") without touching the toggle at all. A message with
+/// no absolute time falls back to the stream-relative form in both modes —
+/// better than a blank column.
+pub(in crate::ui) fn fmt_chat_ts_mode(msg: &ChatMessage, mode: ChatTsMode) -> (String, String) {
+    let rel = fmt_chat_ts(msg.timestamp_secs);
+    match (mode, fmt_chat_clock(msg.ts_unix_ms)) {
+        (ChatTsMode::WallClock, Some(clock)) => (clock, format!("{rel} into the broadcast")),
+        (ChatTsMode::WallClock, None) => (rel, "No wall-clock time recorded for this message".into()),
+        (ChatTsMode::StreamRelative, Some(clock)) => (rel, clock),
+        (ChatTsMode::StreamRelative, None) => (rel, String::new()),
+    }
+}
+
+/// Why a row is drawn differently from an ordinary message.
+///
+/// Twitch renders each of these with its own coloured left accent, and so do
+/// we — see [`row_decor`]. `System` is the pre-existing muted notice line;
+/// the rest arrive once the sidecar records them.
+// Only `System` has a constructor so far: everything else needs the sidecar to
+// record `first-msg`, `custom-reward-id` and USERNOTICE lines, which is the
+// next change. Rendering and colouring land first so that one is purely a
+// capture-side change with the display already tested.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::ui) enum ChatNotice {
+    /// Moderation/room event captured live (mode change, timeout, clear).
+    System,
+    /// The sender's first-ever message in this channel (`first-msg=1`).
+    FirstMessage,
+    /// Sent via a channel-point reward. `reward` is the reward's title once
+    /// resolved, else `None` and the raw `reward_id` is all we have.
+    Redemption { reward: Option<String>, reward_id: String, cost: Option<i64> },
+    /// A sub / resub / gift / mystery gift, carrying Twitch's own rendered
+    /// `system-msg` copy verbatim.
+    Sub { system_msg: String },
+    /// An incoming raid, same.
+    Raid { system_msg: String },
+    /// A moderator announcement.
+    Announce { system_msg: String },
+    /// A viewer-milestone watch streak.
+    WatchStreak { system_msg: String },
+}
+
+/// Twitch's own rendered copy for an event row, when the notice is one that
+/// has a headline of its own. `None` for the kinds that decorate an ordinary
+/// message rather than replacing it.
+pub(in crate::ui) fn notice_headline(notice: &ChatNotice) -> Option<&str> {
+    match notice {
+        ChatNotice::Sub { system_msg }
+        | ChatNotice::Raid { system_msg }
+        | ChatNotice::Announce { system_msg }
+        | ChatNotice::WatchStreak { system_msg } => {
+            (!system_msg.is_empty()).then_some(system_msg.as_str())
+        }
+        ChatNotice::System | ChatNotice::FirstMessage | ChatNotice::Redemption { .. } => None,
+    }
+}
+
+/// How a row's background and left accent are drawn.
+pub(in crate::ui) struct RowDecor {
+    pub(in crate::ui) fill: egui::Color32,
+    /// The 3px bar down the left edge, Twitch-style. `None` = ordinary row.
+    pub(in crate::ui) accent: Option<egui::Color32>,
+}
+
+/// Twitch's own purple, used for first-message and redemption accents.
+pub(in crate::ui) const TWITCH_PURPLE: egui::Color32 = egui::Color32::from_rgb(0x91, 0x47, 0xff);
+
+/// Decide a row's decoration. Pure, so the mapping is testable.
+///
+/// `highlighted` is the user's own "highlight this chatter" pick, which wins
+/// over the message's own kind — it was asked for explicitly, and losing it
+/// behind a sub notice would defeat the point of asking.
+pub(in crate::ui) fn row_decor(
+    msg: &ChatMessage,
+    highlighted: bool,
+    visuals: &egui::Visuals,
+) -> RowDecor {
+    if highlighted {
+        return RowDecor {
+            fill: visuals.selection.bg_fill.gamma_multiply(0.35),
+            accent: Some(visuals.selection.bg_fill),
+        };
+    }
+    let Some(notice) = msg.notice.as_deref() else {
+        return RowDecor { fill: egui::Color32::TRANSPARENT, accent: None };
+    };
+    let tinted = |c: egui::Color32| RowDecor { fill: c.gamma_multiply(0.16), accent: Some(c) };
+    match notice {
+        // The muted informational line keeps its plain look — it is already
+        // visually distinct (italic, weak, no author) and an accent bar would
+        // give routine room events more weight than a sub.
+        ChatNotice::System => RowDecor { fill: egui::Color32::TRANSPARENT, accent: None },
+        ChatNotice::FirstMessage | ChatNotice::Redemption { .. } => tinted(TWITCH_PURPLE),
+        ChatNotice::Sub { .. } | ChatNotice::WatchStreak { .. } => {
+            tinted(egui::Color32::from_rgb(0x3e, 0x9b, 0xd6))
+        }
+        ChatNotice::Raid { .. } => tinted(egui::Color32::from_rgb(0x2e, 0xa0, 0x43)),
+        ChatNotice::Announce { .. } => tinted(egui::Color32::from_rgb(0xd6, 0x9b, 0x3e)),
+    }
 }
 
 /// The family the chat replay renders in. Always registered — with no user
@@ -51,6 +199,9 @@ impl ChatAppearance {
         std::hash::Hash::hash(&self.font_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.emote_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.font_id, &mut h);
+        // `[00:40:10]` and `19:30` are different widths, which changes where
+        // a long message wraps and therefore how tall its row is.
+        std::hash::Hash::hash(&self.ts_mode, &mut h);
         std::hash::Hasher::finish(&h)
     }
 }
@@ -99,6 +250,7 @@ pub(in crate::ui) fn render_chat_message(
     ctx: &egui::Context,
     appearance: &ChatAppearance,
 ) -> Option<UserCardClick> {
+    let (shown_ts, other_ts) = fmt_chat_ts_mode(msg, appearance.ts_mode);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         // Timestamp — monospace, sized/colored to match the message body
@@ -106,12 +258,14 @@ pub(in crate::ui) fn render_chat_message(
         ui.label(
             // Monospace on purpose, and NOT the chat family: the bracketed
             // stream-relative timestamp is a column, and a proportional face
-            // destroys the alignment that makes it scannable.
-            egui::RichText::new(fmt_chat_ts(msg.timestamp_secs))
+            // destroys the alignment that makes it scannable. The wall-clock
+            // form keeps it too, so switching modes doesn't shuffle the layout.
+            egui::RichText::new(shown_ts)
                 .monospace()
                 .size(appearance.font_pt)
                 .color(appearance.ts_color),
-        );
+        )
+        .on_hover_text(other_ts);
         // System notice (moderation marker: mode change, timeout/ban, clear)
         // — muted ℹ line, no author/badges.
         if msg.system {
@@ -127,6 +281,43 @@ pub(in crate::ui) fn render_chat_message(
                 "Moderation/room event captured live from Twitch chat while recording",
             );
             return None;
+        }
+        // Standalone event rows (sub / resub / gift / raid / announcement /
+        // watch streak): Twitch's own `system-msg` copy verbatim, on its own
+        // line above the sender's message if they left one. Using Twitch's
+        // string rather than composing our own gets the pluralisation,
+        // tier wording and localisation right for free.
+        if let Some(line) = msg.notice.as_deref().and_then(notice_headline) {
+            ui.label(
+                egui::RichText::new(line)
+                    .strong()
+                    .font(egui::FontId::new(appearance.font_pt, chat_family()))
+                    .color(appearance.text_color),
+            );
+            // A sub/raid notice with no message body of its own is the whole
+            // row; one that carries a message falls through and renders the
+            // sender beneath it.
+            if msg.text.is_empty() {
+                return None;
+            }
+            ui.end_row();
+        }
+        // A channel-point redemption gets Twitch's header line ("X redeemed
+        // Hydrate!"), with the cost where Twitch puts it.
+        if let Some(ChatNotice::Redemption { reward, reward_id, cost }) = msg.notice.as_deref() {
+            let title = reward.clone().unwrap_or_else(|| "a channel-point reward".to_string());
+            ui.label(
+                egui::RichText::new(format!("redeemed {title}"))
+                    .font(egui::FontId::new(appearance.font_pt * 0.92, chat_family()))
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .on_hover_text(match cost {
+                Some(c) => format!("{} channel points · reward id {reward_id}", crate::models::group_thousands(*c)),
+                // Only redemptions that carry a message reach chat at all, and
+                // IRC never names the reward — the title comes from a separate
+                // lookup, so a miss leaves just the id.
+                None => format!("Reward id {reward_id} (title not resolved)"),
+            });
         }
         // Badges — real cached Twitch badge icons when resolved (Phase 1's
         // `ChatMessage::badge_icons`, index-aligned with `badges`), falling
@@ -300,6 +491,14 @@ pub(in crate::ui) fn render_chat_message(
                     }
                 }
             }
+        }
+        // Twitch tags a first-ever message in the channel. Trailing rather
+        // than right-aligned: this is a wrapped inline layout, so a
+        // right-aligned chip would need its own pass to place and would
+        // collide with a long message's last line anyway.
+        if matches!(msg.notice.as_deref(), Some(ChatNotice::FirstMessage)) {
+            ui.label(egui::RichText::new("FIRST MESSAGE").small().strong().color(TWITCH_PURPLE))
+                .on_hover_text("The first message this account has ever sent in this channel");
         }
         click
     })

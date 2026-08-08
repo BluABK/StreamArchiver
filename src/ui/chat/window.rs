@@ -267,6 +267,7 @@ impl StreamArchiverApp {
                     ts_color: cs.ts_color,
                     text_color: cs.text_color,
                     font_id: font_name_key(&cs.chat_font),
+                    ts_mode: cs.ts_mode,
                 },
             )
         };
@@ -473,6 +474,41 @@ impl StreamArchiverApp {
                                         built_at_count: 0,
                                     })
                                 };
+                            }
+                            // Timestamp format. A toggle rather than a Settings
+                            // field because both answers are right at different
+                            // moments: the wall clock while watching a live
+                            // broadcast, the stream-relative offset when you
+                            // need to seek the local recording to a moment.
+                            // (The other format is also on each timestamp's
+                            // hover, so a one-off check needs no click at all.)
+                            {
+                                let cur = popup.settings.lock().unwrap().ts_mode;
+                                let mut wall = cur == ChatTsMode::WallClock;
+                                // Hover describes the CURRENT state and what a
+                                // click does, so it must read `cur`, not the
+                                // `wall` the toggle is about to write through.
+                                let hint = if wall {
+                                    "Showing wall-clock time. Click for time into the \
+                                     broadcast, which is what you need to seek the recording."
+                                } else {
+                                    "Showing time into the broadcast. Click for wall-clock \
+                                     time, as Twitch's own chat shows."
+                                };
+                                if icon_toggle(ui, &mut wall, Some(&ui_tex), ICON_CLOCK, 16.0, hint)
+                                    .changed()
+                                {
+                                    let mode = if wall {
+                                        ChatTsMode::WallClock
+                                    } else {
+                                        ChatTsMode::StreamRelative
+                                    };
+                                    popup.settings.lock().unwrap().ts_mode = mode;
+                                    let _ = shared
+                                        .core
+                                        .store
+                                        .set_setting(K_CHAT_TS_MODE, mode.as_str());
+                                }
                             }
                             // The two info-card toggles. Rendered whenever this
                             // is a Twitch window and the card's feature switch
@@ -1207,14 +1243,6 @@ impl StreamArchiverApp {
                                     let total = y;
                                     ui.add_space(offset as f32);
                                     let mut mismeasured = false;
-                                    // A translucent tint of the theme's own selection color for
-                                    // the highlighted user's rows (🔔 "Highlight messages of
-                                    // this user" in the usercard) — reuses the same visual
-                                    // language egui already uses for "this is selected/marked",
-                                    // just softened so message text stays legible on top.
-                                    let sel = ui.visuals().selection.bg_fill;
-                                    let highlight_bg =
-                                        egui::Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 40);
                                     for di in first..last {
                                         let mi = filtered.map_or(di, |v| v[di] as usize);
                                         let highlighted = popup
@@ -1224,13 +1252,22 @@ impl StreamArchiverApp {
                                                 let login = &log.messages[mi].login;
                                                 !login.is_empty() && login == hl
                                             });
+                                        // Fill + left-accent colour for this row —
+                                        // the highlighted user, or the message's own
+                                        // kind (first message, redemption, sub…).
+                                        let decor =
+                                            row_decor(&log.messages[mi], highlighted, ui.visuals());
+                                        // Room for the accent bar on the left. Reserved
+                                        // on EVERY row, not just accented ones, so text
+                                        // doesn't shift sideways as notices scroll past.
                                         let r = egui::Frame::new()
-                                            .fill(if highlighted {
-                                                highlight_bg
-                                            } else {
-                                                egui::Color32::TRANSPARENT
+                                            .fill(decor.fill)
+                                            .inner_margin(egui::Margin {
+                                                left: 7,
+                                                right: 2,
+                                                top: 1,
+                                                bottom: 1,
                                             })
-                                            .inner_margin(egui::Margin::symmetric(2, 1))
                                             .corner_radius(2.0)
                                             .show(ui, |ui| {
                                                 ui.scope(|ui| {
@@ -1248,6 +1285,23 @@ impl StreamArchiverApp {
                                                     )
                                                 })
                                             });
+                                        // egui's Frame has no per-side border, so the
+                                        // Twitch-style accent is painted from the
+                                        // frame's own rect after the fact. Doing it
+                                        // here rather than inside keeps
+                                        // `response.rect.height()` the measured row
+                                        // height the virtualizer caches.
+                                        if let Some(c) = decor.accent {
+                                            let rect = r.response.rect;
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    rect.min,
+                                                    egui::vec2(3.0, rect.height()),
+                                                ),
+                                                1.0,
+                                                c,
+                                            );
+                                        }
                                         if let Some(req) = r.inner.inner {
                                             usercard_click = Some(req);
                                         }

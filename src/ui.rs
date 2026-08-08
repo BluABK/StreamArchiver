@@ -167,6 +167,12 @@ pub(crate) const K_APP_FONT_FAMILY: &str = "app_font_family";
 /// ([`crate::fonts::CHAT_FAMILY`]) so the two can differ without either
 /// losing the non-Latin fallbacks.
 pub(crate) const K_CHAT_FONT_FAMILY: &str = "chat_font_family";
+/// Which clock the chat replay's timestamps show: `"relative"` (default,
+/// `[00:40:10]` into the broadcast) or `"clock"` (`19:30` local time, as
+/// Twitch's own popout does). Flipped from the 🕒 toolbar toggle in any chat
+/// window rather than buried in Settings — both are the right answer at
+/// different moments. See `ui::chat::rows::ChatTsMode`.
+const K_CHAT_TS_MODE: &str = "chat_timestamp_mode";
 /// Path to the media player binary used by "Play local recording (start)" on
 /// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
 /// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`

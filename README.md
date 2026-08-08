@@ -3628,6 +3628,27 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**Two clocks, one click apart.** The 🕒 toolbar toggle switches every
+timestamp between **time into the broadcast** (`[00:40:10]`, the default —
+this is an archive tool, and it's what lets you seek the local recording to a
+moment) and **wall-clock time** (`19:30`, as Twitch's own popout shows, which
+is what you want while watching live). Whichever isn't shown is on each
+timestamp's **hover**, so the occasional "what offset was that at?" needs no
+click at all. Either way the timestamp stays monospace so the column lines up.
+Logs recorded before this existed carry no absolute time and always show the
+relative form.
+
+**Rows are decorated the way Twitch decorates them** — a coloured 3px bar down
+the left edge plus a matching tint: purple for a **first message** in the
+channel (with a `FIRST MESSAGE` tag) and for **channel-point redemptions**,
+blue for **subs / resubs / gifts** and **watch streaks**, green for **raids**,
+amber for **mod announcements**. Event rows use Twitch's own `system-msg` text
+verbatim, so tier wording, pluralisation and localisation are right by
+construction rather than reinvented. Explicitly highlighting a chatter (🔔 on
+their usercard) outranks all of it — you asked for that one. The accent gutter
+is reserved on every row, not just decorated ones, so text doesn't shift
+sideways as notices scroll past.
+
 **Pick your own fonts** — *Settings → Interface → Display* has two pickers,
 **App font** (the whole interface) and **Chat font** (the chat replay only),
 each listing every font installed on the machine with a live preview in that
