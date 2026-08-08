@@ -339,10 +339,21 @@ pub(super) struct ChatSettingsState {
     /// Chat font family by display name (`""` = follow the app font). See
     /// [`K_CHAT_FONT_FAMILY`].
     pub(super) chat_font: String,
-    /// Wall-clock vs stream-relative timestamps — see [`ChatTsMode`].
+    /// The DEFAULT wall-clock vs stream-relative timestamp mode — see
+    /// [`ChatTsMode`]. Per-instance overrides live in `ts_mode_by_monitor`;
+    /// read them together via [`ChatSettingsState::ts_mode_for`].
     pub(super) ts_mode: ChatTsMode,
+    /// Per-instance overrides of `ts_mode`, keyed by monitor id. Absent =
+    /// inherit the default.
+    pub(super) ts_mode_by_monitor: HashMap<i64, ChatTsMode>,
     /// Whether 7TV gradient usernames render — see [`crate::cosmetics`].
     pub(super) render_paints: bool,
+    /// Where the Creator Goal bar's fill comes from — see [`GoalColor`].
+    pub(super) goal_color: GoalColor,
+    /// The custom highlight rules. Live here rather than snapshotted per
+    /// window: a rule added while a chat window is open has to start
+    /// accenting rows immediately, without reopening it.
+    pub(super) highlight_rules: Vec<crate::chat_highlight::HighlightRule>,
 }
 
 impl ChatSettingsState {
@@ -396,9 +407,60 @@ impl ChatSettingsState {
             show_channel_info: flag(K_CHAT_SHOW_INFO, true),
             chat_font: store.get_setting(K_CHAT_FONT_FAMILY).ok().flatten().unwrap_or_default(),
             render_paints: crate::cosmetics::render_paints(store),
+            highlight_rules: crate::chat_highlight::load_rules(store),
+            goal_color: GoalColor::parse(
+                &store.get_setting(K_CHAT_GOAL_COLOR).ok().flatten().unwrap_or_default(),
+            ),
             ts_mode: ChatTsMode::parse(
                 store.get_setting(K_CHAT_TS_MODE).ok().flatten().unwrap_or_default().as_str(),
             ),
+            ts_mode_by_monitor: store
+                .get_setting(K_CHAT_TS_MODE_BY_MONITOR)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+                .map(|m| {
+                    m.into_iter()
+                        .filter_map(|(k, v)| Some((k.parse().ok()?, ChatTsMode::parse(&v))))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl ChatSettingsState {
+    /// The timestamp mode one instance should use: its own override, else the
+    /// global default.
+    pub(super) fn ts_mode_for(&self, monitor_id: i64) -> ChatTsMode {
+        self.ts_mode_by_monitor.get(&monitor_id).copied().unwrap_or(self.ts_mode)
+    }
+
+    /// Set one instance's mode, and persist.
+    ///
+    /// Choosing the default DELETES the override rather than storing a copy of
+    /// it — so an instance that follows the default keeps following it when
+    /// the default later changes, instead of being silently pinned to what it
+    /// happened to be at the time. Same reasoning as the scoped capture
+    /// settings' `is_inherit`.
+    pub(super) fn set_ts_mode_for(
+        &mut self,
+        store: &crate::store::Store,
+        monitor_id: i64,
+        mode: ChatTsMode,
+    ) {
+        if mode == self.ts_mode {
+            self.ts_mode_by_monitor.remove(&monitor_id);
+        } else {
+            self.ts_mode_by_monitor.insert(monitor_id, mode);
+        }
+        let map: HashMap<String, &str> = self
+            .ts_mode_by_monitor
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.as_str()))
+            .collect();
+        if let Ok(json) = serde_json::to_string(&map) {
+            let _ = store.set_setting(K_CHAT_TS_MODE_BY_MONITOR, &json);
         }
     }
 }
@@ -490,11 +552,20 @@ pub(super) struct ChatPopup {
     pub(super) show_hype: bool,
     /// Same, for the channel-info card (top supporters, goals).
     pub(super) show_info: bool,
-    /// The custom highlight rules + the connected login, snapshotted when the
-    /// window opened. Used only to ACCENT matching rows — the notification
-    /// half runs in the live chat logger (see [`crate::chat_highlight`]), so
-    /// a ping doesn't depend on a window being open.
-    pub(super) highlights: Arc<(String, Vec<crate::chat_highlight::HighlightRule>)>,
+    /// The connected Twitch login at the time this window opened, for
+    /// accenting rows that name you. The RULES live on the shared settings
+    /// (see `ChatSettingsState::highlight_rules`) so an edit applies at once;
+    /// the login is snapshotted because it only changes when an account is
+    /// connected, which is a restart-shaped event anyway.
+    ///
+    /// Accenting only — the notification half runs in the live chat logger
+    /// (see [`crate::chat_highlight`]), so a ping never depends on a window
+    /// being open.
+    pub(super) my_login: String,
+    /// This channel's own display colour, snapshotted at open for the
+    /// "inherit channel colour" goal-bar option — computing it needs
+    /// `&mut self`, which the deferred render closure doesn't have.
+    pub(super) channel_color: egui::Color32,
     /// 7TV paints for the chatters in this log, keyed by Twitch user id.
     /// Behind a mutex because a background fetch fills it in while the window
     /// renders. Empty for YouTube, and when the feature is off.
@@ -901,6 +972,62 @@ mod tests {
         let cjk = "あいうえおかきくけこさしすせそたちつてと:";
         let job = paint_name_job(cjk, &paint, font);
         assert_eq!(job.text, cjk);
+    }
+
+    /// Per-instance timestamp overrides, and the reason they are stored by
+    /// ABSENCE: an instance following the default has to keep following it
+    /// when the default later changes, rather than being silently pinned to
+    /// whatever it happened to be at the time.
+    #[test]
+    fn timestamp_overrides_are_per_instance_and_inherit_by_absence() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut cs = ChatSettingsState::load(&store);
+        cs.ts_mode = ChatTsMode::StreamRelative;
+        cs.ts_mode_by_monitor.clear();
+
+        // Everything inherits to start with.
+        assert_eq!(cs.ts_mode_for(1), ChatTsMode::StreamRelative);
+        assert_eq!(cs.ts_mode_for(2), ChatTsMode::StreamRelative);
+
+        // Overriding ONE instance leaves the others alone — the whole point.
+        cs.set_ts_mode_for(&store, 1, ChatTsMode::WallClock);
+        assert_eq!(cs.ts_mode_for(1), ChatTsMode::WallClock);
+        assert_eq!(cs.ts_mode_for(2), ChatTsMode::StreamRelative);
+
+        // Setting an instance back to the default clears its override…
+        cs.set_ts_mode_for(&store, 1, ChatTsMode::StreamRelative);
+        assert!(cs.ts_mode_by_monitor.is_empty(), "matching the default is not an override");
+
+        // …so changing the default later carries it, instead of leaving it
+        // pinned to the old value.
+        cs.ts_mode = ChatTsMode::WallClock;
+        assert_eq!(cs.ts_mode_for(1), ChatTsMode::WallClock);
+
+        // An instance that really did opt out stays opted out.
+        cs.set_ts_mode_for(&store, 2, ChatTsMode::StreamRelative);
+        assert_eq!(cs.ts_mode_for(2), ChatTsMode::StreamRelative);
+        assert_eq!(cs.ts_mode_for(1), ChatTsMode::WallClock);
+
+        // And it survives a reload from the store.
+        let reloaded = ChatSettingsState::load(&store);
+        assert_eq!(reloaded.ts_mode_by_monitor.get(&2), Some(&ChatTsMode::StreamRelative));
+        assert_eq!(reloaded.ts_mode_by_monitor.get(&1), None);
+    }
+
+    #[test]
+    fn goal_colour_round_trips_including_the_channel_sentinel() {
+        assert_eq!(GoalColor::parse("channel"), GoalColor::Channel);
+        assert_eq!(GoalColor::Channel.as_setting(), "channel");
+        let c = egui::Color32::from_rgb(0x12, 0x34, 0x56);
+        assert_eq!(GoalColor::parse("#123456"), GoalColor::Fixed(c));
+        assert_eq!(GoalColor::parse(&GoalColor::Fixed(c).as_setting()), GoalColor::Fixed(c));
+        // Unset / junk falls back to the default rather than erroring.
+        assert_eq!(GoalColor::parse(""), GoalColor::Fixed(GOAL_COLOR));
+        assert_eq!(GoalColor::parse("not a colour"), GoalColor::Fixed(GOAL_COLOR));
+        // "Use the channel colour" only resolves to it when actually chosen.
+        let ch = egui::Color32::from_rgb(9, 9, 9);
+        assert_eq!(GoalColor::Channel.resolve(ch), ch);
+        assert_eq!(GoalColor::Fixed(c).resolve(ch), c);
     }
 
     /// The height cache is keyed on everything that changes how tall a row

@@ -578,19 +578,45 @@ fn font_picker(
         ui.label(label).on_hover_text(hover);
         let shown = if current.is_empty() { "Default" } else { current.as_str() };
         egui::ComboBox::from_id_salt(id).selected_text(shown).width(220.0).show_ui(ui, |ui| {
-            ui.set_max_height(320.0);
-            if ui.selectable_label(current.is_empty(), "Default").clicked() && !current.is_empty() {
+            // A typical Windows box has 300+ installed faces, so: a filter,
+            // and a real ScrollArea. `set_max_height` alone only caps the
+            // BOX — without something to scroll inside it the list draws
+            // straight past the bottom and over whatever is beneath it.
+            let filter_id = egui::Id::new((id, "filter"));
+            let mut filter: String = ui.data_mut(|d| d.get_temp(filter_id).unwrap_or_default());
+            ui.add(
+                egui::TextEdit::singleline(&mut filter)
+                    .hint_text("filter…")
+                    .desired_width(200.0),
+            );
+            let needle = filter.trim().to_lowercase();
+            ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+
+            if needle.is_empty()
+                && ui.selectable_label(current.is_empty(), "Default").clicked()
+                && !current.is_empty()
+            {
                 current.clear();
                 changed = true;
             }
             ui.separator();
-            for f in fonts {
-                let sel = current.eq_ignore_ascii_case(&f.display);
-                if ui.selectable_label(sel, &f.display).clicked() && !sel {
-                    *current = f.display.clone();
-                    changed = true;
+            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                let mut any = false;
+                for f in fonts {
+                    if !needle.is_empty() && !f.display.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    any = true;
+                    let sel = current.eq_ignore_ascii_case(&f.display);
+                    if ui.selectable_label(sel, &f.display).clicked() && !sel {
+                        *current = f.display.clone();
+                        changed = true;
+                    }
                 }
-            }
+                if !any {
+                    ui.weak("No font matches that.");
+                }
+            });
         });
         if !current.is_empty()
             && ui.button("Reset").on_hover_text("Back to the bundled default font.").clicked()
@@ -1772,6 +1798,85 @@ impl StreamArchiverApp {
                         .store
                         .set_setting(K_CHAT_SHOW_HYPE, if cs.show_hype_train { "1" } else { "0" });
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Default chat timestamps").on_hover_text(
+                        "What a chat window shows until you tell that one otherwise. The 🕒 \
+                         button on each window's toolbar overrides it for that instance only; \
+                         setting an instance back to this value clears its override, so it \
+                         follows this default again if you change it later.",
+                    );
+                    let mut mode = cs.ts_mode;
+                    egui::ComboBox::from_id_salt("chat_ts_mode_default")
+                        .selected_text(match mode {
+                            ChatTsMode::StreamRelative => "Time into the broadcast",
+                            ChatTsMode::WallClock => "Wall-clock time",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut mode,
+                                ChatTsMode::StreamRelative,
+                                "Time into the broadcast",
+                            )
+                            .on_hover_text("[00:40:10] — what you need to seek a recording.");
+                            ui.selectable_value(&mut mode, ChatTsMode::WallClock, "Wall-clock time")
+                                .on_hover_text("19:30 — as Twitch's own chat shows.");
+                        });
+                    if mode != cs.ts_mode {
+                        cs.ts_mode = mode;
+                        let _ = self.core.store.set_setting(K_CHAT_TS_MODE, mode.as_str());
+                    }
+                });
+                // Goal bar colour: a picker, a hex field, and "use the
+                // channel's own colour". Twitch's own red is loud by design
+                // on a live page; in a window open for hours it grates.
+                ui.horizontal(|ui| {
+                    let mut use_channel = cs.goal_color == GoalColor::Channel;
+                    let mut fixed = match cs.goal_color {
+                        GoalColor::Fixed(c) => c,
+                        GoalColor::Channel => GOAL_COLOR,
+                    };
+                    ui.label("Goal bar colour").on_hover_text(
+                        "Fill colour for the Creator Goal bar above the chat. Twitch's own red                          is tuned to catch the eye on a live page; in a chat window open for                          hours it reads as harsh, so the default here is a muted version of it.",
+                    );
+                    // Same idiom as the chat window's own colour rows.
+                    let mut changed = ui
+                        .add_enabled_ui(!use_channel, |ui| {
+                            egui::color_picker::color_edit_button_srgba(
+                                ui,
+                                &mut fixed,
+                                egui::color_picker::Alpha::Opaque,
+                            )
+                            .changed()
+                        })
+                        .inner;
+                    let mut hex = hex_color_string(fixed);
+                    if ui
+                        .add_enabled(
+                            !use_channel,
+                            egui::TextEdit::singleline(&mut hex).desired_width(80.0),
+                        )
+                        .on_hover_text("#RRGGBB — type or paste.")
+                        .changed()
+                        && let Some(c) = parse_chat_hex_color(&hex)
+                    {
+                        fixed = c;
+                        changed = true;
+                    }
+                    changed |= ui
+                        .checkbox(&mut use_channel, "Use channel colour")
+                        .on_hover_text(
+                            "Fill the bar with the channel's own display colour — the same one                              the Streams grid and the notifications feed give it, so a channel                              reads consistently everywhere.",
+                        )
+                        .changed();
+                    if changed {
+                        cs.goal_color =
+                            if use_channel { GoalColor::Channel } else { GoalColor::Fixed(fixed) };
+                        let _ = self
+                            .core
+                            .store
+                            .set_setting(K_CHAT_GOAL_COLOR, &cs.goal_color.as_setting());
+                    }
+                });
                 if ui
                     .checkbox(&mut cs.show_channel_info, "Channel info card in chat")
                     .on_hover_text(
@@ -4155,7 +4260,7 @@ impl StreamArchiverApp {
             .weak(),
         );
 
-        let mut rules = self.chat_highlights.clone();
+        let mut rules = self.chat_settings.lock().unwrap().highlight_rules.clone();
         let mut changed = false;
         let mut remove: Option<usize> = None;
         for (i, r) in rules.iter_mut().enumerate() {
@@ -4223,7 +4328,10 @@ impl StreamArchiverApp {
         }
         if changed {
             crate::chat_highlight::save_rules(&self.core.store, &rules);
-            self.chat_highlights = rules;
+            // Into the SHARED state, so open chat windows pick it up on their
+            // next frame rather than needing a reopen. The live chat logger
+            // re-reads from the store on its own timer.
+            self.chat_settings.lock().unwrap().highlight_rules = rules;
         }
     }
 

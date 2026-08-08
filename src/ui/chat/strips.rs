@@ -8,8 +8,48 @@ use super::*;
 /// so one broadcast reads the same in both views.
 pub(in crate::ui) const HYPE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x40, 0x81);
 
-/// Twitch's own Creator Goal red.
-pub(in crate::ui) const GOAL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe9, 0x19, 0x16);
+/// Default Creator Goal bar fill: Twitch's goal red, muted. Theirs
+/// (`#E91916`) is tuned for a glance at a live page; in a chat window open
+/// for hours it reads as harsh.
+pub(in crate::ui) const GOAL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xb0, 0x45, 0x5c);
+
+/// Where the Creator Goal bar's fill comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::ui) enum GoalColor {
+    /// A specific colour.
+    Fixed(egui::Color32),
+    /// The channel's own display colour — the same one the Streams grid and
+    /// the notifications feed give it, so a channel reads consistently.
+    Channel,
+}
+
+impl GoalColor {
+    /// Parse the stored setting. Anything unrecognised falls back to the
+    /// default rather than erroring — this is decoration.
+    pub(in crate::ui) fn parse(s: &str) -> GoalColor {
+        match s.trim() {
+            "channel" => GoalColor::Channel,
+            hex => GoalColor::Fixed(parse_chat_hex_color(hex).unwrap_or(GOAL_COLOR)),
+        }
+    }
+
+    pub(in crate::ui) fn as_setting(self) -> String {
+        match self {
+            GoalColor::Channel => "channel".to_string(),
+            GoalColor::Fixed(c) => hex_color_string(c),
+        }
+    }
+
+    /// Resolve to an actual colour. `channel` is this window's channel
+    /// colour, snapshotted at open (it needs `&mut self` to compute, which
+    /// the deferred render closure doesn't have).
+    pub(in crate::ui) fn resolve(self, channel: egui::Color32) -> egui::Color32 {
+        match self {
+            GoalColor::Fixed(c) => c,
+            GoalColor::Channel => channel,
+        }
+    }
+}
 
 /// One info card above the message list.
 ///
@@ -261,15 +301,16 @@ pub(in crate::ui) fn chat_info_cards(
         }
     }
 
-    let (want_hype, want_info) = {
+    let (want_hype, want_info, goal_color) = {
         let cs = popup.settings.lock().unwrap();
-        (cs.show_hype_train, cs.show_channel_info)
+        (cs.show_hype_train, cs.show_channel_info, cs.goal_color)
     };
     let mut ticking = false;
 
     // Creator Goals first, matching where Twitch puts them: above the chat,
     // above everything else.
     if want_info && popup.show_info {
+        let goal_fill = goal_color.resolve(popup.channel_color);
         for g in &popup.stats.goals {
             chat_card(ui, |ui| {
                 if !g.description.is_empty() {
@@ -285,7 +326,7 @@ pub(in crate::ui) fn chat_info_cards(
                         crate::models::group_thousands(g.target),
                         g.noun,
                     ))
-                    .fill(GOAL_COLOR)
+                    .fill(goal_fill)
                     .corner_radius(3.0)
                     .desired_width(ui.available_width()),
                 )

@@ -3648,6 +3648,11 @@ re-asking about every unpainted regular on each reopen would be the bulk of
 the traffic. Never per message. Toggle in *Settings → Interface → Display*;
 any failure leaves usernames rendering exactly as they did before.
 
+A chat sidecar is created **as soon as the logger joins**, empty, rather than
+on the first message — so a quiet stream still has a chat log you can open
+(and send the first message from) instead of *"No chat log file found for this
+stream"*.
+
 **Sending messages.** A live Twitch take's chat window gets a **Send a
 message** bar at the bottom, via Twitch's supported `POST
 /helix/chat/messages` — the archival chat capture stays anonymous and
@@ -3691,11 +3696,12 @@ recording at all. A mention counts whether it's `@name` or your name on its
 own, because that's how people actually address each other; your own messages
 never ping you. Do Not Disturb still suppresses the toast, the 🔔 feed row is
 recorded either way, and there's at most **one toast per channel per 10
-seconds**, so a chat spamming your name can't spawn fifty. Rules are re-read
-on each new chat connection, and the chat window picks them up when reopened.
+seconds**, so a chat spamming your name can't spawn fifty. Rules are re-read by the chat
+logger every 30 seconds and by open chat windows immediately, so a rule added
+mid-stream starts working without restarting anything.
 
-**Two clocks, one click apart.** The 🕒 toolbar toggle switches every
-timestamp between **time into the broadcast** (`[00:40:10]`, the default —
+**Two clocks, one click apart.** The 🕒 toolbar toggle switches that
+window's timestamps between **time into the broadcast** (`[00:40:10]`, the default —
 this is an archive tool, and it's what lets you seek the local recording to a
 moment) and **wall-clock time** (`19:30`, as Twitch's own popout shows, which
 is what you want while watching live). Whichever isn't shown is on each
@@ -3703,6 +3709,12 @@ timestamp's **hover**, so the occasional "what offset was that at?" needs no
 click at all. Either way the timestamp stays monospace so the column lines up.
 Logs recorded before this existed carry no absolute time and always show the
 relative form.
+
+The toggle is **per instance**: flipping one channel's chat doesn't reformat
+every other open window. *Settings → Interface → Display* sets the default an
+instance follows until you tell it otherwise — and setting an instance back to
+that value *clears* its override rather than pinning it, so it follows the
+default again if you change the default later.
 
 The events behind those rows are recorded by the chat logger itself, so a
 sidecar stands on its own: the `first-msg` tag, the `custom-reward-id` a
@@ -3767,6 +3779,12 @@ re-opens the per-window toggle** — you asked to see a new one even after
 hiding the last — but it never overrides the feature switch. The toggles are
 disabled rather than hidden when a broadcast has nothing to put in that card,
 so the toolbar doesn't reflow every time a train starts or ends.
+
+The goal bar's colour is configurable (*Settings → Interface → Display*),
+including **"use the channel colour"** — the same colour the Streams grid and
+the notifications feed give that channel. The default is a muted version of
+Twitch's goal red: theirs is tuned to catch the eye on a live page, and in a
+chat window sitting open for hours it reads as harsh.
 
 **Creator Goals are archived, not just displayed.** Helix's `/goals` needs
 `channel:read:goals` on the *broadcaster's own* token, which is no use for

@@ -204,18 +204,32 @@ impl ChatSink {
                 .is_some_and(|t| t.elapsed() >= FLUSH_EVERY)
     }
 
+    /// Create the sidecar now, empty, without waiting for a first message.
+    ///
+    /// Called once the session has joined, so a quiet stream has an EMPTY chat
+    /// log rather than no log at all. Without this, "View chat" stayed greyed
+    /// out ("No chat log file found for this stream") until someone happened
+    /// to talk — which also meant the send box never appeared, so you couldn't
+    /// type the first message from here either. An empty file is the honest
+    /// answer: chat was captured, nobody said anything yet.
+    async fn ensure_created(&mut self) -> anyhow::Result<()> {
+        if self.file.is_some() {
+            return Ok(());
+        }
+        self.file = Some(
+            crate::iomon::fs::open_with(crate::iomon::Cat::ChatSidecar, &self.path, |o| {
+                o.create(true).append(true);
+            })
+            .await?,
+        );
+        Ok(())
+    }
+
     async fn flush(&mut self) -> anyhow::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        if self.file.is_none() {
-            self.file = Some(
-                crate::iomon::fs::open_with(crate::iomon::Cat::ChatSidecar, &self.path, |o| {
-                    o.create(true).append(true);
-                })
-                .await?,
-            );
-        }
+        self.ensure_created().await?;
         let bytes = self.buf.len() as u64;
         let start = std::time::Instant::now();
         let res = self.file.as_mut().unwrap().write_all(self.buf.as_bytes()).await;
@@ -441,6 +455,12 @@ async fn session(
     // Messages accumulate in the sink and hit disk a couple of times per
     // second at most (see ChatSink); flushed on every exit path below.
     let mut sink = ChatSink::new(path.to_path_buf());
+    // Create it empty right away — see `ensure_created`. A failure here is
+    // not fatal: the first flush retries, and losing the "there is a log"
+    // signal is better than dropping the capture over it.
+    if let Err(e) = sink.ensure_created().await {
+        debug!("chat ({login}): could not pre-create the sidecar: {e:#}");
+    }
     // Moderation tracker (deletions/purges/room modes/role badges) — per
     // connection, so its baselines reset with each reconnect.
     let mut tracker = EventTracker::default();
@@ -448,7 +468,11 @@ async fn session(
     // connected login change from Settings, which is a human action, so a
     // reconnect picking them up is soon enough — and this must not become a
     // settings read per chat message on a busy channel.
-    let mut mentions = events.map(MentionWatch::new).filter(MentionWatch::armed);
+    // NOT filtered on `armed()` here: a rule added while the stream is already
+    // running would otherwise never take effect for the whole connection,
+    // because there'd be no watcher left to re-read it. `check` re-reads on a
+    // timer and no-ops while nothing is armed.
+    let mut mentions = events.map(MentionWatch::new);
     if let Some(ctx) = events {
         tracker.tuning = load_hype_tuning(ctx);
     }
@@ -713,6 +737,11 @@ struct MentionWatch<'a> {
     /// Channel display name, for the notification heading — one store lookup
     /// per connection rather than one per message.
     channel: String,
+    /// When the rules were last read. They're edited in Settings, which is a
+    /// human action, so re-reading on a timer is soon enough — but it has to
+    /// happen at all: a rule added mid-stream must start working without
+    /// restarting the recording.
+    loaded_at: i64,
     /// When this channel last raised a toast, so a chat spamming a name can't
     /// spawn one per message. Suppressed hits still reach the 🔔 feed.
     last_toast: i64,
@@ -740,7 +769,29 @@ impl<'a> MentionWatch<'a> {
             pingable: crate::chat_highlight::pingable(&ctx.store),
             channel,
             last_toast: 0,
+            loaded_at: crate::models::now_unix(),
             ctx,
+        }
+    }
+
+    /// Re-read the rules and the pingable switch if they're stale.
+    fn refresh(&mut self, now: i64) {
+        if now - self.loaded_at < HIGHLIGHT_REFRESH_SECS {
+            return;
+        }
+        self.loaded_at = now;
+        self.rules = crate::chat_highlight::load_rules(&self.ctx.store);
+        self.pingable = crate::chat_highlight::pingable(&self.ctx.store);
+        if self.login.is_empty() {
+            // An account connected after this session started.
+            self.login = self
+                .ctx
+                .store
+                .get_setting(crate::oauth::K_LOGIN)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .to_lowercase();
         }
     }
 
@@ -758,12 +809,16 @@ impl<'a> MentionWatch<'a> {
     /// done twice — `parse_privmsg` has already unescaped and extracted
     /// everything, and this runs for every single message on the channel.
     fn check(&mut self, json: &str) {
+        let now = crate::models::now_unix();
+        self.refresh(now);
+        if !self.armed() {
+            return;
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return };
         let text = v["text"].as_str().unwrap_or("");
         if text.is_empty() {
             return;
         }
-        let now = crate::models::now_unix();
         // Every "should this interrupt someone" rule lives in one pure
         // function — self-suppression, notify gating, and the per-channel
         // cooldown — so it can be tested without a socket or a clock.
@@ -1082,6 +1137,11 @@ struct EventTracker {
 
 /// How often a live session re-reads the hype tuning from settings.
 const TUNING_REFRESH_SECS: i64 = 300;
+
+/// How often a live session re-reads the chat highlight rules. Shorter than
+/// the tuning refresh because this is something a user edits and then
+/// immediately expects to work — waiting five minutes reads as broken.
+const HIGHLIGHT_REFRESH_SECS: i64 = 30;
 
 impl EventTracker {
     /// Note one sub/gift/bits contribution (pre-scored via

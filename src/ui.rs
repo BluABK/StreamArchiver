@@ -173,6 +173,18 @@ pub(crate) const K_CHAT_FONT_FAMILY: &str = "chat_font_family";
 /// window rather than buried in Settings — both are the right answer at
 /// different moments. See `ui::chat::rows::ChatTsMode`.
 const K_CHAT_TS_MODE: &str = "chat_timestamp_mode";
+/// Fill colour for the chat window's Creator Goal bar: a `#RRGGBB`, or the
+/// sentinel `"channel"` to use the channel's own display colour. Twitch's own
+/// goal red is deliberately loud on a live page and reads as harsh in a
+/// desktop chat window sitting open for hours, so the default here is a
+/// muted version of it — and the whole thing is configurable because "how
+/// loud" is a matter of taste, not correctness.
+const K_CHAT_GOAL_COLOR: &str = "chat_goal_color";
+/// Per-instance timestamp-mode overrides, as `{"<monitor id>": "clock"}`.
+/// An instance absent from the map INHERITS [`K_CHAT_TS_MODE`] — the same
+/// delete-not-store shape the scoped capture settings use, so "follow the
+/// default" and "happens to match the default" stay the same state.
+const K_CHAT_TS_MODE_BY_MONITOR: &str = "chat_timestamp_mode_by_monitor";
 /// Path to the media player binary used by "Play local recording (start)" on
 /// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
 /// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`
@@ -2195,9 +2207,7 @@ pub struct StreamArchiverApp {
     /// [`crate::chat_highlight::K_PINGABLE`]. Mirrors the setting so the
     /// checkbox has somewhere to live; the chat logger reads the store.
     chat_pingable: bool,
-    /// The custom highlight rules, as edited in Settings. Saved on every
-    /// change; the chat logger re-reads them on each new connection.
-    chat_highlights: Vec<crate::chat_highlight::HighlightRule>,
+
     /// Which monitor's Properties window is open (None = closed).
     properties_popups: Vec<i64>,
     /// Deferred-viewport state for each open instance-Properties window,

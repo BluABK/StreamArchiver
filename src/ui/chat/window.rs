@@ -193,10 +193,20 @@ impl StreamArchiverApp {
             // Snapshotted at open: the rules change from Settings, which is a
             // human action, so reopening the window to pick them up is fine —
             // and this must not become a settings read per rendered row.
-            highlights: Arc::new((
-                self.core.store.get_setting(crate::oauth::K_LOGIN).ok().flatten().unwrap_or_default(),
-                crate::chat_highlight::load_rules(&self.core.store),
-            )),
+            // Resolved here because it needs `&mut self` (it consults the
+            // cached broadcaster colour and the per-channel palette), which
+            // the deferred render closure doesn't have.
+            channel_color: row
+                .map(|r| r.channel.id)
+                .map(|cid| self.channel_name_color(cid).0)
+                .unwrap_or(GOAL_COLOR),
+            my_login: self
+                .core
+                .store
+                .get_setting(crate::oauth::K_LOGIN)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
             // Both cards start open; the feature switches in Settings decide
             // whether they're available at all.
             show_hype: true,
@@ -244,12 +254,13 @@ impl StreamArchiverApp {
         if popup.paints_checked.is_some_and(|t| t.elapsed().as_secs() < PAINT_SWEEP_SECS) {
             return;
         }
-        popup.paints_checked = Some(std::time::Instant::now());
         let asked = popup.paints_asked.clone();
+        let mut loaded = false;
         let want: Vec<String> = {
             let seen = asked.lock().unwrap();
             match &*popup.load_state.lock().unwrap() {
                 ChatLoadState::Loaded(log) => {
+                    loaded = true;
                     let mut out: Vec<String> = Vec::new();
                     let mut dedup = std::collections::HashSet::new();
                     for m in log.messages.iter().rev().take(PAINT_SCAN_MESSAGES) {
@@ -265,6 +276,14 @@ impl StreamArchiverApp {
                 _ => Vec::new(),
             }
         };
+        // Stamped only once the log has actually LOADED. Stamping before that
+        // armed the 5-minute cooldown against an empty scan of a still-
+        // loading log, so a freshly-opened window never fetched anything —
+        // names just stayed flat forever.
+        if !loaded {
+            return;
+        }
+        popup.paints_checked = Some(std::time::Instant::now());
         if want.is_empty() {
             return;
         }
@@ -389,11 +408,14 @@ impl StreamArchiverApp {
         // The emote cache is shared (Arc<Mutex>), so the closure can use a clone
         // without borrowing `self`. Copy the render toggles out too.
         let anim_cache = self.emote_anim.clone();
-        let highlights = popup.highlights.clone();
+        let my_login = popup.my_login.clone();
         let paints = popup.paints.clone();
         // Uploaded on first use and refcounted, so this clone is free. Moved
         // into the closure because the deferred render can't borrow `self`.
         let ui_tex = self.ui_tex.get_or_insert_with(|| UiTextures::load(ctx)).clone();
+        // Snapshotted once per frame, not per row: this is read for every
+        // rendered message and a lock per row on a busy channel would show.
+        let highlight_rules = self.chat_settings.lock().unwrap().highlight_rules.clone();
         let (render_emotes, animate_emotes, appearance) = {
             let cs = self.chat_settings.lock().unwrap();
             (
@@ -405,7 +427,8 @@ impl StreamArchiverApp {
                     ts_color: cs.ts_color,
                     text_color: cs.text_color,
                     font_id: font_name_key(&cs.chat_font),
-                    ts_mode: cs.ts_mode,
+                    // This instance's own mode, falling back to the default.
+                    ts_mode: cs.ts_mode_for(popup.monitor_id),
                 },
             )
         };
@@ -737,7 +760,8 @@ impl StreamArchiverApp {
                             // (The other format is also on each timestamp's
                             // hover, so a one-off check needs no click at all.)
                             {
-                                let cur = popup.settings.lock().unwrap().ts_mode;
+                                let cur =
+                                    popup.settings.lock().unwrap().ts_mode_for(popup.monitor_id);
                                 let mut wall = cur == ChatTsMode::WallClock;
                                 // Hover describes the CURRENT state and what a
                                 // click does, so it must read `cur`, not the
@@ -757,11 +781,15 @@ impl StreamArchiverApp {
                                     } else {
                                         ChatTsMode::StreamRelative
                                     };
-                                    popup.settings.lock().unwrap().ts_mode = mode;
-                                    let _ = shared
-                                        .core
-                                        .store
-                                        .set_setting(K_CHAT_TS_MODE, mode.as_str());
+                                    // Per INSTANCE — flipping one channel's
+                                    // chat must not reformat every other open
+                                    // window. The global default lives in
+                                    // Settings.
+                                    popup.settings.lock().unwrap().set_ts_mode_for(
+                                        &shared.core.store,
+                                        popup.monitor_id,
+                                        mode,
+                                    );
                                 }
                             }
                             // The two info-card toggles. Rendered whenever this
@@ -1514,8 +1542,8 @@ impl StreamArchiverApp {
                                         let hit = !highlighted
                                             && crate::chat_highlight::first_hit(
                                                 &log.messages[mi].text,
-                                                &highlights.0,
-                                                &highlights.1,
+                                                &my_login,
+                                                &highlight_rules,
                                             )
                                             .is_some();
                                         let decor = row_decor(

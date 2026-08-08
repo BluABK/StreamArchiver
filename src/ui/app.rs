@@ -90,7 +90,6 @@ impl StreamArchiverApp {
         // defaulted so the first frame's `apply_font_settings` is a no-op —
         // main.rs already installed this choice at startup.
         let chat_pingable = crate::chat_highlight::pingable(&core.store);
-        let chat_highlights = crate::chat_highlight::load_rules(&core.store);
         let installed_fonts = crate::fonts::FontChoice {
             app: setting_or_empty(&core, K_APP_FONT_FAMILY),
             chat: setting_or_empty(&core, K_CHAT_FONT_FAMILY),
@@ -820,7 +819,6 @@ impl StreamArchiverApp {
             installed_fonts,
             system_fonts: None,
             chat_pingable,
-            chat_highlights,
             properties_popups: Vec::new(),
             instance_props_registry: Default::default(),
             user_props_popups: Vec::new(),
