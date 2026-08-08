@@ -1178,6 +1178,12 @@ impl StreamArchiverApp {
                         "Tip: if you connected before the Ad-free / Import features, reconnect to \
                          grant the subscriptions + follows scopes.",
                     );
+                    ui.small(
+                        "Sending chat messages needs the newer 'user:write:chat' scope. Twitch \
+                         can't widen an existing grant, so a connection made before that scope \
+                         was added keeps working for everything else but must be reconnected \
+                         once before the chat window will offer a send box.",
+                    );
                     if ui
                         .button("📥 Import followed channels")
                         .on_hover_text(

@@ -10,6 +10,7 @@ mod chapters;
 mod chat;
 mod chat_highlight;
 mod chat_index;
+mod chat_send;
 mod chat_scan;
 mod compat;
 mod db_backup;

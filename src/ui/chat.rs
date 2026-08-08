@@ -391,6 +391,33 @@ impl ChatSettingsState {
     }
 }
 
+/// The chat window's send bar. See [`crate::chat_send`] for the transport and
+/// the rate policy; this is only what the window needs to draw and drive it.
+pub(super) struct SendBar {
+    pub(super) draft: String,
+    /// Local send budget — purely client-side bookkeeping.
+    pub(super) limiter: crate::chat_send::SendLimiter,
+    /// The channel's Twitch id, resolved once in the background on open.
+    /// `None` until it lands; the bar is disabled meanwhile.
+    pub(super) broadcaster_id: Arc<Mutex<Option<String>>>,
+    /// The last send's result, shown under the box.
+    pub(super) status: Arc<Mutex<Option<crate::chat_send::SendOutcome>>>,
+    /// True while a send is in flight.
+    pub(super) sending: Arc<std::sync::atomic::AtomicBool>,
+    /// Messages sent from here that haven't come back through the sidecar
+    /// yet: `(text, sent_at_unix)`. Drawn as pending rows at reduced alpha
+    /// and dropped once the tail-reload returns them — without this the
+    /// round trip (IRC → the logger's 2s flush → the window's 3s tail poll)
+    /// is 2-5 seconds of apparent silence, which reads as broken.
+    pub(super) pending: Vec<(String, i64)>,
+}
+
+/// How long a pending row waits for its own message to come back before it
+/// gives up and says so. It can legitimately never arrive — chat capture may
+/// not be running for this channel at all — and a row stuck at half opacity
+/// forever would be worse than an honest note.
+pub(super) const PENDING_TIMEOUT_SECS: i64 = 30;
+
 pub(super) struct ChatPopup {
     /// Monitor this window belongs to — keys the viewport id, so each channel
     /// gets its OWN chat window (opening another channel's chat no longer
@@ -456,6 +483,11 @@ pub(super) struct ChatPopup {
     /// half runs in the live chat logger (see [`crate::chat_highlight`]), so
     /// a ping doesn't depend on a window being open.
     pub(super) highlights: Arc<(String, Vec<crate::chat_highlight::HighlightRule>)>,
+    /// The message being typed in the send bar, and everything about whether
+    /// it may go out. `None` when this window can't send at all (not Twitch,
+    /// an archived take, no connected account) — the bar isn't drawn then,
+    /// rather than sitting permanently disabled on every historical view.
+    pub(super) send: Option<SendBar>,
     /// The `train_id` of the most recent Hype Train this window has already
     /// reacted to. A different id while the train is running means one just
     /// STARTED, which re-opens `show_hype` — the user asked to be shown a new

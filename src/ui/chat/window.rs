@@ -51,11 +51,15 @@ impl StreamArchiverApp {
             .store
             .recordings_for_monitor(monitor_id)
             .unwrap_or_default();
+        // "Live" here means the take being VIEWED is still running — sending
+        // to a channel whose archived take you happen to be reading would be
+        // surprising at best.
         let rec = rec_id
             .and_then(|id| recs.iter().find(|r| r.id == id))
             .or_else(|| recs.iter().rev().find(|r| chat_file_for_recording(r).is_some()))
             .or_else(|| recs.last())
             .cloned();
+        let rec_is_live = rec.as_ref().is_some_and(|r| r.ended_at.is_none());
 
         // This take's recorded collab partners, keyed by Twitch broadcaster id
         // — resolves each message's `source_room_id` tag to a name for the
@@ -139,6 +143,39 @@ impl StreamArchiverApp {
             user_card: None,
             users_panel: None,
             stats,
+            // Only offered where it can actually work: a live Twitch take
+            // with a connected account. An archived take gets no bar at all
+            // rather than a permanently disabled box on every historical view.
+            send: {
+                let live = rec_is_live && platform == Some(Platform::Twitch);
+                let connected = crate::oauth::connected_user_id(&self.core.store).is_some();
+                (live && connected).then(|| {
+                    let broadcaster_id = Arc::new(Mutex::new(None));
+                    if let Some(login) = row.and_then(|r| crate::detectors::twitch_login(&r.monitor.url)) {
+                        // Resolved off-thread: this is a Helix round trip and
+                        // the window opens on the UI thread.
+                        let slot = broadcaster_id.clone();
+                        let core = self.core.clone();
+                        self.core.rt.spawn(async move {
+                            let ctx = crate::detectors::DetectContext::new(
+                                core.store.clone(),
+                                core.events.clone(),
+                            );
+                            if let Some(id) = ctx.twitch_id_for_login(&login).await {
+                                *slot.lock().unwrap() = Some(id);
+                            }
+                        });
+                    }
+                    SendBar {
+                        draft: String::new(),
+                        limiter: Default::default(),
+                        broadcaster_id,
+                        status: Arc::new(Mutex::new(None)),
+                        sending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        pending: Vec::new(),
+                    }
+                })
+            },
             // Snapshotted at open: the rules change from Settings, which is a
             // human action, so reopening the window to pick them up is fine —
             // and this must not become a settings read per rendered row.
@@ -325,6 +362,120 @@ impl StreamArchiverApp {
                 // captured locals the wrapper reads back after the call returns.
                 let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
                 let mut usercard_click: Option<UserCardClick> = None;
+                // ── Send bar ─────────────────────────────────────────────
+                // Declared BEFORE the CentralPanel: panel order allocates the
+                // space, and the message list's ScrollArea has
+                // `auto_shrink([false, false])`, so a bar added afterwards
+                // would simply have no height left to occupy.
+                if popup.send.is_some() {
+                    egui::TopBottomPanel::bottom(egui::Id::new(("chat_send_bar", popup.monitor_id))).show(
+                        ctx,
+                        |ui| {
+                            let core = shared.core.clone();
+                            let Some(bar) = popup.send.as_mut() else { return };
+                            let now_ms = crate::models::now_unix() * 1000;
+                            let bid = bar.broadcaster_id.lock().unwrap().clone();
+                            let busy = bar.sending.load(std::sync::atomic::Ordering::Relaxed);
+                            let block = bar.limiter.check(&bar.draft, now_ms).err();
+                            let ready = bid.is_some() && !busy && block.is_none();
+
+                            ui.add_space(4.0);
+                            let mut submit = false;
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut bar.draft)
+                                        .hint_text("Send a message")
+                                        .desired_width(ui.available_width() - 90.0),
+                                );
+                                // Enter sends, then keeps focus so a
+                                // conversation doesn't need a click per line.
+                                if resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    submit = true;
+                                    resp.request_focus();
+                                }
+                                submit |= ui
+                                    .add_enabled(ready, egui::Button::new("Send"))
+                                    .on_disabled_hover_text(match (&bid, busy, &block) {
+                                        (None, ..) => {
+                                            "Still looking up this channel on Twitch.".to_string()
+                                        }
+                                        (_, true, _) => "Sending…".to_string(),
+                                        (_, _, Some(b)) => b.message(),
+                                        _ => String::new(),
+                                    })
+                                    .clicked();
+                            });
+                            // One status line: whatever is currently in the
+                            // way, else the last send's outcome.
+                            let n = bar.draft.chars().count();
+                            if n > crate::chat_send::MAX_MESSAGE_CHARS * 4 / 5 {
+                                ui.weak(format!("{n}/{}", crate::chat_send::MAX_MESSAGE_CHARS));
+                            }
+                            if let Some(b) = block.as_ref().filter(|b| {
+                                !matches!(b, crate::chat_send::SendBlock::Empty)
+                            }) {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(200, 150, 60),
+                                    b.message(),
+                                );
+                            } else if let Some(o) = bar.status.lock().unwrap().as_ref() {
+                                let c = if o.is_ok() {
+                                    ui.visuals().weak_text_color()
+                                } else {
+                                    egui::Color32::from_rgb(200, 80, 80)
+                                };
+                                ui.colored_label(c, o.message());
+                            }
+                            ui.add_space(2.0);
+
+                            if submit && ready
+                                && let Some(broadcaster_id) = bid
+                                && let Some(sender_id) =
+                                    crate::oauth::connected_user_id(&core.store)
+                            {
+                                let core = core.clone();
+                                let text = bar.draft.trim().to_string();
+                                bar.limiter.record(&text, now_ms);
+                                bar.draft.clear();
+                                // Optimistic row: the real round trip is IRC →
+                                // the logger's 2s flush → this window's 3s tail
+                                // poll, i.e. 2-5s of apparent silence.
+                                bar.pending.push((text.clone(), crate::models::now_unix()));
+                                bar.sending.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let (status, sending) = (bar.status.clone(), bar.sending.clone());
+                                let rt = core.rt.clone();
+                                rt.spawn(async move {
+                                    let http = reqwest::Client::new();
+                                    let outcome = match (
+                                        core.store.get_setting("twitch_client_id").ok().flatten(),
+                                        crate::oauth::valid_user_token(&http, &core.store).await,
+                                    ) {
+                                        (Some(cid), Some(tok)) if !cid.is_empty() => {
+                                            crate::chat_send::send_message(
+                                                &http,
+                                                &cid,
+                                                &tok,
+                                                &broadcaster_id,
+                                                &sender_id,
+                                                &text,
+                                            )
+                                            .await
+                                        }
+                                        _ => crate::chat_send::SendOutcome::Failed(
+                                            "No usable Twitch credentials — reconnect the \
+                                             account in Settings → Accounts."
+                                                .into(),
+                                        ),
+                                    };
+                                    *status.lock().unwrap() = Some(outcome);
+                                    sending.store(false, std::sync::atomic::Ordering::Relaxed);
+                                });
+                            }
+                        },
+                    );
+                }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // ── Toolbar ──────────────────────────────────────────────
                     ui.horizontal(|ui| {
@@ -1354,6 +1505,49 @@ impl StreamArchiverApp {
                                         // — redo with real heights next frame.
                                         ctx.request_repaint();
                                     }
+                                    // Optimistic rows for messages sent from
+                                    // this window that the sidecar hasn't
+                                    // returned yet. Drawn faded so they read
+                                    // as "on its way", not as archived.
+                                    if let Some(bar) = popup.send.as_ref() {
+                                        for (text, at) in &bar.pending {
+                                            let stale = crate::models::now_unix() - at
+                                                >= PENDING_TIMEOUT_SECS;
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                let dim =
+                                                    appearance.text_color.gamma_multiply(0.55);
+                                                ui_icon(
+                                                    ui,
+                                                    Some(&ui_tex),
+                                                    ICON_CLOCK,
+                                                    appearance.font_pt,
+                                                    dim,
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(text)
+                                                        .font(egui::FontId::new(
+                                                            appearance.font_pt,
+                                                            chat_family(),
+                                                        ))
+                                                        .color(dim),
+                                                );
+                                                if stale {
+                                                    // It can legitimately never
+                                                    // arrive: chat capture may
+                                                    // not be running for this
+                                                    // channel at all.
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "(sent — not captured in this log)",
+                                                        )
+                                                        .small()
+                                                        .weak(),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
                                 });
                         }
                     }
@@ -1534,6 +1728,34 @@ impl StreamArchiverApp {
             // indexed local query — naturally empty for a non-Twitch monitor
             // (those event kinds are only ever written by the Twitch chat
             // parser), so no separate platform check is needed here.
+            // A pending row is resolved once its own message comes back
+            // through the sidecar, or times out. Matched on the text of a
+            // message from OUR login — the sidecar carries no marker for
+            // "this one was sent from here", and an exact text match from the
+            // same account inside the timeout is as close as it gets.
+            if p.send.as_ref().is_some_and(|b| !b.pending.is_empty()) {
+                let mine = crate::oauth::connected_login(&self.core.store).unwrap_or_default();
+                let now = crate::models::now_unix();
+                // Read the log BEFORE borrowing the bar mutably — both hang
+                // off the same popup.
+                let recent: std::collections::HashSet<String> =
+                    match &*p.load_state.lock().unwrap() {
+                        ChatLoadState::Loaded(log) => log
+                            .messages
+                            .iter()
+                            .rev()
+                            .take(200)
+                            .filter(|m| !mine.is_empty() && m.login == mine)
+                            .map(|m| m.text.clone())
+                            .collect(),
+                        _ => Default::default(),
+                    };
+                if let Some(bar) = p.send.as_mut() {
+                    bar.pending.retain(|(text, at)| {
+                        !recent.contains(text) && now - at < PENDING_TIMEOUT_SECS * 2
+                    });
+                }
+            }
             p.stats = load_broadcast_stats(
                 &self.core.store,
                 p.monitor_id,

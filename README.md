@@ -3628,6 +3628,35 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**Sending messages.** A live Twitch take's chat window gets a **Send a
+message** bar at the bottom, via Twitch's supported `POST
+/helix/chat/messages` — the archival chat capture stays anonymous and
+read-only, untouched. Enter sends and keeps focus. The bar is **absent
+entirely** on archived takes and non-Twitch channels rather than sitting
+permanently disabled on every historical view.
+
+This needs the `user:write:chat` scope, and Twitch cannot widen an existing
+grant — **a Twitch account connected before this must be reconnected once**
+(*Settings → Accounts*) before the box appears. Everything else about the
+connection keeps working in the meantime.
+
+A local budget refuses a send before it leaves the app: 1.5 s between
+messages, 20 per rolling 30 s (Twitch's non-moderator allowance), over 500
+characters, or an exact repeat of your last message — Twitch drops repeats
+silently, which reads as the app being broken. Helix's structured reply is
+surfaced verbatim, so an AutoMod hold says so instead of vanishing. A sent
+message shows immediately as a faded pending row and resolves when the
+sidecar returns it; the real round trip is IRC → the logger's 2 s flush → the
+window's 3 s tail poll, so 2–5 s of otherwise unexplained silence. If chat
+capture isn't running for that channel the row can never resolve, so after 30
+seconds it says so plainly rather than fading forever.
+
+> **Unproven end-to-end, deliberately.** Every response branch — sent, AutoMod
+> hold, 401, 403, 429, malformed body — is unit-tested, and the rate policy is
+> a pure function tested without a network. But nothing in this repo has ever
+> posted to anyone's chat: no probe, no test. The first real send is yours, and
+> it may surface something only a live round trip can.
+
 **Be pingable.** *Settings → Interface → Chat highlights* has a **"Notify me
 when someone says my name"** switch — off by default, since it's the one
 setting that can make an unattended machine start talking to you — plus a list

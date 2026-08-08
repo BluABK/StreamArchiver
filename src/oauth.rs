@@ -33,10 +33,16 @@ pub const K_USER_ID: &str = "twitch_user_id";
 /// Scopes requested for the user token. `user:read:subscriptions` lets us check
 /// whether the connected account is subscribed to a broadcaster (ad-free
 /// detection); `user:read:follows` lets us list the account's followed channels
-/// (the "Import followed" feature). Detection (Get Streams) itself needs no scope,
-/// so accounts that connected before a scope was added keep working but must
-/// reconnect to grant it.
-const SCOPES: &str = "user:read:subscriptions user:read:follows";
+/// (the "Import followed" feature); `user:write:chat` lets the chat window send
+/// a message (see [`crate::chat_send`]). Detection (Get Streams) itself needs no
+/// scope, so accounts that connected before a scope was added keep working but
+/// must reconnect to grant it.
+///
+/// **Adding a scope invalidates every existing grant.** Twitch does not widen a
+/// token in place, so a connected account keeps working for what it already had
+/// and must reconnect to gain the new capability. Settings says so where the
+/// connection is shown.
+const SCOPES: &str = "user:read:subscriptions user:read:follows user:write:chat";
 
 /// Live state of an interactive connect flow (for the UI to render).
 #[derive(Clone, Debug)]
