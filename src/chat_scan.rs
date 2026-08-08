@@ -957,12 +957,17 @@ mod tests {
                 r#"{"ts":1700000000000,"login":"ann","name":"Ann","text":"hello","user_id":"42"}"#,
                 // A replay marker, not something anyone said.
                 r#"{"ts":1700000001000,"marker":"del","id":"abc"}"#,
+                // Likewise a sub/raid event row: it carries a `login`, a
+                // `name` AND a `text`, so nothing but the `marker` key stops
+                // it being indexed as if that person had typed Twitch's
+                // system message.
+                r#"{"ts":1700000001500,"marker":"event","kind":"sub","login":"cid","name":"Cid","text":"Cid subscribed!","body":""}"#,
                 // Pre-2026-08-05 line: no user_id at all.
                 r#"{"ts":1700000002000,"login":"Bob","name":"Bob","text":"hi"}"#,
             ],
         );
         let got = scan_twitch_sidecar(&p).unwrap();
-        assert_eq!(got.messages.len(), 2, "the marker line is not a message");
+        assert_eq!(got.messages.len(), 2, "marker lines are not messages");
         assert_eq!(got.messages[0].key.key, "42");
         assert!(!crate::chat_index::key_is_name_matched(&got.messages[0].key.key));
         // Milliseconds in the log, seconds in the index.

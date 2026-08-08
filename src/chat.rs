@@ -342,6 +342,24 @@ struct ChatLine<'a> {
     /// "Subscriber · N months" from this when present.
     #[serde(skip_serializing_if = "str::is_empty")]
     badge_info: &'a str,
+    /// Twitch `first-msg=1` — this account's first ever message in the
+    /// channel. The replay accents the row and tags it, the way Twitch's own
+    /// chat does. Omitted (and so absent from old logs) unless true.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    first: bool,
+    /// Twitch `custom-reward-id` — the channel-point reward this message was
+    /// sent through. Only redemptions that CARRY A MESSAGE reach IRC at all;
+    /// a reward with no message input (a "Hydrate!" style one) is PubSub-only
+    /// and can never appear here. IRC never names the reward either, so the
+    /// title comes from a separate lookup keyed on this id.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reward_id: &'a str,
+    /// Twitch's PRIVMSG `msg-id` tag — `highlighted-message` for Highlight My
+    /// Message (the one channel-point reward identifiable without a lookup),
+    /// `gigantified-emote-message`, and so on. Omitted when absent, which is
+    /// the overwhelming majority of messages.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    msg_kind: &'a str,
 }
 
 /// Capture `url`'s Twitch chat to `path` until `done` (recording ended) or
@@ -486,6 +504,13 @@ async fn session(
                         for m in mod_markers {
                             sink.push(&m);
                         }
+                        // Sub/raid/announcement/watch-streak rows for the
+                        // replay. Written alongside — not instead of — the DB
+                        // event above: the archive has to stand on its own,
+                        // exactly as the moderation markers already do.
+                        if let Some(m) = usernotice_marker(line) {
+                            sink.push(&m);
+                        }
                         if let Some(ev) = contribution {
                             // Sub/gift/bits contributions also feed the
                             // hype-train inference (burst -> one extra event
@@ -608,7 +633,10 @@ fn parse_privmsg(line: &str) -> Option<String> {
         mut source_room_id,
         mut user_id,
         mut badge_info,
-    ) = ("", "", "", "", "", "", 0i64, "", "", "");
+        mut reward_id,
+        mut msg_kind,
+    ) = ("", "", "", "", "", "", 0i64, "", "", "", "", "");
+    let mut first = false;
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -623,6 +651,9 @@ fn parse_privmsg(line: &str) -> Option<String> {
             "source-room-id" => source_room_id = v,
             "user-id" => user_id = v,
             "badge-info" => badge_info = v,
+            "first-msg" => first = v == "1",
+            "custom-reward-id" => reward_id = v,
+            "msg-id" => msg_kind = v,
             _ => {}
         }
     }
@@ -644,7 +675,73 @@ fn parse_privmsg(line: &str) -> Option<String> {
         source_room_id,
         user_id,
         badge_info,
+        first,
+        reward_id,
+        msg_kind,
     })
+    .ok()
+}
+
+/// A sidecar `{"marker":"event",…}` line for a USERNOTICE — sub, resub, gift,
+/// raid, announcement, watch-streak milestone — so the chat replay can show
+/// them the way Twitch's own chat does. `None` for anything else.
+///
+/// These already reach the DB as `stream_event` rows via [`parse_chat_event`],
+/// but that path feeds statistics; this one feeds the replay, and the two want
+/// different things (one wants a typed amount, the other wants a rendered
+/// line). Deliberately separate rather than one doing double duty.
+///
+/// **The headline is Twitch's own `system-msg` tag, verbatim.** It already
+/// reads "Bob subscribed at Tier 1. They've subscribed for 12 months!", with
+/// the right pluralisation, tier wording and localisation. Composing our own
+/// from the `msg-param-*` tags would be reinventing that, worse.
+fn usernotice_marker(line: &str) -> Option<String> {
+    let (tags, rest) = line.strip_prefix('@').and_then(|s| s.split_once(' '))?;
+    let after = rest.strip_prefix(':').and_then(|r| r.split_once(' ')).map(|(_, a)| a)?;
+    if !after.starts_with("USERNOTICE ") {
+        return None;
+    }
+    let (mut msg_id, mut login, mut display, mut system_msg, mut ts_ms) = ("", "", "", "", 0i64);
+    for kv in tags.split(';') {
+        let mut it = kv.splitn(2, '=');
+        let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+        match k {
+            "msg-id" => msg_id = v,
+            "login" => login = v,
+            "display-name" => display = v,
+            "system-msg" => system_msg = v,
+            "tmi-sent-ts" => ts_ms = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    // Only the kinds the replay renders. Everything else (raid cancels,
+    // rituals, charity, unraid…) stays a DB event only.
+    let kind = match msg_id {
+        "sub" | "resub" | "subgift" | "submysterygift" | "anonsubgift"
+        | "anonsubmysterygift" | "giftpaidupgrade" | "anongiftpaidupgrade" => "sub",
+        "raid" => "raid",
+        "announcement" => "announce",
+        "viewermilestone" => "watchstreak",
+        _ => return None,
+    };
+    let text = untag(system_msg);
+    if text.is_empty() {
+        // Nothing to render. Better no row than an empty one.
+        return None;
+    }
+    let name = untag(display);
+    // The user's own message, when they left one alongside the event (a resub
+    // message, an announcement body) — the replay draws it under the headline.
+    let body = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
+    serde_json::to_string(&serde_json::json!({
+        "marker": "event",
+        "kind": kind,
+        "ts": if ts_ms > 0 { ts_ms } else { crate::models::now_unix() * 1000 },
+        "login": login,
+        "name": if name.is_empty() { login } else { name.as_str() },
+        "text": text,
+        "body": body,
+    }))
     .ok()
 }
 
@@ -1140,6 +1237,96 @@ impl EventTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three new PRIVMSG tags reach the sidecar, and every one of them is
+    /// omitted when absent — an ordinary message must not grow three empty
+    /// fields, and an older reader must not meet keys it doesn't know.
+    #[test]
+    fn privmsg_carries_first_message_and_redemption_tags() {
+        let plain = parse_privmsg(
+            "@display-name=Bob;tmi-sent-ts=1700000000000 :bob!bob@bob.tmi.twitch.tv \
+             PRIVMSG #chan :hello",
+        )
+        .unwrap();
+        assert!(!plain.contains("first"), "no first-msg tag => key omitted: {plain}");
+        assert!(!plain.contains("reward_id"), "no reward => key omitted");
+        assert!(!plain.contains("msg_kind"), "no msg-id => key omitted");
+
+        let first = parse_privmsg(
+            "@display-name=Bob;first-msg=1;tmi-sent-ts=1700000000000 \
+             :bob!bob@bob.tmi.twitch.tv PRIVMSG #chan :hello",
+        )
+        .unwrap();
+        assert!(first.contains(r#""first":true"#), "{first}");
+
+        // A reward with a text prompt: IRC gives the id, never the title.
+        let redeem = parse_privmsg(
+            "@display-name=Bob;custom-reward-id=abc-123;tmi-sent-ts=1700000000000 \
+             :bob!bob@bob.tmi.twitch.tv PRIVMSG #chan :hello",
+        )
+        .unwrap();
+        assert!(redeem.contains(r#""reward_id":"abc-123""#), "{redeem}");
+
+        // Highlight My Message is the one reward identifiable without a lookup.
+        let hl = parse_privmsg(
+            "@display-name=Bob;msg-id=highlighted-message;tmi-sent-ts=1700000000000 \
+             :bob!bob@bob.tmi.twitch.tv PRIVMSG #chan :hello",
+        )
+        .unwrap();
+        assert!(hl.contains(r#""msg_kind":"highlighted-message""#), "{hl}");
+    }
+
+    /// The event marker carries Twitch's own rendered copy, unescaped.
+    /// Composing our own sentence from the msg-param tags would mean
+    /// reinventing its pluralisation, tier wording and localisation, worse.
+    #[test]
+    fn usernotice_marker_uses_twitchs_own_system_msg() {
+        let m = usernotice_marker(
+            "@msg-id=resub;login=bob;display-name=Bob;tmi-sent-ts=1700000000000;\
+system-msg=Bob\\ssubscribed\\sat\\sTier\\s1.\\sThey've\\ssubscribed\\sfor\\s12\\smonths! \
+:tmi.twitch.tv USERNOTICE #chan :still here!",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v["marker"], "event");
+        assert_eq!(v["kind"], "sub");
+        assert_eq!(v["name"], "Bob");
+        assert_eq!(v["text"], "Bob subscribed at Tier 1. They've subscribed for 12 months!");
+        // The user's own resub message rides along under the headline.
+        assert_eq!(v["body"], "still here!");
+        assert_eq!(v["ts"], 1_700_000_000_000i64);
+    }
+
+    #[test]
+    fn usernotice_marker_maps_kinds_and_ignores_the_rest() {
+        let mk = |msg_id: &str| {
+            usernotice_marker(&format!(
+                "@msg-id={msg_id};login=bob;system-msg=something\\shappened \
+                 :tmi.twitch.tv USERNOTICE #chan"
+            ))
+            .map(|m| {
+                serde_json::from_str::<serde_json::Value>(&m).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+        };
+        for id in ["sub", "resub", "subgift", "submysterygift", "anonsubgift"] {
+            assert_eq!(mk(id).as_deref(), Some("sub"), "{id}");
+        }
+        assert_eq!(mk("raid").as_deref(), Some("raid"));
+        assert_eq!(mk("announcement").as_deref(), Some("announce"));
+        assert_eq!(mk("viewermilestone").as_deref(), Some("watchstreak"));
+        // Kinds the replay doesn't render stay DB-only.
+        assert_eq!(mk("unraid"), None);
+        assert_eq!(mk("ritual"), None);
+        // A PRIVMSG is not a USERNOTICE.
+        assert!(usernotice_marker(":bob!b@b PRIVMSG #chan :hi").is_none());
+        // No system-msg to show => no row at all, rather than an empty one.
+        assert!(
+            usernotice_marker("@msg-id=resub;login=bob :tmi.twitch.tv USERNOTICE #chan").is_none()
+        );
+    }
 
     /// ALL `set_chat_root` calls in the test suite live in this ONE function:
     /// `CHAT_ROOT` is process-global and tests run in parallel, so a second

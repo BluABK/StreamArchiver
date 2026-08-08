@@ -88,11 +88,6 @@ pub(in crate::ui) fn fmt_chat_ts_mode(msg: &ChatMessage, mode: ChatTsMode) -> (S
 /// Twitch renders each of these with its own coloured left accent, and so do
 /// we — see [`row_decor`]. `System` is the pre-existing muted notice line;
 /// the rest arrive once the sidecar records them.
-// Only `System` has a constructor so far: everything else needs the sidecar to
-// record `first-msg`, `custom-reward-id` and USERNOTICE lines, which is the
-// next change. Rendering and colouring land first so that one is purely a
-// capture-side change with the display already tested.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::ui) enum ChatNotice {
     /// Moderation/room event captured live (mode change, timeout, clear).
@@ -111,6 +106,21 @@ pub(in crate::ui) enum ChatNotice {
     Announce { system_msg: String },
     /// A viewer-milestone watch streak.
     WatchStreak { system_msg: String },
+}
+
+impl ChatNotice {
+    /// Build an event notice from a sidecar `{"marker":"event"}` line's
+    /// `kind`. `None` for an unrecognised kind — a newer build's marker read
+    /// by an older one degrades to nothing rather than a mislabelled row.
+    pub(in crate::ui) fn from_event_kind(kind: &str, system_msg: String) -> Option<ChatNotice> {
+        Some(match kind {
+            "sub" => ChatNotice::Sub { system_msg },
+            "raid" => ChatNotice::Raid { system_msg },
+            "announce" => ChatNotice::Announce { system_msg },
+            "watchstreak" => ChatNotice::WatchStreak { system_msg },
+            _ => return None,
+        })
+    }
 }
 
 /// Twitch's own rendered copy for an event row, when the notice is one that

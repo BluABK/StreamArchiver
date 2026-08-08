@@ -3638,6 +3638,19 @@ click at all. Either way the timestamp stays monospace so the column lines up.
 Logs recorded before this existed carry no absolute time and always show the
 relative form.
 
+The events behind those rows are recorded by the chat logger itself, so a
+sidecar stands on its own: the `first-msg` tag, the `custom-reward-id` a
+channel-point message carries, and one `{"marker":"event"}` line per
+USERNOTICE. Old logs simply have none of it and render exactly as before, and
+an older build reading a newer log ignores what it doesn't recognise —
+compatibility in both directions comes free from the marker parser's `_ =>
+None`. **Two limits are structural, not oversights:** a channel-point reward
+with *no message input* ("Hydrate!") never touches IRC at all — it's PubSub,
+which needs the broadcaster's own token — so only redemptions carrying a
+message can ever appear; and IRC never names the reward, only its id, so a
+redemption reads as "a channel-point reward" until the title lookup resolves
+it (*Highlight My Message* is the exception, which Twitch identifies directly).
+
 **Rows are decorated the way Twitch decorates them** — a coloured 3px bar down
 the left edge plus a matching tint: purple for a **first message** in the
 channel (with a `FIRST MESSAGE` tag) and for **channel-point redemptions**,

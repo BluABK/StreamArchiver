@@ -791,6 +791,29 @@ pub(in crate::ui) fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Opti
             let text = v["text"].as_str().unwrap_or("").to_string();
             (!text.is_empty()).then(|| (None, Some(notice(text))))
         }
+        // Sub / raid / announcement / watch-streak. `text` is Twitch's own
+        // rendered `system-msg`; `body` is the user's own message when they
+        // left one alongside it.
+        "event" => {
+            let headline = v["text"].as_str().unwrap_or("").to_string();
+            if headline.is_empty() {
+                return None;
+            }
+            let body = v["body"].as_str().unwrap_or("").to_string();
+            let n = ChatNotice::from_event_kind(v["kind"].as_str().unwrap_or(""), headline)?;
+            let author = v["name"].as_str().unwrap_or("").to_string();
+            let mut m = notice(body.clone());
+            m.notice = Some(Box::new(n));
+            // NOT `system`: these get a coloured accent and an author, unlike
+            // the muted ℹ room-event line, and `apply_markers` skips system
+            // rows (a sub notice can legitimately be struck by a moderator).
+            m.system = false;
+            m.author = author;
+            m.login = v["login"].as_str().unwrap_or("").to_lowercase();
+            m.segments =
+                if body.is_empty() { Vec::new() } else { vec![ChatSegment::Text(body)] };
+            Some((None, Some(m)))
+        }
         _ => None,
     }
 }
@@ -856,12 +879,37 @@ pub(in crate::ui) fn parse_twitch_chat_line(
     } else {
         source_partners.get(source_room_id).map(|p| p.name.clone()).unwrap_or_default()
     };
+    // A message can be both a first message and a redemption; the redemption
+    // is the more specific fact and carries its own header line, so it wins.
+    // Absent from every log written before these fields existed, which simply
+    // means no accent — exactly as before.
+    let reward_id = v["reward_id"].as_str().unwrap_or("");
+    let notice = if !reward_id.is_empty() {
+        Some(Box::new(ChatNotice::Redemption {
+            // IRC never names the reward; the title is resolved separately.
+            reward: None,
+            reward_id: reward_id.to_string(),
+            cost: None,
+        }))
+    } else if v["msg_kind"].as_str() == Some("highlighted-message") {
+        // The one reward identifiable without a lookup: Twitch gives it its
+        // own msg-id rather than a custom-reward-id.
+        Some(Box::new(ChatNotice::Redemption {
+            reward: Some("Highlight My Message".to_string()),
+            reward_id: String::new(),
+            cost: None,
+        }))
+    } else if v["first"].as_bool().unwrap_or(false) {
+        Some(Box::new(ChatNotice::FirstMessage))
+    } else {
+        None
+    };
     Some(ChatMessage {
         timestamp_secs: (ts_ms - start_ms) / 1000.0,
         // The sidecar's `ts` is unix milliseconds; `start_ms` only converts it
         // to a stream-relative offset.
         ts_unix_ms: ts_ms,
-        notice: None,
+        notice,
         author,
         text,
         segments,

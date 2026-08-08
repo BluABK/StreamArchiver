@@ -1011,6 +1011,96 @@ mod tests {
         assert_eq!(log.messages[1].deleted, None);
     }
 
+    /// The new PRIVMSG fields become notices; a log written before they
+    /// existed simply has none, which is the whole backward-compatibility
+    /// story. Redemption beats first-message when a line is both: it's the
+    /// more specific fact and it carries its own header line.
+    #[test]
+    fn sidecar_notice_fields_round_trip_and_old_lines_stay_plain() {
+        let parse = |line: &str| {
+            let mut fetches = Vec::new();
+            parse_twitch_chat_line(
+                line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false,
+                &mut fetches, &HashMap::new(), &empty_badge_dirs(),
+            )
+            .expect("line parses")
+        };
+        let base = r#""ts":1700000000000,"login":"bob","name":"Bob","text":"hi""#;
+
+        assert_eq!(parse(&format!("{{{base}}}")).notice, None, "an old line has no notice");
+
+        assert_eq!(
+            parse(&format!(r#"{{{base},"first":true}}"#)).notice.as_deref(),
+            Some(&ChatNotice::FirstMessage)
+        );
+
+        assert_eq!(
+            parse(&format!(r#"{{{base},"reward_id":"abc-123"}}"#)).notice.as_deref(),
+            Some(&ChatNotice::Redemption {
+                reward: None,
+                reward_id: "abc-123".into(),
+                cost: None
+            })
+        );
+
+        // Highlight My Message names itself; no lookup needed.
+        assert_eq!(
+            parse(&format!(r#"{{{base},"msg_kind":"highlighted-message"}}"#)).notice.as_deref(),
+            Some(&ChatNotice::Redemption {
+                reward: Some("Highlight My Message".into()),
+                reward_id: String::new(),
+                cost: None
+            })
+        );
+
+        // Both at once: the redemption wins.
+        let both = parse(&format!(r#"{{{base},"first":true,"reward_id":"abc"}}"#));
+        assert!(matches!(both.notice.as_deref(), Some(ChatNotice::Redemption { .. })));
+
+        // Absolute time is preserved for the wall-clock timestamp mode.
+        assert_eq!(parse(&format!("{{{base}}}")).ts_unix_ms, 1_700_000_000_000.0);
+    }
+
+    /// An `event` marker becomes a rendered row carrying Twitch's own copy —
+    /// and an unknown kind (a newer build's marker read by an older one)
+    /// degrades to nothing rather than a mislabelled row.
+    #[test]
+    fn event_markers_render_as_notice_rows() {
+        let parse = |line: &str| parse_twitch_marker_line(line, 1_700_000_000_000.0);
+
+        let (marker, msg) = parse(
+            r#"{"marker":"event","kind":"sub","ts":1700000060000,"login":"bob","name":"Bob",
+                "text":"Bob subscribed at Tier 1.","body":"still here!"}"#,
+        )
+        .expect("event parses");
+        assert!(marker.is_none(), "an event strikes nothing");
+        let m = msg.expect("event produces a row");
+        assert_eq!(
+            m.notice.as_deref(),
+            Some(&ChatNotice::Sub { system_msg: "Bob subscribed at Tier 1.".into() })
+        );
+        assert_eq!(m.author, "Bob");
+        assert_eq!(m.login, "bob");
+        assert_eq!(m.text, "still here!", "the user's own message rides under the headline");
+        assert_eq!(m.timestamp_secs, 60.0);
+        // NOT a system row: `apply_markers` skips those, and a sub notice can
+        // legitimately be struck by a moderator.
+        assert!(!m.system);
+
+        // A raid with no message of its own is just the headline.
+        let (_, msg) = parse(
+            r#"{"marker":"event","kind":"raid","ts":1700000000000,"name":"Ann","text":"Ann raided"}"#,
+        )
+        .unwrap();
+        let m = msg.unwrap();
+        assert!(m.text.is_empty() && m.segments.is_empty());
+        assert_eq!(notice_headline(m.notice.as_deref().unwrap()), Some("Ann raided"));
+
+        // Unknown kind, and an empty headline: neither produces a row.
+        assert!(parse(r#"{"marker":"event","kind":"newthing","ts":1,"text":"x"}"#).is_none());
+        assert!(parse(r#"{"marker":"event","kind":"sub","ts":1,"text":""}"#).is_none());
+    }
+
     #[test]
     fn old_sidecar_lines_without_id_still_parse() {
         // Pre-v60 lines have no `id`/`login`-marker fields; they must load
