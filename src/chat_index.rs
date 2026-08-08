@@ -1052,6 +1052,20 @@ static SHARED: std::sync::OnceLock<Option<Arc<ChatIndex>>> = std::sync::OnceLock
 /// A failure here is never fatal: the index is an accelerator, and everything
 /// that reads it degrades to "not indexed yet" rather than breaking.
 pub fn shared() -> Option<&'static Arc<ChatIndex>> {
+    // Never under test. `Store::delete_recording` calls this, and store tests
+    // run against in-memory stores but would still reach a *real* index file
+    // here — opening it, migrating it, and calling `forget_take` with whatever
+    // small recording id the test invented, against the user's live data.
+    // (Seen for real: a `cargo test` run silently applied the v2 migration to a
+    // 909 MB production index, which then made the app's own startup log say
+    // nothing about a migration it never had to do.) An in-memory default
+    // would be worse than nothing — it would make the tests look like they
+    // exercise the index when they don't.
+    #[cfg(test)]
+    {
+        return None;
+    }
+    #[cfg(not(test))]
     SHARED
         .get_or_init(|| {
             let path = index_path();
@@ -1347,6 +1361,19 @@ mod tests {
         // Rebuild must not leave a stale readout sitting there.
         idx.clear().unwrap();
         assert_eq!(idx.health().unwrap().messages, 0);
+    }
+
+
+    /// Store tests run against in-memory stores, but `delete_recording` reaches
+    /// for the shared index — which is a real file in the user's data
+    /// directory. It must be inert here, or `cargo test` mutates production
+    /// data (it did: a test run migrated a live 909 MB index).
+    #[test]
+    fn the_shared_index_is_never_reachable_from_tests() {
+        assert!(super::shared().is_none());
+        // ...and the path it would have used is a real one, so this is not
+        // passing by accident of an unset environment.
+        assert!(index_path().to_string_lossy().ends_with("chat_index.sqlite3"));
     }
 
     #[test]
