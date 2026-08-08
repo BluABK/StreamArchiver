@@ -741,6 +741,7 @@ impl StreamArchiverApp {
             users_text_labels: HashMap::new(),
             users_takes_total: 0,
             users_error: None,
+            bg_index_stats: None,
             users_scan_channel: None,
             users_scan_count: 10,
             users_scan_running: false,

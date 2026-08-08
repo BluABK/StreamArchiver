@@ -3740,6 +3740,13 @@ reading every chat sidecar on disk — gigabytes.
 - The header line says how many chat logs are still to read. Until that reaches
   zero, an empty result is **not** proof of absence — and it says so.
 
+**Watching it work.** The **🎛 Background** tab carries a **👤 Chat index** row
+with a live progress bar (`read/total`), the chatter and message counts, size on
+disk, how many chat logs were missing, and how many legacy names are still to
+resolve — plus **⏩** to finish the backlog at full speed and a shortcut into the
+Users tab. It's the same picture the Users header and Settings show, in the place
+where the app's other background jobs live.
+
 **What it costs.** Measured over 377 real chat logs (743 MB, 1.8M messages): the
 index came to **0.30 MB per MB of chat log** — so an archive with 2.7 GB of chat
 sidecars produces roughly **800 MB** of index — and read them at **~21 MB/s**,

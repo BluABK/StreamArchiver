@@ -1976,6 +1976,11 @@ pub struct StreamArchiverApp {
     users_takes_total: i64,
     /// Last thing that went wrong in the view, shown inline and dismissable.
     users_error: Option<String>,
+    /// Cached chat-index counters for the Background tab: `(health, candidate
+    /// count, when read)`. The Background view repaints continuously and these
+    /// numbers only move once a minute — querying them per frame would put a
+    /// database read on the render path.
+    bg_index_stats: Option<(crate::chat_index::IndexHealth, i64, std::time::Instant)>,
     /// Channel picked for the on-demand "index this channel's chat logs" scan.
     users_scan_channel: Option<i64>,
     /// How many of that channel's most recent chat logs that scan reads.

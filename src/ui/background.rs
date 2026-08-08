@@ -214,6 +214,14 @@ impl StreamArchiverApp {
 
             ui.add_space(12.0);
 
+            // ── Chat index (background sidecar sweep) ────────────────────
+            // A background job with a finite, draining backlog: the one thing
+            // here that genuinely has "progress", so it gets a real bar rather
+            // than a status word.
+            self.background_chat_index(ui);
+
+            ui.add_space(12.0);
+
             // ── YouTube WebSub relay (headless VPS — we only poll it) ─────
             {
                 let st = crate::websub::status();
@@ -1837,7 +1845,115 @@ impl StreamArchiverApp {
                 }
             });
     }
+
+    /// Chat-index progress: how much of the chat-log backlog has been read.
+    ///
+    /// Counting rows and scanning the candidate list on every frame would be a
+    /// database query on the render path — the exact shape of the unindexed
+    /// `raid_out` query that once froze the UI thread. The numbers only move
+    /// once a minute, so they are cached for [`INDEX_STAT_REFRESH`] and the
+    /// panel repaints from the snapshot.
+    fn background_chat_index(&mut self, ui: &mut egui::Ui) {
+        let stale = self
+            .bg_index_stats
+            .as_ref()
+            .is_none_or(|(_, _, at)| at.elapsed() >= INDEX_STAT_REFRESH);
+        if stale && let Some(idx) = crate::chat_index::shared() {
+            let total = self.core.store.chat_index_candidates().map(|v| v.len() as i64).unwrap_or(0);
+            if let Ok(h) = idx.health() {
+                self.bg_index_stats = Some((h, total, std::time::Instant::now()));
+            }
+        }
+        let Some((h, total, _)) = &self.bg_index_stats else { return };
+        let (h, total) = (h.clone(), *total);
+        let enabled = crate::chat_scan::index_enabled(&self.core.store);
+        let done = h.takes_indexed + h.takes_failed;
+        let remaining = total.saturating_sub(done);
+
+        ui.horizontal(|ui| {
+            ui.strong("👤 Chat index:").on_hover_text(
+                "Reads finished chat logs in the background — who chatted in which stream, \
+                 and a full-text index of every message — behind the Users tab. Runs a few \
+                 logs a minute, always behind any capture using the same drive, and never \
+                 while a stream is still being written to. Configure under \
+                 Settings → System → Chat index.",
+            );
+            let (txt, color) = if !enabled {
+                ("switched off".to_string(), egui::Color32::GRAY)
+            } else if total == 0 {
+                ("no chat logs to read".to_string(), egui::Color32::GRAY)
+            } else if remaining > 0 {
+                (
+                    format!("reading — {remaining} chat log(s) to go"),
+                    egui::Color32::from_rgb(0xd9, 0xa4, 0x06),
+                )
+            } else {
+                ("up to date".to_string(), egui::Color32::from_rgb(0x39, 0xb0, 0x54))
+            };
+            ui.colored_label(color, txt);
+            if enabled && remaining > 0 {
+                let frac = done as f32 / total.max(1) as f32;
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(160.0)
+                        .text(format!("{done}/{total}")),
+                )
+                .on_hover_text(
+                    "Chat logs read so far, out of every finished take that has one. Until \
+                     this completes, a chatter can be missing streams they were really in — \
+                     the Users tab says so rather than letting a partial index read as an \
+                     empty archive.",
+                );
+                if ui
+                    .small_button("⏩")
+                    .on_hover_text(
+                        "Read the rest at full speed instead of a few a minute. Still yields \
+                         to any capture using the same drive.",
+                    )
+                    .clicked()
+                {
+                    self.settings.chat_index_batch = crate::chat_scan::INDEX_BATCH_MAX.to_string();
+                    let ctx = ui.ctx().clone();
+                    self.save_settings(&ctx);
+                    self.status = "Chat indexing set to full speed.".to_string();
+                }
+            }
+            if ui
+                .small_button("👤 Users")
+                .on_hover_text("Open the Users tab and look a chatter up")
+                .clicked()
+            {
+                self.view = View::Users;
+            }
+        });
+        if enabled && total > 0 {
+            let mut line = format!(
+                "{} chatters · {} messages · {}",
+                h.users,
+                h.messages,
+                fmt_bytes(h.bytes_on_disk as i64)
+            );
+            if h.takes_failed > 0 {
+                line.push_str(&format!(" · {} chat log(s) missing", h.takes_failed));
+            }
+            if h.unresolved_logins > 0 {
+                line.push_str(&format!(" · {} legacy name(s) to resolve", h.unresolved_logins));
+            }
+            ui.label(egui::RichText::new(line).small().weak()).on_hover_text(
+                "The index lives in its own database file and is rebuildable from the chat \
+                 logs, so it is never backed up and can be deleted at any time. Missing chat \
+                 logs are takes whose sidecar is gone from disk — stamped so the queue can \
+                 drain. Legacy names are pre-2026-08-05 Twitch chatters, who carry no account \
+                 id and are folded into real accounts as they resolve.",
+            );
+        }
+    }
 }
+
+/// How long the Background tab's chat-index counters are reused before being
+/// re-queried. The sweep only moves them once a minute; anything faster would
+/// be paying database queries for a number that hasn't changed.
+const INDEX_STAT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Plot/legend color for a traffic class. Chosen to read as distinct lines on
 /// both light and dark backgrounds, and reused for the swatches in the live
