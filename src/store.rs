@@ -146,7 +146,7 @@ mod migrations;
 mod monitors;
 mod posts;
 mod recordings;
-pub use recordings::EarlierTakeRow;
+pub use recordings::{ChatIndexTarget, EarlierTakeRow, TakeLabel};
 mod recording_groups;
 mod scheduled;
 mod stats_history;
@@ -279,11 +279,20 @@ pub struct RecInfo {
     pub output_path: String,
 }
 
-/// Live + recent diagnostics for the app-wide DB connection lock — feeds the
-/// "slow DB lock" warnings (naming the holder a waiter was blocked behind)
-/// and the I/O tab's Database panel. Global on purpose: the app has one
-/// on-disk Store. In-memory test stores report into the same slots, which
-/// only matters to tests that would assert on the shared state (none do).
+/// Live + recent diagnostics for a SQLite connection lock — feeds the "slow DB
+/// lock" warnings (naming the holder a waiter was blocked behind) and the I/O
+/// tab's Database panel.
+///
+/// One [`LockDiag`] per connection, not one per process: the app now holds two
+/// independent databases — the operational store ([`MAIN`]) and the rebuildable
+/// chat index ([`CHAT_INDEX`], `crate::chat_index`) — and the whole point of
+/// giving the index its own file is that its multi-hundred-millisecond
+/// full-text writes cannot block the UI's store queries. Merging their
+/// diagnostics into one set of counters would hide exactly the thing worth
+/// watching, so each lane is labelled and reported separately.
+///
+/// In-memory test stores report into [`MAIN`]'s slots, which only matters to
+/// tests that would assert on the shared state (none do).
 pub mod db_lock {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -291,14 +300,14 @@ pub mod db_lock {
 
     /// One party at the lock: which thread, from which store call site, since when.
     #[derive(Clone)]
-    pub(super) struct Entry {
+    pub struct Entry {
         pub(super) thread: String,
         pub(super) file: &'static str,
         pub(super) line: u32,
         pub(super) since: Instant,
         /// Tags which acquisition wrote this entry, so the outgoing holder's
         /// `Drop` can compare-and-clear instead of blindly overwriting —
-        /// see `HOLDER_TOKEN` below.
+        /// see `LockDiag::holder_token` below.
         pub(super) token: u64,
     }
 
@@ -308,19 +317,12 @@ pub mod db_lock {
         }
     }
 
-    pub(super) static HOLDER: parking_lot::Mutex<Option<Entry>> = parking_lot::Mutex::new(None);
-    pub(super) static WAITERS: parking_lot::Mutex<Vec<(u64, Entry)>> =
-        parking_lot::Mutex::new(Vec::new());
-    pub(super) static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-    /// Separate id space from `NEXT_TOKEN` (that one orders the WAITERS
-    /// queue) — mints a unique id per successful acquisition so the outgoing
-    /// holder can tell "is HOLDER still mine?" before clearing it.
-    pub(super) static HOLDER_TOKEN: AtomicU64 = AtomicU64::new(1);
-    pub(super) static SLOW_WAITS: AtomicU64 = AtomicU64::new(0);
-    pub(super) static LONG_HOLDS: AtomicU64 = AtomicU64::new(0);
-    pub(super) static SLOW_EVENTS: parking_lot::Mutex<VecDeque<SlowEvent>> =
-        parking_lot::Mutex::new(VecDeque::new());
     const SLOW_EVENTS_CAP: usize = 64;
+    /// A waiter blocked this long (ms) is worth a warning and a counter.
+    const SLOW_WAIT_MS: u128 = 50;
+    /// A holder keeping the lock this long (ms) is worth a warning — long
+    /// enough that a UI frame would notice.
+    const LONG_HOLD_MS: u128 = 200;
 
     /// One recent contention incident (a ≥50 ms wait or a ≥200 ms hold).
     #[derive(Clone)]
@@ -338,6 +340,8 @@ pub mod db_lock {
     /// Point-in-time picture for the I/O tab's Database panel.
     #[derive(Clone, Default)]
     pub struct Snap {
+        /// Which connection this describes ("database" / "chat index").
+        pub label: &'static str,
         /// `(thread, call site, seconds held)` of the current holder.
         pub holder: Option<(String, String, f64)>,
         /// `(thread, call site, seconds waiting)` per waiter, queue order.
@@ -348,35 +352,97 @@ pub mod db_lock {
         pub recent: Vec<SlowEvent>,
     }
 
-    pub fn snapshot() -> Snap {
-        let holder = HOLDER
-            .lock()
-            .as_ref()
-            .map(|e| (e.thread.clone(), e.call_site(), e.since.elapsed().as_secs_f64()));
-        let waiters = WAITERS
-            .lock()
-            .iter()
-            .map(|(_, e)| (e.thread.clone(), e.call_site(), e.since.elapsed().as_secs_f64()))
-            .collect();
-        Snap {
-            holder,
-            waiters,
-            slow_waits: SLOW_WAITS.load(Ordering::Relaxed),
-            long_holds: LONG_HOLDS.load(Ordering::Relaxed),
-            recent: SLOW_EVENTS.lock().iter().rev().cloned().collect(),
+    /// The diagnostics for one connection lock.
+    pub struct LockDiag {
+        /// Human name of this connection, used in log lines and the I/O tab.
+        pub label: &'static str,
+        /// Log-line prefix, so `store:` and `chat index:` warnings are
+        /// greppable apart.
+        pub log_prefix: &'static str,
+        /// Which I/O-monitor category this lock's hold time is charged to.
+        pub cat: crate::iomon::Cat,
+        holder: parking_lot::Mutex<Option<Entry>>,
+        waiters: parking_lot::Mutex<Vec<(u64, Entry)>>,
+        /// Orders the `waiters` queue.
+        next_token: AtomicU64,
+        /// Separate id space from `next_token` — mints a unique id per
+        /// successful acquisition so the outgoing holder can tell "is the
+        /// holder slot still mine?" before clearing it.
+        holder_token: AtomicU64,
+        slow_waits: AtomicU64,
+        long_holds: AtomicU64,
+        slow_events: parking_lot::Mutex<VecDeque<SlowEvent>>,
+    }
+
+    impl LockDiag {
+        pub const fn new(
+            label: &'static str,
+            log_prefix: &'static str,
+            cat: crate::iomon::Cat,
+        ) -> LockDiag {
+            LockDiag {
+                label,
+                log_prefix,
+                cat,
+                holder: parking_lot::Mutex::new(None),
+                waiters: parking_lot::Mutex::new(Vec::new()),
+                next_token: AtomicU64::new(1),
+                holder_token: AtomicU64::new(1),
+                slow_waits: AtomicU64::new(0),
+                long_holds: AtomicU64::new(0),
+                slow_events: parking_lot::Mutex::new(VecDeque::new()),
+            }
+        }
+
+        pub fn snapshot(&self) -> Snap {
+            let holder = self
+                .holder
+                .lock()
+                .as_ref()
+                .map(|e| (e.thread.clone(), e.call_site(), e.since.elapsed().as_secs_f64()));
+            let waiters = self
+                .waiters
+                .lock()
+                .iter()
+                .map(|(_, e)| (e.thread.clone(), e.call_site(), e.since.elapsed().as_secs_f64()))
+                .collect();
+            Snap {
+                label: self.label,
+                holder,
+                waiters,
+                slow_waits: self.slow_waits.load(Ordering::Relaxed),
+                long_holds: self.long_holds.load(Ordering::Relaxed),
+                recent: self.slow_events.lock().iter().rev().cloned().collect(),
+            }
+        }
+
+        fn push_event(&self, ev: SlowEvent) {
+            let mut q = self.slow_events.lock();
+            if q.len() >= SLOW_EVENTS_CAP {
+                q.pop_front();
+            }
+            q.push_back(ev);
         }
     }
+
+    /// The operational database (`streamarchiver.sqlite3`) — [`super::Store`].
+    pub static MAIN: LockDiag = LockDiag::new("database", "store", crate::iomon::Cat::Db);
+    /// The rebuildable chat index (`chat_index.sqlite3`) —
+    /// [`crate::chat_index::ChatIndex`]. Separate file, separate lock, so a
+    /// long full-text write never shows up as store contention.
+    pub static CHAT_INDEX: LockDiag =
+        LockDiag::new("chat index", "chat index", crate::iomon::Cat::ChatIndexDb);
 
     /// Remove `*slot` iff it's still tagged with `token` — a plain
     /// unconditional clear would risk wiping a fresh entry written by
     /// another thread that raced in and acquired the lock between the real
     /// unlock and this call. A no-op when someone else already holds it.
-    /// Generic over the mutex (rather than hardwired to `HOLDER`) so it's
+    /// Generic over the mutex (rather than hardwired to one `LockDiag`) so it's
     /// independently unit-testable against a throwaway local instance — the
-    /// process-wide `HOLDER` static is shared by every test in the binary
-    /// (each `Store::open_in_memory()` still goes through the real `db()`),
-    /// so asserting on it directly would be racy under `cargo test`'s
-    /// parallel runner.
+    /// process-wide statics are shared by every test in the binary (each
+    /// `Store::open_in_memory()` still goes through the real `db()`), so
+    /// asserting on them directly would be racy under `cargo test`'s parallel
+    /// runner.
     pub(super) fn clear_holder_if_matches_in(slot: &parking_lot::Mutex<Option<Entry>>, token: u64) {
         let mut h = slot.lock();
         if h.as_ref().is_some_and(|e| e.token == token) {
@@ -384,114 +450,220 @@ pub mod db_lock {
         }
     }
 
-    pub(super) fn clear_holder_if_matches(token: u64) {
-        clear_holder_if_matches_in(&HOLDER, token)
-    }
-
-    pub(super) fn push_event(ev: SlowEvent) {
-        let mut q = SLOW_EVENTS.lock();
-        if q.len() >= SLOW_EVENTS_CAP {
-            q.pop_front();
-        }
-        q.push_back(ev);
-    }
-
     pub(super) fn thread_name() -> String {
         std::thread::current().name().unwrap_or("?").to_string()
     }
-}
 
-/// RAII guard returned by [`Store::db`]. Logs a warning when the lock is held
-/// longer than 200 ms, showing the call-site that acquired it — useful for
-/// identifying which store method is the bottleneck.
-///
-/// `inner` is an `Option` solely so `Drop` can release the real mutex as its
-/// very first action (`self.inner.take()`) — before any of the bookkeeping/
-/// logging below, which is not instant (tracing dispatch, a locked VecDeque
-/// push). It is `Some` for the guard's entire externally-visible lifetime;
-/// only `Drop::drop` ever sees it `None`.
-struct DbGuard<'a> {
-    inner: Option<parking_lot::FairMutexGuard<'a, Connection>>,
-    acquired_at: std::time::Instant,
-    caller: &'static std::panic::Location<'static>,
-    /// This guard's `db_lock::HOLDER_TOKEN` — lets `Drop` compare-and-clear.
-    token: u64,
-}
-
-impl std::ops::Deref for DbGuard<'_> {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.inner.as_deref().expect("DbGuard.inner is only None mid-drop")
-    }
-}
-
-impl std::ops::DerefMut for DbGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Connection {
-        self.inner.as_deref_mut().expect("DbGuard.inner is only None mid-drop")
-    }
-}
-
-impl Drop for DbGuard<'_> {
-    fn drop(&mut self) {
-        // Release the REAL lock first, before any bookkeeping/logging below
-        // (which is not instant: tracing dispatch, a locked VecDeque push for
-        // a long hold). Waiters unblock immediately instead of waiting out
-        // our logging too, and — the point of doing this here rather than
-        // letting the field drop naturally after this function returns — it
-        // closes a holder-attribution race: the old ordering cleared HOLDER
-        // to None *before* actually unlocking, so a waiter whose try_lock()
-        // genuinely failed (we still held the real mutex) could read HOLDER
-        // as already-empty and misattribute its wait to "<holder unknown>"
-        // (see [[db-lock-holder-unknown]] — this is that bug's sibling on
-        // the release side rather than the acquire side).
-        drop(self.inner.take());
-
-        // Count every DB access (ops + cumulative hold time) at the single
-        // chokepoint all queries pass through; byte-level growth is sampled
-        // from the db/WAL file sizes by the I/O monitor instead.
-        crate::iomon::record_region(
-            crate::iomon::Cat::Db,
-            crate::iomon::Region::AppData,
-            crate::iomon::OpKind::Meta,
-            0,
-            self.acquired_at.elapsed(),
-            true,
-        );
-        // Compare-and-clear: only remove OUR entry. Between the unlock above
-        // and this line, another thread may already have acquired the real
-        // mutex and written its own HOLDER entry — a blind overwrite here
-        // would wipe that fresh, correct entry back to "no one" while they
-        // still hold it.
-        db_lock::clear_holder_if_matches(self.token);
-        let ms = self.acquired_at.elapsed().as_millis();
-        if ms >= 200 {
-            db_lock::LONG_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let thread = db_lock::thread_name();
-            tracing::warn!(
-                hold_ms = ms,
-                thread = thread.as_str(),
-                file = self.caller.file(),
-                line = self.caller.line(),
-                "store: long DB lock hold"
-            );
-            db_lock::push_event(db_lock::SlowEvent {
-                at_unix: crate::models::now_unix(),
-                kind: "hold",
-                ms: ms as u64,
-                thread,
-                call_site: format!("{}:{}", self.caller.file(), self.caller.line()),
-                blocked_on: None,
+    /// Acquire `mutex`, recording the wait/hold in `diag`.
+    ///
+    /// Shared by every instrumented connection in the app: adding a second
+    /// database must not mean a second copy of this (subtle) bookkeeping —
+    /// the holder-attribution races it guards against were found the hard way
+    /// (see [[db-lock-holder-unknown]]) and are not worth re-deriving.
+    #[track_caller]
+    pub fn acquire<'a, T>(
+        mutex: &'a parking_lot::FairMutex<T>,
+        diag: &'static LockDiag,
+    ) -> Guard<'a, T> {
+        let caller = std::panic::Location::caller();
+        let t = Instant::now();
+        // Record ourselves as HOLDER right after actually acquiring the real
+        // mutex, before doing anything else. Slow-wait logging below (atomic
+        // counters, `tracing::warn!` formatting/dispatch, a locked VecDeque
+        // push) is not instant — a waiter whose own `try_lock()` fails while
+        // we're still in that logging, before the holder slot is updated,
+        // would otherwise blame "<holder unknown>" despite us clearly holding
+        // the lock (seen live: a wait logged unknown immediately after another
+        // thread's own contended acquisition). Returns the token this entry
+        // was tagged with, so `Guard::drop` can compare-and-clear.
+        let set_holder = || -> u64 {
+            let holder_token = diag.holder_token.fetch_add(1, Ordering::Relaxed);
+            *diag.holder.lock() = Some(Entry {
+                thread: thread_name(),
+                file: caller.file(),
+                line: caller.line(),
+                since: Instant::now(),
+                token: holder_token,
             });
-        } else if ms >= 50 {
-            tracing::debug!(
-                hold_ms = ms,
-                file = self.caller.file(),
-                line = self.caller.line(),
-                "store: DB lock hold"
+            holder_token
+        };
+        // Uncontended fast path (parking_lot's fair unlock hands the mutex
+        // directly to the next queued waiter, so try_lock can't barge).
+        let (g, holder_token) = match mutex.try_lock() {
+            Some(g) => {
+                let holder_token = set_holder();
+                (g, holder_token)
+            }
+            None => {
+                // Contended: remember who we're stuck behind (the holder at
+                // wait start — the one worth blaming) and join the visible
+                // waiter queue for the I/O tab.
+                let blocked_on = diag.holder.lock().as_ref().map(|h| {
+                    format!(
+                        "{} at {} (held {}ms so far)",
+                        h.thread,
+                        h.call_site(),
+                        h.since.elapsed().as_millis()
+                    )
+                });
+                let token = diag.next_token.fetch_add(1, Ordering::Relaxed);
+                diag.waiters.lock().push((
+                    token,
+                    Entry {
+                        thread: thread_name(),
+                        file: caller.file(),
+                        line: caller.line(),
+                        since: t,
+                        token,
+                    },
+                ));
+                // Leaves the queue on every exit path (incl. unwinds).
+                struct WaiterGuard(&'static LockDiag, u64);
+                impl Drop for WaiterGuard {
+                    fn drop(&mut self) {
+                        self.0.waiters.lock().retain(|(t, _)| *t != self.1);
+                    }
+                }
+                let _wg = WaiterGuard(diag, token);
+                let g = mutex.lock();
+                let holder_token = set_holder();
+                let wait_ms = t.elapsed().as_millis();
+                if wait_ms >= SLOW_WAIT_MS {
+                    diag.slow_waits.fetch_add(1, Ordering::Relaxed);
+                    let blame =
+                        blocked_on.clone().unwrap_or_else(|| "<holder unknown>".to_string());
+                    tracing::warn!(
+                        wait_ms,
+                        lock = diag.label,
+                        file = caller.file(),
+                        line = caller.line(),
+                        "{}: slow DB lock – blocked behind {blame}",
+                        diag.log_prefix
+                    );
+                    diag.push_event(SlowEvent {
+                        at_unix: crate::models::now_unix(),
+                        kind: "wait",
+                        ms: wait_ms as u64,
+                        thread: thread_name(),
+                        call_site: format!("{}:{}", caller.file(), caller.line()),
+                        blocked_on,
+                    });
+                } else if wait_ms >= 5 {
+                    tracing::debug!(
+                        wait_ms,
+                        lock = diag.label,
+                        file = caller.file(),
+                        line = caller.line(),
+                        "{}: DB lock wait",
+                        diag.log_prefix
+                    );
+                }
+                (g, holder_token)
+            }
+        };
+        Guard { inner: Some(g), acquired_at: Instant::now(), caller, token: holder_token, diag }
+    }
+
+    /// RAII guard returned by [`acquire`]. Logs a warning when the lock is held
+    /// longer than 200 ms, showing the call-site that acquired it — useful for
+    /// identifying which method is the bottleneck.
+    ///
+    /// `inner` is an `Option` solely so `Drop` can release the real mutex as its
+    /// very first action (`self.inner.take()`) — before any of the bookkeeping/
+    /// logging below, which is not instant (tracing dispatch, a locked VecDeque
+    /// push). It is `Some` for the guard's entire externally-visible lifetime;
+    /// only `Drop::drop` ever sees it `None`.
+    pub struct Guard<'a, T> {
+        inner: Option<parking_lot::FairMutexGuard<'a, T>>,
+        acquired_at: Instant,
+        caller: &'static std::panic::Location<'static>,
+        /// This guard's holder token — lets `Drop` compare-and-clear.
+        token: u64,
+        diag: &'static LockDiag,
+    }
+
+    impl<T> std::ops::Deref for Guard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            self.inner.as_deref().expect("Guard.inner is only None mid-drop")
+        }
+    }
+
+    impl<T> std::ops::DerefMut for Guard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            self.inner.as_deref_mut().expect("Guard.inner is only None mid-drop")
+        }
+    }
+
+    impl<T> Drop for Guard<'_, T> {
+        fn drop(&mut self) {
+            // Release the REAL lock first, before any bookkeeping/logging below
+            // (which is not instant: tracing dispatch, a locked VecDeque push for
+            // a long hold). Waiters unblock immediately instead of waiting out
+            // our logging too, and — the point of doing this here rather than
+            // letting the field drop naturally after this function returns — it
+            // closes a holder-attribution race: the old ordering cleared the
+            // holder slot to None *before* actually unlocking, so a waiter whose
+            // try_lock() genuinely failed (we still held the real mutex) could
+            // read it as already-empty and misattribute its wait to
+            // "<holder unknown>" (see [[db-lock-holder-unknown]] — this is that
+            // bug's sibling on the release side rather than the acquire side).
+            drop(self.inner.take());
+
+            // Count every DB access (ops + cumulative hold time) at the single
+            // chokepoint all queries pass through; byte-level growth is sampled
+            // from the db/WAL file sizes by the I/O monitor instead.
+            crate::iomon::record_region(
+                self.diag.cat,
+                crate::iomon::Region::AppData,
+                crate::iomon::OpKind::Meta,
+                0,
+                self.acquired_at.elapsed(),
+                true,
             );
+            // Compare-and-clear: only remove OUR entry. Between the unlock above
+            // and this line, another thread may already have acquired the real
+            // mutex and written its own holder entry — a blind overwrite here
+            // would wipe that fresh, correct entry back to "no one" while they
+            // still hold it.
+            clear_holder_if_matches_in(&self.diag.holder, self.token);
+            let ms = self.acquired_at.elapsed().as_millis();
+            if ms >= LONG_HOLD_MS {
+                self.diag.long_holds.fetch_add(1, Ordering::Relaxed);
+                let thread = thread_name();
+                tracing::warn!(
+                    hold_ms = ms,
+                    lock = self.diag.label,
+                    thread = thread.as_str(),
+                    file = self.caller.file(),
+                    line = self.caller.line(),
+                    "{}: long DB lock hold",
+                    self.diag.log_prefix
+                );
+                self.diag.push_event(SlowEvent {
+                    at_unix: crate::models::now_unix(),
+                    kind: "hold",
+                    ms: ms as u64,
+                    thread,
+                    call_site: format!("{}:{}", self.caller.file(), self.caller.line()),
+                    blocked_on: None,
+                });
+            } else if ms >= SLOW_WAIT_MS {
+                tracing::debug!(
+                    hold_ms = ms,
+                    lock = self.diag.label,
+                    file = self.caller.file(),
+                    line = self.caller.line(),
+                    "{}: DB lock hold",
+                    self.diag.log_prefix
+                );
+            }
         }
     }
 }
+
+/// RAII guard over the main store's connection.
+type DbGuard<'a> = db_lock::Guard<'a, Connection>;
 
 /// `(channel_id, monitor_id, live output_path, muted_secs)` — the archive-replace
 /// decision inputs for a recording.
@@ -507,101 +679,7 @@ impl Store {
     /// location in both log lines so slow call-sites are immediately visible.
     #[track_caller]
     fn db(&self) -> DbGuard<'_> {
-        let caller = std::panic::Location::caller();
-        let t = std::time::Instant::now();
-        // Record ourselves as HOLDER right after actually acquiring the real
-        // mutex, before doing anything else. Slow-wait logging below (atomic
-        // counters, `tracing::warn!` formatting/dispatch, a locked VecDeque
-        // push) is not instant — a waiter whose own `try_lock()` fails while
-        // we're still in that logging, before HOLDER is updated, would
-        // otherwise blame "<holder unknown>" despite us clearly holding the
-        // lock (seen live: a wait logged unknown immediately after another
-        // thread's own contended acquisition). Returns the token this entry
-        // was tagged with, so `DbGuard::drop` can compare-and-clear.
-        let set_holder = || -> u64 {
-            let holder_token =
-                db_lock::HOLDER_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            *db_lock::HOLDER.lock() = Some(db_lock::Entry {
-                thread: db_lock::thread_name(),
-                file: caller.file(),
-                line: caller.line(),
-                since: std::time::Instant::now(),
-                token: holder_token,
-            });
-            holder_token
-        };
-        // Uncontended fast path (parking_lot's fair unlock hands the mutex
-        // directly to the next queued waiter, so try_lock can't barge).
-        let (g, holder_token) = match self.conn.try_lock() {
-            Some(g) => {
-                let holder_token = set_holder();
-                (g, holder_token)
-            }
-            None => {
-                // Contended: remember who we're stuck behind (the holder at
-                // wait start — the one worth blaming) and join the visible
-                // waiter queue for the I/O tab.
-                let blocked_on = db_lock::HOLDER.lock().as_ref().map(|h| {
-                    format!(
-                        "{} at {} (held {}ms so far)",
-                        h.thread,
-                        h.call_site(),
-                        h.since.elapsed().as_millis()
-                    )
-                });
-                let token =
-                    db_lock::NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                db_lock::WAITERS.lock().push((
-                    token,
-                    db_lock::Entry {
-                        thread: db_lock::thread_name(),
-                        file: caller.file(),
-                        line: caller.line(),
-                        since: t,
-                        token,
-                    },
-                ));
-                // Leaves the queue on every exit path (incl. unwinds).
-                struct WaiterGuard(u64);
-                impl Drop for WaiterGuard {
-                    fn drop(&mut self) {
-                        db_lock::WAITERS.lock().retain(|(t, _)| *t != self.0);
-                    }
-                }
-                let _wg = WaiterGuard(token);
-                let g = self.conn.lock();
-                let holder_token = set_holder();
-                let wait_ms = t.elapsed().as_millis();
-                if wait_ms >= 50 {
-                    db_lock::SLOW_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let blame =
-                        blocked_on.clone().unwrap_or_else(|| "<holder unknown>".to_string());
-                    tracing::warn!(
-                        wait_ms,
-                        file = caller.file(),
-                        line = caller.line(),
-                        "store: slow DB lock – blocked behind {blame}"
-                    );
-                    db_lock::push_event(db_lock::SlowEvent {
-                        at_unix: crate::models::now_unix(),
-                        kind: "wait",
-                        ms: wait_ms as u64,
-                        thread: db_lock::thread_name(),
-                        call_site: format!("{}:{}", caller.file(), caller.line()),
-                        blocked_on,
-                    });
-                } else if wait_ms >= 5 {
-                    tracing::debug!(
-                        wait_ms,
-                        file = caller.file(),
-                        line = caller.line(),
-                        "store: DB lock wait"
-                    );
-                }
-                (g, holder_token)
-            }
-        };
-        DbGuard { inner: Some(g), acquired_at: std::time::Instant::now(), caller, token: holder_token }
+        db_lock::acquire(&self.conn, &db_lock::MAIN)
     }
 
     /// Open (or create) the database at `path`, set pragmas, and migrate.

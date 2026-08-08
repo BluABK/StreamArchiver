@@ -671,6 +671,7 @@ impl StreamArchiverApp {
             self.settings_startup_section(ui);
             self.settings_shutdown_section(ui);
             self.settings_db_backup_section(ui);
+            self.settings_chat_index_section(ui);
             self.settings_diagnostics_section(ui);
             // Maintenance (manual batch operations).
             self.settings_maintenance_section(ui);
@@ -4495,6 +4496,186 @@ impl StreamArchiverApp {
                 ));
             });
             }
+    }
+
+    /// Chat index: the switch, the pace, what it costs, and how to rebuild it.
+    fn settings_chat_index_section(&mut self, ui: &mut egui::Ui) {
+        if !self.section_shown(
+            SettingsTab::System,
+            "Chat index",
+            &["chat", "index", "users", "chatter", "search", "fts", "messages", "presence"],
+        ) {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.heading("Chat index 👤");
+        ui.label(
+            "Reads finished chat logs in the background and records who chatted in which \
+             stream, plus a full-text index of every message — the data behind the Users \
+             view. Nothing is written while a stream is being captured: logs are only read \
+             once a take has ended, behind the disk gate, so this never competes with a \
+             recording.",
+        );
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.settings.chat_index_enabled, "Enable chat indexing")
+            .on_hover_text(
+                "On by default. Off stops all indexing immediately — reads, writes and the \
+                 legacy-name lookups. Anything already indexed stays searchable; it just \
+                 stops growing.",
+            );
+
+        let index = crate::chat_index::shared();
+        let health = index.and_then(|i| i.health().ok());
+        let total = self.core.store.chat_index_candidates().map(|v| v.len() as i64).unwrap_or(0);
+
+        egui::Grid::new("chat_index_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Streams per sweep");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.chat_index_batch)
+                    .desired_width(60.0),
+            )
+            .on_hover_text(format!(
+                "How many chat logs one background pass reads (one pass a minute). Higher \
+                 finishes the backlog sooner but puts more sustained load on the drive the \
+                 logs live on. Empty or invalid defaults to 5; the ceiling is {}.",
+                crate::chat_scan::INDEX_BATCH_MAX
+            ));
+            ui.end_row();
+
+            if let Some(h) = &health {
+                let done = h.takes_indexed + h.takes_failed;
+                let remaining = total.saturating_sub(done);
+                ui.label("Progress");
+                if remaining > 0 {
+                    ui.label(format!("{done} of {total} chat logs read — {remaining} to go"))
+                        .on_hover_text(
+                            "At the default pace this drains a large backlog over a few \
+                             hours. Until it finishes, the Users view can be missing streams \
+                             a chatter was really in, and says so.",
+                        );
+                } else if total > 0 {
+                    ui.label(format!("all {total} chat logs read"));
+                } else {
+                    ui.label("no chat logs to read yet");
+                }
+                ui.end_row();
+
+                ui.label("Contents");
+                ui.label(format!(
+                    "{} chatters · {} messages · {} appearances · {} on disk",
+                    h.users,
+                    h.messages,
+                    h.presence_rows,
+                    fmt_bytes(h.bytes_on_disk as i64)
+                ))
+                .on_hover_text(
+                    "The index lives in its own database file (chat_index.sqlite3) — \
+                     deliberately NOT inside the main database, so it never bloats the \
+                     rolling backups and its writes can never block the app's own queries. \
+                     It is rebuildable from the chat logs, so it is not backed up.",
+                );
+                ui.end_row();
+
+                if h.takes_failed > 0 {
+                    ui.label("Unreadable");
+                    ui.label(
+                        egui::RichText::new(format!("{} chat log(s) missing or unreadable", h.takes_failed))
+                            .color(grid::HL_WARN_TEXT),
+                    )
+                    .on_hover_text(
+                        "Chat logs that were deleted, moved, or written before chat logging \
+                         existed. They are stamped so the queue can drain; those streams are \
+                         simply not searchable.",
+                    );
+                    ui.end_row();
+                }
+
+                if h.unresolved_logins > 0 {
+                    ui.label("Legacy names");
+                    ui.label(format!("{} chatter(s) still keyed by name", h.unresolved_logins))
+                        .on_hover_text(
+                            "Twitch chat logs written before 2026-08-05 carry no account id, \
+                             so those chatters are filed under their name. A background \
+                             lookup folds them into real accounts 100 at a time. Until then \
+                             — and for anyone since renamed — their history stays split.",
+                        );
+                    ui.end_row();
+                }
+
+                if h.slowest_ms > 0 {
+                    ui.label("Slowest log");
+                    ui.label(format!(
+                        "{} ms (recording {})",
+                        h.slowest_ms, h.slowest_rec_id
+                    ))
+                    .on_hover_text(
+                        "The worst single chat log on record, start to finish. If this climbs \
+                         into seconds, the app log has a line per indexed take with the parse \
+                         and write split out.",
+                    );
+                    ui.end_row();
+                }
+            } else {
+                ui.label("Status");
+                ui.label(
+                    egui::RichText::new("index unavailable — see the app log")
+                        .color(grid::HL_ERROR_TEXT),
+                );
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Index all now")
+                .on_hover_text(
+                    "Raise the pace to the maximum so the backlog is read as fast as the \
+                     disk gate allows, instead of a few logs a minute. Still yields to any \
+                     running capture. Lower 'Streams per sweep' again to go back to a trickle.",
+                )
+                .clicked()
+            {
+                self.settings.chat_index_batch = crate::chat_scan::INDEX_BATCH_MAX.to_string();
+                self.settings.chat_index_enabled = true;
+                let ctx = ui.ctx().clone();
+                self.save_settings(&ctx);
+                self.status =
+                    "Chat indexing set to full speed — it will still wait behind any capture."
+                        .to_string();
+            }
+            if ui
+                .button("Rebuild index")
+                .on_hover_text(
+                    "Throw the index away and read every chat log again from scratch. Useful \
+                     if it is ever suspected of being wrong. Nothing else is affected — no \
+                     recording, chat log or statistic is touched.",
+                )
+                .clicked()
+            {
+                match index {
+                    Some(i) => match i.clear() {
+                        Ok(()) => {
+                            self.users_results.clear();
+                            self.users_detail = None;
+                            self.users_selected = None;
+                            self.status =
+                                "Chat index cleared — every chat log will be read again."
+                                    .to_string();
+                        }
+                        Err(e) => self.status = format!("Could not clear the chat index: {e:#}"),
+                    },
+                    None => self.status = "The chat index is not available.".to_string(),
+                }
+            }
+            if ui
+                .button("👤 Open Users")
+                .on_hover_text("Go to the Users view and look a chatter up")
+                .clicked()
+            {
+                self.view = View::Users;
+            }
+        });
     }
 
     fn settings_diagnostics_section(&mut self, ui: &mut egui::Ui) {

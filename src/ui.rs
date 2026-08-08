@@ -211,6 +211,9 @@ enum View {
     Stats,
     IoMonitor,
     Debug,
+    /// Who chatted where: search a chatter and see every stream they were in,
+    /// what they said, gave, and what moderators did — see `users::users_view`.
+    Users,
     /// In-app manual (the embedded README, sectioned) + About (version/build
     /// info and data paths). Reached via the Help ▾ menu.
     Help,
@@ -520,6 +523,7 @@ mod schedule;
 mod settings;
 mod streams;
 mod trash;
+mod users;
 mod videos;
 
 #[allow(unused_imports)]
@@ -1382,6 +1386,13 @@ pub(crate) struct SettingsForm {
     /// Per-drive I/O limit overrides: (drive letter, limits). The default
     /// readrate/rate-limit live in `postproc_readrate`/`download_rate_limit`.
     disk_overrides: Vec<(String, crate::io_gate::DiskLimits)>,
+    // --- Chat index ---
+    /// Master switch for the chat index (`crate::chat_index`). Default on;
+    /// off stops every read and write it does, immediately.
+    chat_index_enabled: bool,
+    /// Takes indexed per sweep (parsed on save; empty/invalid falls back to
+    /// the module default).
+    chat_index_batch: String,
     // --- Rolling database backups ---
     /// Periodically `VACUUM INTO` a timestamped snapshot of the live database
     /// (see `crate::db_backup`). Default on — a safety net, not an opt-in.
@@ -1938,6 +1949,42 @@ pub struct StreamArchiverApp {
     /// background thread) — drained on the UI thread at the top of
     /// `trash::trash_view` each frame, same shape as `trash_action_done`.
     trash_import_done: Arc<Mutex<Option<crate::disposal_backfill::BackfillReport>>>,
+    // ── Users view (`ui::users`) ─────────────────────────────────────────
+    /// Identity search box.
+    users_query: String,
+    /// True between a keystroke and the search that follows it.
+    users_search_dirty: bool,
+    /// True once a search has actually run, so "no matches" can be told apart
+    /// from "you haven't searched yet".
+    users_searched: bool,
+    users_results: Vec<crate::chat_index::UserRow>,
+    users_selected: Option<i64>,
+    /// The selected identity's whole record, loaded once on selection — never
+    /// on a render pass, so the index's lock stays off the UI thread.
+    users_detail: Option<users::UserDetail>,
+    users_tab: users::UserTab,
+    /// Per-user message filter, as typed.
+    users_msg_filter: String,
+    /// Whole-archive message search, as typed.
+    users_text_query: String,
+    users_text_searched: bool,
+    users_text_hits: Vec<crate::chat_index::MessageHit>,
+    /// Take labels for `users_text_hits` (the index only returns ids).
+    users_text_labels: HashMap<i64, crate::store::TakeLabel>,
+    /// How many takes have a chat log at all — the denominator behind "N still
+    /// to read", so an incomplete index never reads as an empty archive.
+    users_takes_total: i64,
+    /// Last thing that went wrong in the view, shown inline and dismissable.
+    users_error: Option<String>,
+    /// Channel picked for the on-demand "index this channel's chat logs" scan.
+    users_scan_channel: Option<i64>,
+    /// How many of that channel's most recent chat logs that scan reads.
+    users_scan_count: i64,
+    /// True while an on-demand scan is running, so a second can't overlap it.
+    users_scan_running: bool,
+    /// Finished on-demand scan's summary, posted from the background task and
+    /// drained on the UI thread — same shape as `trash_action_done`.
+    users_scan_done: Arc<Mutex<Option<String>>>,
     vod_info_popup_cache: HashMap<i64, (String, Recording)>,
     /// Deferred-viewport content for each open `vod_info_popups` entry.
     vod_info_popup_registry: PopupRegistry<i64, VodInfoContent>,
@@ -2880,6 +2927,14 @@ impl eframe::App for StreamArchiverApp {
                              delete a soft-deleted (trash-folder) file.",
                         ),
                         (
+                            View::Users,
+                            "👤",
+                            "Users",
+                            "Look a chatter up: every stream they were in, what they said, \
+                             what they gave, and any moderation against them — across all \
+                             channels.",
+                        ),
+                        (
                             View::ChannelStats,
                             "📈",
                             "Channel Stats",
@@ -3540,6 +3595,7 @@ impl eframe::App for StreamArchiverApp {
             View::Stats => self.stats_view(ui),
             View::IoMonitor => self.io_view(ui),
             View::Debug => self.debug_view(ui),
+            View::Users => self.users_view(ui),
             View::Help => self.help_view(ui),
         });
 
@@ -3582,7 +3638,7 @@ impl eframe::App for StreamArchiverApp {
                 }
                 View::Videos | View::ChannelStats | View::Stats | View::IoMonitor
                 | View::Debug | View::Posts | View::Files | View::Help
-                | View::Backlog | View::StreamHistory | View::Trash => {}
+                | View::Backlog | View::StreamHistory | View::Trash | View::Users => {}
             }
         });
         if ctx_add_stream {

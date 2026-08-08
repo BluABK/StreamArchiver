@@ -33,6 +33,34 @@ pub struct ChatScanTarget {
     pub chat_path: String,
 }
 
+/// Enough of a take to name it in a list — see [`Store::take_labels`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TakeLabel {
+    pub channel: String,
+    pub platform: String,
+    pub started_at: i64,
+    pub title: String,
+    pub monitor_id: i64,
+}
+
+/// One take the chat index has yet to read — see
+/// [`Store::chat_index_candidates`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatIndexTarget {
+    pub rec_id: i64,
+    pub monitor_id: i64,
+    /// Denormalised into `chat_presence` so "which channels was this person in"
+    /// never has to reach back into the main database.
+    pub channel_id: i64,
+    /// Capture start, the anchor for a YouTube sidecar's relative timestamps.
+    pub started_at: i64,
+    pub chat_path: String,
+    /// The instance's source URL — `Platform::detect` turns it into a platform.
+    /// There is no `monitor.platform` column: an instance's platform has always
+    /// been derived from its URL.
+    pub url: String,
+}
+
 impl Store {
     // ----- recordings -----
 
@@ -182,6 +210,94 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Every finished take that has a chat sidecar, with the ids the chat index
+    /// needs to file it under — newest first, so a fresh install indexes the
+    /// streams the user is most likely to look up before the 2024 backlog.
+    ///
+    /// The "already indexed" stamp lives in the *other* database file
+    /// (`indexed_take`, see [`crate::chat_index`]), so it can't be joined here;
+    /// the caller filters this list against
+    /// [`ChatIndex::indexed_rec_ids`](crate::chat_index::ChatIndex::indexed_rec_ids).
+    /// Keeping the stamp in one place is worth the full list: a mirrored column
+    /// here could drift out of step with a deleted or rebuilt index file, and a
+    /// take that silently believes it was indexed is invisible — nothing would
+    /// ever look for it again.
+    pub fn chat_index_candidates(&self) -> Result<Vec<ChatIndexTarget>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.monitor_id, m.channel_id, r.started_at, r.chat_path, m.url
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             WHERE COALESCE(r.chat_path, '') != ''
+               AND r.ended_at IS NOT NULL
+             ORDER BY r.id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ChatIndexTarget {
+                    rec_id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    channel_id: r.get(2)?,
+                    started_at: r.get(3)?,
+                    chat_path: r.get(4)?,
+                    url: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Name, platform, start time and title for a set of takes, in one query.
+    ///
+    /// The chat index returns recording ids and nothing else (it is a separate
+    /// database file and cannot join against this one), so the Users view needs
+    /// to turn a page of ids into something readable. One statement rather than
+    /// a `get_recording` per row: a busy chatter's page is fifty streams, and
+    /// fifty lock acquisitions on the render path is exactly the sort of thing
+    /// that shows up as a stutter.
+    pub fn take_labels(&self, rec_ids: &[i64]) -> Result<std::collections::HashMap<i64, TakeLabel>> {
+        if rec_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.db();
+        let placeholders = vec!["?"; rec_ids.len()].join(",");
+        let sql = format!(
+            // `title` is derived from `stream_meta_change`, not a stored column
+            // — the same latest-title subquery `RECORDING_FULL_COLUMNS` uses.
+            "SELECT r.id, c.name, m.url, r.started_at,
+                    COALESCE((SELECT new_value FROM stream_meta_change smc
+                              WHERE smc.recording_id = r.id AND smc.kind = 'title'
+                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+                    m.id
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE r.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(rec_ids.iter());
+        let rows = stmt.query_map(params, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                TakeLabel {
+                    channel: r.get(1)?,
+                    platform: crate::models::Platform::detect(&r.get::<_, String>(2)?)
+                        .as_str()
+                        .to_string(),
+                    started_at: r.get(3)?,
+                    title: r.get(4)?,
+                    monitor_id: r.get(5)?,
+                },
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, label) = row?;
+            out.insert(id, label);
+        }
+        Ok(out)
     }
 
     /// Stamp a take's chat sidecar as mined. Also used to force a **rescan**
@@ -551,12 +667,27 @@ impl Store {
     /// Remove a recording (take) row from the history. The captured file on disk
     /// is left untouched. Refuses an in-progress ('recording') take so we never
     /// orphan a running capture from its history row; returns the rows removed.
+    ///
+    /// Also drops the take's chat-index rows. That lives here, at the single
+    /// choke point every deletion path goes through, rather than at the half
+    /// dozen call sites — a missed one would leave the index claiming a chatter
+    /// was in a stream that no longer exists, and "seen in N streams" would
+    /// slowly drift upward forever. Best-effort by design: a broken index must
+    /// never block deleting a row from the real database.
     pub fn delete_recording(&self, id: i64) -> Result<usize> {
-        let conn = self.db();
-        let n = conn.execute(
-            "DELETE FROM recording WHERE id = ?1 AND status <> 'recording'",
-            params![id],
-        )?;
+        let n = {
+            let conn = self.db();
+            conn.execute(
+                "DELETE FROM recording WHERE id = ?1 AND status <> 'recording'",
+                params![id],
+            )?
+        };
+        if n > 0
+            && let Some(idx) = crate::chat_index::shared()
+            && let Err(e) = idx.forget_take(id)
+        {
+            tracing::warn!(rec_id = id, "chat index: could not drop rows for a deleted take: {e:#}");
+        }
         Ok(n)
     }
 
@@ -3318,6 +3449,42 @@ mod tests {
         // Once stamped it never comes back — that's what drains the queue.
         store.set_recording_chat_scanned(ready, 9_999).unwrap();
         assert!(store.recordings_needing_chat_scan(10).unwrap().is_empty());
+    }
+
+    /// Both chat-index queries join `monitor`, and one of them wants the
+    /// instance's platform — which is **not** a column (it is derived from the
+    /// URL). Exercising them against a real schema is what catches that; a
+    /// query referencing a column that doesn't exist compiles perfectly well.
+    #[test]
+    fn chat_index_candidates_and_labels_join_real_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", None, false, Some("s1"), None, "", "")
+            .unwrap();
+        store.set_recording_chat_path(rid, "C:/tmp/a.chat.jsonl").unwrap();
+        // Unfinished takes are excluded: a live sidecar is still being written.
+        let live = store
+            .insert_recording(mid, 200, "C:/tmp/b.mkv", None, false, Some("s2"), None, "", "")
+            .unwrap();
+        store.set_recording_chat_path(live, "C:/tmp/b.chat.jsonl").unwrap();
+        store.finish_recording(rid, 110, 1, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+
+        let cands = store.chat_index_candidates().unwrap();
+        assert_eq!(cands.iter().map(|c| c.rec_id).collect::<Vec<_>>(), vec![rid]);
+        let c = &cands[0];
+        assert_eq!((c.monitor_id, c.channel_id, c.started_at), (mid, cid, 100));
+        assert_eq!(c.chat_path, "C:/tmp/a.chat.jsonl");
+        assert_eq!(crate::models::Platform::detect(&c.url), Platform::Twitch);
+
+        let labels = store.take_labels(&[rid, 9_999]).unwrap();
+        assert_eq!(labels.len(), 1, "a missing id is simply absent, not an error");
+        let l = &labels[&rid];
+        assert_eq!((l.channel.as_str(), l.monitor_id, l.started_at), ("A", mid, 100));
+        assert_eq!(l.platform, Platform::Twitch.as_str());
+        // Empty input must not build a `WHERE id IN ()`, which is a syntax error.
+        assert!(store.take_labels(&[]).unwrap().is_empty());
     }
 
     #[test]

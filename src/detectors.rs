@@ -1943,6 +1943,54 @@ impl DetectContext {
         Some(u["id"].as_str()?.to_string())
     }
 
+    /// Resolve up to 100 Twitch logins to ids in one Helix Get Users call —
+    /// the batch form of [`twitch_id_for_login`](Self::twitch_id_for_login),
+    /// used by the chat index to fold pre-2026-08-05 login-keyed chatters into
+    /// their real accounts.
+    ///
+    /// Returns `login (lowercased) -> id` for the ones Helix knew. A login that
+    /// is simply absent from the response is a deleted or renamed account, and
+    /// the caller must treat that as "no answer" rather than guessing —
+    /// silently merging on a guess would attribute one person's chat history to
+    /// another.
+    ///
+    /// `None` only on a request failure, which the caller retries later; an
+    /// empty map is a real answer ("Helix knows none of these").
+    pub async fn twitch_ids_for_logins(
+        &self,
+        logins: &[String],
+    ) -> Option<HashMap<String, String>> {
+        if logins.is_empty() {
+            return Some(HashMap::new());
+        }
+        let (client_id, token) = self.twitch_helix_auth().await.ok()?;
+        // Helix caps Get Users at 100 `login` parameters per request.
+        let query: Vec<(&str, &str)> =
+            logins.iter().take(100).map(|l| ("login", l.as_str())).collect();
+        let resp = self
+            .http
+            .get("https://api.twitch.tv/helix/users")
+            .header("Client-Id", &client_id)
+            .bearer_auth(&token)
+            .query(&query)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            debug!(status = %resp.status(), n = query.len(), "helix get users (batch) failed");
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        let mut out = HashMap::new();
+        for u in v["data"].as_array().into_iter().flatten() {
+            cache_twitch_user_info(&self.store, u);
+            if let (Some(login), Some(id)) = (u["login"].as_str(), u["id"].as_str()) {
+                out.insert(login.to_lowercase(), id.to_string());
+            }
+        }
+        Some(out)
+    }
+
     // ----- schedule (upcoming streams) -----
 
     /// A Twitch channel's upcoming scheduled streams via Helix `Get Channel Stream

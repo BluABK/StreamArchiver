@@ -23,6 +23,10 @@ pub(super) const HL_FILTER_TEXT_BG: egui::Color32 = egui::Color32::from_rgb(0x2e
 /// Readable red for inline error/validation *text* (the row tint [`HL_ERROR`] is
 /// too dark to read as a foreground colour).
 pub(super) const HL_ERROR_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
+/// Readable amber for inline caveats — something the reader must weigh, but
+/// which isn't an error. Matches the "aborted" badge's amber so one hue means
+/// "qualified" throughout.
+pub(super) const HL_WARN_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0xa8, 0x50);
 
 /// Paint a row-tint background for one table cell + apply the selected-row
 /// text colour. Call at the TOP of a cell closure so widgets draw on top.

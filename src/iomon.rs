@@ -91,6 +91,10 @@ pub enum Cat {
     /// SQLite access (op counts + hold time via the store's guard; byte
     /// growth is sampled from the db/WAL file sizes).
     Db,
+    /// The chat index database (`chat_index.sqlite3`) — a second, separate
+    /// SQLite file whose lock is deliberately independent of [`Cat::Db`]'s, so
+    /// its long full-text writes are never mistaken for store contention.
+    ChatIndexDb,
     /// The app's own rolling log (+ startup prune).
     AppLog,
     /// Detection metadata/thumbnail cache writes.
@@ -103,7 +107,7 @@ pub enum Cat {
     Other,
 }
 
-pub const CAT_COUNT: usize = 19;
+pub const CAT_COUNT: usize = 20;
 
 impl Cat {
     pub const ALL: [Cat; CAT_COUNT] = [
@@ -121,6 +125,7 @@ impl Cat {
         Cat::FsProbe,
         Cat::RecordingDelete,
         Cat::Db,
+        Cat::ChatIndexDb,
         Cat::AppLog,
         Cat::Detector,
         Cat::Startup,
@@ -144,6 +149,7 @@ impl Cat {
             Cat::FsProbe => "fs probes",
             Cat::RecordingDelete => "deletions",
             Cat::Db => "database",
+            Cat::ChatIndexDb => "chat index db",
             Cat::AppLog => "app log",
             Cat::Detector => "detectors",
             Cat::Startup => "startup/misc",
@@ -519,9 +525,10 @@ fn record_inner(
     }
 
     // DB guard drops fire hundreds of times a second under load and carry no
-    // path — counters only. The store logs slow lock holds itself, with the
-    // acquiring call site (file:line), which this pathless warn can't match.
-    if matches!(cat, Cat::Db) {
+    // path — counters only. Both stores log slow lock holds themselves, with
+    // the acquiring call site (file:line), which this pathless warn can't
+    // match.
+    if matches!(cat, Cat::Db | Cat::ChatIndexDb) {
         return;
     }
 

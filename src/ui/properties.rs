@@ -174,6 +174,10 @@ pub(super) struct UserPropsPopupState {
     /// Whether this channel has a Twitch instance — decides if a profile link
     /// can be built from the display name.
     pub(super) twitch: bool,
+    /// Set by the "Full user info" button; drained by
+    /// `user_properties_windows`, which owns the app state the view switch
+    /// needs (a deferred viewport's closure cannot reach `self`).
+    pub(super) open_full_info: bool,
     pub(super) closed: bool,
 }
 
@@ -277,6 +281,17 @@ impl UserPropsPopupState {
                     .clicked()
             {
                 crate::platform::open_url(&format!("https://twitch.tv/{}", self.name));
+            }
+            if ui
+                .button("👤 Full user info")
+                .on_hover_text(
+                    "Open the Users view for this chatter: every channel they've been seen \
+                     in, every stream, everything they said, and what moderators did — not \
+                     just this one channel's record.",
+                )
+                .clicked()
+            {
+                self.open_full_info = true;
             }
         });
     }
@@ -2164,6 +2179,7 @@ impl StreamArchiverApp {
             summary: crate::models::ModerationSummary::from_events(&moderation),
             moderation,
             twitch,
+            open_full_info: false,
             closed: false,
         };
         self.user_props_registry.get_or_init(key.clone(), || state);
@@ -2174,6 +2190,7 @@ impl StreamArchiverApp {
     pub(super) fn user_properties_windows(&mut self, ctx: &egui::Context) {
         let open: Vec<(i64, String)> = self.user_props_popups.clone();
         let mut closed: Vec<(i64, String)> = Vec::new();
+        let mut full_info: Vec<String> = Vec::new();
         for key in open {
             // `open_user_properties` always seeds the registry before pushing
             // the key, so this only ever hands back the seeded state; the
@@ -2186,6 +2203,7 @@ impl StreamArchiverApp {
                 moderation: Vec::new(),
                 summary: crate::models::ModerationSummary::default(),
                 twitch: false,
+                open_full_info: false,
                 closed: true,
             });
             let title = {
@@ -2211,13 +2229,29 @@ impl StreamArchiverApp {
                     });
                 },
             );
-            if state.lock().unwrap().closed {
+            let (want_full, is_closed) = {
+                let mut s = state.lock().unwrap();
+                (std::mem::take(&mut s.open_full_info), s.closed)
+            };
+            if want_full {
+                full_info.push(key.1.clone());
+            }
+            if is_closed {
                 closed.push(key);
             }
         }
         for key in closed {
             self.user_props_popups.retain(|k| k != &key);
             self.user_props_registry.remove(&key);
+        }
+        // Hand the name to the Users view and switch to it. Searching by name
+        // rather than jumping to an id on purpose: this popup only ever knew a
+        // name, and if it matches two accounts the user should see both rather
+        // than be silently shown one.
+        if let Some(name) = full_info.into_iter().next() {
+            self.users_query = name;
+            self.reload_user_search();
+            self.view = View::Users;
         }
     }
 

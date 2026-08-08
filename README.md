@@ -83,9 +83,9 @@ so both quit paths work without touching the tray icon.
 Every view is an always-visible tab, shown as an icon only at 2x the normal
 button size — big enough to hit without hunting — (hover any tab for its
 name, plus a description for the less-obvious ones): **📺 Streams, 🎬
-Videos, 🗓 Schedule, 📣 Posts, 🎛 Background, 📁 Files, 📈 Channel Stats, 📊
-App Stats, 🖴 I/O** (same HDD glyph as the Background tab's disk gate), and
-**🐞 Debug** when enabled. Four tabs carry a live count badge next to their
+Videos, 🗓 Schedule, 📣 Posts, 🎛 Background, 📁 Files, 👤 Users, 📈 Channel
+Stats, 📊 App Stats, 🖴 I/O** (same HDD glyph as the Background tab's disk
+gate), and **🐞 Debug** when enabled. Four tabs carry a live count badge next to their
 icon, computed in-memory every frame (no extra DB load) so it's always
 current even if you never open the tab: **🗑 Trash** — soft-deleted files
 still sitting in a trash folder (amber, since these quietly eat disk space
@@ -3668,6 +3668,104 @@ never a live push update. Once the countdown lapses (or for an older
 broadcast reviewed later, whose train ended between polls) it falls back to
 a plain "reached Level N" summary line instead of a bar.
 
+### Users 👤 (who chatted where)
+
+The **Users** tab answers a question the archive could always have answered but
+never could *afford* to: **who is this person, and where have I seen them?**
+
+Search a chatter by display name, Twitch login, or an exact platform id (a
+Twitch `user-id` or a YouTube `UC…` channel id) and get their whole record
+across **every** channel you capture:
+
+- **📺 Streams** — every stream they chatted in, per channel, with their message
+  count and first/last message time. Clicking a row opens that take's chat
+  replay with them highlighted.
+- **💬 Messages** — everything they said, with a full-text filter scoped to
+  them. There is also a search box at the top of the view that searches **every
+  indexed message from every channel** at once — type words as you would in any
+  search box; add `*` for a prefix search (`poggers*`). Punctuation and
+  operator-looking text (`:)`, `NOT`, `@name`) are searched literally rather
+  than treated as query syntax.
+- **💎 Contributions** — bits, subs, gift subs and raids, grouped by channel
+  (the same cross-reference the chat usercard shows).
+- **🔨 Moderation** — timeouts, bans, deleted messages and removals, with the
+  channel each happened in.
+
+The per-channel **user Properties** window (the one you get by clicking a name
+in a stats table or the chat) is unchanged and still answers the narrower "what
+does *this* channel have on record" — it now has a **👤 Full user info** button
+that hands the name to this view.
+
+**Only people who actually said something are indexed.** Lurkers leave no trace
+in a chat log, so absence from this view means "never spoke here", not "never
+watched".
+
+#### Identity: ids, not names
+
+Chatters are keyed on the platform's own account id wherever one exists —
+Twitch's `user-id`, YouTube's `UC…` channel id — because logins and display
+names are both freely renameable and a name is not a person.
+
+There is one gap, and the view is explicit about it rather than papering over
+it: **Twitch chat logs written before 2026-08-05 carry no account id at all**
+(roughly two thirds of an archive that predates that). Those chatters are filed
+under their login and marked **⚠ name-matched**. A background pass looks those
+logins up through Twitch's API, 100 at a time, and folds each one into the real
+account when it resolves — after which searching the *old* name still finds the
+person, and their aliases are listed on the identity.
+
+The catch, stated where you'll see it: a login resolves to whoever holds that
+name **today**. If a chatter renamed since those old logs were written, some of
+that history may belong to someone else. An identity that has folded in
+name-matched streams says how many, and a lookup that Twitch can't answer is
+left alone rather than guessed at.
+
+#### The chat index
+
+Behind all of it is a background index of the chat logs, built once and
+maintained from then on. Without it, "which streams was this person in" means
+reading every chat sidecar on disk — gigabytes.
+
+- **Nothing is written while a stream is being captured.** Chat logs are read
+  only after a take has ended, a few per minute, behind the same disk gate that
+  keeps everything else out of a running capture's way. Indexing can never slow
+  a recording down.
+- **It lives in its own database file** (`chat_index.sqlite3`), deliberately not
+  inside the main one. Three reasons: the rolling [database backups](#database-backups-)
+  stay small and fast (the index is fully rebuildable from the chat logs, so
+  it is not worth backing up); its writes get their own lock and so can never
+  block the app's own queries; and "rebuild it" is just deleting a file.
+- **A stream becomes searchable when it ends**, not while it runs. The chat
+  replay already covers the live case.
+- The header line says how many chat logs are still to read. Until that reaches
+  zero, an empty result is **not** proof of absence — and it says so.
+
+**What it costs.** Measured over 377 real chat logs (743 MB, 1.8M messages): the
+index came to **0.30 MB per MB of chat log** — so an archive with 2.7 GB of chat
+sidecars produces roughly **800 MB** of index — and read them at **~21 MB/s**,
+i.e. a couple of minutes of CPU for that whole archive, spread over hours at the
+default pace. The presence data (who was in which stream) is a small fraction of
+that; the bulk is the full-text message index.
+
+**Indexing one channel now.** The row above the results indexes a chosen
+channel's most recent chat logs ahead of the queue — for when you are looking
+someone up and that channel's streams haven't been read yet. It skips anything
+already indexed and still yields to any capture using the same drive.
+
+**Settings → System → Chat index 👤** has the master switch, the pace ("streams
+per sweep"), a full readout — chatters, messages, appearances, size on disk,
+progress, unreadable logs, legacy names still to resolve, and the slowest single
+log on record — plus **Index all now** (full speed) and **Rebuild index** (throw
+it away and read everything again). Switching indexing off stops all of it
+immediately; anything already indexed stays searchable, it just stops growing.
+
+**If it ever misbehaves**, it says so in the log before you feel it: one line per
+indexed chat log with the parse and write times split out and the throughput, a
+warning for any log that takes more than two seconds, and a warning for any
+index query slower than 200 ms. The **I/O → Database** tab shows the index's
+lock as a **separate lane** from the main database's, so index contention can
+never be mistaken for the app being slow.
+
 ### YouTube community posts (📣 Posts)
 
 ![Posts tab showing a channel's archived community posts](doc/screenshots/community-posts.png)
@@ -4379,6 +4477,13 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   `STREAMARCHIVER_OUT` (handy for testing).
 - Rolling database backups: `%APPDATA%\StreamArchiver\data\backups\` — see
   *Database backups* (Settings → System).
+- Chat index: `%APPDATA%\StreamArchiver\data\chat_index.sqlite3` (SQLite, WAL) —
+  a **second, separate** database holding who chatted in which stream and the
+  full-text message index behind the [Users](#users--who-chatted-where) tab.
+  Deliberately outside the main DB so it never bloats the backups above and its
+  writes can't block the app's queries. It is rebuildable from the chat logs, so
+  it is **not** backed up and can be deleted at any time — the background sweep
+  reads everything again.
 - Recordings + sidecars (`.chat.jsonl`, `.live_chat.json`, subtitle `.vtt`): your
   configured output folder (default: `Videos\StreamArchiver\`). Companion video
   files share the recording's stem: `{stem}.vod.mkv` (downloaded published VOD),
@@ -4510,9 +4615,15 @@ type(s) and re-exports, with the implementation spread over
   `naming`, `finalize`.
 - `src/ui/` — egui app: `app` (pump/persistence), one module per view
   (`streams`, `videos`, `schedule`, `settings`, `files`, `io_view`, `posts`,
-  `background`, `channel_stats`, `issues`, `debug`), window clusters
+  `background`, `channel_stats`, `users`, `issues`, `debug`), window clusters
   (`dialogs`, `properties`, `chat`), and shared helpers (`grid`, `calendar`,
   `format`, `player`, `assets_helpers`).
+
+`src/chat_index.rs` is the app's **second** SQLite database (see
+[Users](#users--who-chatted-where)) — its own file, migrations and connection
+lock, written only by the `chat_scan` sweep. Both databases share one
+instrumented lock helper (`store::db_lock`), which is what lets the I/O tab
+report them as separate lanes.
 
 Unit tests live in a `#[cfg(test)] mod tests` inside the submodule whose code
 they cover (they exercise private items and compile out of release builds).
