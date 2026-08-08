@@ -653,6 +653,9 @@ async fn tick(
         })
         .collect();
     ctx.refresh_hype_trains(&hype_targets, false).await;
+    // Creator Goals ride the same targets and cadence — one more anonymous
+    // GQL request per poll for channels we're already asking about.
+    ctx.refresh_creator_goals(&hype_targets).await;
 
     min_wait.clamp(1, MAX_SLEEP_SECS) as u64
 }

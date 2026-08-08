@@ -32,6 +32,11 @@ impl StreamArchiverApp {
         } else {
             (Arc::new(HashMap::new()), None, Arc::new(HashMap::new()))
         };
+        let rewards = Arc::new(if platform == Some(Platform::Twitch) {
+            crate::assets::load_reward_titles(&monitor_name, &account)
+        } else {
+            HashMap::new()
+        });
         let twitch_badge_dirs = Arc::new(if platform == Some(Platform::Twitch) {
             TwitchBadgeDirs {
                 channel: Some(twitch_badge_dir(&monitor_name, &account)),
@@ -111,6 +116,7 @@ impl StreamArchiverApp {
                 render_emotes,
                 source_partners.clone(),
                 twitch_badge_dirs.clone(),
+                rewards.clone(),
                 ctx.clone(),
             ));
         } else {
@@ -150,6 +156,7 @@ impl StreamArchiverApp {
             twitch_emote_dir,
             twitch_fallback_index,
             twitch_badge_dirs,
+            rewards,
             source_partners,
             fetch_unknown_emotes,
             loading,
@@ -229,6 +236,7 @@ impl StreamArchiverApp {
             Arc<AtomicBool>,
             Arc<HashMap<String, crate::models::CollabPartner>>,
             Arc<TwitchBadgeDirs>,
+            Arc<HashMap<String, crate::assets::RewardEntry>>,
         );
         let reload_info: Option<ReloadInfo> =
             if rec_active && popup.last_reload.elapsed() >= reload_after {
@@ -250,6 +258,7 @@ impl StreamArchiverApp {
                             popup.loading.clone(),
                             popup.source_partners.clone(),
                             popup.twitch_badge_dirs.clone(),
+                            popup.rewards.clone(),
                         )
                     })
                 })
@@ -362,6 +371,7 @@ impl StreamArchiverApp {
                                             let tdir = popup.twitch_emote_dir.clone();
                                             let tfallback = popup.twitch_fallback_index.clone();
                                             let bdirs = popup.twitch_badge_dirs.clone();
+                                            let rewards = popup.rewards.clone();
                                             let funknown = popup.fetch_unknown_emotes;
                                             // A different recording is a
                                             // different broadcast — its
@@ -420,6 +430,7 @@ impl StreamArchiverApp {
                                                 render_emotes,
                                                 source_partners,
                                                 bdirs,
+                                                rewards,
                                                 ctx.clone(),
                                             ));
                                         }
@@ -550,7 +561,8 @@ impl StreamArchiverApp {
                                 }
                                 if want_info {
                                     let has = !popup.stats.top_gifters.is_empty()
-                                        || !popup.stats.top_cheerers.is_empty();
+                                        || !popup.stats.top_cheerers.is_empty()
+                                        || !popup.stats.goals.is_empty();
                                     ui.add_enabled_ui(has, |ui| {
                                         icon_toggle(
                                             ui,
@@ -559,9 +571,9 @@ impl StreamArchiverApp {
                                             ICON_GIFT,
                                             16.0,
                                             if has {
-                                                "Show this broadcast's top supporters."
+                                                "Show this broadcast's channel info: its Creator                                                  Goals and its top supporters."
                                             } else {
-                                                "No gift subs or bits recorded for this broadcast."
+                                                "No goals, gift subs or bits recorded for this                                                  broadcast."
                                             },
                                         );
                                     });
@@ -1501,7 +1513,20 @@ impl StreamArchiverApp {
         // Tail-reload: while the recording is live, parse only the bytes
         // appended since the last pass and push them onto the shown log —
         // the whole file is never re-read.
-        if let Some((path, start_ts, state, emap, tdir, tfallback, funknown, loading, spartners, bdirs)) = reload_info {
+        if let Some((
+            path,
+            start_ts,
+            state,
+            emap,
+            tdir,
+            tfallback,
+            funknown,
+            loading,
+            spartners,
+            bdirs,
+            rewards,
+        )) = reload_info
+        {
             let mut p = popup_arc.lock().unwrap();
             p.last_reload = std::time::Instant::now();
             // Same cadence as the tail-reload: the leaderboard/Hype Train
@@ -1531,6 +1556,7 @@ impl StreamArchiverApp {
                 render_emotes,
                 spartners,
                 bdirs,
+                rewards,
                 ctx.clone(),
             ));
         }

@@ -1216,6 +1216,9 @@ progress_info: None,
                     true,
                     empty_partners.clone(),
                     no_channel_badges.clone(),
+                    // The sweep only indexes message text; a redemption's
+                    // reward title is a display concern.
+                    Default::default(),
                 )
                 .await
                 {

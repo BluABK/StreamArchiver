@@ -1296,11 +1296,11 @@ pub(super) async fn meta_watcher(
                 // feed. The 60 s cadence makes "no train" a tight statement,
                 // so this side also runs the false-positive sweep that
                 // tightens the inference tuning.
-                ctx.refresh_hype_trains(
-                    &[(monitor_id, login.clone(), sample_stream_id.clone())],
-                    true,
-                )
-                .await;
+                let targets = [(monitor_id, login.clone(), sample_stream_id.clone())];
+                ctx.refresh_hype_trains(&targets, true).await;
+                // Creator Goals, same 60 s cadence — the goal a broadcast was
+                // running with is archived alongside it.
+                ctx.refresh_creator_goals(&targets).await;
             }
             if let Some(rule) = &stop_rule
                 && !stop_sent

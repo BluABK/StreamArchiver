@@ -25,6 +25,7 @@ pub(in crate::ui) fn parse_chat_chunk(
     fetch_unknown_emotes: bool,
     source_partners: &HashMap<String, crate::models::CollabPartner>,
     badge_dirs: &TwitchBadgeDirs,
+    rewards: &HashMap<String, crate::assets::RewardEntry>,
 ) -> anyhow::Result<ChatChunk> {
     use std::io::{Read, Seek, SeekFrom};
     // Read window: bounds peak memory on huge logs — the previous whole-range
@@ -119,6 +120,7 @@ pub(in crate::ui) fn parse_chat_chunk(
                     &mut fetches,
                     source_partners,
                     badge_dirs,
+        rewards,
                 ) {
                     messages.push(m);
                 }
@@ -176,6 +178,7 @@ pub(crate) async fn parse_chunk_blocking(
     fetch_unknown_emotes: bool,
     source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
     badge_dirs: Arc<TwitchBadgeDirs>,
+    rewards: Arc<HashMap<String, crate::assets::RewardEntry>>,
 ) -> Result<ChatChunk, String> {
     tokio::task::spawn_blocking(move || {
         parse_chat_chunk(
@@ -189,6 +192,7 @@ pub(crate) async fn parse_chunk_blocking(
             fetch_unknown_emotes,
             &source_partners,
             &badge_dirs,
+            &rewards,
         )
     })
     .await
@@ -318,6 +322,7 @@ pub(in crate::ui) async fn load_chat(
     fetch_emoji: bool,
     source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
     badge_dirs: Arc<TwitchBadgeDirs>,
+    rewards: Arc<HashMap<String, crate::assets::RewardEntry>>,
     ctx: egui::Context,
 ) {
     let Some(path) = path else {
@@ -354,6 +359,7 @@ pub(in crate::ui) async fn load_chat(
         fetch_unknown_emotes,
         source_partners.clone(),
         badge_dirs.clone(),
+        rewards.clone(),
     )
     .await
     {
@@ -390,6 +396,7 @@ pub(in crate::ui) async fn load_chat(
             fetch_unknown_emotes,
             source_partners.clone(),
             badge_dirs.clone(),
+            rewards.clone(),
         )
         .await
         {
@@ -449,6 +456,7 @@ pub(in crate::ui) async fn tail_chat(
     fetch_emoji: bool,
     source_partners: Arc<HashMap<String, crate::models::CollabPartner>>,
     badge_dirs: Arc<TwitchBadgeDirs>,
+    rewards: Arc<HashMap<String, crate::assets::RewardEntry>>,
     ctx: egui::Context,
 ) {
     let from = {
@@ -475,6 +483,7 @@ pub(in crate::ui) async fn tail_chat(
             fetch_emoji,
             source_partners,
             badge_dirs,
+        rewards,
             ctx,
         )
         .await;
@@ -491,6 +500,7 @@ pub(in crate::ui) async fn tail_chat(
         fetch_unknown_emotes,
         source_partners,
         badge_dirs,
+        rewards,
     )
     .await
     else {
@@ -831,6 +841,7 @@ pub(in crate::ui) fn parse_twitch_chat_line(
     fetches: &mut Vec<EmojiFetch>,
     source_partners: &HashMap<String, crate::models::CollabPartner>,
     badge_dirs: &TwitchBadgeDirs,
+    rewards: &HashMap<String, crate::assets::RewardEntry>,
 ) -> Option<ChatMessage> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let ts_ms = v["ts"].as_f64().unwrap_or(0.0);
@@ -885,11 +896,14 @@ pub(in crate::ui) fn parse_twitch_chat_line(
     // means no accent — exactly as before.
     let reward_id = v["reward_id"].as_str().unwrap_or("");
     let notice = if !reward_id.is_empty() {
+        // IRC never names the reward, only its id — the title comes from the
+        // channel's cached reward list, and is simply absent when that hasn't
+        // been fetched (or the reward has since been deleted).
+        let known = rewards.get(reward_id);
         Some(Box::new(ChatNotice::Redemption {
-            // IRC never names the reward; the title is resolved separately.
-            reward: None,
+            reward: known.map(|r| r.title.clone()),
             reward_id: reward_id.to_string(),
-            cost: None,
+            cost: known.map(|r| r.cost).filter(|c| *c > 0),
         }))
     } else if v["msg_kind"].as_str() == Some("highlighted-message") {
         // The one reward identifiable without a lookup: Twitch gives it its

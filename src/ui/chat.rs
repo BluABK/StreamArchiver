@@ -489,6 +489,12 @@ pub(super) struct ChatPopup {
     /// popup-open, reused unchanged across recording switches within the
     /// same popup (badges aren't per-broadcast). Empty for YouTube.
     pub(super) twitch_badge_dirs: Arc<TwitchBadgeDirs>,
+    /// The channel's cached channel-point reward titles, keyed by reward id
+    /// (`rewards.json`, written by the asset fetcher). Built ONCE on popup
+    /// open, like `emote_map` — IRC only ever names a reward by its UUID, so
+    /// without this a redemption row can't say what was redeemed. Empty when
+    /// assets haven't been fetched, or for a non-Twitch monitor.
+    pub(super) rewards: Arc<HashMap<String, crate::assets::RewardEntry>>,
     /// This take's recorded Shared Chat / collab partners, keyed by Twitch
     /// broadcaster id (`store::collab::collab_partners_for_stream`) — resolves
     /// each message's raw `source_room_id` tag to a name for the "which
@@ -1026,7 +1032,7 @@ mod tests {
             let mut fetches = Vec::new();
             parse_twitch_chat_line(
                 line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false,
-                &mut fetches, &HashMap::new(), &empty_badge_dirs(),
+                &mut fetches, &HashMap::new(), &empty_badge_dirs(), &HashMap::new(),
             )
             .expect("line parses")
         };
@@ -1114,7 +1120,7 @@ mod tests {
         let mut fetches = Vec::new();
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &HashMap::new(), &empty_badge_dirs(),
+            &HashMap::new(), &empty_badge_dirs(), &HashMap::new(),
         )
         .expect("old line parses");
         assert_eq!(m.msg_id, "");
@@ -1141,7 +1147,7 @@ mod tests {
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi","source_room_id":"999"}"#;
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &partners, &empty_badge_dirs(),
+            &partners, &empty_badge_dirs(), &HashMap::new(),
         )
         .expect("parses");
         assert_eq!(m.source_name, "OtherStreamer");
@@ -1151,7 +1157,7 @@ mod tests {
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi","source_room_id":"111"}"#;
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &partners, &empty_badge_dirs(),
+            &partners, &empty_badge_dirs(), &HashMap::new(),
         )
         .expect("parses");
         assert_eq!(m.source_name, "");
@@ -1160,7 +1166,7 @@ mod tests {
         let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi"}"#;
         let m = parse_twitch_chat_line(
             line, 1_700_000_000_000.0, &HashMap::new(), None, &HashMap::new(), false, &mut fetches,
-            &partners, &empty_badge_dirs(),
+            &partners, &empty_badge_dirs(), &HashMap::new(),
         )
         .expect("parses");
         assert_eq!(m.source_name, "");

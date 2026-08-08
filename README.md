@@ -3704,9 +3704,9 @@ falls back to the default rather than leaving the app unreadable.
 
 **Info cards above the log.** Twitch's popout puts its channel furniture in
 translucent rounded panels that sit *on* the chat rather than boxing it in,
-and the chat window now does the same: a **channel info** card (this
-broadcast's top supporters — gift subs and bits) and a **Hype Train** card,
-both derived from the locally recorded chat-event history, no network. The
+and the chat window now does the same: **Creator Goals** ("BONUS STREAM
+SATURDAY · 73/100 New Subs"), a **channel info** card (this broadcast's top
+supporters — gift subs and bits), and a **Hype Train** card. The
 fill is the panel colour lifted (or deepened, in light mode) and made partly
 transparent, so a card reads as part of the same surface instead of a widget
 bolted on top.
@@ -3718,6 +3718,23 @@ re-opens the per-window toggle** — you asked to see a new one even after
 hiding the last — but it never overrides the feature switch. The toggles are
 disabled rather than hidden when a broadcast has nothing to put in that card,
 so the toolbar doesn't reflow every time a train starts or ends.
+
+**Creator Goals are archived, not just displayed.** Helix's `/goals` needs
+`channel:read:goals` on the *broadcaster's own* token, which is no use for
+archiving someone else's channel, so goals come from the same anonymous Twitch
+GQL surface the Hype Train check already uses — read on the same ~60 s poll,
+and written into the broadcast's event history rather than fetched when you
+look. Open a six-month-old take's chat and you still see what the channel was
+working toward at the time. Only goals Twitch marks `ACTIVE` are shown, so an
+old completed one doesn't linger; a goal type we haven't seen before still
+renders, with a best-effort noun rather than being dropped.
+
+**Channel-point redemptions get their real name.** IRC hands a redeemed
+message only the reward's UUID, so the channel's public reward list is fetched
+alongside its emotes and badges into `rewards.json` and used to turn
+`abc-123…` into "redeemed Hydrate! ⏱500". Un-fetched or since-deleted rewards
+fall back to "a channel-point reward" with the id on hover — no lookup, no
+loss.
 
 **A finished Hype Train says so, then gets out of the way.** While it runs the
 card is a live bar (level, points, countdown); for **five minutes** after its

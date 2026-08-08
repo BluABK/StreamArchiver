@@ -487,6 +487,47 @@ impl Store {
         Ok(true)
     }
 
+    /// Insert or update one Creator Goal, keyed on `(monitor, goal id)`.
+    /// Returns `true` on first sighting.
+    ///
+    /// Reuses `stream_event`'s v86 columns rather than needing a table or a
+    /// migration of its own: `amount` = contributions so far, `goal` = the
+    /// target, `tier` = the goal id, `level` is unused. Persisting it (rather
+    /// than fetching on view) is what archives the goal a broadcast was
+    /// running with — open a six-month-old take's chat and it's still there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_creator_goal_event(
+        &self,
+        monitor_id: i64,
+        at: i64,
+        stream_id: &str,
+        goal_id: &str,
+        current: i64,
+        target: i64,
+        description: &str,
+        kind: &str,
+    ) -> Result<bool> {
+        let conn = self.db();
+        // `at` is deliberately NOT updated: it stamps when the goal was first
+        // seen on this broadcast, which is what scopes it to a take's span.
+        let updated = conn.execute(
+            "UPDATE stream_event
+             SET amount = ?3, goal = ?4, detail = ?5, actor = ?6,
+                 stream_id = CASE WHEN ?7 != '' THEN ?7 ELSE stream_id END
+             WHERE monitor_id = ?1 AND kind = 'creator_goal' AND tier = ?2",
+            params![monitor_id, goal_id, current, target, description, kind, stream_id],
+        )?;
+        if updated > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO stream_event(monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, goal, expires_at, level)
+             VALUES(?1, ?2, ?3, 'creator_goal', ?4, '', ?5, ?6, ?7, ?8, 0, 0)",
+            params![monitor_id, at, stream_id, kind, current, goal_id, description, target],
+        )?;
+        Ok(true)
+    }
+
     /// Delete chat-inferred hype_train rows near `at` (a confirmed train
     /// supersedes them). Returns how many were removed — non-zero means the
     /// inference had caught this train (no loosening needed).

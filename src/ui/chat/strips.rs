@@ -8,6 +8,9 @@ use super::*;
 /// so one broadcast reads the same in both views.
 pub(in crate::ui) const HYPE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x40, 0x81);
 
+/// Twitch's own Creator Goal red.
+pub(in crate::ui) const GOAL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe9, 0x19, 0x16);
+
 /// One info card above the message list.
 ///
 /// Twitch's popout gets its "smooth and flowy" feel from translucent rounded
@@ -142,13 +145,28 @@ pub(in crate::ui) struct BroadcastStats {
     pub(in crate::ui) top_gifters: Vec<(String, i64)>,
     pub(in crate::ui) top_cheerers: Vec<(String, i64)>,
     pub(in crate::ui) hype_train: Option<HypeTrainDisplay>,
+    /// This broadcast's Creator Goals, newest first — the "BONUS STREAM
+    /// SATURDAY · 53/100 New Subs" bars Twitch shows above its own chat.
+    pub(in crate::ui) goals: Vec<CreatorGoalDisplay>,
+}
+
+/// One Creator Goal as the chat card draws it.
+pub(in crate::ui) struct CreatorGoalDisplay {
+    pub(in crate::ui) description: String,
+    pub(in crate::ui) current: i64,
+    pub(in crate::ui) target: i64,
+    /// What it counts ("New Subs"), already worded for display.
+    pub(in crate::ui) noun: String,
 }
 
 impl BroadcastStats {
     /// Nothing to show — the strips collapse entirely rather than drawing an
     /// empty card.
     pub(in crate::ui) fn is_empty(&self) -> bool {
-        self.top_gifters.is_empty() && self.top_cheerers.is_empty() && self.hype_train.is_none()
+        self.top_gifters.is_empty()
+            && self.top_cheerers.is_empty()
+            && self.hype_train.is_none()
+            && self.goals.is_empty()
     }
 }
 
@@ -171,6 +189,31 @@ pub(in crate::ui) fn load_broadcast_stats(
     BroadcastStats {
         top_gifters: crate::ui::channel_stats::top_contributors(&events, "subgift", 5),
         top_cheerers: crate::ui::channel_stats::top_contributors(&events, "bits", 5),
+        // Newest first, one row per goal id (the upsert keeps a single row
+        // per goal, so this is already deduped).
+        goals: {
+            let mut g: Vec<_> = events
+                .iter()
+                .filter(|e| e.kind == "creator_goal" && e.goal > 0)
+                .collect();
+            g.sort_by_key(|e| std::cmp::Reverse(e.at));
+            g.into_iter()
+                .map(|e| CreatorGoalDisplay {
+                    description: e.detail.clone(),
+                    current: e.amount,
+                    target: e.goal,
+                    // `actor` carries the raw contribution type.
+                    noun: crate::detectors::CreatorGoal {
+                        id: String::new(),
+                        kind: e.actor.clone(),
+                        description: String::new(),
+                        current: 0,
+                        target: 0,
+                    }
+                    .noun(),
+                })
+                .collect()
+        },
         hype_train: events
             .iter()
             .filter(|e| e.kind == "hype_train")
@@ -223,6 +266,35 @@ pub(in crate::ui) fn chat_info_cards(
         (cs.show_hype_train, cs.show_channel_info)
     };
     let mut ticking = false;
+
+    // Creator Goals first, matching where Twitch puts them: above the chat,
+    // above everything else.
+    if want_info && popup.show_info {
+        for g in &popup.stats.goals {
+            chat_card(ui, |ui| {
+                if !g.description.is_empty() {
+                    ui.label(egui::RichText::new(&g.description).strong());
+                }
+                ui.add(
+                    egui::ProgressBar::new(
+                        (g.current as f32 / g.target as f32).clamp(0.0, 1.0),
+                    )
+                    .text(format!(
+                        "{}/{} {}",
+                        crate::models::group_thousands(g.current),
+                        crate::models::group_thousands(g.target),
+                        g.noun,
+                    ))
+                    .fill(GOAL_COLOR)
+                    .corner_radius(3.0)
+                    .desired_width(ui.available_width()),
+                )
+                .on_hover_text(
+                    "A Creator Goal this channel was running. Read from Twitch on the same                      ~60s poll as the Hype Train, and archived with the broadcast — so an old                      take still shows what the channel was working toward at the time.",
+                );
+            });
+        }
+    }
 
     if want_info
         && popup.show_info

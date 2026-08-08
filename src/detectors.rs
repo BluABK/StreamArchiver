@@ -293,7 +293,7 @@ pub struct CollabGroup {
 
 /// The Twitch web client's own public Client-ID — what its anonymous GQL
 /// requests send (same id streamlink/yt-dlp use for playback queries).
-const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+pub(crate) const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 /// Logins per aliased hype-train GQL request (a 10-login batch measured
 /// ~90 ms; 30 keeps the query size comfortable).
@@ -335,6 +335,85 @@ pub struct HypeTrainState {
     /// Current conductors (top contributors): `(display name, source
     /// "BITS"/"SUBS", quantity)`.
     pub conductors: Vec<(String, String, i64)>,
+}
+
+/// One of a channel's active Creator Goals — the "BONUS STREAM SATURDAY —
+/// 53/100 New Subs" bar Twitch shows above its chat.
+///
+/// Helix's `/goals` needs `channel:read:goals` on the BROADCASTER's own token,
+/// which is no use for archiving other people's channels, so this comes from
+/// the same anonymous GQL surface the hype-train check already uses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatorGoal {
+    pub id: String,
+    /// `NEW_SUBS` / `SUBS` / `FOLLOWERS` / `NEW_BITS` / … — see
+    /// [`CreatorGoal::noun`].
+    pub kind: String,
+    pub description: String,
+    pub current: i64,
+    pub target: i64,
+}
+
+impl CreatorGoal {
+    /// What the goal counts, for the progress bar's "53/100 New Subs".
+    /// Unknown kinds fall back to a title-cased form of the raw value rather
+    /// than being dropped — a goal type we haven't seen is still a goal.
+    pub fn noun(&self) -> String {
+        match self.kind.as_str() {
+            "NEW_SUBSCRIPTIONS" | "NEW_SUBS" => "New Subs".into(),
+            "SUBSCRIPTIONS" | "SUBS" => "Subs".into(),
+            "NEW_SUB_POINTS" => "New Sub Points".into(),
+            "SUB_POINTS" => "Sub Points".into(),
+            "NEW_FOLLOWERS" | "FOLLOWERS" => "Followers".into(),
+            "NEW_BITS" | "BITS" => "Bits".into(),
+            other => other
+                .split('_')
+                .filter(|w| !w.is_empty())
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+/// Pull a channel's ACTIVE goals out of its GQL node. Every field is optional
+/// and a malformed entry is skipped, per the house rule for unofficial APIs.
+///
+/// An empty result from a successful fetch is authoritative "no active goal";
+/// a transport failure is a separate thing and leaves callers unchanged — the
+/// same contract `twitch_hype_trains` has, and the reason both are safe to run
+/// against an undocumented API.
+pub(crate) fn parse_goals_sync(node: &Value) -> Vec<CreatorGoal> {
+    node["edges"]
+        .as_array()
+        .map(|edges| {
+            edges
+                .iter()
+                .map(|e| &e["node"])
+                // No `state` (an older schema) is treated as active: better a
+                // stale goal than none at all.
+                .filter(|n| n["state"].as_str().unwrap_or("ACTIVE") == "ACTIVE")
+                .filter_map(|n| {
+                    let target = n["targetContributions"].as_i64().unwrap_or(0);
+                    // A zero target would divide by zero in the bar and means
+                    // nothing to a reader either.
+                    (target > 0).then(|| CreatorGoal {
+                        id: n["id"].as_str().unwrap_or_default().to_string(),
+                        kind: n["contributionType"].as_str().unwrap_or_default().to_string(),
+                        description: n["description"].as_str().unwrap_or_default().to_string(),
+                        current: n["currentContributions"].as_i64().unwrap_or(0),
+                        target,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse one `channel.hypeTrain` GQL node. `None` when no train is running
@@ -1727,6 +1806,98 @@ impl DetectContext {
     /// `Ok(map[login] = None)` is the authoritative "no train right now";
     /// `Err` = transport/schema failure (callers must NOT treat that as
     /// "no train" — the poll simply wasn't watching).
+    /// Active Creator Goals for a batch of Twitch logins, keyed by login.
+    /// Same anonymous-GQL shape and chunking as [`Self::twitch_hype_trains`].
+    pub async fn twitch_creator_goals(
+        &self,
+        logins: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<CreatorGoal>>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in logins.chunks(HYPE_GQL_CHUNK) {
+            // Logins come from `twitch_login` — lowercase `[a-z0-9_]`, safe to
+            // embed. Aliases can't start with a digit, hence the `c` prefix.
+            let subs: String = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, login)| {
+                    format!(
+                        "c{i}: user(login: \"{login}\") {{ channel {{ goals {{ edges {{ node {{ \
+                         id contributionType description currentContributions \
+                         targetContributions state }} }} }} }} }} "
+                    )
+                })
+                .collect();
+            let v = self.twitch_gql(&format!("query {{ {subs}}}")).await?;
+            for (i, login) in chunk.iter().enumerate() {
+                let node = &v["data"][format!("c{i}")]["channel"]["goals"];
+                out.insert(login.to_string(), parse_goals_sync(node));
+            }
+        }
+        Ok(out)
+    }
+
+    /// POST one anonymous GQL query and return the parsed body, failing on a
+    /// non-2xx status or a GraphQL `errors` array. Factored out of the three
+    /// callers so the transport contract (which headers, what counts as a
+    /// failure) is stated once.
+    async fn twitch_gql(&self, query: &str) -> anyhow::Result<Value> {
+        let resp = self
+            .http
+            .post("https://gql.twitch.tv/gql")
+            .header("Client-Id", TWITCH_WEB_CLIENT_ID)
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("gql {}", resp.status());
+        }
+        let v: Value = resp.json().await?;
+        if let Some(errs) = v["errors"].as_array()
+            && !errs.is_empty()
+        {
+            anyhow::bail!("gql error: {}", errs[0]["message"].as_str().unwrap_or("?"));
+        }
+        Ok(v)
+    }
+
+    /// Refresh a set of live monitors' Creator Goals into `stream_event`,
+    /// alongside the hype-train check that shares this cadence.
+    ///
+    /// Persisted rather than fetched on view so the goal that was live DURING
+    /// a broadcast is archived with it — open the chat for a six-month-old
+    /// take and you see what the channel was working toward at the time. A
+    /// transport failure changes nothing, same as the train check.
+    pub async fn refresh_creator_goals(&self, targets: &[(i64, String, String)]) {
+        if targets.is_empty() || !crate::hype::gql_enabled(&self.store) {
+            return;
+        }
+        let logins: Vec<&str> = targets.iter().map(|(_, l, _)| l.as_str()).collect();
+        let goals = match self.twitch_creator_goals(&logins).await {
+            Ok(g) => g,
+            Err(e) => {
+                debug!("goals: GQL check failed: {e:#}");
+                return;
+            }
+        };
+        let now = crate::models::now_unix();
+        for (monitor_id, login, stream_id) in targets {
+            for g in goals.get(login.as_str()).into_iter().flatten() {
+                if let Err(e) = self.store.upsert_creator_goal_event(
+                    *monitor_id,
+                    now,
+                    stream_id,
+                    &g.id,
+                    g.current,
+                    g.target,
+                    &g.description,
+                    &g.kind,
+                ) {
+                    warn!("goals: persisting {login} goal failed: {e:#}");
+                }
+            }
+        }
+    }
+
     pub async fn twitch_hype_trains(
         &self,
         logins: &[&str],
@@ -5938,6 +6109,61 @@ mod tests {
         assert_eq!(yt_compact_number("998"), Some(998));
         assert_eq!(yt_compact_number("2,100"), Some(2100));
         assert_eq!(yt_compact_number("1B"), Some(1_000_000_000));
+    }
+
+    /// Real shape, straight off the anonymous GQL endpoint (LaynaLazar,
+    /// 2026-08-08) — the "BONUS STREAM SATURDAY" bar from Twitch's own chat.
+    #[test]
+    fn parse_goals_reads_active_goals_and_skips_the_rest() {
+        let node: Value = serde_json::from_str(
+            r#"{"edges":[
+                {"node":{"id":"g1","contributionType":"NEW_SUBS","description":"BONUS STREAM SATURDAY",
+                         "currentContributions":73,"targetContributions":100,"state":"ACTIVE"}},
+                {"node":{"id":"g2","contributionType":"FOLLOWERS","description":"old one",
+                         "currentContributions":50,"targetContributions":50,"state":"ENDED"}},
+                {"node":{"id":"g3","contributionType":"NEW_SUBS","description":"broken",
+                         "currentContributions":1,"targetContributions":0,"state":"ACTIVE"}}
+            ]}"#,
+        )
+        .unwrap();
+        let goals = parse_goals_sync(&node);
+        assert_eq!(goals.len(), 1, "only the active, well-formed goal");
+        assert_eq!(goals[0].id, "g1");
+        assert_eq!(goals[0].description, "BONUS STREAM SATURDAY");
+        assert_eq!((goals[0].current, goals[0].target), (73, 100));
+        assert_eq!(goals[0].noun(), "New Subs");
+    }
+
+    /// The whole point of the "we weren't watching vs there is nothing"
+    /// distinction: an unrecognisable node yields no goals rather than
+    /// panicking or inventing one.
+    #[test]
+    fn parse_goals_degrades_on_a_shape_it_does_not_know() {
+        assert!(parse_goals_sync(&Value::Null).is_empty());
+        assert!(parse_goals_sync(&serde_json::json!({})).is_empty());
+        assert!(parse_goals_sync(&serde_json::json!({"edges": []})).is_empty());
+        // Missing `state` is treated as active — better a stale goal than none.
+        let n = serde_json::json!({"edges":[{"node":{"id":"x","targetContributions":10}}]});
+        assert_eq!(parse_goals_sync(&n).len(), 1);
+    }
+
+    /// An unknown contribution type is still a goal; it just gets a
+    /// best-effort noun rather than being dropped.
+    #[test]
+    fn goal_nouns_cover_the_known_kinds_and_title_case_the_rest() {
+        let g = |kind: &str| CreatorGoal {
+            id: String::new(),
+            kind: kind.into(),
+            description: String::new(),
+            current: 0,
+            target: 1,
+        };
+        assert_eq!(g("NEW_SUBS").noun(), "New Subs");
+        assert_eq!(g("SUB_POINTS").noun(), "Sub Points");
+        assert_eq!(g("FOLLOWERS").noun(), "Followers");
+        assert_eq!(g("BITS").noun(), "Bits");
+        assert_eq!(g("SOME_NEW_THING").noun(), "Some New Thing");
+        assert_eq!(g("").noun(), "");
     }
 
     #[test]

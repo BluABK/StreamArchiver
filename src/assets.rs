@@ -1643,6 +1643,83 @@ async fn fetch_kick_channel_assets(
 
 // ---------- Platform orchestrators ----------
 
+/// The channel's channel-point reward titles, cached as `rewards.json` next to
+/// the emote/badge assets.
+///
+/// IRC hands a redeemed message only the reward's UUID, so without this the
+/// chat replay can only say "a channel-point reward". The reward list is
+/// public (it's what the channel page renders), read from the same anonymous
+/// GQL surface the hype-train and goal checks use — no auth, and nothing
+/// per-viewer is involved.
+///
+/// Best-effort: a failure leaves the previous file in place, and the replay
+/// degrades to the UUID on hover.
+pub async fn fetch_twitch_rewards(client: &Client, login: &str, asset_dir: &Path) -> Result<usize> {
+    let body = serde_json::json!({
+        "query": format!(
+            "query {{ user(login: \"{login}\") {{ channel {{ \
+             communityPointsSettings {{ customRewards {{ id title cost }} }} }} }} }}"
+        )
+    });
+    let v: serde_json::Value = client
+        .post("https://gql.twitch.tv/gql")
+        .header("Client-Id", crate::detectors::TWITCH_WEB_CLIENT_ID)
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let list = &v["data"]["user"]["channel"]["communityPointsSettings"]["customRewards"];
+    let Some(arr) = list.as_array() else {
+        anyhow::bail!("no customRewards in response");
+    };
+    let map: std::collections::HashMap<String, RewardEntry> = arr
+        .iter()
+        .filter_map(|r| {
+            let id = r["id"].as_str()?;
+            let title = r["title"].as_str()?;
+            (!id.is_empty() && !title.is_empty()).then(|| {
+                (id.to_string(), RewardEntry {
+                    title: title.to_string(),
+                    cost: r["cost"].as_i64().unwrap_or(0),
+                })
+            })
+        })
+        .collect();
+    crate::iomon::fs::create_dir_all_sync(crate::iomon::Cat::AssetCache, asset_dir)?;
+    crate::iomon::fs::write_sync(
+        crate::iomon::Cat::AssetCache,
+        asset_dir.join("rewards.json"),
+        serde_json::to_vec_pretty(&map)?,
+    )?;
+    Ok(map.len())
+}
+
+/// One cached channel-point reward.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RewardEntry {
+    pub title: String,
+    pub cost: i64,
+}
+
+/// Read the cached reward titles for a channel, keyed by reward id. Empty when
+/// never fetched or unreadable — the replay then shows the raw id on hover.
+pub fn load_reward_titles(
+    name: &str,
+    account: &str,
+) -> std::collections::HashMap<String, RewardEntry> {
+    for dir in asset_read_dirs(name, crate::models::Platform::Twitch, account) {
+        if let Ok(s) = crate::iomon::fs::read_to_string_sync(
+            crate::iomon::Cat::AssetCache,
+            dir.join("rewards.json"),
+        ) && let Ok(m) = serde_json::from_str(&s)
+        {
+            return m;
+        }
+    }
+    std::collections::HashMap::new()
+}
+
 /// Run all Twitch channel asset fetches:
 /// - Icon + banner → `asset_dir/`
 /// - Channel badges → `asset_dir/badges/`
@@ -1667,10 +1744,14 @@ pub async fn run_twitch_assets(
     about: Option<&AboutSink>,
 ) -> bool {
     let mut description: Option<String> = None;
+    // The reward fetch below is keyed by login, which this first call is what
+    // tells us.
+    let mut login = String::new();
     let ok = match fetch_twitch_channel_assets(client, client_id, token, broadcaster_id, asset_dir)
         .await
     {
         Ok(info) => {
+            login = info.login.clone();
             if let Some(sink) = about {
                 crate::detectors::record_twitch_user_info(
                     &sink.store,
@@ -1708,6 +1789,15 @@ pub async fn run_twitch_assets(
     }
     if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("7TV ({broadcaster_id}): {e}");
+    }
+    if !login.is_empty() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match fetch_twitch_rewards(client, &login, asset_dir).await {
+            Ok(n) => tracing::debug!("Twitch rewards ({login}): {n} cached"),
+            // Not an error worth a warn!: a channel with points disabled has
+            // none, and the replay degrades to showing the reward's id.
+            Err(e) => tracing::debug!("Twitch rewards ({login}): {e}"),
+        }
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     if let Err(e) =
