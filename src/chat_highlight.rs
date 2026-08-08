@@ -207,12 +207,19 @@ pub fn first_hit(text: &str, login: &str, rules: &[HighlightRule]) -> Option<Hig
 ///   per message. Suppressed hits still reach the 🔔 feed via the row accent —
 ///   nothing is lost, only the interruption.
 ///
-/// `my_login` empty (no connected account, or "pingable" off) disables the
-/// mention half; rules that opted in still fire.
+/// `my_login` is the connected account (empty when none) and is ALWAYS what
+/// self-suppression matches on. `pingable` separately decides whether being
+/// named counts as a hit.
+///
+/// Those two must stay separate: folding them into one "the login to match"
+/// argument meant that turning mentions off also turned SELF-suppression off,
+/// so your own messages started pinging you through any notify rule. The
+/// broadcaster typing in their own chat hits that instantly.
 pub fn notify_reason(
     text: &str,
     author_login: &str,
     my_login: &str,
+    pingable: bool,
     rules: &[HighlightRule],
     now: i64,
     last_toast: i64,
@@ -220,7 +227,7 @@ pub fn notify_reason(
     if !my_login.is_empty() && author_login.eq_ignore_ascii_case(my_login) {
         return None;
     }
-    let hit = first_hit(text, my_login, rules)?;
+    let hit = first_hit(text, if pingable { my_login } else { "" }, rules)?;
     if !hit.notifies() || now - last_toast < MENTION_TOAST_COOLDOWN_SECS {
         return None;
     }
@@ -359,34 +366,59 @@ mod tests {
 
         // A mention pings, and names the reason.
         assert_eq!(
-            notify_reason("hey bluabk", "someone", "bluabk", &[], 100, 0).as_deref(),
+            notify_reason("hey bluabk", "someone", "bluabk", true, &[], 100, 0).as_deref(),
             Some("mentioned you")
         );
 
         // Your own message never pings you, however it matched.
-        assert_eq!(notify_reason("hey bluabk", "BluABK", "bluabk", &[], 100, 0), None);
-        assert_eq!(notify_reason("karaoke!", "bluabk", "bluabk", &loud, 100, 0), None);
+        assert_eq!(notify_reason("hey bluabk", "BluABK", "bluabk", true, &[], 100, 0), None);
+        assert_eq!(notify_reason("karaoke!", "bluabk", "bluabk", true, &loud, 100, 0), None);
 
         // A rule that didn't ask to notify only accents the row.
-        assert_eq!(notify_reason("karaoke!", "someone", "bluabk", &quiet, 100, 0), None);
+        assert_eq!(notify_reason("karaoke!", "someone", "bluabk", true, &quiet, 100, 0), None);
         assert_eq!(
-            notify_reason("karaoke!", "someone", "bluabk", &loud, 100, 0).as_deref(),
+            notify_reason("karaoke!", "someone", "bluabk", true, &loud, 100, 0).as_deref(),
             Some("matched Karaoke")
         );
 
         // Cooldown: a chat spamming your name gets one toast, not fifty.
-        assert_eq!(notify_reason("hey bluabk", "a", "bluabk", &[], 100, 95), None);
+        assert_eq!(notify_reason("hey bluabk", "a", "bluabk", true, &[], 100, 95), None);
         assert!(
-            notify_reason("hey bluabk", "a", "bluabk", &[], 100 + MENTION_TOAST_COOLDOWN_SECS, 100)
-                .is_some()
+            notify_reason(
+                "hey bluabk",
+                "a",
+                "bluabk",
+                true,
+                &[],
+                100 + MENTION_TOAST_COOLDOWN_SECS,
+                100
+            )
+            .is_some()
         );
 
-        // "Pingable" off (empty login) silences mentions but not opted-in rules.
-        assert_eq!(notify_reason("hey bluabk", "a", "", &[], 100, 0), None);
-        assert!(notify_reason("karaoke!", "a", "", &loud, 100, 0).is_some());
-
         // Nothing matched at all.
-        assert_eq!(notify_reason("just chatting", "a", "bluabk", &loud, 100, 0), None);
+        assert_eq!(notify_reason("just chatting", "a", "bluabk", true, &loud, 100, 0), None);
+    }
+
+    /// Turning mentions off must NOT also turn self-suppression off. These
+    /// were one argument, and the result was that a broadcaster with
+    /// "notify me by name" off and any notify rule on pinged themselves on
+    /// every message they typed in their own chat.
+    #[test]
+    fn mentions_off_still_suppresses_your_own_messages() {
+        let loud = vec![HighlightRule { notify: true, label: "Karaoke".into(), ..rule("karaoke") }];
+
+        // Mentions off: being named no longer pings…
+        assert_eq!(notify_reason("hey bluabk", "someone", "bluabk", false, &[], 100, 0), None);
+        // …but an opted-in rule still does, from someone else.
+        assert!(notify_reason("karaoke!", "someone", "bluabk", false, &loud, 100, 0).is_some());
+        // …and never from yourself.
+        assert_eq!(notify_reason("karaoke!", "bluabk", "bluabk", false, &loud, 100, 0), None);
+        assert_eq!(notify_reason("karaoke!", "BluABK", "bluabk", false, &loud, 100, 0), None);
+
+        // No account connected at all: nothing to self-suppress against, and
+        // rules still work.
+        assert!(notify_reason("karaoke!", "anyone", "", false, &loud, 100, 0).is_some());
     }
 
     #[test]

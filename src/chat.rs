@@ -770,7 +770,8 @@ impl<'a> MentionWatch<'a> {
         let Some(reason) = crate::chat_highlight::notify_reason(
             text,
             v["login"].as_str().unwrap_or(""),
-            if self.pingable { self.login.as_str() } else { "" },
+            &self.login,
+            self.pingable,
             &self.rules,
             now,
             self.last_toast,
