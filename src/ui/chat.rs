@@ -307,6 +307,13 @@ pub(super) struct ChatSettingsState {
     pub(super) emote_pt: f32,
     pub(super) ts_color: egui::Color32,
     pub(super) text_color: egui::Color32,
+    /// Feature switch for the Hype Train card — see [`K_CHAT_SHOW_HYPE`].
+    /// Distinct from `ChatPopup::show_hype`, which is one window's own
+    /// collapse for this session.
+    pub(super) show_hype_train: bool,
+    /// Feature switch for the channel-info card (top supporters, goals) —
+    /// see [`K_CHAT_SHOW_INFO`].
+    pub(super) show_channel_info: bool,
 }
 
 impl ChatSettingsState {
@@ -353,6 +360,11 @@ impl ChatSettingsState {
                 .flatten()
                 .and_then(|v| parse_chat_hex_color(&v))
                 .unwrap_or(egui::Color32::WHITE),
+            // Both cards default on: they're the Twitch-parity furniture, and
+            // each one already hides itself when the broadcast has nothing to
+            // put in it.
+            show_hype_train: flag(K_CHAT_SHOW_HYPE, true),
+            show_channel_info: flag(K_CHAT_SHOW_INFO, true),
         }
     }
 }
@@ -409,6 +421,19 @@ pub(super) struct ChatPopup {
     /// the same cadence as the live tail-reload while the recording is still
     /// going. See [`BroadcastStats`].
     pub(super) stats: BroadcastStats,
+    /// Per-window, per-session collapse for the Hype Train card. Distinct
+    /// from `ChatSettingsState::show_hype_train`, which is the feature
+    /// switch: this is "not right now, in this window", the same shape as
+    /// `full_view`/`hide_shared`. A new train re-opens it (see
+    /// `hype_seen_id`) but can never override the feature switch.
+    pub(super) show_hype: bool,
+    /// Same, for the channel-info card (top supporters, goals).
+    pub(super) show_info: bool,
+    /// The `train_id` of the most recent Hype Train this window has already
+    /// reacted to. A different id while the train is running means one just
+    /// STARTED, which re-opens `show_hype` — the user asked to be shown a new
+    /// train even if they'd collapsed the last one.
+    pub(super) hype_seen_id: String,
     /// When the popup last triggered a background re-read of the chat file.
     /// Used to tail a live recording: the file is re-parsed every few seconds
     /// while `recording.ended_at` is `None`.
@@ -588,6 +613,68 @@ mod tests {
         // rather than drawing an empty card.
         let empty_mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
         assert!(load_broadcast_stats(&store, empty_mid, 0, 200).is_empty());
+    }
+
+    fn train(goal: i64, expires_at: i64) -> HypeTrainDisplay {
+        HypeTrainDisplay {
+            detail: "level 3 · 4,200 pts (confirmed)".into(),
+            train_id: "t1".into(),
+            level: 3,
+            total: 4200,
+            goal,
+            expires_at,
+        }
+    }
+
+    /// The whole Hype Train card lifecycle, without a clock or a UI.
+    #[test]
+    fn hype_phase_runs_then_grace_then_hides_only_on_a_live_view() {
+        let t = train(5000, 1_000);
+
+        // Running: fraction of the way to the next level, seconds left.
+        assert_eq!(
+            hype_phase(&t, 940, true),
+            HypePhase::Running { frac: 4200.0 / 5000.0, remaining: 60 }
+        );
+
+        // Just over: the grace window says so rather than vanishing mid-read.
+        assert_eq!(hype_phase(&t, 1_000, true), HypePhase::Ended { since_secs: 0 });
+        assert_eq!(
+            hype_phase(&t, 1_000 + HYPE_ENDED_GRACE_SECS - 1, true),
+            HypePhase::Ended { since_secs: HYPE_ENDED_GRACE_SECS - 1 }
+        );
+
+        // Past the grace window, a LIVE view hides it — that's the whole
+        // point of the auto-hide.
+        assert_eq!(hype_phase(&t, 1_000 + HYPE_ENDED_GRACE_SECS, true), HypePhase::Hidden);
+
+        // …but an ARCHIVED take must keep showing it forever. This is an
+        // archive tool; a three-week-old broadcast still had a Level 3 train,
+        // and hiding it because wall-clock time passed would be a regression.
+        assert_eq!(hype_phase(&t, 1_000 + HYPE_ENDED_GRACE_SECS, false), HypePhase::Summary);
+        assert_eq!(hype_phase(&t, 99_999_999, false), HypePhase::Summary);
+    }
+
+    /// A row with no timing (pre-v86, or inference-only that GQL never
+    /// confirmed) has nothing to count against, so it is always the static
+    /// summary — never "ended", never hidden.
+    #[test]
+    fn hype_phase_untimed_rows_are_always_a_summary() {
+        for t in [train(0, 1_000), train(5000, 0), train(0, 0)] {
+            for live in [true, false] {
+                assert_eq!(hype_phase(&t, 1_000_000, live), HypePhase::Summary);
+                assert_eq!(hype_phase(&t, 0, live), HypePhase::Summary);
+            }
+        }
+    }
+
+    #[test]
+    fn fmt_ago_reads_naturally_across_the_grace_window() {
+        assert_eq!(fmt_ago(0), "just now");
+        assert_eq!(fmt_ago(29), "just now");
+        assert_eq!(fmt_ago(60), "1m ago");
+        assert_eq!(fmt_ago(299), "4m ago");
+        assert_eq!(fmt_ago(3_900), "1h 5m ago");
     }
 
     /// The height cache is keyed on everything that changes how tall a row

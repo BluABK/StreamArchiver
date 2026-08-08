@@ -133,6 +133,11 @@ impl StreamArchiverApp {
             user_card: None,
             users_panel: None,
             stats,
+            // Both cards start open; the feature switches in Settings decide
+            // whether they're available at all.
+            show_hype: true,
+            show_info: true,
+            hype_seen_id: String::new(),
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
@@ -467,6 +472,55 @@ impl StreamArchiverApp {
                                         built_at_count: 0,
                                     })
                                 };
+                            }
+                            // The two info-card toggles. Rendered whenever this
+                            // is a Twitch window and the card's feature switch
+                            // is on, and DISABLED (rather than hidden) when the
+                            // broadcast has nothing to put in that card — a
+                            // toolbar that reflows every time a Hype Train
+                            // starts or ends is worse than a greyed button.
+                            if popup.is_twitch {
+                                let (want_hype, want_info) = {
+                                    let cs = popup.settings.lock().unwrap();
+                                    (cs.show_hype_train, cs.show_channel_info)
+                                };
+                                if want_hype {
+                                    let has = popup.stats.hype_train.is_some();
+                                    ui.add_enabled_ui(has, |ui| {
+                                        icon_toggle(
+                                            ui,
+                                            &mut popup.show_hype,
+                                            Some(&ui_tex),
+                                            ICON_TRAIN,
+                                            16.0,
+                                            if has {
+                                                "Show this broadcast's Hype Train. A new train \
+                                                 re-opens this even after you close it; turn the \
+                                                 card off entirely in Settings → Interface."
+                                            } else {
+                                                "No Hype Train recorded for this broadcast."
+                                            },
+                                        );
+                                    });
+                                }
+                                if want_info {
+                                    let has = !popup.stats.top_gifters.is_empty()
+                                        || !popup.stats.top_cheerers.is_empty();
+                                    ui.add_enabled_ui(has, |ui| {
+                                        icon_toggle(
+                                            ui,
+                                            &mut popup.show_info,
+                                            Some(&ui_tex),
+                                            ICON_GIFT,
+                                            16.0,
+                                            if has {
+                                                "Show this broadcast's top supporters."
+                                            } else {
+                                                "No gift subs or bits recorded for this broadcast."
+                                            },
+                                        );
+                                    });
+                                }
                             }
                             ui.checkbox(&mut popup.hide_shared, "Hide shared")
                                 .on_hover_text(
@@ -996,87 +1050,29 @@ impl StreamArchiverApp {
                         }
                     }
 
-                    // ── Leaderboard / Hype Train ────────────────────────────
-                    // Matches Twitch's own layout: a top-supporters strip and
-                    // an ongoing/reached Hype Train indicator sit above the
-                    // message list. Built entirely from `stream_event` (see
-                    // `load_broadcast_stats`'s doc) — no live carousel/train
-                    // capture exists, so this is a local reconstruction: the
-                    // leaderboard won't match Twitch's exact carousel (no
-                    // follow/viewer-count data available to us), and the
-                    // Hype Train bar reflects this app's own periodic
-                    // (~60s) Twitch poll, not a smooth animated countdown.
-                    if !popup.stats.is_empty() {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            if !popup.stats.top_gifters.is_empty() || !popup.stats.top_cheerers.is_empty() {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 10.0;
-                                    ui.label(egui::RichText::new("Top supporters:").weak());
-                                    let accent = ui.visuals().weak_text_color();
-                                    for (name, n) in &popup.stats.top_gifters {
-                                        ui_icon(ui, Some(&ui_tex), ICON_GIFT, 13.0, accent)
-                                            .on_hover_text("Gift subs given this broadcast");
-                                        ui.label(format!("{name} ×{n}"))
-                                            .on_hover_text("Gift subs given this broadcast");
-                                    }
-                                    for (name, n) in &popup.stats.top_cheerers {
-                                        ui_icon(ui, Some(&ui_tex), ICON_GEM, 13.0, accent)
-                                            .on_hover_text("Bits cheered this broadcast");
-                                        ui.label(format!("{name} ×{n}"))
-                                            .on_hover_text("Bits cheered this broadcast");
-                                    }
-                                });
-                            }
-                            if let Some(train) = &popup.stats.hype_train {
-                                if !popup.stats.top_gifters.is_empty() || !popup.stats.top_cheerers.is_empty() {
-                                    ui.separator();
-                                }
-                                // `goal`/`expires_at` are only populated (v86+) for a
-                                // GQL-confirmed train; `now < expires_at` is this app's
-                                // best-effort "is it still running" signal (Twitch
-                                // gives no explicit end event) — everything else
-                                // (pre-v86 rows, inference-only rows GQL never
-                                // confirmed, or a train whose timer has lapsed) falls
-                                // back to the plain reached-level summary line.
-                                let now = crate::models::now_unix();
-                                let live = train.goal > 0 && train.expires_at > now;
-                                if live {
-                                    let frac = (train.total as f32 / train.goal as f32).clamp(0.0, 1.0);
-                                    let remaining = (train.expires_at - now).max(0);
-                                    ui.horizontal(|ui| {
-                                        ui_icon(ui, Some(&ui_tex), ICON_TRAIN, 15.0, HYPE_COLOR);
-                                        ui.add(
-                                            egui::ProgressBar::new(frac)
-                                                .text(format!(
-                                                    "Hype Train · Lvl {} · {}/{} · {}:{:02}",
-                                                    train.level.max(1),
-                                                    crate::models::group_thousands(train.total),
-                                                    crate::models::group_thousands(train.goal),
-                                                    remaining / 60,
-                                                    remaining % 60,
-                                                ))
-                                                .fill(HYPE_COLOR)
-                                                .desired_width(ui.available_width() - 24.0),
-                                        )
-                                        .on_hover_text(
-                                            "Reconstructed from this app's periodic (~60s) \
-                                             anonymous Twitch poll — not a live push update, \
-                                             so it can lag a few seconds behind Twitch's own bar.",
-                                        );
-                                    });
-                                } else {
-                                    ui.horizontal(|ui| {
-                                        ui_icon(ui, Some(&ui_tex), ICON_TRAIN, 15.0, HYPE_COLOR);
-                                        ui.label(&train.detail).on_hover_text(
-                                            "This broadcast's most recent Hype Train — the last \
-                                             confirmed poll before it ended (or a chat-inferred \
-                                             estimate if Twitch's GQL never confirmed it).",
-                                        );
-                                    });
-                                }
-                            }
-                        });
-                        ui.add_space(2.0);
+                    // ── Info cards (channel info / Hype Train) ───────────────
+                    // Twitch's own layout: a supporters strip and a Hype Train
+                    // indicator sit above the message list. Built entirely from
+                    // `stream_event` (see `load_broadcast_stats`'s doc) — no live
+                    // carousel/train capture exists, so this is a local
+                    // reconstruction: the leaderboard won't match Twitch's exact
+                    // carousel (no follow/viewer-count data available to us).
+                    //
+                    // `live_view`: the auto-hide of a finished train applies only
+                    // while following a still-running recording — see
+                    // `hype_phase`'s doc for why an archived take must keep it.
+                    let live_view = popup.recording.as_ref().is_some_and(|r| r.ended_at.is_none());
+                    if chat_info_cards(
+                        ui,
+                        popup,
+                        Some(&ui_tex),
+                        live_view,
+                        crate::models::now_unix(),
+                    ) {
+                        // A running countdown / an ended train's grace window.
+                        // Requested HERE, inside the deferred closure, so it goes
+                        // to this popup's viewport and not the root's.
+                        ctx.request_repaint_after(std::time::Duration::from_secs(1));
                     }
 
                     // ── Content ──────────────────────────────────────────────

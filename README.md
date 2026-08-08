@@ -3628,6 +3628,36 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**Info cards above the log.** Twitch's popout puts its channel furniture in
+translucent rounded panels that sit *on* the chat rather than boxing it in,
+and the chat window now does the same: a **channel info** card (this
+broadcast's top supporters — gift subs and bits) and a **Hype Train** card,
+both derived from the locally recorded chat-event history, no network. The
+fill is the panel colour lifted (or deepened, in light mode) and made partly
+transparent, so a card reads as part of the same surface instead of a widget
+bolted on top.
+
+Each card has a **toolbar toggle** (🚂 and 🎁) that collapses it in that
+window for the session, and a **feature switch** in *Settings → Interface →
+Display* that decides whether it exists at all. **A Hype Train starting
+re-opens the per-window toggle** — you asked to see a new one even after
+hiding the last — but it never overrides the feature switch. The toggles are
+disabled rather than hidden when a broadcast has nothing to put in that card,
+so the toolbar doesn't reflow every time a train starts or ends.
+
+**A finished Hype Train says so, then gets out of the way.** While it runs the
+card is a live bar (level, points, countdown); for **five minutes** after its
+timer lapses it stays as a greyed "Hype Train ended · Lvl 4 · 10,600 pts · 3m
+ago"; after that it hides itself — **but only while following a live
+recording**. Open the chat for a three-week-old take and the train is still
+there as a reached-level summary, because that is what an archive is for.
+Rows with no timing at all (pre-v86, or chat-inferred trains Twitch's GQL
+never confirmed) are always that summary. Two caveats the hover text repeats:
+Twitch sends no explicit start or end event, so all of this rides on this
+app's own ~60 s poll — "ended" can be up to a minute late, and a train that
+finishes early by completing its last level sits as running until the timer it
+was last seen with lapses.
+
 **The chat window's affordances are real icons, not emoji.** egui rasterizes
 glyph *outlines* and ignores a font's colour tables (COLR/CPAL), so every 🔍
 ⚙ 👥 🎁 💎 🚂 rendered as a flat monochrome silhouette — and as tofu on a

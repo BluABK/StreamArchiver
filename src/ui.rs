@@ -146,6 +146,16 @@ const K_CHAT_TEXT_COLOR: &str = "chat_text_color";
 /// not just once per missing asset. A failed lookup shows "N/A" and files a
 /// warning (see `ui::chat`'s usercard fetch).
 const K_FETCH_USERCARD_INFO: &str = "fetch_usercard_twitch_info";
+/// Whether the chat window's Hype Train card is available at all. Default on;
+/// only an explicit `"0"` disables. This is the FEATURE switch — the toolbar's
+/// 🚂 toggle collapses the card in one window for this session, and a train
+/// starting re-opens that per-window toggle but never overrides this one. See
+/// `ui::chat::strips::hype_phase`.
+const K_CHAT_SHOW_HYPE: &str = "chat_show_hype_train";
+/// Whether the chat window's channel-info card (top supporters, and creator
+/// goals once those land) is available at all. Default on; the toolbar toggle
+/// is the per-window collapse, same shape as [`K_CHAT_SHOW_HYPE`].
+const K_CHAT_SHOW_INFO: &str = "chat_show_channel_info";
 /// Path to the media player binary used by "Play local recording (start)" on
 /// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
 /// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`

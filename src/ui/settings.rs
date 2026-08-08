@@ -1630,6 +1630,37 @@ impl StreamArchiverApp {
                         if cs.animate_emotes { "1" } else { "0" },
                     );
                 }
+                if ui
+                    .checkbox(&mut cs.show_hype_train, "Hype Train card in chat")
+                    .on_hover_text(
+                        "Show a broadcast's Hype Train above the chat log — a live progress bar \
+                         while it runs, then \"ended\" for a few minutes, and a reached-level \
+                         summary on archived takes. Off hides it everywhere; the 🚂 button on \
+                         each chat window's toolbar collapses it in just that window (a new \
+                         train re-opens that one, but never this). Applies immediately.",
+                    )
+                    .changed()
+                {
+                    let _ = self
+                        .core
+                        .store
+                        .set_setting(K_CHAT_SHOW_HYPE, if cs.show_hype_train { "1" } else { "0" });
+                }
+                if ui
+                    .checkbox(&mut cs.show_channel_info, "Channel info card in chat")
+                    .on_hover_text(
+                        "Show this broadcast's top supporters (gift subs and bits) above the \
+                         chat log. Reconstructed from locally recorded chat events, so it won't \
+                         match Twitch's own carousel exactly. Off hides it everywhere; the 🎁 \
+                         toolbar button collapses it per window. Applies immediately.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        K_CHAT_SHOW_INFO,
+                        if cs.show_channel_info { "1" } else { "0" },
+                    );
+                }
             }
             ui.label(
                 egui::RichText::new(
