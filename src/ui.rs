@@ -2935,9 +2935,7 @@ impl eframe::App for StreamArchiverApp {
                             View::Users,
                             "👤",
                             "Users",
-                            "Look a chatter up: every stream they were in, what they said, \
-                             what they gave, and any moderation against them — across all \
-                             channels.",
+                            "Expanded user info.",
                         ),
                         (
                             View::ChannelStats,

@@ -4670,7 +4670,7 @@ impl StreamArchiverApp {
             }
             if ui
                 .button("👤 Open Users")
-                .on_hover_text("Go to the Users view and look a chatter up")
+                .on_hover_text("Go to the Users view for expanded info.")
                 .clicked()
             {
                 self.view = View::Users;
