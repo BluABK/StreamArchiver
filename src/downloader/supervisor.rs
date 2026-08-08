@@ -36,6 +36,10 @@ const PO_TOKEN_COOLDOWN_MAX_SECS: u64 = 900;
 /// time*, so this interval is exactly the worst-case gap at the end of the
 /// broadcast — while halving the re-download churn of the old cadence.
 pub const SUB_ONLY_COOLDOWN_SECS: u64 = 600;
+/// Retry cadence for a gated broadcast with **no** fallback capture path
+/// ([`Gated::NoFallback`]). Long on purpose: nothing is being archived either
+/// way, so this only exists to notice the broadcast being opened up.
+pub const GATED_NO_FALLBACK_COOLDOWN_SECS: u64 = 3600;
 
 // The PO-token rejection predicate lives in `models::po_token_rejected` —
 // the store's failed-take alert filing needs it too (a rejected take that
@@ -56,11 +60,31 @@ pub(super) use crate::models::po_token_rejected;
 ///   the episodes range from ~7 minutes (2026-07-31 00:03) to 3+ hours
 ///   rejecting two concurrent captures' every attempt (same night, 02:20).
 ///   The ordinary ladder just burns takes against that wall.
+/// Why a capture was refused entitlement, and therefore whether retrying it
+/// achieves anything.
+///
+/// Both platforms refuse a broadcast we aren't entitled to, but the value of
+/// asking again could not be more different, so one "gated" flag cannot set the
+/// cadence for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Gated {
+    /// Not gated — an ordinary failure, escalating backoff applies.
+    No,
+    /// Twitch subscriber-only: the live edge refuses us, but each new take
+    /// kicks off a fresh CDN head backfill, and that is the ONLY thing
+    /// archiving the broadcast. Retrying buys real footage.
+    WithCdnFallback,
+    /// YouTube members-only: nothing to fall back to. yt-dlp cannot even see
+    /// the stream, so every retry is another 0-byte failure and another
+    /// failed-take row. Ask rarely, purely in case the streamer opens it up.
+    NoFallback,
+}
+
 pub(super) fn failure_backoff_secs(
     fails: u32,
     duration_secs: i64,
     po_token_rejected: bool,
-    sub_only: bool,
+    gated: Gated,
 ) -> u64 {
     let mut wait = (30u64 * fails as u64).min(600);
     const INSTANT_FAIL_SECS: i64 = 10;
@@ -79,8 +103,14 @@ pub(super) fn failure_backoff_secs(
     // rather than an escalating cooldown: escalating would stretch the archive
     // gap wider and wider, and never retrying at all would freeze coverage
     // where it stands.
-    if sub_only {
-        wait = SUB_ONLY_COOLDOWN_SECS;
+    match gated {
+        Gated::No => {}
+        Gated::WithCdnFallback => wait = SUB_ONLY_COOLDOWN_SECS,
+        // No footage to gain, so the escalating ladder above is pointless
+        // noise: it produced a doomed capture every few minutes for hours on a
+        // members-only broadcast (Mori Calliope, 2026-08-08). One attempt an
+        // hour is enough to notice the stream being opened up.
+        Gated::NoFallback => wait = GATED_NO_FALLBACK_COOLDOWN_SECS,
     }
     wait
 }
@@ -3303,7 +3333,7 @@ progress_info: None,
         ok: bool,
         po_token_rejected: bool,
         used_po_fallback: bool,
-        sub_only: bool,
+        gated: Gated,
     ) {
         let mut map = self.backoff.lock().unwrap();
         // Back off on any capture that produced no footage (bytes == 0), even one
@@ -3330,7 +3360,7 @@ progress_info: None,
             // and every held-off minute is live-edge footage lost for good.
             let escalate_po = po_token_rejected
                 && (used_po_fallback || sabr_po_fallback_client(&self.store).is_empty());
-            let wait = failure_backoff_secs(entry.fails, duration_secs, escalate_po, sub_only);
+            let wait = failure_backoff_secs(entry.fails, duration_secs, escalate_po, gated);
             entry.until = Instant::now() + Duration::from_secs(wait);
             warn!(
                 monitor_id,
@@ -3904,11 +3934,27 @@ progress_info: None,
         // Both platforms' "you aren't entitled to this broadcast" refusals
         // share a cadence and a badge; only Twitch has a CDN fallback to
         // hand the broadcast to afterwards.
-        let gated = !manually_stopped
+        // The third arm is detection's knowledge rather than the tool's. A
+        // members-only YouTube stream is INVISIBLE to an unauthenticated
+        // yt-dlp — it reports "The channel is not currently live", which says
+        // nothing about entitlement and matches neither refusal above. Our own
+        // poll saw the stream (badged members-only on the /streams tab), so a
+        // capture that then fails is a gated broadcast, not a transient error,
+        // and must not be relaunched every few minutes for hours.
+        let is_gated = !manually_stopped
             && !ok
             && (crate::models::sub_only_rejected(&outcome.log)
-                || crate::models::members_only_rejected(&outcome.log));
-        if gated {
+                || crate::models::members_only_rejected(&outcome.log)
+                || self.store.monitor_members_only(monitor_id));
+        // Twitch has somewhere to put a refused broadcast (the CDN segments);
+        // nothing else does. That decides whether asking again is worth
+        // anything, and so the retry cadence.
+        let gated = match (is_gated, row.monitor.platform()) {
+            (false, _) => Gated::No,
+            (true, Platform::Twitch) => Gated::WithCdnFallback,
+            (true, _) => Gated::NoFallback,
+        };
+        if is_gated {
             self.file_sub_only_alert(&row, monitor_id, rec_id, stream_id.as_deref());
             // Hand the broadcast to a CDN capture session: it archives from the
             // segments Twitch does serve, incrementally, and holds the monitor
@@ -5023,20 +5069,20 @@ mod tests {
     #[test]
     fn failure_backoff_escalates_po_token_rejections_to_a_15_minute_cap() {
         // Generic ladder: 30s × fails, capped at 10 min.
-        assert_eq!(failure_backoff_secs(1, 120, false, false), 30);
-        assert_eq!(failure_backoff_secs(3, 120, false, false), 90);
-        assert_eq!(failure_backoff_secs(25, 120, false, false), 600);
+        assert_eq!(failure_backoff_secs(1, 120, false, Gated::No), 30);
+        assert_eq!(failure_backoff_secs(3, 120, false, Gated::No), 90);
+        assert_eq!(failure_backoff_secs(25, 120, false, Gated::No), 600);
         // Instant deaths floor at 5 min regardless of fail count.
-        assert_eq!(failure_backoff_secs(1, 3, false, false), 300);
+        assert_eq!(failure_backoff_secs(1, 3, false, Gated::No), 300);
         // PO rejection: 5/10/15 then flat 15 — never the 30s burn, never
         // unbounded either.
-        assert_eq!(failure_backoff_secs(1, 120, true, false), 300);
-        assert_eq!(failure_backoff_secs(2, 120, true, false), 600);
-        assert_eq!(failure_backoff_secs(3, 120, true, false), 900);
-        assert_eq!(failure_backoff_secs(25, 120, true, false), 900);
+        assert_eq!(failure_backoff_secs(1, 120, true, Gated::No), 300);
+        assert_eq!(failure_backoff_secs(2, 120, true, Gated::No), 600);
+        assert_eq!(failure_backoff_secs(3, 120, true, Gated::No), 900);
+        assert_eq!(failure_backoff_secs(25, 120, true, Gated::No), 900);
         // Tiers compose: an instant PO death takes the larger wait.
-        assert_eq!(failure_backoff_secs(1, 3, true, false), 300);
-        assert_eq!(failure_backoff_secs(4, 3, true, false), 900);
+        assert_eq!(failure_backoff_secs(1, 3, true, Gated::No), 300);
+        assert_eq!(failure_backoff_secs(4, 3, true, Gated::No), 900);
     }
 
     /// A subscriber-only stream is a FLAT cadence, not a ladder — every retry
@@ -5048,18 +5094,42 @@ mod tests {
     fn subscriber_only_retries_at_a_flat_cadence_and_never_escalates() {
         for fails in [1u32, 3, 25] {
             assert_eq!(
-                failure_backoff_secs(fails, 19, false, true),
+                failure_backoff_secs(fails, 19, false, Gated::WithCdnFallback),
                 SUB_ONLY_COOLDOWN_SECS,
                 "fails={fails}"
             );
         }
         // It also wins over the instant-death floor and the PO ladder: those
         // escalate against a fault, and this isn't one.
-        assert_eq!(failure_backoff_secs(9, 3, true, true), SUB_ONLY_COOLDOWN_SECS);
+        assert_eq!(failure_backoff_secs(9, 3, true, Gated::WithCdnFallback), SUB_ONLY_COOLDOWN_SECS);
         // Without the flag this exact failure shape is what caused the churn:
         // a 19-second death clears the instant-death floor (10s), so the first
         // retry comes 30 seconds later and the ladder crawls up from there.
-        assert_eq!(failure_backoff_secs(1, 19, false, false), 30);
+        assert_eq!(failure_backoff_secs(1, 19, false, Gated::No), 30);
+    }
+
+
+    /// YouTube members-only is gated with NOTHING to fall back to: yt-dlp
+    /// cannot see the stream at all, so every retry is another 0-byte take.
+    /// Twitch's flat 10-minute cadence would be wrong here — it exists because
+    /// each Twitch retry refreshes a CDN backfill that is really archiving
+    /// footage. (Mori Calliope, 2026-08-08: a members-only broadcast relaunched
+    /// a doomed capture every 6-11 minutes for hours, archiving nothing.)
+    #[test]
+    fn a_gated_broadcast_with_no_fallback_is_asked_about_hourly_not_every_few_minutes() {
+        for fails in [1u32, 3, 25] {
+            assert_eq!(
+                failure_backoff_secs(fails, 3, false, Gated::NoFallback),
+                GATED_NO_FALLBACK_COOLDOWN_SECS,
+                "fails={fails}"
+            );
+        }
+        // Well clear of the cadence that produced the loop, and of the Twitch
+        // one — which would still be six doomed attempts an hour.
+        assert!(GATED_NO_FALLBACK_COOLDOWN_SECS > SUB_ONLY_COOLDOWN_SECS);
+        // Still bounded: it is a cooldown, not a giving-up. A stream opened to
+        // the public mid-broadcast is picked up within the hour.
+        assert_eq!(GATED_NO_FALLBACK_COOLDOWN_SECS, 3600);
     }
 
     /// Straight off the wire (Nyana Banyana, 2026-08-07): streamlink's own

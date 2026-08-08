@@ -2117,6 +2117,29 @@ the stream capture normally instead.
 > stream produced 22 takes and re-downloaded 11.8 GB per cycle. It worked — at
 > roughly quadratic cost, and only because a capture kept failing on a timer.
 
+#### YouTube members-only streams
+
+A **members-only** YouTube stream is gated the same way, but there is **no CDN
+fallback** — nothing to archive it from. It also hides itself far better than
+Twitch does: to an unauthenticated yt-dlp a members-only stream isn't merely
+forbidden, it is *invisible*, and the tool reports `The channel is not currently
+live` — indistinguishable from an ordinary "the stream ended between the poll
+and the spawn" race.
+
+The app's own detection knows better (a members-only live stream is badged as
+such on the channel's `/streams` tab), so that verdict is recorded on the
+instance and consulted when a capture fails. A failure on a broadcast we know is
+members-only is treated as a **gated broadcast, not a fault**: it files the 🔒
+alert and then asks again only **once an hour** — long enough to notice the
+stream being opened to the public, rare enough that it stops producing an empty
+take every few minutes for the whole broadcast. Twitch's flat ten-minute cadence
+is deliberately *not* used here, because that interval exists to refresh a CDN
+backfill that is genuinely archiving footage; with no fallback there is nothing
+to gain by asking sooner.
+
+Configuring cookies from a browser signed into an account with that membership
+(*Authentication*, below) makes the stream capture normally instead.
+
 ### Twitch VOD recovery (deleted & muted VODs)
 
 ![Recording context menu with Recover VOD / Download post-stream VOD / Backfill head](doc/screenshots/vod-recovery-menu.png)

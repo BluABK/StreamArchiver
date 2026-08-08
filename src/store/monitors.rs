@@ -441,6 +441,42 @@ impl Store {
         Ok(())
     }
 
+    /// Remember whether the broadcast we can currently see is members-only
+    /// (schema v91), written on every poll so it clears itself when the
+    /// broadcast ends.
+    ///
+    /// This is detection's knowledge, kept for the *capture* path — which
+    /// cannot work it out for itself. To an unauthenticated yt-dlp a
+    /// members-only stream is not merely forbidden, it is invisible: it reports
+    /// "The channel is not currently live", which is indistinguishable from the
+    /// ordinary "the stream ended between the poll and the spawn" race. Without
+    /// this flag that failure took the short retry backoff and the app relaunched
+    /// a doomed capture every few minutes for the whole broadcast.
+    pub fn set_monitor_members_only(&self, id: i64, members_only: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_members_only = ?2 WHERE id = ?1",
+            params![id, members_only as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the broadcast this instance can currently see is members-only.
+    /// False for a monitor that is gone, so a missing row can never make a
+    /// capture failure look gated.
+    pub fn monitor_members_only(&self, id: i64) -> bool {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT last_members_only FROM monitor WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some_and(|v| v != 0)
+    }
+
     /// Make a monitor due for polling on the very next scheduler tick (resets
     /// `last_checked_at`), without touching its state — how an EventSub
     /// shared-chat push accelerates the collab refresh.

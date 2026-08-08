@@ -1711,9 +1711,9 @@ impl Supervisor {
                 ok,
                 po_rejected,
                 used_po_fallback,
-                // Resume path: a sub-only rejection can only come from the
+                // Resume path: an entitlement refusal can only come from the
                 // original capture, which already set the cadence.
-                false,
+                crate::downloader::supervisor::Gated::No,
             );
         }
         let _ = self.store.finish_recording(

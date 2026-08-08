@@ -1769,7 +1769,20 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 90)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 90);
+        if version < 91 {
+            // "The live broadcast we can see is members-only." Detection can
+            // tell (the /streams tab badges it), but the capture tool cannot:
+            // to an unauthenticated yt-dlp a members-only stream simply isn't
+            // there, and it reports the channel as not live at all. Without
+            // somewhere to keep what detection knew, a failed capture looked
+            // like any other transient error and was retried on the short
+            // backoff — forever, every few minutes, for the whole broadcast.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN last_members_only INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 91)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 91);
         Ok(())
     }
 }

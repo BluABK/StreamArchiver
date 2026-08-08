@@ -452,6 +452,12 @@ async fn tick(
         {
             warn!("scheduler: failed to persist tags for {}: {e:#}", o.monitor_id);
         }
+        // Detection's members-only verdict, kept for the capture path (see
+        // `set_monitor_members_only`). Written every poll, including offline
+        // ones, so it clears itself when the broadcast ends.
+        if let Err(e) = ctx.store.set_monitor_members_only(o.monitor_id, o.members_only) {
+            warn!("scheduler: failed to persist members-only flag for {}: {e:#}", o.monitor_id);
+        }
         if let Err(e) = ctx.store.set_monitor_live_meta(
             o.monitor_id,
             title,
