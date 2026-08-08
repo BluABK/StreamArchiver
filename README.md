@@ -4661,9 +4661,9 @@ egui window (on demand) ◄── events ──┘
 
 ### Source layout
 
-The three biggest modules are split into directories; each keeps a small facade
-file (`src/store.rs`, `src/downloader.rs`, `src/ui.rs`) holding the core
-type(s) and re-exports, with the implementation spread over
+The biggest modules are split into directories; each keeps a small facade
+file (`src/store.rs`, `src/downloader.rs`, `src/ui.rs`, `src/ui/chat.rs`)
+holding the core type(s) and re-exports, with the implementation spread over
 `src/<module>/*.rs` submodules (`impl` blocks continue across files):
 
 - `src/store/` — SQLite persistence: `migrations`, plus per-domain query
@@ -4677,6 +4677,11 @@ type(s) and re-exports, with the implementation spread over
   `background`, `channel_stats`, `users`, `issues`, `debug`), window clusters
   (`dialogs`, `properties`, `chat`), and shared helpers (`grid`, `calendar`,
   `format`, `player`, `assets_helpers`).
+- `src/ui/chat/` — the chat window, itself a facade (`src/ui/chat.rs` holds the
+  message/log/popup types) over `window` (toolbar, panels, message list),
+  `rows` (one message drawn), `parse` (sidecar → messages), `emotes`,
+  `helpers` (asset lookups, segment building), `colors`, `usercard`, `strips`
+  (top supporters / Hype Train).
 
 `src/chat_index.rs` is the app's **second** SQLite database (see
 [Users](#users--who-chatted-where)) — its own file, migrations and connection
