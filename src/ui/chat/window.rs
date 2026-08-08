@@ -32,6 +32,13 @@ impl StreamArchiverApp {
         } else {
             (Arc::new(HashMap::new()), None, Arc::new(HashMap::new()))
         };
+        // Cloned before the struct literal moves `monitor_name`.
+        let monitor_name_for_paints = monitor_name.clone();
+        let paint_cache = if platform == Some(Platform::Twitch) {
+            crate::cosmetics::PaintCache::load(&monitor_name, &account)
+        } else {
+            Default::default()
+        };
         let rewards = Arc::new(if platform == Some(Platform::Twitch) {
             crate::assets::load_reward_titles(&monitor_name, &account)
         } else {
@@ -143,6 +150,13 @@ impl StreamArchiverApp {
             user_card: None,
             users_panel: None,
             stats,
+            // Seeded from disk: most chatters have no paint, and without
+            // remembering the misses every reopen would re-ask 7TV about
+            // every unpainted regular in the channel.
+            paints: Arc::new(Mutex::new(paint_cache.paints)),
+            paints_asked: Arc::new(Mutex::new(paint_cache.asked.into_iter().collect())),
+            paints_checked: None,
+            paints_key: (monitor_name_for_paints, account.clone()),
             // Only offered where it can actually work: a live Twitch take
             // with a connected account. An archived take gets no bar at all
             // rather than a permanently disabled box on every historical view.
@@ -213,11 +227,80 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Fetch 7TV paints for chatters in this window's log that we haven't
+    /// asked about yet.
+    ///
+    /// Coalesced hard: at most once per [`PAINT_SWEEP_SECS`], over the most
+    /// recent [`PAINT_SCAN_MESSAGES`] messages, and every id asked about is
+    /// remembered whether or not it HAD a paint — otherwise a channel full of
+    /// unpainted chatters would re-ask for all of them on every sweep forever.
+    /// Never per message, and never on the render path.
+    fn pump_chat_paints(&mut self, idx: usize) {
+        let popup_arc = self.chat_popups[idx].clone();
+        let mut popup = popup_arc.lock().unwrap();
+        if !popup.is_twitch || !crate::cosmetics::render_paints(&self.core.store) {
+            return;
+        }
+        if popup.paints_checked.is_some_and(|t| t.elapsed().as_secs() < PAINT_SWEEP_SECS) {
+            return;
+        }
+        popup.paints_checked = Some(std::time::Instant::now());
+        let asked = popup.paints_asked.clone();
+        let want: Vec<String> = {
+            let seen = asked.lock().unwrap();
+            match &*popup.load_state.lock().unwrap() {
+                ChatLoadState::Loaded(log) => {
+                    let mut out: Vec<String> = Vec::new();
+                    let mut dedup = std::collections::HashSet::new();
+                    for m in log.messages.iter().rev().take(PAINT_SCAN_MESSAGES) {
+                        if !m.user_id.is_empty()
+                            && !seen.contains(&m.user_id)
+                            && dedup.insert(m.user_id.clone())
+                        {
+                            out.push(m.user_id.clone());
+                        }
+                    }
+                    out
+                }
+                _ => Vec::new(),
+            }
+        };
+        if want.is_empty() {
+            return;
+        }
+        let paints = popup.paints.clone();
+        let key = popup.paints_key.clone();
+        drop(popup);
+        self.core.rt.spawn(async move {
+            let http = reqwest::Client::new();
+            match crate::cosmetics::fetch_paints(&http, &want).await {
+                Ok(found) => {
+                    // Record every id we ASKED about, not just the hits.
+                    let mut seen = asked.lock().unwrap();
+                    for id in &want {
+                        seen.insert(id.clone());
+                    }
+                    let mut have = paints.lock().unwrap();
+                    have.extend(found);
+                    crate::cosmetics::PaintCache {
+                        fetched_at: crate::models::now_unix(),
+                        asked: seen.iter().cloned().collect(),
+                        paints: have.clone(),
+                    }
+                    .save(&key.0, &key.1);
+                }
+                // Couldn't ask: leave `asked` alone so the next sweep retries.
+                Err(e) => tracing::debug!("7tv paints: {e:#}"),
+            }
+        });
+    }
+
     #[allow(deprecated)]
     /// Render every open chat window (one OS viewport per monitor).
     pub(in crate::ui) fn chat_popup_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
         for idx in 0..self.chat_popups.len() {
+            self.pump_chat_paints(idx);
             if self.chat_popup_window(ctx, idx) {
                 closed.push(self.chat_popups[idx].lock().unwrap().monitor_id);
             }
@@ -307,6 +390,7 @@ impl StreamArchiverApp {
         // without borrowing `self`. Copy the render toggles out too.
         let anim_cache = self.emote_anim.clone();
         let highlights = popup.highlights.clone();
+        let paints = popup.paints.clone();
         // Uploaded on first use and refcounted, so this clone is free. Moved
         // into the closure because the deferred render can't borrow `self`.
         let ui_tex = self.ui_tex.get_or_insert_with(|| UiTextures::load(ctx)).clone();
@@ -1462,6 +1546,7 @@ impl StreamArchiverApp {
                                                         now,
                                                         &mut decode_misses,
                                                         Some(&ui_tex),
+                                                        &paints.lock().unwrap(),
                                                         ctx,
                                                         &appearance,
                                                     )

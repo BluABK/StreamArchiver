@@ -3628,6 +3628,26 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**7TV gradient usernames ("paints")** render for chatters who have one, from
+7TV's v4 GraphQL API. It is an approximation, and the shape of the
+approximation is worth knowing: egui colours text one *run* at a time, so a
+gradient is quantized into at most 12 flat-coloured runs across the name —
+enough to read as a smooth sweep at chat sizes, and bounded so a screen full
+of painted senders stays cheap. Only the gradient's **horizontal** component
+is expressible, so a vertical paint (by far the most common) renders as a
+single colour — its midpoint — rather than sweeping the wrong way. Image
+paints and drop shadows aren't drawn at all, and **animated paints render
+static**: recolouring per frame would bust egui's text-layout cache for every
+painted name every frame, and the repaint driving it comes from a child
+viewport that can starve the main window's frame loop.
+
+Paints are fetched **once per channel per day**, batched, only for chatters
+actually in the loaded log, and cached to `paints.json` beside that channel's
+emotes — including the *misses*, since most chatters have no paint and
+re-asking about every unpainted regular on each reopen would be the bulk of
+the traffic. Never per message. Toggle in *Settings → Interface → Display*;
+any failure leaves usernames rendering exactly as they did before.
+
 **Sending messages.** A live Twitch take's chat window gets a **Send a
 message** bar at the bottom, via Twitch's supported `POST
 /helix/chat/messages` — the archival chat capture stays anonymous and
@@ -4751,6 +4771,10 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
       (24 h freshness stamp).
     - `badges\`, `emotes\twitch\` (first-party files), `emotes\{bttv,ffz,7tv}.json`
       (third-party emote manifests).
+    - `rewards.json` — channel-point reward titles by id, so a redemption in the
+      chat replay reads as a name instead of a UUID.
+    - `paints.json` — 7TV gradient usernames for chatters seen in this channel,
+      including the ones with none (24 h freshness stamp inside the file).
     - `history\` — superseded icons/banners; `emotes\history\` — superseded emote
       manifests; `asset_changes.jsonl` — the append-only change log.
     - (`posts\` and `schedule_src\` may still sit at the platform level for

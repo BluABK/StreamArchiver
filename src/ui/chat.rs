@@ -125,6 +125,15 @@ impl ChatMessage {
     }
 }
 
+/// How often a chat window sweeps its log for chatters whose 7TV paint it
+/// hasn't looked up yet. Coarse on purpose: paints are cosmetic and change
+/// rarely, and this must never approach a per-message or per-frame cost.
+pub(super) const PAINT_SWEEP_SECS: u64 = 300;
+/// How far back a paint sweep looks. The visible window plus a wide margin —
+/// scanning a six-hour log's every sender would ask 7TV about thousands of
+/// people nobody is looking at.
+pub(super) const PAINT_SCAN_MESSAGES: usize = 500;
+
 /// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
 pub(super) const CHAT_ROW_EST: f32 = 20.0;
 
@@ -332,6 +341,8 @@ pub(super) struct ChatSettingsState {
     pub(super) chat_font: String,
     /// Wall-clock vs stream-relative timestamps — see [`ChatTsMode`].
     pub(super) ts_mode: ChatTsMode,
+    /// Whether 7TV gradient usernames render — see [`crate::cosmetics`].
+    pub(super) render_paints: bool,
 }
 
 impl ChatSettingsState {
@@ -384,6 +395,7 @@ impl ChatSettingsState {
             show_hype_train: flag(K_CHAT_SHOW_HYPE, true),
             show_channel_info: flag(K_CHAT_SHOW_INFO, true),
             chat_font: store.get_setting(K_CHAT_FONT_FAMILY).ok().flatten().unwrap_or_default(),
+            render_paints: crate::cosmetics::render_paints(store),
             ts_mode: ChatTsMode::parse(
                 store.get_setting(K_CHAT_TS_MODE).ok().flatten().unwrap_or_default().as_str(),
             ),
@@ -483,6 +495,18 @@ pub(super) struct ChatPopup {
     /// half runs in the live chat logger (see [`crate::chat_highlight`]), so
     /// a ping doesn't depend on a window being open.
     pub(super) highlights: Arc<(String, Vec<crate::chat_highlight::HighlightRule>)>,
+    /// 7TV paints for the chatters in this log, keyed by Twitch user id.
+    /// Behind a mutex because a background fetch fills it in while the window
+    /// renders. Empty for YouTube, and when the feature is off.
+    pub(super) paints: Arc<Mutex<HashMap<String, crate::cosmetics::Paint>>>,
+    /// User ids already asked about — including ones with NO paint, so a miss
+    /// isn't re-requested every few minutes.
+    pub(super) paints_asked: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// When the last paint fetch ran, so the sweep is coalesced rather than
+    /// firing on every 3s tail tick.
+    pub(super) paints_checked: Option<std::time::Instant>,
+    /// `(channel name, account)` — where the paint cache is written back to.
+    pub(super) paints_key: (String, String),
     /// The message being typed in the send bar, and everything about whether
     /// it may go out. `None` when this window can't send at all (not Twitch,
     /// an archived take, no connected account) — the bar isn't drawn then,
@@ -841,6 +865,42 @@ mod tests {
         assert_eq!(notice_headline(&ChatNotice::System), None);
         // An event whose system-msg tag was missing has nothing to say.
         assert_eq!(notice_headline(&ChatNotice::Raid { system_msg: String::new() }), None);
+    }
+
+    /// A painted name is one `LayoutJob` of flat-coloured runs. The cap is
+    /// what keeps this affordable — egui does real layout work per run, and
+    /// this happens for every painted sender on screen.
+    #[test]
+    fn a_painted_name_is_quantized_into_bounded_runs() {
+        let paint = crate::cosmetics::Paint {
+            name: "g".into(),
+            angle: 90,
+            stops: vec![
+                crate::cosmetics::Stop { at: 0.0, rgba: [0, 0, 0, 255] },
+                crate::cosmetics::Stop { at: 1.0, rgba: [255, 255, 255, 255] },
+            ],
+        };
+        let font = egui::FontId::proportional(14.0);
+
+        // A short name gets one run per character…
+        let short = paint_name_job("bob:", &paint, font.clone());
+        assert_eq!(short.sections.len(), 4);
+        assert_eq!(short.text, "bob:");
+
+        // …and a long one is chunked, never exceeding the cap.
+        let long_name = "a".repeat(120);
+        let long = paint_name_job(&long_name, &paint, font.clone());
+        assert!(long.sections.len() <= MAX_PAINT_RUNS, "{} runs", long.sections.len());
+        assert_eq!(long.text, long_name, "every character still renders");
+
+        // The runs actually differ, i.e. it reads as a gradient.
+        let colors: Vec<_> = long.sections.iter().map(|s| s.format.color).collect();
+        assert!(colors.first() != colors.last(), "the sweep is visible");
+
+        // Chunking must not split a multi-byte character.
+        let cjk = "あいうえおかきくけこさしすせそたちつてと:";
+        let job = paint_name_job(cjk, &paint, font);
+        assert_eq!(job.text, cjk);
     }
 
     /// The height cache is keyed on everything that changes how tall a row

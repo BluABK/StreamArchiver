@@ -13,6 +13,7 @@ mod chat_index;
 mod chat_send;
 mod chat_scan;
 mod compat;
+mod cosmetics;
 mod db_backup;
 mod detectors;
 mod display;

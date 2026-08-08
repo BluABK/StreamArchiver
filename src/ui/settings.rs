@@ -1745,6 +1745,18 @@ impl StreamArchiverApp {
                     let _ = self.core.store.set_setting(K_CHAT_FONT_FAMILY, &chat_font);
                 }
                 if ui
+                    .checkbox(&mut cs.render_paints, "7TV gradient usernames")
+                    .on_hover_text(
+                        "Render a chatter's 7TV \"paint\" — the gradient some people have on                          their name. Approximated: egui colours text a run at a time, so a                          gradient is quantized into a few flat runs, only its horizontal                          component is expressible (a vertical gradient shows as one colour                          rather than pointing the wrong way), and animated paints render                          static. Fetched once per channel per day and cached. Applies to                          newly-opened chat windows.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        crate::cosmetics::K_RENDER_PAINTS,
+                        if cs.render_paints { "1" } else { "0" },
+                    );
+                }
+                if ui
                     .checkbox(&mut cs.show_hype_train, "Hype Train card in chat")
                     .on_hover_text(
                         "Show a broadcast's Hype Train above the chat log — a live progress bar \

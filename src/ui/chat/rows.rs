@@ -182,6 +182,55 @@ pub(in crate::ui) fn row_decor(
     }
 }
 
+/// At most this many colour runs per painted name.
+///
+/// egui caches a galley per `LayoutJob`, so each run is real layout work.
+/// Twelve is enough that a 15-character name reads as a smooth sweep at chat
+/// sizes, and it bounds the cost: even a screen where every sender has a
+/// paint is a few hundred runs, and painted chatters are a small minority in
+/// practice.
+pub(in crate::ui) const MAX_PAINT_RUNS: usize = 12;
+
+/// Draw a username as a quantized gradient, or `None` if there's nothing to
+/// draw it with.
+///
+/// **Static, never animated — deliberately.** egui keys its galley cache on
+/// the `LayoutJob`, so recolouring every frame would bust that cache for every
+/// painted name on screen, every frame; and the repaint needed to drive it
+/// comes from a deferred child viewport, which `MIN_ANIM_REPAINT_SECS`
+/// documents (with a measured repro) as able to starve the ROOT viewport to
+/// zero passes per second. A moving name gradient is not worth risking the
+/// whole UI's frame loop.
+pub(in crate::ui) fn paint_name_job(
+    text: &str,
+    paint: &crate::cosmetics::Paint,
+    font: egui::FontId,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let chars: Vec<char> = text.chars().collect();
+    // One run per character up to the cap, then evenly-sized chunks.
+    let runs = chars.len().clamp(1, MAX_PAINT_RUNS);
+    let per = chars.len().div_ceil(runs).max(1);
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + per).min(chars.len());
+        // Sample at the chunk's midpoint so the sweep is centred on it.
+        let t = ((i + end) as f32 / 2.0) / chars.len() as f32;
+        let [r, g, b, a] = paint.sample(t);
+        job.append(
+            &chars[i..end].iter().collect::<String>(),
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+                ..Default::default()
+            },
+        );
+        i = end;
+    }
+    job
+}
+
 /// The family the chat replay renders in. Always registered — with no user
 /// pick it mirrors the proportional stack, so this is safe unconditionally.
 pub(in crate::ui) fn chat_family() -> egui::FontFamily {
@@ -257,6 +306,7 @@ pub(in crate::ui) fn render_chat_message(
     now: f64,
     misses: &mut Vec<std::path::PathBuf>,
     icons: Option<&UiTextures>,
+    paints: &HashMap<String, crate::cosmetics::Paint>,
     ctx: &egui::Context,
     appearance: &ChatAppearance,
 ) -> Option<UserCardClick> {
@@ -384,14 +434,24 @@ pub(in crate::ui) fn render_chat_message(
         // Twitch login, or a YouTube author channel id. Pre-feature logs have
         // neither and stay a plain label.
         let name_color = chat_username_color(msg, ui.visuals().panel_fill);
+        let name_font = egui::FontId::new(appearance.font_pt, chat_family());
+        // A 7TV paint replaces the flat colour with a quantized gradient. The
+        // name keeps its `:` suffix and everything else about the row.
+        let painted = (!msg.user_id.is_empty())
+            .then(|| paints.get(&msg.user_id))
+            .flatten()
+            .map(|p| paint_name_job(&format!("{}:", msg.author), p, name_font.clone()));
         let name_text = egui::RichText::new(format!("{}:", msg.author))
             .strong()
-            .font(egui::FontId::new(appearance.font_pt, chat_family()))
+            .font(name_font)
             .color(name_color);
         let mut click: Option<UserCardClick> = None;
         if !msg.purge_key().is_empty() {
             let resp = ui
-                .add(egui::Label::new(name_text).sense(egui::Sense::click()))
+                .add(match painted {
+                    Some(job) => egui::Label::new(job).sense(egui::Sense::click()),
+                    None => egui::Label::new(name_text).sense(egui::Sense::click()),
+                })
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(
                     "Click for user info — messages in this log, what this channel has \
@@ -416,7 +476,10 @@ pub(in crate::ui) fn render_chat_message(
                 });
             }
         } else {
-            ui.label(name_text);
+            match painted {
+                Some(job) => ui.label(job),
+                None => ui.label(name_text),
+            };
         }
         // Reply-thread prefix (Twitch): who this message answers.
         if !msg.reply_to.is_empty() {
