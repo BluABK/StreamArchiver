@@ -262,6 +262,22 @@ pub enum AppEvent {
         from: String,
         to: String,
     },
+    /// Someone named the connected account in a monitored channel's chat, or
+    /// a custom highlight rule matched. Raised from the live IRC client (see
+    /// `chat_highlight`) so it fires whether or not a chat window is open.
+    ChatMention {
+        monitor_id: Option<i64>,
+        channel: String,
+        /// Who said it (display name).
+        author: String,
+        /// The message, verbatim.
+        text: String,
+        /// Why it matched — "mentioned you", or the rule's own description.
+        reason: String,
+        /// The message's IRCv3 id, used to dedup: a re-scan or a reconnect
+        /// replaying the same line must not toast twice.
+        msg_id: String,
+    },
     /// A trigger-word rule matched a live stream's title/game and a recording
     /// is starting because of it (or, with Auto on, its per-rule overrides
     /// were applied to the normal start).

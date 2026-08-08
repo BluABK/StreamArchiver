@@ -728,6 +728,7 @@ impl StreamArchiverApp {
             // Interface.
             self.settings_display_section(ui);
             self.settings_table_columns_section(ui);
+            self.settings_chat_highlights_section(ui);
             self.settings_notifications_section(ui);
             // System.
             self.settings_startup_section(ui);
@@ -4078,6 +4079,139 @@ impl StreamArchiverApp {
                      alert instead of failing silently.",
                 );
         }
+    }
+
+    /// ── Chat highlights & mentions ──
+    fn settings_chat_highlights_section(&mut self, ui: &mut egui::Ui) {
+        if !self.section_shown(
+            SettingsTab::Interface,
+            "Chat highlights",
+            &["chat", "highlight", "mention", "ping", "notify", "regex", "@", "💬"],
+        ) {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.heading("Chat highlights & mentions 💬");
+        ui.label(
+            "Words to watch for in every monitored channel's live chat. Matching runs in the \
+             chat logger itself, so it works with no chat window open — and for channels being \
+             logged without a recording.",
+        );
+        ui.add_space(6.0);
+
+        let mut pingable = self.chat_pingable;
+        if ui
+            .checkbox(&mut pingable, "Notify me when someone says my name")
+            .on_hover_text(
+                "Raise a desktop toast and a 🔔 feed row when a chatter names the connected \
+                 Twitch account — either as @name or on its own. Off by default: this is the \
+                 one setting that can make an unattended machine start talking to you. Do Not \
+                 Disturb still suppresses the toast (the feed row is always recorded). At most \
+                 one toast per channel per 10s, so a chat spamming your name can't spawn fifty. \
+                 Requires a connected Twitch account. Applies to new chat connections.",
+            )
+            .changed()
+        {
+            self.chat_pingable = pingable;
+            let _ = self
+                .core
+                .store
+                .set_setting(crate::chat_highlight::K_PINGABLE, if pingable { "1" } else { "0" });
+        }
+        if pingable && self.connected_twitch_login().is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 150, 60),
+                "No Twitch account connected — nothing to be named as. Connect one under \
+                 Accounts.",
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Custom highlights").strong());
+        ui.label(
+            egui::RichText::new(
+                "Each rule highlights matching messages in the chat window. Tick Notify to also \
+                 raise a toast for it.",
+            )
+            .small()
+            .weak(),
+        );
+
+        let mut rules = self.chat_highlights.clone();
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        for (i, r) in rules.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(&mut r.enabled, "")
+                    .on_hover_text("Off keeps the rule but stops it matching.")
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut r.label)
+                            .hint_text("name (optional)")
+                            .desired_width(120.0),
+                    )
+                    .on_hover_text(
+                        "Shown in the rule list and in notifications, so a long regex isn't the \
+                         only thing identifying this rule.",
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut r.pattern)
+                            .hint_text("word, phrase or regex")
+                            .desired_width(220.0),
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut r.regex, "Regex")
+                    .on_hover_text(
+                        "Treat the pattern as a regular expression, case-insensitive unless it \
+                         opts out with (?-i). Off matches it as plain text.",
+                    )
+                    .changed();
+                changed |= ui
+                    .add_enabled(!r.regex, egui::Checkbox::new(&mut r.whole_word, "Whole word"))
+                    .on_hover_text(
+                        "Only match on word boundaries, so \"art\" doesn't fire on \"start\". \
+                         Regex rules express this themselves with \\b.",
+                    )
+                    .on_disabled_hover_text("Use \\b in the regex instead.")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut r.notify, "Notify")
+                    .on_hover_text(
+                        "Also raise a toast for this rule, not just a highlighted row. Off by \
+                         default — most people want a few words to stand out and only their own \
+                         name to interrupt them.",
+                    )
+                    .changed();
+                if ui.button("🗑").on_hover_text("Remove this rule.").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if let Some(err) = crate::chat_highlight::pattern_error(r) {
+                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), format!("   regex: {err}"));
+            }
+        }
+        if let Some(i) = remove {
+            rules.remove(i);
+            changed = true;
+        }
+        if ui.button("+ Add highlight").clicked() {
+            rules.push(crate::chat_highlight::HighlightRule::default());
+            changed = true;
+        }
+        if changed {
+            crate::chat_highlight::save_rules(&self.core.store, &rules);
+            self.chat_highlights = rules;
+        }
+    }
+
+    /// The connected Twitch account's login, or `""`.
+    fn connected_twitch_login(&self) -> String {
+        self.core.store.get_setting(crate::oauth::K_LOGIN).ok().flatten().unwrap_or_default()
     }
 
     fn settings_chat_section(&mut self, ui: &mut egui::Ui) {

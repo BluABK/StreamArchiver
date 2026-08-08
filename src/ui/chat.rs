@@ -451,6 +451,11 @@ pub(super) struct ChatPopup {
     pub(super) show_hype: bool,
     /// Same, for the channel-info card (top supporters, goals).
     pub(super) show_info: bool,
+    /// The custom highlight rules + the connected login, snapshotted when the
+    /// window opened. Used only to ACCENT matching rows — the notification
+    /// half runs in the live chat logger (see [`crate::chat_highlight`]), so
+    /// a ping doesn't depend on a window being open.
+    pub(super) highlights: Arc<(String, Vec<crate::chat_highlight::HighlightRule>)>,
     /// The `train_id` of the most recent Hype Train this window has already
     /// reacted to. A different id while the train is running means one just
     /// STARTED, which re-opens `show_hype` — the user asked to be shown a new

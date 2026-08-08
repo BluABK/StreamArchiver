@@ -8,6 +8,7 @@ mod assets;
 mod browser_ua;
 mod chapters;
 mod chat;
+mod chat_highlight;
 mod chat_index;
 mod chat_scan;
 mod compat;

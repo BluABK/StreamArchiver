@@ -1411,11 +1411,15 @@ pub enum NotificationKind {
     /// A better rendition appeared after the capture joined (Twitch lists the
     /// source quality late) — the take was restarted to record at it.
     QualityUpgrade,
+    /// Someone named you in a monitored channel's chat, or a custom highlight
+    /// rule matched. See [`crate::chat_highlight`].
+    ChatMention,
 }
 
 impl NotificationKind {
     /// Every kind, in feed-filter display order.
-    pub const ALL: [NotificationKind; 12] = [
+    pub const ALL: [NotificationKind; 13] = [
+        NotificationKind::ChatMention,
         NotificationKind::WentLive,
         NotificationKind::TriggerMatched,
         NotificationKind::TriggerBlocked,
@@ -1445,6 +1449,7 @@ impl NotificationKind {
             NotificationKind::TriggerBlocked => "trigger_blocked",
             NotificationKind::QualityUpgrade => "quality_upgrade",
             NotificationKind::CaptureAlert => "capture_alert",
+            NotificationKind::ChatMention => "chat_mention",
         }
     }
 
@@ -1468,6 +1473,7 @@ impl NotificationKind {
             NotificationKind::TriggerBlocked => "Blacklist blocked",
             NotificationKind::QualityUpgrade => "Quality upgrade",
             NotificationKind::CaptureAlert => "Capture warning",
+            NotificationKind::ChatMention => "Chat mention",
         }
     }
 
@@ -1487,6 +1493,7 @@ impl NotificationKind {
             NotificationKind::TriggerBlocked => "🚫",
             NotificationKind::QualityUpgrade => "⬆",
             NotificationKind::CaptureAlert => "🚨",
+            NotificationKind::ChatMention => "💬",
         }
     }
 }

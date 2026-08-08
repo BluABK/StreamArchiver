@@ -242,6 +242,10 @@ pub struct ChatEventCtx {
     pub monitor_id: i64,
     /// Broadcast id of the recording this chat belongs to (`''` if unknown).
     pub stream_id: String,
+    /// The app event bus, for raising a mention/highlight notification. See
+    /// [`crate::chat_highlight`] for why detection lives here rather than in
+    /// the chat window.
+    pub events: crate::events::EventTx,
 }
 
 /// One stream event parsed from a raw IRC line ([`parse_chat_event`] /
@@ -440,6 +444,11 @@ async fn session(
     // Moderation tracker (deletions/purges/room modes/role badges) — per
     // connection, so its baselines reset with each reconnect.
     let mut tracker = EventTracker::default();
+    // Mention/highlight watcher. Read ONCE per connection: the rules and the
+    // connected login change from Settings, which is a human action, so a
+    // reconnect picking them up is soon enough — and this must not become a
+    // settings read per chat message on a busy channel.
+    let mut mentions = events.map(MentionWatch::new).filter(MentionWatch::armed);
     if let Some(ctx) = events {
         tracker.tuning = load_hype_tuning(ctx);
     }
@@ -562,6 +571,9 @@ async fn session(
                             }
                         }
                         if let Some(json) = parse_privmsg(line) {
+                            if let Some(w) = mentions.as_mut() {
+                                w.check(&json);
+                            }
                             sink.push(&json);
                         }
                     }
@@ -680,6 +692,101 @@ fn parse_privmsg(line: &str) -> Option<String> {
         msg_kind,
     })
     .ok()
+}
+
+/// Watches a live chat for messages that name the connected account or match
+/// a custom highlight rule, and raises a notification for them.
+///
+/// Lives here rather than in the chat window because the window is a file-tail
+/// replay that may not be open — and being told while you're doing something
+/// else is the entire point of "pingable". It also means chat-only sessions
+/// (no recording at all) ping just the same.
+struct MentionWatch<'a> {
+    ctx: &'a ChatEventCtx,
+    /// The connected Twitch account's login, lowercased. Empty when no
+    /// account is connected, which disarms the mention half.
+    login: String,
+    rules: Vec<crate::chat_highlight::HighlightRule>,
+    /// Whether mentions of `login` should notify at all (the "pingable"
+    /// setting). Rules that opted in still notify regardless.
+    pingable: bool,
+    /// Channel display name, for the notification heading — one store lookup
+    /// per connection rather than one per message.
+    channel: String,
+    /// When this channel last raised a toast, so a chat spamming a name can't
+    /// spawn one per message. Suppressed hits still reach the 🔔 feed.
+    last_toast: i64,
+}
+
+impl<'a> MentionWatch<'a> {
+    fn new(ctx: &'a ChatEventCtx) -> MentionWatch<'a> {
+        let login = ctx
+            .store
+            .get_setting(crate::oauth::K_LOGIN)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_lowercase();
+        let channel = ctx
+            .store
+            .get_monitor_with_channel(ctx.monitor_id)
+            .ok()
+            .flatten()
+            .map(|r| r.channel.name)
+            .unwrap_or_default();
+        MentionWatch {
+            login,
+            rules: crate::chat_highlight::load_rules(&ctx.store),
+            pingable: crate::chat_highlight::pingable(&ctx.store),
+            channel,
+            last_toast: 0,
+            ctx,
+        }
+    }
+
+    /// Whether there's anything to watch for at all. A watcher with no rules
+    /// and no connected login would run a matcher over every message to
+    /// always answer "no".
+    fn armed(&self) -> bool {
+        (self.pingable && !self.login.is_empty())
+            || self.rules.iter().any(|r| r.enabled && r.notify)
+    }
+
+    /// Check one already-serialized sidecar line.
+    ///
+    /// Takes the JSON rather than the raw IRC line so the tag parsing isn't
+    /// done twice — `parse_privmsg` has already unescaped and extracted
+    /// everything, and this runs for every single message on the channel.
+    fn check(&mut self, json: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return };
+        let text = v["text"].as_str().unwrap_or("");
+        if text.is_empty() {
+            return;
+        }
+        let now = crate::models::now_unix();
+        // Every "should this interrupt someone" rule lives in one pure
+        // function — self-suppression, notify gating, and the per-channel
+        // cooldown — so it can be tested without a socket or a clock.
+        let Some(reason) = crate::chat_highlight::notify_reason(
+            text,
+            v["login"].as_str().unwrap_or(""),
+            if self.pingable { self.login.as_str() } else { "" },
+            &self.rules,
+            now,
+            self.last_toast,
+        ) else {
+            return;
+        };
+        self.last_toast = now;
+        let _ = self.ctx.events.send(crate::events::AppEvent::ChatMention {
+            monitor_id: Some(self.ctx.monitor_id),
+            channel: self.channel.clone(),
+            author: v["name"].as_str().unwrap_or("").to_string(),
+            text: text.to_string(),
+            reason,
+            msg_id: v["id"].as_str().unwrap_or("").to_string(),
+        });
+    }
 }
 
 /// A sidecar `{"marker":"event",…}` line for a USERNOTICE — sub, resub, gift,

@@ -133,6 +133,13 @@ impl StreamArchiverApp {
             user_card: None,
             users_panel: None,
             stats,
+            // Snapshotted at open: the rules change from Settings, which is a
+            // human action, so reopening the window to pick them up is fine —
+            // and this must not become a settings read per rendered row.
+            highlights: Arc::new((
+                self.core.store.get_setting(crate::oauth::K_LOGIN).ok().flatten().unwrap_or_default(),
+                crate::chat_highlight::load_rules(&self.core.store),
+            )),
             // Both cards start open; the feature switches in Settings decide
             // whether they're available at all.
             show_hype: true,
@@ -253,6 +260,7 @@ impl StreamArchiverApp {
         // The emote cache is shared (Arc<Mutex>), so the closure can use a clone
         // without borrowing `self`. Copy the render toggles out too.
         let anim_cache = self.emote_anim.clone();
+        let highlights = popup.highlights.clone();
         // Uploaded on first use and refcounted, so this clone is free. Moved
         // into the closure because the deferred render can't borrow `self`.
         let ui_tex = self.ui_tex.get_or_insert_with(|| UiTextures::load(ctx)).clone();
@@ -1253,10 +1261,21 @@ impl StreamArchiverApp {
                                                 !login.is_empty() && login == hl
                                             });
                                         // Fill + left-accent colour for this row —
-                                        // the highlighted user, or the message's own
-                                        // kind (first message, redemption, sub…).
-                                        let decor =
-                                            row_decor(&log.messages[mi], highlighted, ui.visuals());
+                                        // the highlighted user, a highlight-rule or
+                                        // mention hit, or the message's own kind
+                                        // (first message, redemption, sub…).
+                                        let hit = !highlighted
+                                            && crate::chat_highlight::first_hit(
+                                                &log.messages[mi].text,
+                                                &highlights.0,
+                                                &highlights.1,
+                                            )
+                                            .is_some();
+                                        let decor = row_decor(
+                                            &log.messages[mi],
+                                            highlighted || hit,
+                                            ui.visuals(),
+                                        );
                                         // Room for the accent bar on the left. Reserved
                                         // on EVERY row, not just accented ones, so text
                                         // doesn't shift sideways as notices scroll past.

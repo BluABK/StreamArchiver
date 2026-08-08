@@ -816,6 +816,7 @@ impl Supervisor {
                             .store
                             .recording_stream_id(row.ref_id)
                             .unwrap_or_default(),
+                        events: self.events.clone(),
                     }),
                 )));
             }

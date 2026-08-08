@@ -4517,6 +4517,7 @@ progress_info: None,
                         store: self.store.clone(),
                         monitor_id,
                         stream_id: stream_id.to_string(),
+                        events: self.events.clone(),
                     }),
                 );
                 tokio::spawn(async move {

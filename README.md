@@ -3628,6 +3628,23 @@ actually has, so usernames line up in a straight column instead of drifting
 left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
+**Be pingable.** *Settings → Interface → Chat highlights* has a **"Notify me
+when someone says my name"** switch — off by default, since it's the one
+setting that can make an unattended machine start talking to you — plus a list
+of **custom highlights**: a word, a phrase, or a regex, each with an optional
+name, a *Whole word* option (so `art` doesn't fire on "start") and its own
+*Notify* tick. Rules highlight matching rows in the chat window; only mentions
+and rules that opted in raise a toast.
+
+Matching runs in the **chat logger itself, not the chat window** — so you get
+pinged with no window open, and it works for channels being logged without a
+recording at all. A mention counts whether it's `@name` or your name on its
+own, because that's how people actually address each other; your own messages
+never ping you. Do Not Disturb still suppresses the toast, the 🔔 feed row is
+recorded either way, and there's at most **one toast per channel per 10
+seconds**, so a chat spamming your name can't spawn fifty. Rules are re-read
+on each new chat connection, and the chat window picks them up when reopened.
+
 **Two clocks, one click apart.** The 🕒 toolbar toggle switches every
 timestamp between **time into the broadcast** (`[00:40:10]`, the default —
 this is an archive tool, and it's what lets you seek the local recording to a

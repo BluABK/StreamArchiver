@@ -410,6 +410,30 @@ fn handle(store: &Store, ev: AppEvent) {
             };
             (content, meta)
         }
+        AppEvent::ChatMention { monitor_id, channel, author, text, reason, msg_id } => {
+            let mut content = ToastContent::text(
+                format!("💬 {author} {reason} in {channel}"),
+                text.clone(),
+            );
+            content.launch = "action=notifications";
+            let meta = NotifMeta {
+                kind: NotificationKind::ChatMention,
+                severity: "info",
+                monitor_id,
+                channel,
+                recording_id: None,
+                // Keyed on the message id so a reconnect replaying the same
+                // line, or a second window seeing it, can't toast twice. A
+                // line with no id (pre-tags) is treated as always-distinct.
+                ref_key: if msg_id.is_empty() {
+                    String::new()
+                } else {
+                    format!("mention:{msg_id}")
+                },
+                skip_toast: false,
+            };
+            (content, meta)
+        }
         AppEvent::Error { context, message } => {
             let mut content = ToastContent::text(
                 "StreamArchiver error".to_string(),

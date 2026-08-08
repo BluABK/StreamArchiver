@@ -2191,6 +2191,13 @@ pub struct StreamArchiverApp {
     /// Installed system fonts for the pickers, enumerated once on first use
     /// (~400 registry values plus an existence check each).
     system_fonts: Option<Vec<crate::fonts::SystemFont>>,
+    /// Whether being named in chat raises a notification — see
+    /// [`crate::chat_highlight::K_PINGABLE`]. Mirrors the setting so the
+    /// checkbox has somewhere to live; the chat logger reads the store.
+    chat_pingable: bool,
+    /// The custom highlight rules, as edited in Settings. Saved on every
+    /// change; the chat logger re-reads them on each new connection.
+    chat_highlights: Vec<crate::chat_highlight::HighlightRule>,
     /// Which monitor's Properties window is open (None = closed).
     properties_popups: Vec<i64>,
     /// Deferred-viewport state for each open instance-Properties window,
