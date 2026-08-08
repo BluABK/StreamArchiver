@@ -1917,6 +1917,20 @@ pub(super) fn take_status_badges(
                      content. Click for the 🚨 Warnings details.",
                 );
             open_warnings |= resp.clicked();
+        } else if a.gated {
+            // Ahead of the generic warning branch: "tool warnings" is true
+            // here but useless. The take did not fail because the tool
+            // misbehaved, it failed because the broadcast was not ours to
+            // capture — which is a state, and should read as one.
+            let resp = clickable(ui, SUB_ONLY_COLOR, "🔒 not entitled".into())
+                .on_hover_text(
+                    "This broadcast was subscriber-only or members-only and the \
+                     credentials in use do not hold that entitlement, so this take \
+                     captured nothing. That is a state of the broadcast, not a capture \
+                     fault — retries are spaced out accordingly. Click for the 🚨 \
+                     Warnings details.",
+                );
+            open_warnings |= resp.clicked();
         } else if !a.errors && a.warnings {
             let resp = clickable(ui, egui::Color32::from_rgb(220, 175, 60), "⚠ tool warnings".into())
                 .on_hover_text(

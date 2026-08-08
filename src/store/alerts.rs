@@ -90,6 +90,10 @@ pub struct RecAlertBadge {
     /// The take failed but a later take of the same broadcast completed (see
     /// [`CaptureAlertRow::superseded`]).
     pub superseded: bool,
+    /// The broadcast was gated (subscriber-only / members-only) and simply
+    /// wasn't ours to capture. Not a fault, and rendered as its own 🔒 state
+    /// rather than falling in with generic tool warnings.
+    pub gated: bool,
 }
 
 /// Lifetime capture-health rollup (the App Stats "Capture health" totals).
@@ -610,7 +614,8 @@ impl Store {
                     MAX(CASE WHEN severity = 'error' THEN 1 ELSE 0 END),
                     MAX(CASE WHEN severity != 'error' THEN 1 ELSE 0 END),
                     SUM(lost_segments), MAX(ranges_total), MAX(recovered), MAX(recovered_muted),
-                    {ALERT_SUPERSEDED_SQL}
+                    {ALERT_SUPERSEDED_SQL},
+                    MAX(CASE WHEN kind = 'sub_only' THEN 1 ELSE 0 END)
              FROM capture_alert WHERE recording_id IS NOT NULL
              GROUP BY recording_id"
         ))?;
@@ -633,6 +638,7 @@ impl Store {
                         recovered: r.get(5)?,
                         muted: r.get(6)?,
                         superseded,
+                        gated: r.get::<_, i64>(8)? != 0,
                     },
                 ))
             })?
@@ -939,6 +945,55 @@ mod tests {
         let done = &store.gap_ranges_in_state(7, "done").unwrap()[0];
         assert_eq!(done.out_path, "A:\\x.gap100.mkv");
         assert_eq!(done.muted_segs, 2);
+    }
+
+
+    /// A gated broadcast (subscriber-only / members-only) is not a capture
+    /// fault. Its 🔒 alert is only a WARNING, so before this the generic
+    /// `capture_failed` error was filed alongside it and the take rendered
+    /// "⛔ capture error" — the opposite of the truth, and exactly what a
+    /// members-only YouTube stream showed (Mori Calliope, 2026-08-08).
+    #[test]
+    fn a_gated_take_gets_a_lock_state_and_no_capture_failed_error() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store
+            .upsert_channel("Mori", "https://youtube.com/@mori", crate::models::Platform::YouTube)
+            .unwrap();
+        let mid = store.insert_monitor(&crate::store::test_util::sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", None, false, Some("s1"), None, "", "")
+            .unwrap();
+
+        // The 🔒 row as `file_sub_only_alert` writes it: a warning, not an error.
+        let alert = NewCaptureAlert {
+            kind: "sub_only".into(),
+            severity: "warning".into(),
+            source: "capture".into(),
+            take_key: format!("sub_only:{rid}"),
+            monitor_id: Some(mid),
+            recording_id: Some(rid),
+            video_id: None,
+            channel: "Mori".into(),
+            count: 1,
+            lost_segments: 0,
+            last_line: "This YouTube broadcast is members-only…".into(),
+        };
+        store.upsert_capture_alert(&alert).unwrap();
+
+        // Finalizing the failed take must NOT add a second, contradictory row.
+        store
+            .finish_recording(rid, 110, 0, Some(1), "failed", "C:/tmp/a.mkv", "ERROR: not live")
+            .unwrap();
+        let kinds: Vec<String> =
+            store.list_capture_alerts(10).unwrap().into_iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, vec!["sub_only".to_string()], "no capture_failed beside the lock");
+
+        // …and the take's badge says "gated", not "error", so the grid can
+        // render a lock instead of a red fault.
+        let badges = store.alert_badges_by_recording().unwrap();
+        let b = badges.get(&rid).expect("the take has a badge");
+        assert!(b.gated);
+        assert!(!b.errors, "a gated take is not an error state");
     }
 
     #[test]

@@ -2140,6 +2140,13 @@ to gain by asking sooner.
 Configuring cookies from a browser signed into an account with that membership
 (*Authentication*, below) makes the stream capture normally instead.
 
+Either way — Twitch or YouTube — a refused take shows **🔒 not entitled** in the
+Streams grid, not a red capture error. The take genuinely captured nothing, but
+it did so because the broadcast wasn't ours, and that is a state of the
+broadcast rather than a fault in the capture. The 🔒 alert is the only one filed
+for it; the generic "Capture failed" error is deliberately suppressed so the two
+don't contradict each other.
+
 ### Twitch VOD recovery (deleted & muted VODs)
 
 ![Recording context menu with Recover VOD / Download post-stream VOD / Backfill head](doc/screenshots/vod-recovery-menu.png)

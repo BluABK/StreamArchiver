@@ -564,9 +564,16 @@ impl Store {
         exit_code: Option<i64>,
         log_excerpt: &str,
     ) -> Result<()> {
+        // A `sub_only` row counts as covering the take even though it is only
+        // a WARNING. It is the whole explanation for the failure — the
+        // broadcast wasn't ours to capture — and adding "Capture failed" beside
+        // it says the opposite of the truth: it turns a known, expected state
+        // into a red fault, and the take row renders "⛔ capture error" instead
+        // of the 🔒 it earned.
         let covered: bool = self.db().query_row(
             "SELECT EXISTS(SELECT 1 FROM capture_alert
-                           WHERE recording_id = ?1 AND severity = 'error')",
+                           WHERE recording_id = ?1
+                             AND (severity = 'error' OR kind = 'sub_only'))",
             params![rec_id],
             |r| r.get(0),
         )?;
