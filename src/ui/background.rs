@@ -1951,9 +1951,10 @@ impl StreamArchiverApp {
 }
 
 /// How long the Background tab's chat-index counters are reused before being
-/// re-queried. The sweep only moves them once a minute; anything faster would
-/// be paying database queries for a number that hasn't changed.
-const INDEX_STAT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+/// re-queried. Matches `chat_index::HEALTH_TTL`; the extra layer exists because
+/// the candidate count comes from the *main* store (a scan of every take with a
+/// chat log), which the index's own cache knows nothing about.
+const INDEX_STAT_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Plot/legend color for a traffic class. Chosen to read as distinct lines on
 /// both light and dark backgrounds, and reused for the swatches in the live

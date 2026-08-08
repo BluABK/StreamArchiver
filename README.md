@@ -3754,6 +3754,13 @@ i.e. a couple of minutes of CPU for that whole archive, spread over hours at the
 default pace. The presence data (who was in which stream) is a small fraction of
 that; the bulk is the full-text message index.
 
+The readouts above are deliberately cheap to produce and cached for 15s, because
+they are read from the UI thread: the per-stream totals come from a small
+bookkeeping table rather than counting millions of message rows. One consequence
+worth knowing: **appearances** can read a hair high (0.01% on a real index) once
+legacy names start merging into real accounts, since that collapses rows the
+per-stream totals can't see. Everything else is exact.
+
 **Indexing one channel now.** The row above the results indexes a chosen
 channel's most recent chat logs ahead of the queue — for when you are looking
 someone up and that channel's streams haven't been read yet. It skips anything

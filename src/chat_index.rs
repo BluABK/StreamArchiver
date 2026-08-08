@@ -52,7 +52,19 @@ use crate::store::db_lock;
 
 /// Latest index-schema version understood by this build. Independent of the
 /// store's `SCHEMA_VERSION` — the two files migrate separately.
-const INDEX_SCHEMA_VERSION: i64 = 1;
+const INDEX_SCHEMA_VERSION: i64 = 2;
+
+/// How long [`ChatIndex::health`] reuses its last answer.
+///
+/// Every caller is a UI panel that repaints continuously, so without this the
+/// Users tab would run the aggregates every frame. The counters only move when
+/// a sweep lands (once a minute at best, minutes apart while a big backlog is
+/// draining), so a window this wide still reads as live — and it matters,
+/// because the one remaining unavoidable cost is `COUNT(*)` over `chat_user`
+/// (57 ms at a quarter-million chatters, measured) and that lands on the UI
+/// thread. Once every 15 s is invisible; once every 5 s is a rhythm you can
+/// feel.
+const HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// A query slower than this is logged at `warn!` with its shape and row count.
 /// A degrading index should show up in the log before it shows up as a stalled
@@ -228,6 +240,10 @@ pub fn index_path() -> PathBuf {
 pub struct ChatIndex {
     conn: FairMutex<Connection>,
     path: PathBuf,
+    /// Last [`health`](Self::health) answer and when it was taken — see
+    /// [`HEALTH_TTL`]. Its own lock, so reading it never touches the
+    /// connection.
+    health_cache: parking_lot::Mutex<Option<(IndexHealth, std::time::Instant)>>,
 }
 
 impl ChatIndex {
@@ -236,7 +252,11 @@ impl ChatIndex {
         let conn = Connection::open(path)
             .with_context(|| format!("opening chat index at {}", path.display()))?;
         Self::configure(&conn)?;
-        let idx = ChatIndex { conn: FairMutex::new(conn), path: path.to_path_buf() };
+        let idx = ChatIndex {
+            conn: FairMutex::new(conn),
+            path: path.to_path_buf(),
+            health_cache: parking_lot::Mutex::new(None),
+        };
         idx.migrate()?;
         Ok(idx)
     }
@@ -246,7 +266,11 @@ impl ChatIndex {
     pub fn open_in_memory() -> Result<ChatIndex> {
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
-        let idx = ChatIndex { conn: FairMutex::new(conn), path: PathBuf::from(":memory:") };
+        let idx = ChatIndex {
+            conn: FairMutex::new(conn),
+            path: PathBuf::from(":memory:"),
+            health_cache: parking_lot::Mutex::new(None),
+        };
         idx.migrate()?;
         Ok(idx)
     }
@@ -351,9 +375,27 @@ impl ChatIndex {
                 );
                 "#,
             )?;
-            conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
-            info!(version = INDEX_SCHEMA_VERSION, "chat index: schema created");
+            info!(version = 1, "chat index: schema created");
         }
+        if version < 2 {
+            // `resolved` used to be set only by the login resolver, so it was 0
+            // for every id-keyed identity too — which made "still to look up"
+            // an unindexable `user_key LIKE 'login:%'` scan costing a full
+            // second on a real index, on the UI thread. Give it its honest
+            // meaning ("we know this identity's account id"), true by
+            // construction for anything keyed by a real id, and index it.
+            conn.execute_batch(
+                r#"
+                UPDATE chat_user SET resolved = 1
+                 WHERE resolved = 0 AND user_key NOT LIKE 'login:%';
+                CREATE INDEX IF NOT EXISTS idx_chat_user_unresolved
+                    ON chat_user(msgs_total DESC)
+                    WHERE resolved = 0 AND merged_into = 0;
+                "#,
+            )?;
+            info!(version = 2, "chat index: indexed the unresolved-login lookup");
+        }
+        conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -395,8 +437,10 @@ impl ChatIndex {
             // first/last seen widen monotonically so an out-of-order take can
             // never narrow them.
             let mut up_user = tx.prepare(
-                "INSERT INTO chat_user(platform, user_key, login, display, first_seen, last_seen)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                // `resolved` is "we know this identity's account id" — true by
+                // construction unless the key is a bare login.
+                "INSERT INTO chat_user(platform, user_key, login, display, first_seen, last_seen, resolved)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?2 NOT LIKE 'login:%')
                  ON CONFLICT(platform, user_key) DO UPDATE SET
                      login      = CASE WHEN excluded.login != '' THEN excluded.login ELSE login END,
                      display    = CASE WHEN excluded.display != '' THEN excluded.display ELSE display END,
@@ -568,8 +612,7 @@ impl ChatIndex {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, login FROM chat_user
-             WHERE platform = 'twitch' AND resolved = 0 AND merged_into = 0
-               AND user_key LIKE 'login:%' AND login != ''
+             WHERE resolved = 0 AND merged_into = 0 AND platform = 'twitch' AND login != ''
              ORDER BY msgs_total DESC
              LIMIT ?1",
         )?;
@@ -847,19 +890,54 @@ impl ChatIndex {
 
     /// Aggregate counters for the App Stats "Index health" block.
     pub fn health(&self) -> Result<IndexHealth> {
+        if let Some((cached, at)) = &*self.health_cache.lock()
+            && at.elapsed() < HEALTH_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let h = self.health_uncached()?;
+        *self.health_cache.lock() = Some((h.clone(), std::time::Instant::now()));
+        Ok(h)
+    }
+
+    /// The queries behind [`health`](Self::health).
+    ///
+    /// Every count here is deliberately cheap, because this is read from the
+    /// UI thread. `COUNT(*)` over `chat_message` is a full scan of millions of
+    /// rows — 172 ms at 8M messages — and the old unresolved-logins predicate
+    /// (`user_key LIKE 'login:%'`) could not use an index at all and cost a
+    /// full second. Both were measured on a real 909 MB index, on the main
+    /// thread, at which point the Users tab is simply broken.
+    ///
+    /// So the two big totals come from `indexed_take` instead — one row per
+    /// take, ~1 ms — which already records what each take contributed.
+    /// `messages` is exact (it is the sum of what was written). `presence_rows`
+    /// can read a hair high: merging a login-keyed identity into an id-keyed
+    /// one collapses their rows in any stream they BOTH appear in, which the
+    /// per-take totals can't know about. Measured drift on a real index: 70 of
+    /// 610,630, or 0.01%. It is a health readout, not an accounting ledger.
+    fn health_uncached(&self) -> Result<IndexHealth> {
         let t = std::time::Instant::now();
         let conn = self.db();
         let one = |sql: &str| -> rusqlite::Result<i64> { conn.query_row(sql, [], |r| r.get(0)) };
+        let (messages, presence_rows, takes_indexed, takes_failed) = conn.query_row(
+            "SELECT COALESCE(SUM(msgs), 0), COALESCE(SUM(users), 0),
+                    COALESCE(SUM(status = 'ok'), 0), COALESCE(SUM(status != 'ok'), 0)
+             FROM indexed_take",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
         let mut h = IndexHealth {
             users: one("SELECT COUNT(*) FROM chat_user WHERE merged_into = 0")?,
-            presence_rows: one("SELECT COUNT(*) FROM chat_presence")?,
-            messages: one("SELECT COUNT(*) FROM chat_message")?,
-            takes_indexed: one("SELECT COUNT(*) FROM indexed_take WHERE status = 'ok'")?,
-            takes_failed: one("SELECT COUNT(*) FROM indexed_take WHERE status != 'ok'")?,
+            presence_rows,
+            messages,
+            takes_indexed,
+            takes_failed,
+            // `resolved` is set at insert for anything keyed by a real platform
+            // id, so this predicate is exactly "login-keyed and never looked
+            // up" and rides `idx_chat_user_unresolved`.
             unresolved_logins: one(
-                "SELECT COUNT(*) FROM chat_user
-                 WHERE platform = 'twitch' AND resolved = 0 AND merged_into = 0
-                   AND user_key LIKE 'login:%' AND login != ''",
+                "SELECT COUNT(*) FROM chat_user WHERE resolved = 0 AND merged_into = 0",
             )?,
             ..Default::default()
         };
@@ -907,6 +985,9 @@ impl ChatIndex {
              DELETE FROM chat_user;
              DELETE FROM indexed_take;",
         )?;
+        // A user pressing "Rebuild" expects the readout to go to zero at once,
+        // not in five seconds.
+        *self.health_cache.lock() = None;
         info!("chat index: cleared — every take will be re-read");
         Ok(())
     }
@@ -1203,6 +1284,70 @@ mod tests {
         assert!(idx.search_messages("hello", 10).unwrap().is_empty());
     }
 
+
+
+    #[test]
+    fn health_totals_come_from_the_per_take_rollup_not_a_full_scan() {
+        // `COUNT(*)` over chat_message cost 172 ms at 8M rows, on the UI
+        // thread. These totals must agree with the real tables while being
+        // derived from `indexed_take` instead.
+        let idx = ChatIndex::open_in_memory().unwrap();
+        idx.write_take(
+            &take(7, "x"),
+            &parsed(vec![
+                msg("1", "ann", 100, "a"),
+                msg("2", "bob", 110, "b"),
+                msg("2", "bob", 120, "c"),
+            ]),
+            0,
+            1,
+        )
+        .unwrap();
+        idx.write_take(&take(8, "y"), &parsed(vec![msg("1", "ann", 200, "d")]), 0, 1).unwrap();
+        let h = idx.health_uncached().unwrap();
+        assert_eq!(h.messages, 4);
+        assert_eq!(h.presence_rows, 3, "ann in two streams, bob in one");
+        assert_eq!((h.takes_indexed, h.takes_failed), (2, 0));
+        // ...and they match what a full scan would have said.
+        let conn = idx.db();
+        let msgs: i64 = conn.query_row("SELECT COUNT(*) FROM chat_message", [], |r| r.get(0)).unwrap();
+        let pres: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chat_presence", [], |r| r.get(0)).unwrap();
+        assert_eq!((h.messages, h.presence_rows), (msgs, pres));
+    }
+
+    #[test]
+    fn only_login_keyed_identities_are_ever_unresolved() {
+        // `resolved` means "we know this identity's account id" — set at insert
+        // for anything keyed by a real id. That is what lets the lookup use an
+        // index instead of a `LIKE 'login:%'` scan (measured: 1034 ms -> 3 ms).
+        let idx = ChatIndex::open_in_memory().unwrap();
+        idx.write_take(
+            &take(7, "x"),
+            &parsed(vec![msg("42", "hasid", 100, "a"), msg("", "noid", 110, "b")]),
+            0,
+            1,
+        )
+        .unwrap();
+        let pending = idx.unresolved_logins(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "noid");
+        assert_eq!(idx.health_uncached().unwrap().unresolved_logins, 1);
+    }
+
+    #[test]
+    fn health_is_cached_but_a_rebuild_clears_it_immediately() {
+        let idx = ChatIndex::open_in_memory().unwrap();
+        idx.write_take(&take(7, "x"), &parsed(vec![msg("1", "ann", 100, "hi")]), 0, 1).unwrap();
+        assert_eq!(idx.health().unwrap().messages, 1);
+        // Within the TTL a later write is not yet reflected — the whole point.
+        idx.write_take(&take(8, "y"), &parsed(vec![msg("1", "ann", 200, "again")]), 0, 1).unwrap();
+        assert_eq!(idx.health().unwrap().messages, 1, "still the cached answer");
+        assert_eq!(idx.health_uncached().unwrap().messages, 2, "the truth underneath");
+        // Rebuild must not leave a stale readout sitting there.
+        idx.clear().unwrap();
+        assert_eq!(idx.health().unwrap().messages, 0);
+    }
 
     #[test]
     fn clearing_empties_every_table() {
