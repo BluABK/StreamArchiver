@@ -318,6 +318,33 @@ impl Store {
     /// so this stays cheap however large the recording table gets — but it is
     /// still a DB read, so cache it against `streams_cache_rev` rather than
     /// calling it from a render path.
+    /// Per-monitor sum of finished-take bytes — the Streams grid's channel/
+    /// instance "disk use" rollup (`take_size_bytes` covers the period/
+    /// stream/take rows below them, confirming each file against disk; this
+    /// coarser SQL-only sum is what makes a COLLAPSED channel/instance row
+    /// affordable, since it never needs `recordings_for_monitor`'s full
+    /// per-take history — see `[[stream-take-filesize]]`/the `groups` map's
+    /// own doc comment on why that stays expansion-gated).
+    ///
+    /// Excludes `output_path = ''` (a take whose only output was a failed/
+    /// never-attempted VOD backfill, never a real file) but does NOT confirm
+    /// the file still exists — a take whose file vanished after finalize
+    /// keeps counting here until its row is disposed of or its `bytes` is
+    /// otherwise cleared. Cache against `streams_cache_rev`, same as
+    /// `rolling_counts_by_monitor`, never call from a render path.
+    pub fn monitor_disk_usage(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, SUM(bytes) FROM recording
+             WHERE bytes > 0 AND output_path != ''
+             GROUP BY monitor_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<std::collections::HashMap<i64, i64>>>()?;
+        Ok(rows)
+    }
+
     pub fn rolling_counts_by_monitor(&self) -> Result<std::collections::HashMap<i64, i64>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
@@ -2725,6 +2752,60 @@ mod tests {
             store.insert_monitor(&m).unwrap()
         };
         assert!(!store.monitor_meta_filter_texts().unwrap().contains_key(&m2));
+    }
+
+    /// `monitor_disk_usage` sums finished-take bytes per monitor, excluding
+    /// zero-byte and empty-`output_path` rows (a take whose only "output" was
+    /// a failed VOD backfill — see `take_size_bytes`'s doc comment) — it does
+    /// NOT confirm the file still exists, unlike the per-take/stream/period
+    /// figure the Streams grid computes when a channel is actually expanded.
+    #[test]
+    fn monitor_disk_usage_sums_bytes_and_excludes_pathless_or_empty_takes() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m1 = sample_monitor(cid);
+        m1.channel_id = cid;
+        let mid1 = store.insert_monitor(&m1).unwrap();
+        let mut m2 = sample_monitor(cid);
+        m2.channel_id = cid;
+        let mid2 = store.insert_monitor(&m2).unwrap();
+
+        // mid1: two finished takes -> summed.
+        let r1 = store
+            .insert_recording(mid1, 1_000, "C:/rec/a.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(r1, 1_100, 1_000, Some(0), "completed", "C:/rec/a.mkv", "").unwrap();
+        let r2 = store
+            .insert_recording(mid1, 2_000, "C:/rec/b.mkv", Some(2_000), false, Some("s2"), None, "", "")
+            .unwrap();
+        store.finish_recording(r2, 2_100, 2_000, Some(0), "completed", "C:/rec/b.mkv", "").unwrap();
+        // A failed VOD backfill's own recording row: bytes carried over from
+        // the live capture, but no file was ever kept at any path.
+        let r3 = store
+            .insert_recording(mid1, 3_000, "C:/rec/c.mkv", Some(3_000), false, Some("s3"), None, "", "")
+            .unwrap();
+        store.finish_recording(r3, 3_100, 5_000, Some(0), "completed", "", "").unwrap();
+        // A zero-byte take (never actually captured anything).
+        let r4 = store
+            .insert_recording(mid1, 4_000, "C:/rec/d.mkv", Some(4_000), false, Some("s4"), None, "", "")
+            .unwrap();
+        store.finish_recording(r4, 4_100, 0, Some(0), "completed", "C:/rec/d.mkv", "").unwrap();
+
+        // mid2: one finished take.
+        let r5 = store
+            .insert_recording(mid2, 5_000, "C:/rec/e.mkv", Some(5_000), false, Some("s5"), None, "", "")
+            .unwrap();
+        store.finish_recording(r5, 5_100, 500, Some(0), "completed", "C:/rec/e.mkv", "").unwrap();
+
+        let usage = store.monitor_disk_usage().unwrap();
+        assert_eq!(usage.get(&mid1), Some(&3_000), "only the two real files count");
+        assert_eq!(usage.get(&mid2), Some(&500));
+
+        // A monitor with nothing finished has no entry at all (not a zero).
+        let mut m3 = sample_monitor(cid);
+        m3.channel_id = cid;
+        let mid3 = store.insert_monitor(&m3).unwrap();
+        assert!(!store.monitor_disk_usage().unwrap().contains_key(&mid3));
     }
 
     #[test]

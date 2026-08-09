@@ -2129,6 +2129,14 @@ pub struct StreamArchiverApp {
     /// auto-deletion, cached against `streams_cache_rev` — same shape and same
     /// reasoning as [`Self::raid_out_cache`]. Backs the 🕰 rollup badge.
     rolling_counts_cache: Option<(u64, HashMap<i64, i64>)>,
+    /// Per-monitor sum of finished-take bytes, cached against
+    /// `streams_cache_rev` — same shape and same reasoning as
+    /// [`Self::rolling_counts_cache`]. Backs the Streams grid's "Disk use"
+    /// column on channel/instance rows (a collapsed row has no per-take data
+    /// loaded to sum itself — see `Store::monitor_disk_usage`'s doc comment);
+    /// period/stream/take rows below them use `take_size_bytes` instead,
+    /// which confirms each file still exists.
+    disk_usage_cache: Option<(u64, HashMap<i64, i64>)>,
     /// Saved custom window layouts for the collab-play "Layout ▸" submenu,
     /// cached against `streams_cache_rev` — read once per grid rebuild instead
     /// of once per frame (it is a settings-table read, not a hot query, but

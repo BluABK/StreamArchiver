@@ -594,45 +594,52 @@ the channel was added). Timestamps follow the **Date format** chosen in Settings
 
 **Recording history (collapsible).** Each channel row is a tree you can expand
 (the ▶ triangle) to see its **past streams**, and each stream that took more than
-one attempt expands again to its individual **takes**. Both the stream row and
-each take show a file size in parens: the stream row sums every take (hover it,
-or the Duration column, for an average bitrate — a quick way to notice a take
-that captured at the wrong quality); a still-recording take shows its *live*
-size, not the stale 0 B a plain directory listing would give a file another
-process still has open for writing — it's read from the file handle directly
-and updates every couple of seconds. A finished take whose file is no longer
-on disk (deleted, trashed, or a VOD backfill/recovery attempt that failed
-after an earlier attempt had already recorded a size) shows **no size at
-all** rather than the stale byte count from before — confirmed by the same
-never-blocking probe as everything else here, so it can lag a couple of
-seconds behind an on-disk change. A take finalized before 2026-07-26 may
-show a **⚠** on its Duration cell (and in the take's Properties window): a
-since-fixed bug stamped the end time *after* its remux finished rather than
-when the capture actually stopped, so a take whose remux happened to queue
-for hours at the disk gate can show a duration longer than the broadcast
-really was — the capture itself is still complete, only the timestamp is
-off; compare against the file's own duration to check.
+one attempt expands again to its individual **takes**. Every level — channel,
+instance, Week/Month/Year header, stream, and take — reports its size in the
+**💾 Disk use** column, summing as it goes up: a stream sums its takes, a
+period header sums its streams, an instance sums its streams, and a channel
+sums its instances. A still-recording take shows its *live* size, not the
+stale 0 B a plain directory listing would give a file another process still
+has open for writing — it's read from the file handle directly and updates
+every couple of seconds. A finished take whose file is no longer on disk
+(deleted, trashed, or a VOD backfill/recovery attempt that failed after an
+earlier attempt had already recorded a size) shows **no size at all** rather
+than the stale byte count from before, and that absence propagates up through
+every stream/period total above it — confirmed by the same never-blocking
+probe as everything else here, so it can lag a couple of seconds behind an
+on-disk change. The channel and instance rows are the one exception: expanding
+every channel just to keep their totals live isn't affordable, so those two
+levels show a **stored** total instead (refreshed whenever the grid reloads,
+not confirmed against disk) — hover either for the distinction, and expand
+down to a stream/take for the exact, disk-confirmed figure. A take finalized
+before 2026-07-26 may show a **⚠** on its Duration cell (and in the take's
+Properties window): a since-fixed bug stamped the end time *after* its remux
+finished rather than when the capture actually stopped, so a take whose remux
+happened to queue for hours at the disk gate can show a duration longer than
+the broadcast really was — the capture itself is still complete, only the
+timestamp is off; compare against the file's own duration to check.
 
 Once a channel has been recording long enough, its streams also subgroup into
 collapsible **Week → Month → Year** headers so the list doesn't turn into a
-wall of text — each header shows its own stream count + total size. A level
-only appears once it would actually group more than one bucket (a channel
-whose whole history is still within one week shows no headers at all, exactly
-as before); only the single most recent bucket at each level starts expanded,
-so a channel you've been recording for years still opens straight to its
-newest streams, with everything older one click away:
+wall of text. A level only appears once it would actually group more than one
+bucket (a channel whose whole history is still within one week shows no
+headers at all, exactly as before); only the single most recent bucket at
+each level starts expanded, so a channel you've been recording for years
+still opens straight to its newest streams, with everything older one click
+away:
 
 ```
-▼ Layna            twitch  streamlink  recording
-   ▼ 2026                                          · 41 streams (312 GB)
-      ▶ Jan 2026                                    · 4 streams (28 GB)
+                                                                          💾
+▼ Layna            twitch  streamlink  recording                      312 GB
+   ▼ 2026                                          · 41 streams        312 GB
+      ▶ Jan 2026                                    · 4 streams         28 GB
       ...
-      ▼ Jun 29 – Jul 5                               · 3 streams (22 GB)
-         ▼ 🎬 2026-07-02 18:00   recording   · 2 takes (7.4 GB)
-              Take 1   18:00–18:12   failed       (crashed)  (1.1 GB)
-              Take 2   18:13–…       recording               (6.3 GB)
-         ▶ 🎬 2026-06-30 21:30   completed                    (5.8 GB)
-   ▶ 2025                                          · 187 streams (1.4 TB)
+      ▼ Jun 29 – Jul 5                               · 3 streams        22 GB
+         ▼ 🎬 2026-07-02 18:00   recording   · 2 takes                 7.4 GB
+              Take 1   18:00–18:12   failed       (crashed)            1.1 GB
+              Take 2   18:13–…       recording                         6.3 GB
+         ▶ 🎬 2026-06-30 21:30   completed                             5.8 GB
+   ▶ 2025                                          · 187 streams       1.4 TB
 ```
 
 A channel with **multiple capture instances** (e.g. streamlink *and* yt-dlp on the

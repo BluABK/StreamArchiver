@@ -799,7 +799,7 @@ pub(super) fn video_status_color(status: &str) -> egui::Color32 {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-pub(super) const STREAM_COLUMNS: [GridCol; 24] = [
+pub(super) const STREAM_COLUMNS: [GridCol; 25] = [
     GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Automation) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
@@ -824,6 +824,7 @@ pub(super) const STREAM_COLUMNS: [GridCol; 24] = [
     GridCol { id: "ad_free",     title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts. A channel row shows one 🛡 per ad-free instance.", min_width: 54.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "tags",        title: "Tags",       tooltip: "The stream's tags (Twitch; Kick when set) — persists through offline as the channel's usual tags, same as language/category id. Hover for the full list; changes are archived — see 📝 Title/category/tags history.", min_width: 0.0, initial: 120.0, sortable: true, stretch: false },
+    GridCol { id: "disk_use",    title: "💾",         tooltip: "Disk space used by stored recordings. Period/stream/take rows confirm each file still exists before counting it; the channel/instance rollup is a stored total instead (refreshed when the grid reloads, not live) and can briefly overcount a take whose file has since gone missing — expand down to it for the exact figure.", min_width: 64.0, initial: 0.0, sortable: true, stretch: false },
 ];
 
 /// Total Streams columns, including the non-sortable Actions slot.
@@ -1129,6 +1130,11 @@ pub(super) struct StreamsViewCache {
     /// DB read, so it lives here rather than in the render path; see
     /// [`crate::rolling`].
     pub(super) rolling_counts: HashMap<i64, i64>,
+    /// Per-monitor sum of finished-take bytes — the "Disk use" column on
+    /// channel/instance rows. See `Store::monitor_disk_usage`'s doc comment
+    /// for why this is a coarser figure than what period/stream/take rows
+    /// show (those confirm each file against disk; this doesn't).
+    pub(super) monitor_disk_usage: HashMap<i64, i64>,
     pub(super) model: Vec<Vec<Cell>>,
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.
@@ -2243,14 +2249,18 @@ pub(super) fn channel_cells(
     // — feeds the deep-filter haystacks below. Empty map = no deep history
     // matching (tests).
     rec_texts: &HashMap<i64, (String, String)>,
+    // Per-monitor finished-take byte sum (`Store::monitor_disk_usage`) — the
+    // channel row's "Disk use" cell sums every instance's entry.
+    monitor_disk_usage: &HashMap<i64, i64>,
 ) -> Vec<Cell> {
     if monitors.is_empty() {
-        // Empty container: just the name + "added"; everything else blank. Index
-        // order matches STREAM_COLUMNS: On=0, Name=3, Added=last.
+        // Empty container: just the name + "added"; everything else blank
+        // (including disk use — nothing stored with no instances to store it).
         let mut cells: Vec<Cell> = (0..STREAM_COLS).map(|_| Cell::text(String::new())).collect();
         cells[0] = Cell::num(0.0, "off");
-        cells[3] = Cell::text(channel.name.clone());
-        cells[STREAM_COLS - 1] = Cell::num(channel.created_at as f64, fmt_date(channel.created_at));
+        let pos = |id: &str| STREAM_COLUMNS.iter().position(|c| c.id == id).unwrap();
+        cells[pos("name")] = Cell::text(channel.name.clone());
+        cells[pos("added")] = Cell::num(channel.created_at as f64, fmt_date(channel.created_at));
         return cells;
     }
     // Live process state, not the DB snapshot — matches the rendered state dot.
@@ -2371,6 +2381,12 @@ pub(super) fn channel_cells(
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
         // Tags — the primary live instance's current tag list.
         Cell::text(primary.last_tags.clone()),
+        // Disk use — summed across every instance (index last).
+        {
+            let total: i64 =
+                monitors.iter().map(|m| monitor_disk_usage.get(&m.monitor.id).copied().unwrap_or(0)).sum();
+            Cell::num(total as f64, if total > 0 { fmt_bytes(total) } else { String::new() })
+        },
     ];
 
     // ── Deep-filter haystacks ────────────────────────────────────────────
@@ -2651,6 +2667,9 @@ pub(super) fn render_instance_row(
     // User-saved tiling layouts (name is the identity), listed in each Layout
     // submenu alongside the 3 built-in presets — see `crate::layout`.
     saved_layouts: &[crate::layout::CustomLayout],
+    // This instance's finished-take byte sum (`Store::monitor_disk_usage`) —
+    // the "Disk use" cell.
+    disk_use: i64,
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -3527,6 +3546,12 @@ pub(super) fn render_instance_row(
             "tags" => {
                 tags_cell(ui, &row.last_tags, &row.last_language);
             }
+            "disk_use" if disk_use > 0 => {
+                ui.weak(fmt_bytes(disk_use)).on_hover_text(
+                    "A stored total, refreshed when the grid reloads — not confirmed \
+                     against disk the way an expanded stream/take's own figure is.",
+                );
+            }
             _ => {}
         }});
     }
@@ -3657,8 +3682,9 @@ mod tests {
             ),
         );
         let no_pref = crate::platform_pref::PlatformPrefCtx::default();
-        let model =
-            vec![channel_cells(&channel, &[&row], &HashSet::new(), now, &no_pref, &rec_texts)];
+        let model = vec![channel_cells(
+            &channel, &[&row], &HashSet::new(), now, &no_pref, &rec_texts, &HashMap::new(),
+        )];
 
         let idx = |id: &str| STREAM_COLUMNS.iter().position(|c| c.id == id).unwrap();
         let sort = SortState::default();
@@ -3941,7 +3967,8 @@ mod tests {
         let state_idx = STREAM_COLUMNS.iter().position(|c| c.id == "state").unwrap();
         let no_pref = crate::platform_pref::PlatformPrefCtx::default();
         let state_priority = |m: &MonitorWithChannel, active: &HashSet<i64>| {
-            let cells = channel_cells(&channel, &[m], active, now, &no_pref, &HashMap::new());
+            let cells =
+                channel_cells(&channel, &[m], active, now, &no_pref, &HashMap::new(), &HashMap::new());
             assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
             match cells[state_idx].key {
                 SortKey::Num(n) => n,

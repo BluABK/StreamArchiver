@@ -1725,6 +1725,18 @@ impl StreamArchiverApp {
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default();
+            // Same rev-keyed treatment as `rolling_counts_cache` — backs the
+            // channel/instance "Disk use" column, which has no per-take data
+            // loaded to sum itself when collapsed (see `groups`, above).
+            if self.disk_usage_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
+                let fresh = self.core.store.monitor_disk_usage().unwrap_or_default();
+                self.disk_usage_cache = Some((self.streams_cache_rev, fresh));
+            }
+            let monitor_disk_usage = self
+                .disk_usage_cache
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
 
             // Per-recording ad-break detail (offsets) for the cut-list tooltips on
             // expanded history rows. Cached (cleared on reload) so we issue the SELECT
@@ -1876,7 +1888,10 @@ impl StreamArchiverApp {
                 .map(|e| {
                     let mons: Vec<&MonitorWithChannel> =
                         e.rows.iter().map(|&i| &self.rows[i]).collect();
-                    channel_cells(&e.channel, &mons, active_ids, now, &platform_pref, &rec_texts)
+                    channel_cells(
+                        &e.channel, &mons, active_ids, now, &platform_pref, &rec_texts,
+                        &monitor_disk_usage,
+                    )
                 })
                 .collect();
 
@@ -1891,6 +1906,7 @@ impl StreamArchiverApp {
                 twitch_login_to_mid,
                 latest_raid_out,
                 rolling_counts,
+                monitor_disk_usage,
                 model,
                 platform_pref,
                 simulcast_standby,
@@ -2204,7 +2220,7 @@ impl StreamArchiverApp {
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
                                     fhits.as_ref(), &mut out, &cache.platform_pref,
-                                    self.collab_title_in_name,
+                                    self.collab_title_in_name, &cache.monitor_disk_usage,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -2218,6 +2234,7 @@ impl StreamArchiverApp {
                                     selected_monitor,
                                     &exp_instances, instance_avatars,
                                     cache.rolling_counts.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
+                                    cache.monitor_disk_usage.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
                                     cache
                                         .simulcast_standby
                                         .get(&self.rows[ri].monitor.id)
@@ -3371,6 +3388,9 @@ impl StreamArchiverApp {
         // must match or a collapsed channel silently drops collab info its
         // own (expanded) instance row shows.
         collab_title_in_name: bool,
+        // Per-monitor finished-take byte sum (`Store::monitor_disk_usage`) —
+        // summed across this channel's instances for the "Disk use" cell.
+        monitor_disk_usage: &HashMap<i64, i64>,
     ) {
         let ch = &e.channel;
         let cid = ch.id;
@@ -3445,6 +3465,10 @@ impl StreamArchiverApp {
         let any_err = mons.iter().copied().any(monitor_errored);
         let tint =
             row_tint(any_rec, any_ad, any_err, false, sel_color, status_bgcolor);
+        let disk_use_total: i64 = mons
+            .iter()
+            .map(|m| monitor_disk_usage.get(&m.monitor.id).copied().unwrap_or(0))
+            .sum();
         {
             let mut disc = false;
             for &ci2 in col_order {
@@ -3854,6 +3878,13 @@ impl StreamArchiverApp {
                             primary.map(|m| m.last_language.clone()).unwrap_or_default();
                         tags_cell(ui, &cur_tags, &cur_lang);
                     }
+                    "disk_use" if disk_use_total > 0 => {
+                        ui.weak(fmt_bytes(disk_use_total)).on_hover_text(
+                            "Total across every instance. A stored total, refreshed \
+                             when the grid reloads — not confirmed against disk the \
+                             way an expanded stream/take's own figure is.",
+                        );
+                    }
                     _ => {}
                 }});
             }
@@ -4074,6 +4105,9 @@ impl StreamArchiverApp {
         // Takes of THIS instance still counting down towards rolling
         // auto-deletion — the 🕰 rollup badge (see `crate::rolling`).
         rolling_count: i64,
+        // This instance's finished-take byte sum (`Store::monitor_disk_usage`)
+        // — the "Disk use" cell.
+        disk_use: i64,
         // Set when this instance is live but standing by for a sibling that is
         // recording the broadcast on the named platform (see `crate::simulcast`).
         standby_for: Option<&str>,
@@ -4220,6 +4254,7 @@ impl StreamArchiverApp {
             col_order, fhits,
             collab_title_in_name,
             saved_layouts,
+            disk_use,
             &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
@@ -4321,10 +4356,9 @@ impl StreamArchiverApp {
                     disc = tree_name(ui, depth, true, expanded, None, egui::RichText::new(label.clone()));
                     let noun = if n == 1 { "stream" } else { "streams" };
                     ui.weak(format!("· {n} {noun}"));
-                    if total > 0 {
-                        ui.weak(format!("({})", fmt_bytes(total as i64)))
-                            .on_hover_text(stream_size_hover(total, captured_secs));
-                    }
+                } else if STREAM_COLUMNS[ci].id == "disk_use" && total > 0 {
+                    ui.weak(fmt_bytes(total as i64))
+                        .on_hover_text(stream_size_hover(total, captured_secs));
                 }
             });
         }
@@ -4599,6 +4633,8 @@ impl StreamArchiverApp {
                         if has_takes {
                             ui.weak(format!("· {} takes", g.takes.len()));
                         }
+                    }
+                    "disk_use" => {
                         // Per-take live probe: `t.bytes` alone reads 0 for an
                         // active take (that column is only written at
                         // finalize), which would make the group's running
@@ -4606,7 +4642,7 @@ impl StreamArchiverApp {
                         let total: u64 =
                             g.takes.iter().map(|t| take_size_bytes(fs_probes, t)).sum();
                         if total > 0 {
-                            ui.weak(format!("({})", fmt_bytes(total as i64)))
+                            ui.weak(fmt_bytes(total as i64))
                                 .on_hover_text(stream_size_hover(total, g.captured_secs(now)));
                         }
                     }
@@ -5365,6 +5401,8 @@ impl StreamArchiverApp {
                             ui, depth, false, false, None,
                             egui::RichText::new(label).weak(),
                         );
+                    }
+                    "disk_use" => {
                         let size = take_size_bytes(fs_probes, t);
                         if size > 0 {
                             let hover = if t.is_active() {
@@ -5374,8 +5412,7 @@ impl StreamArchiverApp {
                             } else {
                                 "Final file size."
                             };
-                            ui.weak(format!("({})", fmt_bytes(size as i64)))
-                                .on_hover_text(hover);
+                            ui.weak(fmt_bytes(size as i64)).on_hover_text(hover);
                         }
                     }
                     "state" => {
