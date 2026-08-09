@@ -2160,6 +2160,15 @@ forbidden, it is *invisible*, and the tool reports `The channel is not currently
 live` — indistinguishable from an ordinary "the stream ended between the poll
 and the spawn" race.
 
+That `/streams`-tab check costs about a megabyte, so it is throttled to once
+every few minutes per channel. Crucially, a poll that **skips** the check
+reports *"didn't look"*, not *"offline"* — it serves the last real answer.
+Before that, a members-only channel flapped: live on the one poll that paid for
+a check, offline on every poll in between, which churned the row's state and
+(on Twitch) tore down and rebuilt the CDN capture session. The same holds for a
+failed fetch. Only a page that was actually read can say a stream has ended, so
+the end still lands — within one throttle window.
+
 The app's own detection knows better (a members-only live stream is badged as
 such on the channel's `/streams` tab), so that verdict is recorded on the
 instance and consulted when a capture fails. A failure on a broadcast we know is

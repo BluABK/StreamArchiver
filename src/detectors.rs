@@ -697,7 +697,10 @@ pub struct DetectContext {
     /// When each monitor last paid for the `/streams`-tab fallback scrape
     /// (see `youtube_streams_tab_live`). In-memory only: a missed gated
     /// go-live after a restart costs one extra poll, not correctness.
-    yt_streams_checked: Mutex<HashMap<i64, std::time::Instant>>,
+    /// …and **what it found**, not just when. Serving the last answer while
+    /// the throttle is closed is what stops a gated broadcast flapping — see
+    /// [`ScrapeCtx::youtube_streams_tab_live`].
+    yt_streams_checked: Mutex<HashMap<i64, (std::time::Instant, Option<StreamsTabLive>)>>,
 }
 
 /// FNV-1a 64-bit hash — simple, stable, and fast; used instead of `DefaultHasher`
@@ -3826,16 +3829,34 @@ impl DetectContext {
     /// Only reached when `/live` reported offline, so the cost lands on
     /// channels that aren't streaming — hence the throttle. A hit means the
     /// channel IS live and `/live` simply didn't say so.
+    ///
+    /// **The throttle serves the last answer, it does not answer "offline".**
+    /// The caller turns `None` straight into an offline verdict, so returning
+    /// `None` merely because the page was too expensive to re-fetch made a
+    /// members-only broadcast flap: live on the one poll in five minutes that
+    /// paid for a check, offline on every poll in between (Nyana Banyana,
+    /// 2026-08-09). That is the same "didn't look" being read as "isn't there"
+    /// that the tri-state metadata fetch exists to prevent.
+    ///
+    /// The cost is symmetrical and bounded: a broadcast that has *ended* keeps
+    /// reading live for up to one throttle window, which is the same latency
+    /// the throttle already accepts in the other direction.
     async fn youtube_streams_tab_live(&self, item: &DetectItem) -> Option<StreamsTabLive> {
+        // The previous answer, returned unchanged by every "didn't look" exit.
+        let carried;
         {
             let mut last = self.yt_streams_checked.lock().await;
             let now = std::time::Instant::now();
-            if let Some(t) = last.get(&item.monitor_id)
+            if let Some((t, cached)) = last.get(&item.monitor_id)
                 && now.duration_since(*t).as_secs() < YT_STREAMS_FALLBACK_SECS
             {
-                return None;
+                return cached.clone();
             }
-            last.insert(item.monitor_id, now);
+            // Claim the window before the (slow, ~1 MB) fetch so concurrent
+            // polls don't stampede it, carrying the previous answer forward
+            // until this one lands.
+            carried = last.get(&item.monitor_id).and_then(|(_, c)| c.clone());
+            last.insert(item.monitor_id, (now, carried.clone()));
         }
         let url = youtube_streams_url(&item.url);
         let rb = self
@@ -3843,23 +3864,41 @@ impl DetectContext {
             .get(&url)
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
-        let body = self
-            .fingerprint
-            .apply_yt_nav_headers(rb)
-            .send()
+        // A failed fetch is "didn't look", not "isn't live" — same distinction
+        // the throttle makes above, and just as important: a single dropped
+        // request would otherwise report a live gated stream as offline.
+        let body = match self.fingerprint.apply_yt_nav_headers(rb).send().await {
+            Ok(r) => match r.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!(monitor_id = item.monitor_id, "youtube /streams read failed: {e}");
+                    return carried;
+                }
+            },
+            Err(e) => {
+                debug!(monitor_id = item.monitor_id, "youtube /streams fetch failed: {e}");
+                return carried;
+            }
+        };
+        // This page WAS read, so its verdict is authoritative either way — the
+        // stream ending has to be able to land, or the cache would pin a
+        // finished broadcast live forever.
+        let hit = find_streams_tab_live(&body);
+        if let Some(h) = &hit
+            && carried.as_ref() != Some(h)
+        {
+            info!(
+                monitor_id = item.monitor_id,
+                video_id = h.video_id.as_str(),
+                members_only = h.members_only,
+                "youtube: live stream found on the /streams tab that /live didn't report"
+            );
+        }
+        self.yt_streams_checked
+            .lock()
             .await
-            .ok()?
-            .text()
-            .await
-            .ok()?;
-        let hit = find_streams_tab_live(&body)?;
-        info!(
-            monitor_id = item.monitor_id,
-            video_id = hit.video_id.as_str(),
-            members_only = hit.members_only,
-            "youtube: live stream found on the /streams tab that /live didn't report"
-        );
-        Some(hit)
+            .insert(item.monitor_id, (std::time::Instant::now(), hit.clone()));
+        hit
     }
 
     /// Title + (broad) content category of a currently-live YouTube channel,
