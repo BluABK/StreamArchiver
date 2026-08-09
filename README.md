@@ -600,7 +600,12 @@ or the Duration column, for an average bitrate — a quick way to notice a take
 that captured at the wrong quality); a still-recording take shows its *live*
 size, not the stale 0 B a plain directory listing would give a file another
 process still has open for writing — it's read from the file handle directly
-and updates every couple of seconds. A take finalized before 2026-07-26 may
+and updates every couple of seconds. A finished take whose file is no longer
+on disk (deleted, trashed, or a VOD backfill/recovery attempt that failed
+after an earlier attempt had already recorded a size) shows **no size at
+all** rather than the stale byte count from before — confirmed by the same
+never-blocking probe as everything else here, so it can lag a couple of
+seconds behind an on-disk change. A take finalized before 2026-07-26 may
 show a **⚠** on its Duration cell (and in the take's Properties window): a
 since-fixed bug stamped the end time *after* its remux finished rather than
 when the capture actually stopped, so a take whose remux happened to queue

@@ -181,12 +181,23 @@ pub(super) fn dual_take_variant(g: &StreamGroup, t: &Recording) -> Option<&'stat
 /// written that column yet, so it needs a live probe instead (a plain
 /// directory-entry read stays near-zero for the whole session while ffmpeg/
 /// streamlink holds the file open — see `live_file_len`'s doc comment).
+///
+/// `bytes` is a one-time snapshot: nothing clears it when a later VOD
+/// backfill/recovery attempt fails or the file is deleted/trashed, so a
+/// finished take can carry a stale nonzero `bytes` for media that no longer
+/// exists. Confirming the file is still there before trusting `bytes` is
+/// cheap here — [`FsProbes::is_file`] is the same never-blocking cache every
+/// other row probe uses, defaulting to "missing" only until its first result
+/// lands.
 pub(super) fn take_size_bytes(fs_probes: &mut FsProbes, t: &Recording) -> u64 {
     if t.is_active() {
-        fs_probes.live_len(std::path::Path::new(&t.output_path))
-    } else {
-        t.bytes.max(0) as u64
+        return fs_probes.live_len(std::path::Path::new(&t.output_path));
     }
+    let bytes = t.bytes.max(0) as u64;
+    if bytes == 0 || t.output_path.is_empty() {
+        return 0;
+    }
+    if fs_probes.is_file(std::path::Path::new(&t.output_path)) { bytes } else { 0 }
 }
 
 /// Attribute a monitor-scoped `stream_stats_for_monitor` result set to one
@@ -622,6 +633,118 @@ mod tests {
         // — nothing to divide by, so just the byte count, no "average" line.
         let s = stream_size_hover(500, 0);
         assert!(!s.contains("average"), "got {s:?}");
+    }
+
+    fn rec_with_bytes(output_path: &str, bytes: i64) -> Recording {
+        Recording {
+            id: 1,
+            monitor_id: 1,
+            started_at: 0,
+            ended_at: Some(1),
+            status: "completed".into(),
+            bytes,
+            exit_code: None,
+            output_path: output_path.into(),
+            went_live_at: None,
+            went_live_approx: false,
+            lost_secs: None,
+            stream_id: None,
+            take_group: None,
+            ad_count: 0,
+            ad_secs: 0,
+            meta_change_count: 0,
+            title: String::new(),
+            category: String::new(),
+            log_excerpt: String::new(),
+            notes: String::new(),
+            vod_id: None,
+            vod_state: None,
+            vod_muted_secs: None,
+            vod_views: None,
+            recovery_state: None,
+            recovered_path: None,
+            vod_dl_state: None,
+            vod_dl_path: None,
+            vod_dl_video_id: None,
+            backfill_path: None,
+            full_path: None,
+            trigger_info: String::new(),
+            head_backfill_state: String::new(),
+            gap_splice_state: String::new(),
+            trigger_rule_json: String::new(),
+            err_ack: false,
+            sabr_live_edge_fallback: false,
+            chapters_state: String::new(),
+            chapters_json: String::new(),
+            chapters_attempts: 0,
+            chat_path: String::new(),
+            rolling: crate::models::Rolling::default(),
+            not_recorded_reason: String::new(),
+            gated: false,
+        }
+    }
+
+    /// Poll `drain + take_size_bytes` until it settles on `want` or a deadline
+    /// passes — `FsProbes`'s worker answers asynchronously.
+    fn wait_take_size(fp: &mut FsProbes, t: &Recording, want: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            fp.drain_results();
+            if take_size_bytes(fp, t) == want {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn take_size_bytes_hides_a_stale_byte_count_for_a_gone_file() {
+        // The bug this guards: `bytes` is written once at finalize and never
+        // cleared, so a take whose file was later deleted or whose VOD
+        // backfill failed still carries its old nonzero `bytes` — the Streams
+        // grid must not keep showing that size once the file is confirmed
+        // gone (see `take_size_bytes`'s doc comment).
+        let dir = std::env::temp_dir().join(format!(
+            "sa_take_size_{}_{}",
+            std::process::id(),
+            crate::models::now_unix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("real.mkv");
+        std::fs::write(&file, vec![0u8; 1024]).unwrap();
+        let t = rec_with_bytes(&file.to_string_lossy(), 1024);
+        let mut fp = FsProbes::new(egui::Context::default());
+
+        // File still on disk: the cached `bytes` value is trusted once the
+        // probe confirms it.
+        assert!(wait_take_size(&mut fp, &t, 1024), "size never settled on 1024");
+
+        // The file vanishes (deleted, or a VOD backfill that never wrote
+        // one) — `bytes` itself is untouched, but the probe now says
+        // missing, so the badge must drop to 0 rather than keep 1024.
+        std::fs::remove_file(&file).unwrap();
+        assert!(wait_take_size(&mut fp, &t, 0), "stale size was never cleared");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn take_size_bytes_skips_the_probe_for_a_zero_byte_or_pathless_take() {
+        // A take that never wrote anything (bytes == 0) or has no
+        // output_path at all must read 0 without needing any FsProbes result
+        // — the pessimistic `is_file` placeholder is `false` on first sight,
+        // so these would already read 0, but they must not queue file I/O.
+        let mut fp = FsProbes::new(egui::Context::default());
+        let t = rec_with_bytes("", 0);
+        assert_eq!(take_size_bytes(&mut fp, &t), 0);
+        assert!(fp.files.is_empty(), "zero-byte take queued a needless probe");
+
+        let t = rec_with_bytes("", 500);
+        assert_eq!(take_size_bytes(&mut fp, &t), 0);
+        assert!(fp.files.is_empty(), "pathless take queued a needless probe");
     }
 
     #[test]
