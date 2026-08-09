@@ -3689,6 +3689,21 @@ read-only, untouched. Enter sends and keeps focus. The bar is **absent
 entirely** on archived takes and non-Twitch channels rather than sitting
 permanently disabled on every historical view.
 
+**Emotes, two ways.** The 🙂 button opens a picker of every emote cached for
+this channel — its own Twitch, 7TV, BTTV and FFZ sets, then each provider's
+globals — grouped under headings with a search box; click one to drop its code
+into the message. Or just type: `:spin` suggests matching codes inline, with
+↑/↓ to move, Tab or Enter to accept and Esc to dismiss. Enter completes rather
+than sends while that list is open, because a half-typed `:spin` is never what
+you meant to say. One-character emoticons (`:)`, `:D`, `:3`) never open it,
+and neither does a colon inside a word, so `10:30` and `https://` are safe.
+
+The picker offers Twitch's first-party emotes even though the replay never
+word-matches those (it renders them from the tags Twitch sends instead) — you
+can genuinely type them, so leaving them out would be the wrong kind of
+consistency. It is virtualized: a channel with every provider's globals runs
+past a thousand emotes, and only the rows on screen are decoded.
+
 This needs the `user:write:chat` scope, and Twitch cannot widen an existing
 grant — **a Twitch account connected before this must be reconnected once**
 (*Settings → Accounts*) before the box appears. Everything else about the
@@ -3717,7 +3732,15 @@ setting that can make an unattended machine start talking to you — plus a list
 of **custom highlights**: a word, a phrase, or a regex, each with an optional
 name, a *Whole word* option (so `art` doesn't fire on "start") and its own
 *Notify* tick. Rules highlight matching rows in the chat window; only mentions
-and rules that opted in raise a toast.
+and rules that opted in raise a toast. If a rule lights up rows but never
+interrupts you, that tick is why.
+
+A matched rule and a **watched chatter** are drawn in *different* colours —
+red for a hit, the selection colour for a chatter — and a hit wins when both
+apply. These used to be one flag, which had two consequences: you could not
+tell which had fired, and the trigger check was skipped entirely for a watched
+chatter, so a rule matching someone you were already watching changed nothing
+on screen at all.
 
 Matching runs in the **chat logger itself, not the chat window** — so you get
 pinged with no window open, and it works for channels being logged without a
@@ -3897,7 +3920,9 @@ quietly disappears can't tell you apart from one that wasn't checked.
 
 A 🔔 **"Highlight messages of this user"** toggle tints that person's rows
 throughout the chat so they're easy to track while scrolling (one
-highlighted user per chat window at a time). Turning on **Settings →
+highlighted user per chat window at a time). A message of theirs that also
+matches a highlight rule switches to the rule's own colour — that message is
+the new information, and the rest of their rows still mark them. Turning on **Settings →
 Interface → Display → "Fetch live Twitch info for chat usercards"** (off by
 default) additionally fetches that user's live avatar and Twitch
 account-created date via the Helix API each time a card opens; a failed
@@ -4925,7 +4950,8 @@ holding the core type(s) and re-exports, with the implementation spread over
   message/log/popup types) over `window` (toolbar, panels, message list),
   `rows` (one message drawn), `parse` (sidecar → messages), `emotes`,
   `helpers` (asset lookups, segment building), `colors`, `usercard`, `strips`
-  (top supporters / Hype Train).
+  (top supporters / Hype Train), `compose` (emote picker + `:code`
+  autocomplete).
 
 `src/chat_index.rs` is the app's **second** SQLite database (see
 [Users](#users--who-chatted-where)) — its own file, migrations and connection

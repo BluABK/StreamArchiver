@@ -148,21 +148,58 @@ pub(in crate::ui) struct RowDecor {
 /// Twitch's own purple, used for first-message and redemption accents.
 pub(in crate::ui) const TWITCH_PURPLE: egui::Color32 = egui::Color32::from_rgb(0x91, 0x47, 0xff);
 
+/// A message that named you or matched a highlight rule. Red, as Twitch marks
+/// its own mentions — and deliberately NOT the selection colour, so it cannot
+/// be confused with "highlight this chatter".
+pub(in crate::ui) const HIT_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd6, 0x45, 0x45);
+
+/// Why a row stands out, beyond the message's own kind.
+///
+/// An enum rather than two booleans because the two reasons are different
+/// facts that were being OR-ed into one: `highlighted || hit` made a matched
+/// trigger indistinguishable from a watched chatter, and the caller then
+/// skipped the trigger check entirely for a watched chatter's messages — so a
+/// rule firing on someone you were already watching was invisible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(in crate::ui) enum RowEmphasis {
+    #[default]
+    None,
+    /// The user's own "highlight this chatter" pick, from a usercard.
+    Chatter,
+    /// The message names the connected account, or matched a highlight rule.
+    Hit,
+}
+
 /// Decide a row's decoration. Pure, so the mapping is testable.
 ///
-/// `highlighted` is the user's own "highlight this chatter" pick, which wins
-/// over the message's own kind — it was asked for explicitly, and losing it
+/// Precedence, strongest first: a **hit**, then a watched **chatter**, then the
+/// message's own kind.
+///
+/// A hit outranks a watched chatter because it is the new information. Every
+/// message from a watched chatter is marked already, so losing one of them to
+/// the hit colour costs nothing — whereas the reverse hides the one message of
+/// theirs that actually said the thing you asked to be told about. Both
+/// outrank the message kind: they were asked for explicitly, and losing them
 /// behind a sub notice would defeat the point of asking.
 pub(in crate::ui) fn row_decor(
     msg: &ChatMessage,
-    highlighted: bool,
+    emphasis: RowEmphasis,
     visuals: &egui::Visuals,
 ) -> RowDecor {
-    if highlighted {
-        return RowDecor {
-            fill: visuals.selection.bg_fill.gamma_multiply(0.35),
-            accent: Some(visuals.selection.bg_fill),
-        };
+    match emphasis {
+        RowEmphasis::Hit => {
+            return RowDecor {
+                fill: HIT_COLOR.gamma_multiply(0.22),
+                accent: Some(HIT_COLOR),
+            };
+        }
+        RowEmphasis::Chatter => {
+            return RowDecor {
+                fill: visuals.selection.bg_fill.gamma_multiply(0.35),
+                accent: Some(visuals.selection.bg_fill),
+            };
+        }
+        RowEmphasis::None => {}
     }
     let Some(notice) = msg.notice.as_deref() else {
         return RowDecor { fill: egui::Color32::TRANSPARENT, accent: None };

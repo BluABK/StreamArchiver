@@ -23,15 +23,24 @@ impl StreamArchiverApp {
         // dir as a fallback (any subscriber can use their sub emotes in any
         // channel's chat — see `twitch_fallback_index`'s doc). YouTube/others:
         // empty map, no dir (emotes come inline in the runs / aren't word-matched).
+        // The catalogue is the single manifest read; the render-time map is
+        // derived from it (see `emote_map_from_catalog`), so the picker cannot
+        // offer an emote the replay wouldn't find.
+        let emote_catalog = if platform == Some(Platform::Twitch) {
+            build_emote_catalog(&monitor_name, &account)
+        } else {
+            Vec::new()
+        };
         let (emote_map, twitch_emote_dir, twitch_fallback_index) = if platform == Some(Platform::Twitch) {
             let dir = twitch_emotes_dir(&monitor_name, &account).join("twitch");
             let fallback_dirs: Vec<_> =
                 crate::assets::all_twitch_emote_dirs().into_iter().filter(|d| *d != dir).collect();
             let index = crate::assets::index_emote_stems(&fallback_dirs);
-            (Arc::new(build_emote_map(&monitor_name, &account)), Some(dir), Arc::new(index))
+            (Arc::new(emote_map_from_catalog(&emote_catalog)), Some(dir), Arc::new(index))
         } else {
             (Arc::new(HashMap::new()), None, Arc::new(HashMap::new()))
         };
+        let emote_catalog = Arc::new(emote_catalog);
         // Cloned before the struct literal moves `monitor_name`.
         let monitor_name_for_paints = monitor_name.clone();
         let paint_cache = if platform == Some(Platform::Twitch) {
@@ -189,6 +198,10 @@ impl StreamArchiverApp {
                         status: Arc::new(Mutex::new(None)),
                         sending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         pending: Vec::new(),
+                        picker_open: false,
+                        picker_filter: String::new(),
+                        complete_sel: 0,
+                        complete_dismissed: String::new(),
                     }
                 })
             },
@@ -216,6 +229,7 @@ impl StreamArchiverApp {
             hype_seen_id: String::new(),
             last_reload: std::time::Instant::now(),
             emote_map,
+            emote_catalog,
             twitch_emote_dir,
             twitch_fallback_index,
             twitch_badge_dirs,
@@ -481,6 +495,12 @@ impl StreamArchiverApp {
                         ctx,
                         |ui| {
                             let core = shared.core.clone();
+                            // Read off `popup` BEFORE the mutable borrow of
+                            // `popup.send` below, which would otherwise lock
+                            // the whole struct for the rest of the bar.
+                            let catalog = popup.emote_catalog.clone();
+                            let channel = popup.monitor_name.clone();
+                            let edit_id = egui::Id::new(("chat_send_edit", popup.monitor_id));
                             let Some(bar) = popup.send.as_mut() else { return };
                             let now_ms = crate::models::now_unix() * 1000;
                             let bid = bar.broadcaster_id.lock().unwrap().clone();
@@ -490,19 +510,85 @@ impl StreamArchiverApp {
 
                             ui.add_space(4.0);
                             let mut submit = false;
+                            // The picker sits ABOVE the box, inside the panel
+                            // rather than floating over chat: it's a tall grid
+                            // and an overlay that size would hide the
+                            // conversation being replied to.
+                            if bar.picker_open
+                                && let Some(code) = emote_picker(
+                                    ui,
+                                    bar,
+                                    &catalog,
+                                    &channel,
+                                    &anim_cache,
+                                    &mut decode_misses,
+                                    animate_emotes,
+                                    now,
+                                    ctx,
+                                )
+                            {
+                                if !bar.draft.is_empty() && !bar.draft.ends_with(' ') {
+                                    bar.draft.push(' ');
+                                }
+                                bar.draft.push_str(&code);
+                                bar.draft.push(' ');
+                                // Clicking the grid took focus off the box;
+                                // hand it back with the caret at the end so
+                                // picking two emotes in a row just works.
+                                set_draft_caret(ctx, edit_id, bar.draft.chars().count());
+                            }
                             ui.horizontal(|ui| {
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut bar.draft)
-                                        .hint_text("Send a message")
-                                        .desired_width(ui.available_width() - 90.0),
+                                let out = egui::TextEdit::singleline(&mut bar.draft)
+                                    .id(edit_id)
+                                    .hint_text("Send a message")
+                                    .desired_width(ui.available_width() - 120.0)
+                                    .show(ui);
+                                let resp = out.response;
+                                let caret = out.cursor_range.map(|c| c.primary.index);
+                                let completion = emote_autocomplete(
+                                    ui,
+                                    bar,
+                                    &resp,
+                                    caret,
+                                    &catalog,
+                                    &anim_cache,
+                                    &mut decode_misses,
+                                    now,
+                                    ctx,
                                 );
-                                // Enter sends, then keeps focus so a
-                                // conversation doesn't need a click per line.
-                                if resp.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                match completion {
+                                    Completion::Accept(range, code) => {
+                                        let (text, at) =
+                                            apply_completion(&bar.draft, range, &code);
+                                        bar.draft = text;
+                                        set_draft_caret(ctx, edit_id, at);
+                                    }
+                                    // A list is open: Enter completes, it does
+                                    // NOT send a half-typed `:spin`.
+                                    Completion::Open => {}
+                                    Completion::None => {
+                                        // Enter sends, then keeps focus so a
+                                        // conversation doesn't need a click
+                                        // per line.
+                                        if resp.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
+                                            submit = true;
+                                            resp.request_focus();
+                                        }
+                                    }
+                                }
+                                if ui
+                                    .selectable_label(bar.picker_open, "🙂")
+                                    .on_hover_text(
+                                        "Emotes available in this channel — its own sets \
+                                         plus every provider's globals. Click one to add it \
+                                         to the message. Typing :code in the box suggests \
+                                         them inline.",
+                                    )
+                                    .clicked()
                                 {
-                                    submit = true;
-                                    resp.request_focus();
+                                    bar.picker_open = !bar.picker_open;
                                 }
                                 submit |= ui
                                     .add_enabled(ready, egui::Button::new("Send"))
@@ -1571,21 +1657,28 @@ impl StreamArchiverApp {
                                                 !login.is_empty() && login == hl
                                             });
                                         // Fill + left-accent colour for this row —
-                                        // the highlighted user, a highlight-rule or
-                                        // mention hit, or the message's own kind
-                                        // (first message, redemption, sub…).
-                                        let hit = !highlighted
-                                            && crate::chat_highlight::first_hit(
-                                                &log.messages[mi].text,
-                                                &my_login,
-                                                &highlight_rules,
-                                            )
-                                            .is_some();
-                                        let decor = row_decor(
-                                            &log.messages[mi],
-                                            highlighted || hit,
-                                            ui.visuals(),
-                                        );
+                                        // a highlight-rule or mention hit, the
+                                        // watched chatter, or the message's own
+                                        // kind (first message, redemption, sub…).
+                                        //
+                                        // The hit is computed even when the sender
+                                        // is a watched chatter: skipping it there
+                                        // meant a rule firing on someone you were
+                                        // already watching produced no visible
+                                        // difference at all.
+                                        let hit = crate::chat_highlight::first_hit(
+                                            &log.messages[mi].text,
+                                            &my_login,
+                                            &highlight_rules,
+                                        )
+                                        .is_some();
+                                        let emphasis = match (hit, highlighted) {
+                                            (true, _) => RowEmphasis::Hit,
+                                            (_, true) => RowEmphasis::Chatter,
+                                            _ => RowEmphasis::None,
+                                        };
+                                        let decor =
+                                            row_decor(&log.messages[mi], emphasis, ui.visuals());
                                         // Room for the accent bar on the left. Reserved
                                         // on EVERY row, not just accented ones, so text
                                         // doesn't shift sideways as notices scroll past.

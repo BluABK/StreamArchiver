@@ -554,6 +554,16 @@ pub(super) struct SendBar {
     /// round trip (IRC → the logger's 2s flush → the window's 3s tail poll)
     /// is 2-5 seconds of apparent silence, which reads as broken.
     pub(super) pending: Vec<(String, i64)>,
+    /// Whether the emote picker panel is showing.
+    pub(super) picker_open: bool,
+    /// The picker's own search box.
+    pub(super) picker_filter: String,
+    /// Which `:code` suggestion is selected. Clamped to the match count each
+    /// frame rather than reset, so it survives typing another character.
+    pub(super) complete_sel: usize,
+    /// The query Esc dismissed, so the list stays down for THAT word but
+    /// comes back for the next one. Empty = nothing dismissed.
+    pub(super) complete_dismissed: String,
 }
 
 /// How long a pending row waits for its own message to come back before it
@@ -669,6 +679,10 @@ pub(super) struct ChatPopup {
     /// Empty for YouTube / when chat assets aren't fetched. `Arc` so the
     /// background (re)parse tasks share it without rebuilding per tick.
     pub(super) emote_map: Arc<HashMap<String, std::path::PathBuf>>,
+    /// The same emotes as `emote_map`, grouped and in display order, plus
+    /// Twitch's first-party ones — what the emote picker and the `:code`
+    /// autocomplete offer. Built once at open from the same manifest read.
+    pub(super) emote_catalog: Arc<Vec<CatalogEmote>>,
     /// `…/{channel}/twitch/emotes/twitch/` — Twitch first-party emotes are
     /// id-keyed (resolved as `{id}.png` at parse time). `None` for YouTube.
     pub(super) twitch_emote_dir: Option<std::path::PathBuf>,
@@ -757,6 +771,7 @@ pub(in crate::ui) fn chat_vp_id(monitor_id: i64) -> egui::ViewportId {
 // shared types every one of them needs. Each submodule is a pure move out
 // of what used to be one 5,000-line file — same items, same bodies.
 mod colors;
+mod compose;
 mod emotes;
 mod helpers;
 mod parse;
@@ -766,6 +781,7 @@ mod usercard;
 mod window;
 
 pub(in crate::ui) use colors::*;
+pub(in crate::ui) use compose::*;
 pub(crate) use emotes::*;
 pub(crate) use helpers::*;
 pub(crate) use parse::*;
@@ -961,23 +977,23 @@ mod tests {
         assert_eq!(ChatTsMode::parse("nonsense"), ChatTsMode::StreamRelative);
     }
 
-    /// Every notice kind gets an accent; an ordinary message gets none. The
-    /// explicit "highlight this chatter" pick outranks the message's own kind
-    /// — it was asked for, and losing it behind a sub notice would defeat the
-    /// point of asking.
+    /// Every notice kind gets an accent; an ordinary message gets none. Both
+    /// emphases outrank the message's own kind — they were asked for, and
+    /// losing one behind a sub notice would defeat the point of asking.
     #[test]
     fn row_decor_accents_notices_and_lets_an_explicit_highlight_win() {
         let v = egui::Visuals::dark();
+        let none = RowEmphasis::None;
         let with = |n: Option<ChatNotice>| {
             let mut m = plain_msg(1.0, "bob", "id1", "hi");
             m.notice = n.map(Box::new);
             m
         };
 
-        assert!(row_decor(&with(None), false, &v).accent.is_none(), "ordinary message");
+        assert!(row_decor(&with(None), none, &v).accent.is_none(), "ordinary message");
         // A muted room event stays muted: an accent bar would give it more
         // weight than a sub, which it does not deserve.
-        assert!(row_decor(&with(Some(ChatNotice::System)), false, &v).accent.is_none());
+        assert!(row_decor(&with(Some(ChatNotice::System)), none, &v).accent.is_none());
 
         for n in [
             ChatNotice::FirstMessage,
@@ -987,15 +1003,40 @@ mod tests {
             ChatNotice::Announce { system_msg: "listen up".into() },
             ChatNotice::WatchStreak { system_msg: "streak".into() },
         ] {
-            assert!(row_decor(&with(Some(n.clone())), false, &v).accent.is_some(), "{n:?}");
+            assert!(row_decor(&with(Some(n.clone())), none, &v).accent.is_some(), "{n:?}");
         }
 
         let sub = with(Some(ChatNotice::Sub { system_msg: "subbed".into() }));
         assert_eq!(
-            row_decor(&sub, true, &v).accent,
+            row_decor(&sub, RowEmphasis::Chatter, &v).accent,
             Some(v.selection.bg_fill),
             "an explicit highlight outranks the notice kind"
         );
+    }
+
+    /// A matched trigger and a watched chatter must not look the same, and the
+    /// trigger must win.
+    ///
+    /// These were one boolean OR-ed together, which had two consequences the
+    /// user hit: the two reasons were indistinguishable on screen, and the
+    /// caller skipped the trigger check entirely for a watched chatter — so a
+    /// rule firing on someone already being watched changed nothing visible.
+    #[test]
+    fn a_matched_trigger_is_distinct_from_a_watched_chatter_and_outranks_it() {
+        let v = egui::Visuals::dark();
+        let msg = plain_msg(1.0, "bob", "id1", "hi");
+
+        let hit = row_decor(&msg, RowEmphasis::Hit, &v);
+        let chatter = row_decor(&msg, RowEmphasis::Chatter, &v);
+        assert_eq!(hit.accent, Some(HIT_COLOR));
+        assert_eq!(chatter.accent, Some(v.selection.bg_fill));
+        assert_ne!(hit.accent, chatter.accent, "the two reasons must be tellable apart");
+        assert_ne!(hit.fill, chatter.fill);
+
+        // And a hit is never invisible behind a notice kind either.
+        let mut sub = msg;
+        sub.notice = Some(Box::new(ChatNotice::Sub { system_msg: "subbed".into() }));
+        assert_eq!(row_decor(&sub, RowEmphasis::Hit, &v).accent, Some(HIT_COLOR));
     }
 
     /// Only the kinds that REPLACE a message have a headline; the ones that

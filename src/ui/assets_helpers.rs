@@ -1021,7 +1021,7 @@ pub(super) fn emote_provider_counts(
 
 /// Enumerate a provider's emotes for a channel, resolved to on-disk image paths.
 /// Third parties read their manifest and resolve into the per-channel/shared caches
-/// exactly like [`build_emote_map`]; an entry whose image is gone is kept but marked
+/// exactly like [`emote_map_from_catalog`]; an entry whose image is gone is kept but marked
 /// `exists = false` (the viewer lists those under "Deprecated"). Twitch is
 /// directory-listed by opaque id (no codes, so never deprecated). Sorted by code.
 pub(super) fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider) -> Vec<ViewerEmote> {
@@ -1029,7 +1029,7 @@ pub(super) fn enumerate_provider_emotes(name: &str, account: &str, provider: Emo
     let emotes_dir = twitch_emotes_dir(name, account);
     let plat = crate::app_paths::platform_assets_dir();
 
-    // Resolve an emote's on-disk path — shared with `build_emote_map`'s chat
+    // Resolve an emote's on-disk path — shared with `emote_map_from_catalog`'s chat
     // render-time lookup so both readers can never drift on the filename
     // scheme a manifest points into.
     let resolve_path = |base: std::path::PathBuf, e: &EmoteManifestEntry| -> std::path::PathBuf {

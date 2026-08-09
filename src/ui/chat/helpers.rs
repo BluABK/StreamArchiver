@@ -115,19 +115,78 @@ pub(in crate::ui) fn badge_label(raw: &str) -> String {
     }
 }
 
-pub(in crate::ui) fn build_emote_map(name: &str, account: &str) -> HashMap<String, std::path::PathBuf> {
+/// Who supplies an emote. Ordering is display order in the picker.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(in crate::ui) enum EmoteSource {
+    /// Twitch's own — the channel's sub emotes and your unlocked ones.
+    Twitch,
+    SevenTv,
+    Bttv,
+    Ffz,
+}
+
+impl EmoteSource {
+    pub(in crate::ui) fn label(self) -> &'static str {
+        match self {
+            EmoteSource::Twitch => "Twitch",
+            EmoteSource::SevenTv => "7TV",
+            EmoteSource::Bttv => "BTTV",
+            EmoteSource::Ffz => "FFZ",
+        }
+    }
+}
+
+/// Which set an emote came from. Derived `Ord` sorts channel sets before
+/// global ones, and within each, by provider — which is both the picker's
+/// section order and [`emote_map_from_catalog`]'s precedence order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(in crate::ui) struct EmoteGroup {
+    pub(in crate::ui) global: bool,
+    pub(in crate::ui) source: EmoteSource,
+}
+
+impl EmoteGroup {
+    /// Section heading in the picker.
+    pub(in crate::ui) fn title(self, channel: &str) -> String {
+        if self.global {
+            format!("{} global emotes", self.source.label())
+        } else if self.source == EmoteSource::Twitch {
+            format!("{channel} — Twitch emotes")
+        } else {
+            format!("{channel} — {}", self.source.label())
+        }
+    }
+}
+
+/// One emote a chatter can type in this channel.
+#[derive(Clone, Debug)]
+pub(in crate::ui) struct CatalogEmote {
+    pub(in crate::ui) code: String,
+    pub(in crate::ui) path: std::path::PathBuf,
+    pub(in crate::ui) group: EmoteGroup,
+}
+
+/// Every emote cached for this channel, grouped and in display order.
+///
+/// One pass over the manifests feeding both readers: the picker/autocomplete
+/// need the grouping, and [`emote_map_from_catalog`] needs the flattened
+/// code → image lookup. Building them separately would let the two drift on
+/// which emotes exist.
+pub(in crate::ui) fn build_emote_catalog(name: &str, account: &str) -> Vec<CatalogEmote> {
     use crate::assets::EmoteManifestEntry;
     let emotes_dir = twitch_emotes_dir(name, account);
     let plat = crate::app_paths::platform_assets_dir();
-    let mut map: HashMap<String, std::path::PathBuf> = HashMap::new();
+    let mut out: Vec<CatalogEmote> = Vec::new();
 
-    let load = |file: &str| -> Vec<EmoteManifestEntry> {
-        crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, emotes_dir.join(file))
+    let load = |path: std::path::PathBuf| -> Vec<EmoteManifestEntry> {
+        crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     };
-    let mut insert = |entries: Vec<EmoteManifestEntry>, base_dir: &dyn Fn(&EmoteManifestEntry) -> std::path::PathBuf| {
+    let mut push = |entries: Vec<EmoteManifestEntry>,
+                    group: EmoteGroup,
+                    base_dir: &dyn Fn(&EmoteManifestEntry) -> std::path::PathBuf| {
         for e in entries {
             // Skip empty/whitespace-only codes (old name-less manifests, or odd
             // provider data) — they could never match a chat token anyway.
@@ -140,42 +199,76 @@ pub(in crate::ui) fn build_emote_map(name: &str, account: &str) -> HashMap<Strin
             // the fetchers instead of hardcoding one scheme here.
             let path = crate::assets::resolve_emote_path(&base_dir(&e), &e);
             if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &path) {
-                map.entry(e.name).or_insert(path);
+                out.push(CatalogEmote { code: e.name, path, group });
             }
         }
     };
 
-    // 7TV: always in the shared global cache.
-    insert(load("7tv.json"), &|_| plat.join("7tv").join("emotes"));
-    // BTTV: per-channel for channel emotes, shared global for shared emotes.
+    let chan = |source| EmoteGroup { global: false, source };
+    let glob = |source| EmoteGroup { global: true, source };
+
+    // Twitch first-party: the channel's own sub emotes, by code. Picker-only
+    // — see `emote_map_from_catalog` for why these must NOT word-match here.
+    let twitch_dir = emotes_dir.join("twitch");
+    push(load(emotes_dir.join("twitch.json")), chan(EmoteSource::Twitch), &|_| {
+        twitch_dir.clone()
+    });
+    // 7TV: always in the shared cache.
+    push(load(emotes_dir.join("7tv.json")), chan(EmoteSource::SevenTv), &|_| {
+        plat.join("7tv").join("emotes")
+    });
+    // BTTV: per-channel for channel emotes, shared for the rest.
     let bttv_channel = emotes_dir.join("bttv");
     let bttv_shared = plat.join("bttv").join("emotes");
-    insert(load("bttv.json"), &|e| {
+    push(load(emotes_dir.join("bttv.json")), chan(EmoteSource::Bttv), &|e| {
         if e.shared { bttv_shared.clone() } else { bttv_channel.clone() }
     });
-    // FFZ: always in the shared global cache.
-    insert(load("ffz.json"), &|_| plat.join("ffz").join("emotes"));
+    // FFZ: always in the shared cache.
+    push(load(emotes_dir.join("ffz.json")), chan(EmoteSource::Ffz), &|_| {
+        plat.join("ffz").join("emotes")
+    });
 
     // Each provider's GLOBAL set — the emotes every channel gets for free.
-    // Last on purpose: `insert` is first-wins, so a channel that aliases a
-    // global's code to its own emote keeps its own, exactly as Twitch shows
-    // it. Images live in the same shared per-provider cache the channel sets
-    // resolve into, so this only adds names, never a second copy on disk.
-    let load_global = |provider: &str| -> Vec<EmoteManifestEntry> {
-        crate::iomon::fs::read_to_string_sync(
-            crate::iomon::Cat::AssetCache,
-            crate::assets::global_emote_manifest(&plat, provider),
-        )
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-    };
-    for provider in ["7tv", "bttv", "ffz"] {
+    // After the channel sets on purpose: `emote_map_from_catalog` is
+    // first-wins, so a channel that aliases a global's code to its own emote
+    // keeps its own, exactly as Twitch shows it. Images live in the same
+    // shared per-provider cache the channel sets resolve into, so this only
+    // adds names, never a second copy on disk.
+    for (provider, source) in
+        [("7tv", EmoteSource::SevenTv), ("bttv", EmoteSource::Bttv), ("ffz", EmoteSource::Ffz)]
+    {
         let dir = plat.join(provider).join("emotes");
-        insert(load_global(provider), &|_| dir.clone());
+        push(load(crate::assets::global_emote_manifest(&plat, provider)), glob(source), &|_| {
+            dir.clone()
+        });
+    }
+    out
+}
+
+/// Chat's code → image lookup: what a bare word in a message renders as.
+///
+/// First-wins over [`build_emote_catalog`]'s order, so a channel's own emote
+/// beats a global of the same code.
+///
+/// **Twitch first-party emotes are excluded on purpose.** Twitch tells us
+/// exactly which ranges of a message are its own emotes, via the IRC `emotes`
+/// tag, and those are rendered from that. Word-matching them by code as well
+/// would render `Kappa` as a picture in messages where Twitch showed the
+/// literal word — anyone can type another channel's sub-emote code without
+/// being able to use it.
+pub(in crate::ui) fn emote_map_from_catalog(
+    catalog: &[CatalogEmote],
+) -> HashMap<String, std::path::PathBuf> {
+    let mut map: HashMap<String, std::path::PathBuf> = HashMap::new();
+    for e in catalog {
+        if e.group.source == EmoteSource::Twitch {
+            continue;
+        }
+        map.entry(e.code.clone()).or_insert_with(|| e.path.clone());
     }
     map
 }
+
 /// Truncate a label to at most `max` characters, appending `…` when shortened.
 /// Char-aware so it never splits a multi-byte UTF-8 emote code mid-codepoint.
 pub(in crate::ui) fn truncate_label(s: &str, max: usize) -> String {
