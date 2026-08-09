@@ -1794,7 +1794,18 @@ impl StreamArchiverApp {
             // `streams_cache_rev`, NOT the per-second stamp: while a capture
             // is active this rebuild runs every second, and the history only
             // changes when the data reloads (which bumps the rev).
-            if self.deep_filter_texts.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
+            //
+            // …and only when a filter is actually set. This scans every
+            // logged title/category change in the archive and costs ~100 ms
+            // with the store lock held; the result is read by exactly one
+            // caller, which does nothing at all unless the grid is filtered
+            // (`FilterHits::from_filters` returns None). 238 runs and 25
+            // seconds of held lock in one session, every one of them for a
+            // grid nobody was filtering.
+            let filtering = self.streams_filters.iter().any(|f| !f.trim().is_empty());
+            if filtering
+                && self.deep_filter_texts.as_ref().map(|(rev, _)| *rev)
+                    != Some(self.streams_cache_rev)
             {
                 let texts = self.core.store.monitor_meta_filter_texts().unwrap_or_default();
                 self.deep_filter_texts = Some((self.streams_cache_rev, texts));

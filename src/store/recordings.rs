@@ -2091,12 +2091,21 @@ impl Store {
     /// Recordings that have a non-TS final output path but whose file no longer
     /// exists on disk — e.g. the user manually deleted the file. Returns the most
     /// recent 500 candidates; caller filters with `path.exists()`.
+    ///
+    /// **`log_excerpt` is deliberately not selected**, and comes back empty.
+    /// It averages 8 KB per row here and peaks at 275 KB, so including it made
+    /// this 500-row query move ~4 MB and take **123 ms with the store lock
+    /// held** — for a question that only needs a path. Measured on the real
+    /// library: 546 runs in one session, 73 seconds of held lock, more than
+    /// half of ALL lock time in the app. Dropping it takes the query to a few
+    /// milliseconds; the handful of rows that turn out to be missing can be
+    /// re-read individually if their log is ever wanted.
     pub fn recordings_with_final_path(&self) -> Result<Vec<crate::models::Recording>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, started_at, ended_at, status,
                     COALESCE(output_path, ''), went_live_at, went_live_approx,
-                    take_group, COALESCE(log_excerpt, '')
+                    take_group, ''
              FROM recording
              WHERE output_path != ''
                AND output_path NOT LIKE '%.ts'

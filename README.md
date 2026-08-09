@@ -4455,14 +4455,27 @@ Notes:
 The separate **Output folder** field (Settings → Defaults → *Default output
 folder*, the per-platform/global rows under *Monitor defaults*, and an
 instance's own Output folder in the Add/Edit form) supports its own small
-token set — `{name}` (channel name) and `{platform}`/`{platform_short}` —
-as real path segments, e.g. `G:\streams\{platform}\{name}`. Unlike the
+token set — `{name}` (channel name, with `{channel}` as an alias) and
+`{platform}`/`{platform_short}` — as real path segments, e.g.
+`G:\streams\{platform}\{name}`. Unlike the
 filename template, `/`/`\` in an output-folder template **do** create real
 subfolders; a token's expanded value that happens to contain `/`/`\`
 instead gets sanitized within its own segment, so it can never inject an
 extra directory level of its own.
 
-Only these two identity tokens are supported — no `{date}`/`{title}`/
+**Anything else is flagged in place, under the field.** An unsupported token
+doesn't fail — it stays literal and becomes part of the *folder name*, and
+because a template is shared by every channel that uses it, they all land in
+that one folder together. `{channel}` was the way this bit: it is a real
+token in the *filename* template, so it reads as the obvious word, and typing
+it here produced a directory called `{channel}` holding seven channels'
+recordings. It's an alias now, and any remaining unknown token is called out
+before the folder can be created. Paths already written with a literal
+`{channel}` are repaired on upgrade (schema 93) — the *files* aren't moved,
+so takes whose media is still at the old path show up in the Issues panel as
+missing, and the Files view can relocate them.
+
+Only these identity tokens are supported — no `{date}`/`{title}`/
 `{quality}`/etc. That's a deliberate, permanent limit, not a missing
 feature: an instance's `output_dir` is resolved **once**, when the channel/
 instance is created (or its URL's platform changes) or you Save the

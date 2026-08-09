@@ -482,6 +482,30 @@ pub(super) fn trigger_scope_editor(
 /// change (see `io_gate::pin_dynamic_permits`), plus a 🔓 to release any
 /// active pin back to the adjuster. `letter` is the row's (possibly still
 /// being typed) drive-letter field.
+/// Flag tokens an output-**folder** template won't expand.
+///
+/// A folder template is expanded once, when a channel is created, and stored
+/// as a literal path — so an unsupported token doesn't fail, it becomes a
+/// directory with braces in its name, and every channel that shares the
+/// template lands in that same directory together. This is the only chance to
+/// say so, since by the time it's visible the recordings are already there.
+pub(super) fn dir_token_warning(ui: &mut egui::Ui, template: &str) {
+    let bad = crate::downloader::unsupported_dir_tokens(template);
+    if bad.is_empty() {
+        return;
+    }
+    ui.colored_label(
+        egui::Color32::from_rgb(200, 80, 80),
+        format!("Not a folder token: {} — it would become part of the folder NAME", bad.join(" ")),
+    )
+    .on_hover_text(format!(
+        "Folder templates expand only {}. Everything else stays literal, so this template \
+         would create a directory with braces in its name and put every channel that uses \
+         it in there together.",
+        crate::downloader::DIR_TOKENS.join(" "),
+    ));
+}
+
 fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ceiling: u32) {
     let key = letter.trim().to_uppercase();
     if key.len() != 1 || !key.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -1368,24 +1392,28 @@ impl StreamArchiverApp {
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("Default output folder").on_hover_text(
-                        "Seeds new instances' Output folder. Supports {name} (channel name) \
-                         and {platform}/{platform_short} as path segments, e.g. \
+                        "Seeds new instances' Output folder. Supports {name} (or its alias \
+                         {channel}) and {platform}/{platform_short} as path segments, e.g. \
                          G:\\streams\\{platform}\\{name} — expanded once when the channel/\
                          instance is created (or its URL's platform changes), then stored as \
                          a fixed literal path; it does not re-expand later if you rename the \
-                         channel. Only these two identity tokens are supported — no \
+                         channel. Only those identity tokens are supported — no \
                          {date}/{title}/etc., since a folder that silently changed meaning \
                          every time it was read would be far more surprising than a filename \
-                         token that does.",
+                         token that does. Anything else is flagged below rather than becoming \
+                         a directory with braces in its name.",
                     );
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.settings.default_output_dir);
-                        if ui.button("Browse…").clicked() {
-                            self.pending_browse = Some(spawn_browse_folder(
-                                &self.settings.default_output_dir,
-                                |app, p| app.settings.default_output_dir = p,
-                            ));
-                        }
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.settings.default_output_dir);
+                            if ui.button("Browse…").clicked() {
+                                self.pending_browse = Some(spawn_browse_folder(
+                                    &self.settings.default_output_dir,
+                                    |app, p| app.settings.default_output_dir = p,
+                                ));
+                            }
+                        });
+                        dir_token_warning(ui, &self.settings.default_output_dir);
                     });
                     ui.end_row();
                     ui.label("Default video download folder").on_hover_text(

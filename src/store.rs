@@ -5,6 +5,7 @@
 //! happens on the UI thread (low volume); background tasks will access the same
 //! `Arc<Store>` via `spawn_blocking`.
 
+use std::collections::HashMap;
 use std::path::Path;
 use parking_lot::FairMutex;
 
@@ -35,10 +36,25 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 92;
+const SCHEMA_VERSION: i64 = 93;
 
 pub struct Store {
     conn: FairMutex<Connection>,
+    /// Whole-table mirror of `app_settings`, `None` until first read.
+    ///
+    /// Settings are the app's most-read table by a wide margin — every render
+    /// path asks about a toggle — and each ask took the one store-wide
+    /// connection lock. Measured on a real session: **16,484 slow waits and
+    /// 234 seconds of waiting** at [`Store::get_setting`] alone, 39% of every
+    /// contended acquire in the app, for a table of 207 rows whose query costs
+    /// 0.04 ms. The cost was never the query; it was queueing behind whatever
+    /// else held the connection.
+    ///
+    /// Safe to cache because [`Store::set_setting`] is the only writer outside
+    /// migrations, and migrations run to completion before anything can read.
+    /// An `RwLock`, not the connection lock: concurrent readers is the whole
+    /// point.
+    settings: std::sync::RwLock<Option<HashMap<String, String>>>,
 }
 
 /// One archived community-post image (schema v28 `community_post_archive`), as
@@ -323,6 +339,15 @@ pub mod db_lock {
     /// A holder keeping the lock this long (ms) is worth a warning — long
     /// enough that a UI frame would notice.
     const LONG_HOLD_MS: u128 = 200;
+    /// Floor for the per-acquire DEBUG lines below [`SLOW_WAIT_MS`].
+    ///
+    /// Was 5 ms, which on a busy library produced **42,000 log lines in one
+    /// session** — enough that reading the log for anything else meant
+    /// filtering them out first, and the diagnostic drowned the diagnosis.
+    /// A few milliseconds of queueing is ordinary and says nothing; the
+    /// counters and the Stats tab's Database panel already carry the totals
+    /// for anyone who wants the distribution.
+    const CHATTY_MS: u128 = 25;
 
     /// One recent contention incident (a ≥50 ms wait or a ≥200 ms hold).
     #[derive(Clone)]
@@ -548,7 +573,7 @@ pub mod db_lock {
                         call_site: format!("{}:{}", caller.file(), caller.line()),
                         blocked_on,
                     });
-                } else if wait_ms >= 5 {
+                } else if wait_ms >= CHATTY_MS {
                     tracing::debug!(
                         wait_ms,
                         lock = diag.label,
@@ -689,6 +714,7 @@ impl Store {
         Self::configure(&conn)?;
         let store = Store {
             conn: FairMutex::new(conn),
+            settings: std::sync::RwLock::new(None),
         };
         store.migrate()?;
         Ok(store)
@@ -701,6 +727,7 @@ impl Store {
         Self::configure(&conn)?;
         let store = Store {
             conn: FairMutex::new(conn),
+            settings: std::sync::RwLock::new(None),
         };
         store.migrate()?;
         Ok(store)
@@ -716,24 +743,36 @@ impl Store {
     // ----- settings (key/value, also used for credentials) -----
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.db();
-        let value = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key = ?1",
-                params![key],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
+        if let Some(map) = self.settings.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return Ok(map.get(key).cloned());
+        }
+        // First read of the session: pull the whole (small) table in one go,
+        // so this is the last time settings touch the connection lock.
+        let loaded = {
+            let conn = self.db();
+            let mut stmt = conn.prepare("SELECT key, value FROM app_settings")?;
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
+        let value = loaded.get(key).cloned();
+        *self.settings.write().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
         Ok(value)
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.db();
-        conn.execute(
-            "INSERT INTO app_settings(key, value) VALUES(?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
+        {
+            let conn = self.db();
+            conn.execute(
+                "INSERT INTO app_settings(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        // After the write, and only if it succeeded: a failed write must not
+        // leave the mirror claiming a value the table doesn't hold.
+        if let Some(map) = self.settings.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.insert(key.to_string(), value.to_string());
+        }
         Ok(())
     }
 
@@ -879,6 +918,45 @@ mod tests {
             store.get_setting("twitch_client_id").unwrap().as_deref(),
             Some("xyz789")
         );
+    }
+
+    /// Settings are served from an in-memory mirror, so every way the mirror
+    /// could disagree with the table has to be closed.
+    ///
+    /// The dangerous shapes are: a value read BEFORE the mirror is built
+    /// (which is what populates it) and then written; a key that didn't exist
+    /// when the mirror was built; and a value written before any read at all,
+    /// so the mirror is built from a table that already has it.
+    #[test]
+    fn settings_cache_never_serves_a_value_the_table_doesnt_have() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Read first (builds the mirror with the key absent), then write.
+        assert_eq!(store.get_setting("a").unwrap(), None);
+        store.set_setting("a", "1").unwrap();
+        assert_eq!(store.get_setting("a").unwrap().as_deref(), Some("1"));
+
+        // A key the mirror has never seen still resolves.
+        store.set_setting("b", "2").unwrap();
+        assert_eq!(store.get_setting("b").unwrap().as_deref(), Some("2"));
+
+        // Overwrites land, including to empty (a real value, not "unset").
+        store.set_setting("a", "").unwrap();
+        assert_eq!(store.get_setting("a").unwrap().as_deref(), Some(""));
+
+        // …and the mirror agrees with the table itself, not just with itself.
+        let from_table: Option<String> = store
+            .db()
+            .query_row("SELECT value FROM app_settings WHERE key = 'a'", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(from_table.as_deref(), Some(""));
+
+        // Write-before-any-read: the mirror is built from a table that
+        // already holds the value.
+        let store2 = Store::open_in_memory().unwrap();
+        store2.set_setting("c", "3").unwrap();
+        assert_eq!(store2.get_setting("c").unwrap().as_deref(), Some("3"));
     }
 
     /// A stale `DbGuard::drop` (delayed by its own slow-hold logging) must

@@ -1837,9 +1837,81 @@ impl Store {
             repair_gated_takes(&conn)?;
             conn.pragma_update(None, "user_version", 92)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 92);
+        if version < 93 {
+            repair_literal_channel_token(&conn)?;
+            // The Issues sweep's two "most recent 500" scans both sorted the
+            // whole recording table through a temp B-tree (`SCAN recording;
+            // USE TEMP B-TREE FOR ORDER BY`) on every refresh, with the store
+            // lock held. Same shape as migration 87's `raid_out` index.
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_recording_started
+                     ON recording(started_at DESC);",
+            )?;
+            conn.pragma_update(None, "user_version", 93)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 93);
         Ok(())
     }
+}
+
+/// Replace a literal, never-expanded `{channel}` in stored paths with the
+/// channel's actual name.
+///
+/// `{channel}` is a token in the *filename* template but was not one in the
+/// **folder** template, where only `{name}` meant the channel. An unsupported
+/// token is left literal, so anyone who typed the natural word got a directory
+/// called `{channel}` — and, because the template is shared, every channel
+/// using it landed in that one directory together (2026-08-09: seven channels,
+/// one folder, 21 takes).
+///
+/// The token is now an alias, so new paths are correct. This repairs the ones
+/// already written: the monitor's own `output_dir`, and the recording paths
+/// derived from it. Rewriting the DB does **not** move the files — a take
+/// whose file is still at the old path surfaces in the Issues panel as
+/// missing, which is what that panel is for, and the Files view can relocate
+/// it. Better that than leaving the paths permanently wrong.
+///
+/// Substring replacement rather than path surgery, deliberately: the token can
+/// sit anywhere in the template (`G:\{channel}\vods`, `G:\a\{channel}-live`),
+/// and every affected path was built from the same monitor's `output_dir`, so
+/// the same substitution is correct wherever it appears.
+fn repair_literal_channel_token(conn: &rusqlite::Connection) -> Result<()> {
+    let mut st = conn.prepare(
+        "SELECT m.id, ch.name FROM monitor m
+           JOIN channel ch ON ch.id = m.channel_id
+          WHERE m.output_dir LIKE '%{channel}%'",
+    )?;
+    let affected: Vec<(i64, String)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(st);
+    for (monitor_id, name) in affected {
+        // A channel name can contain characters a path can't; the expander
+        // sanitizes each folder segment, so match it rather than inventing a
+        // second rule here.
+        let dir_name = crate::downloader::sanitize_filename(&name);
+        if dir_name.is_empty() {
+            continue; // nothing better to put there — leave it for the user
+        }
+        for (table, col) in
+            [("monitor", "output_dir"), ("recording", "output_path"), ("recording", "chat_path")]
+        {
+            let key = if table == "monitor" { "id" } else { "monitor_id" };
+            conn.execute(
+                &format!(
+                    "UPDATE {table} SET {col} = replace({col}, '{{channel}}', ?1)
+                      WHERE {key} = ?2 AND {col} LIKE '%{{channel}}%'"
+                ),
+                rusqlite::params![dir_name, monitor_id],
+            )?;
+        }
+        tracing::info!(
+            monitor_id,
+            channel = %dir_name,
+            "migration 93: expanded a literal {{channel}} left in stored paths"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2074,6 +2146,58 @@ mod tests {
             "an unrelated failed take must not be marked gated"
         );
         assert_eq!(reds(&store), vec![other], "only the false reds were dropped");
+    }
+
+    /// A literal `{channel}` in stored paths is expanded per monitor, not
+    /// globally — two channels sharing the same broken template must come out
+    /// in two different folders, which is the whole point.
+    #[test]
+    fn migration_93_expands_a_literal_channel_token_per_channel() {
+        let store = Store::open_in_memory().unwrap();
+        let c1 = store.upsert_channel("Blu", "https://twitch.tv/bluabk", Platform::Twitch).unwrap();
+        let c2 = store
+            .upsert_channel("Nyana Banyana", "https://twitch.tv/nyana", Platform::Twitch)
+            .unwrap();
+        let mut m1 = sample_monitor(c1);
+        m1.output_dir = r"G:\streams\{channel}".into();
+        let mid1 = store.insert_monitor(&m1).unwrap();
+        let mut m2 = sample_monitor(c2);
+        m2.output_dir = r"G:\streams\{channel}".into();
+        let mid2 = store.insert_monitor(&m2).unwrap();
+        // An unaffected monitor must be left completely alone.
+        let mut m3 = sample_monitor(c1);
+        m3.output_dir = r"G:\streams\Blu".into();
+        let mid3 = store.insert_monitor(&m3).unwrap();
+
+        let r1 = store
+            .insert_recording(mid1, 100, r"G:\streams\{channel}\a.mkv", None, false, Some("s1"), None, "", "")
+            .unwrap();
+        let r2 = store
+            .insert_recording(mid2, 100, r"G:\streams\{channel}\b.mkv", None, false, Some("s2"), None, "", "")
+            .unwrap();
+        store.set_recording_chat_path(r2, r"C:\chat\G\streams\{channel}\b.chat.jsonl").unwrap();
+        let r3 = store
+            .insert_recording(mid3, 100, r"G:\streams\Blu\c.mkv", None, false, Some("s3"), None, "", "")
+            .unwrap();
+
+        repair_literal_channel_token(&store.db()).unwrap();
+
+        let dir = |id| store.get_monitor_output_dir(id).unwrap().unwrap_or_default().0;
+        assert_eq!(dir(mid1), r"G:\streams\Blu");
+        assert_eq!(dir(mid2), r"G:\streams\Nyana Banyana", "each channel gets its OWN folder");
+        assert_eq!(dir(mid3), r"G:\streams\Blu", "an unaffected monitor is untouched");
+
+        let rec = |id| store.get_recording(id).unwrap().unwrap();
+        assert_eq!(rec(r1).output_path, r"G:\streams\Blu\a.mkv");
+        assert_eq!(rec(r2).output_path, r"G:\streams\Nyana Banyana\b.mkv");
+        // Companion paths derived from the same folder are repaired too.
+        assert_eq!(rec(r2).chat_path, r"C:\chat\G\streams\Nyana Banyana\b.chat.jsonl");
+        assert_eq!(rec(r3).output_path, r"G:\streams\Blu\c.mkv");
+
+        // Idempotent: an upgrade that re-runs it changes nothing further.
+        repair_literal_channel_token(&store.db()).unwrap();
+        assert_eq!(dir(mid2), r"G:\streams\Nyana Banyana");
+        assert_eq!(rec(r2).output_path, r"G:\streams\Nyana Banyana\b.mkv");
     }
 
     #[test]

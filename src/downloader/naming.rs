@@ -706,8 +706,39 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
     }
 }
 
-/// Expand `{name}`/`{platform}`/`{platform_short}` in an output-**folder**
-/// template, preserving `/`/`\` as real directory levels — unlike
+/// The identity tokens an output-**folder** template may use.
+///
+/// `{channel}` is an alias for `{name}`: in a folder the value is the same
+/// (the channel/container name), and `{channel}` is both the obvious word and
+/// a real token in the *filename* template — so leaving it out meant someone
+/// reading the filename token list typed the natural thing and silently got a
+/// directory literally called `{channel}`, with every channel's recordings
+/// merged into it. (2026-08-09: seven channels, one folder.)
+pub const DIR_TOKENS: [&str; 4] = ["{name}", "{channel}", "{platform}", "{platform_short}"];
+
+/// Tokens in a folder template that [`expand_dir_template`] will NOT expand,
+/// in the order they appear.
+///
+/// Left literal, an unsupported token becomes a real directory name — so this
+/// exists to say so before the folder is ever created, rather than after N
+/// recordings have landed in it. Anything `{…}` that isn't in [`DIR_TOKENS`]
+/// counts, including a typo or a filename-only token like `{date}`.
+pub fn unsupported_dir_tokens(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else { break };
+        let tok = &rest[open..open + close + 1];
+        if !DIR_TOKENS.contains(&tok) && !out.iter().any(|t| t == tok) {
+            out.push(tok.to_string());
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out
+}
+
+/// Expand `{name}`/`{channel}`/`{platform}`/`{platform_short}` in an
+/// output-**folder** template, preserving `/`/`\` as real directory levels — unlike
 /// [`expand_template`] (filenames), which sanitizes separators away as
 /// junk. Walks `template` as actual path [`std::path::Component`]s so a
 /// drive letter (`G:`) or UNC prefix is passed through untouched instead of
@@ -719,7 +750,7 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
 /// — an empty folder level should just not exist, unlike a filename, which
 /// must never be empty.
 ///
-/// Deliberately supports only these two identity tokens — not
+/// Deliberately supports only the identity tokens in [`DIR_TOKENS`] — not
 /// `{date}`/`{time}`/`{title}`/`{quality}`/etc. A monitor's `output_dir` is
 /// resolved once, when the channel/instance is created (or its URL's
 /// platform changes), and then stays a fixed literal path for that
@@ -740,6 +771,7 @@ pub fn expand_dir_template(template: &str, name: &str, platform: &str) -> String
                 let seg = seg.to_string_lossy();
                 let expanded = seg
                     .replace("{name}", name)
+                    .replace("{channel}", name)
                     .replace("{platform_short}", &styled_token("platform_short", platform, &style))
                     .replace("{platform}", &styled_token("platform", platform, &style));
                 let cleaned = sanitize_filename(&expanded);
@@ -1823,12 +1855,52 @@ mod tests {
 
     #[test]
     fn dir_template_unsupported_per_recording_tokens_are_left_literal() {
-        // Only {name}/{platform}/{platform_short} are supported here — a
-        // stray {date}/{title} in a folder template isn't expanded (and
-        // isn't sanitized away either, since braces aren't forbidden chars).
+        // Only the identity tokens are supported here — a stray {date}/{title}
+        // in a folder template isn't expanded (and isn't sanitized away
+        // either, since braces aren't forbidden chars). Which is exactly why
+        // `unsupported_dir_tokens` has to flag them before the folder exists.
         assert_eq!(
             expand_dir_template(r"G:\streams\{name}\{date}", "Foo", "twitch"),
             r"G:\streams\Foo\{date}"
         );
+    }
+
+    /// `{channel}` reads as the obvious word, is a real token in the FILENAME
+    /// template, and used to be silently literal here — so it produced a
+    /// directory called `{channel}` shared by every channel using the
+    /// template (2026-08-09: seven channels, one folder). It is an alias now.
+    #[test]
+    fn dir_template_accepts_channel_as_an_alias_of_name() {
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{channel}", "Nyana Banyana", "twitch"),
+            r"G:\streams\Nyana Banyana"
+        );
+        // Same value as {name}, wherever it sits and however it is mixed.
+        assert_eq!(
+            expand_dir_template(r"G:\{platform}\{channel}\vods", "Foo", "twitch"),
+            expand_dir_template(r"G:\{platform}\{name}\vods", "Foo", "twitch"),
+        );
+        // And a value containing a separator still cannot inject a level.
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{channel}", "A/B", "twitch"),
+            expand_dir_template(r"G:\streams\{name}", "A/B", "twitch"),
+        );
+    }
+
+    #[test]
+    fn unsupported_dir_tokens_names_exactly_what_would_become_a_folder_name() {
+        assert!(unsupported_dir_tokens(r"G:\streams\{channel}\{platform}").is_empty());
+        assert!(unsupported_dir_tokens(r"G:\streams\plain").is_empty());
+        // A filename-only token, and a typo, both reported — in order, deduped.
+        assert_eq!(
+            unsupported_dir_tokens(r"G:\{date}\{name}\{Channel}\{date}"),
+            ["{date}", "{Channel}"]
+        );
+        // An unterminated brace is not a token; nothing to report, and no hang.
+        assert!(unsupported_dir_tokens(r"G:\streams\{name").is_empty());
+        // Every advertised token really is accepted, so the two can't drift.
+        for tok in DIR_TOKENS {
+            assert!(unsupported_dir_tokens(&format!(r"G:\a\{tok}")).is_empty(), "{tok}");
+        }
     }
 }
