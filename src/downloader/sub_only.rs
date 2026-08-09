@@ -251,14 +251,6 @@ impl Supervisor {
 
         loop {
             let stopping = self.shutdown.load(Ordering::SeqCst) || abort.load(Ordering::SeqCst);
-            // The broadcast's own end is the normal exit: one last pass to pick
-            // up whatever landed since, then join.
-            let live = self
-                .store
-                .get_monitor_with_channel(monitor_id)
-                .ok()
-                .flatten()
-                .is_some_and(|m| m.monitor.last_state == "live");
             self.sub_only_pass(
                 &client,
                 &playlist_url,
@@ -273,7 +265,16 @@ impl Supervisor {
                 &mut state,
             )
             .await;
-            if stopping || !live {
+            if stopping {
+                break;
+            }
+            // The broadcast's own end is the normal exit — but only once it is
+            // CONFIRMED, never on a single reading. See `broadcast_still_live`.
+            if !self.broadcast_still_live(monitor_id, rec_id, &abort).await {
+                if self.shutdown.load(Ordering::SeqCst) {
+                    info!(monitor_id, rec_id, "sub-only: session interrupted — parts kept");
+                    return;
+                }
                 break;
             }
             if !self.sleep_watching(REFRESH_SECS, &abort).await {
@@ -283,6 +284,78 @@ impl Supervisor {
             }
         }
         self.finish_sub_only_session(rec_id, monitor_id, &row, &out_dir, &stem, &state).await;
+    }
+
+    /// How often to re-ask while a non-live reading is being confirmed.
+    const END_POLL_SECS: u64 = 20;
+    /// How long the monitor must read non-live, unbroken, before a session
+    /// accepts that the broadcast is over.
+    ///
+    /// Sized against what was actually observed rather than a round number:
+    /// finalizing a refused take left `last_state` at `ended` for 65 seconds
+    /// before the next poll put it back to `live`. Three minutes clears that
+    /// with room, and costs nothing when a stream really has ended — the final
+    /// pass has already run by then, so this only delays the join.
+    const END_CONFIRM_SECS: u64 = 180;
+
+    /// Whether the broadcast is still running, tolerating the state flapping
+    /// detection genuinely produces.
+    ///
+    /// A single `last_state` reading is not evidence. It sits at `ended` for
+    /// about a minute every time a doomed take finalizes — *including the very
+    /// take that opened this session* — and a channel with two live sources
+    /// can have its pollers disagree for a cycle.
+    ///
+    /// Believing one reading cost real money. The session exited mid-broadcast;
+    /// `try_begin` then saw no session owning the monitor, spawned another
+    /// capture Twitch refused, and that fresh take queued its own **full head
+    /// backfill** — re-downloading the broadcast from its start. That is
+    /// precisely the quadratic re-fetch this module was written to stop,
+    /// arriving on a slower timer. Observed 2026-08-09 on one two-hour
+    /// broadcast: two sessions, two 14 GB head fetches, parts split across two
+    /// takes' names.
+    ///
+    /// So a non-live reading is a question, not an answer.
+    async fn broadcast_still_live(
+        &self,
+        monitor_id: i64,
+        rec_id: i64,
+        abort: &Arc<AtomicBool>,
+    ) -> bool {
+        let reads_live = || {
+            self.store
+                .get_monitor_with_channel(monitor_id)
+                .ok()
+                .flatten()
+                // `recording` counts: a capture that started for some other
+                // reason (a manual Start, the user having just subscribed) is
+                // not this broadcast ending.
+                .is_some_and(|m| matches!(m.monitor.last_state.as_str(), "live" | "recording"))
+        };
+        if reads_live() {
+            return true;
+        }
+        let mut waited = 0;
+        while waited < Self::END_CONFIRM_SECS {
+            if !self.sleep_watching(Self::END_POLL_SECS, abort).await {
+                return false; // shutdown / manual stop — the caller decides
+            }
+            waited += Self::END_POLL_SECS;
+            if reads_live() {
+                info!(
+                    monitor_id,
+                    rec_id, waited, "sub-only: state flapped back to live — session continues"
+                );
+                return true;
+            }
+        }
+        info!(
+            monitor_id,
+            rec_id,
+            secs = Self::END_CONFIRM_SECS,
+            "sub-only: broadcast confirmed over — joining"
+        );
+        false
     }
 
     /// Sleep in short slices, giving up early on shutdown/abort. Returns false
@@ -671,6 +744,50 @@ mod tests {
         names.sort();
         assert_eq!(names[0], part_name(stem, 1));
         assert_eq!(names[2], part_name(stem, 10));
+    }
+
+    /// The confirm window has to outlast the flap that actually happened, or
+    /// this fix is decoration.
+    ///
+    /// Measured on 2026-08-09: finalizing the refused take that OPENED the
+    /// session left `last_state` at `ended` for 65 seconds before the next
+    /// poll restored `live`. A session that acted on the first reading exited
+    /// mid-broadcast, and the capture that then spawned queued another full
+    /// head backfill.
+    #[test]
+    fn the_end_confirm_window_outlasts_a_real_state_flap() {
+        /// When each re-check happens, and how many there are — the schedule
+        /// `broadcast_still_live` actually walks.
+        fn recheck_offsets() -> Vec<u64> {
+            let (poll, confirm) = (Supervisor::END_POLL_SECS, Supervisor::END_CONFIRM_SECS);
+            let mut at = Vec::new();
+            let mut waited = 0;
+            while waited < confirm {
+                waited += poll;
+                at.push(waited);
+            }
+            at
+        }
+        /// How long `last_state` sat at `ended` on 2026-08-09 while the
+        /// broadcast was still running — the flap this exists to survive.
+        const OBSERVED_FLAP_SECS: u64 = 65;
+
+        let at = recheck_offsets();
+        assert!(
+            at.len() >= 3,
+            "too few re-checks ({at:?}) to call the result confirmation rather than a guess"
+        );
+        assert!(
+            at.iter().any(|t| *t > OBSERVED_FLAP_SECS),
+            "no re-check lands after the {OBSERVED_FLAP_SECS}s flap seen in the wild: {at:?}"
+        );
+        assert!(
+            at.last().copied().unwrap_or(0) >= OBSERVED_FLAP_SECS * 2,
+            "the window closes too soon to leave any margin: {at:?}"
+        );
+        // And it stays cheap next to a refresh interval, or a session would
+        // spend its life deciding whether to exit.
+        assert!(at.last().copied().unwrap_or(0) < REFRESH_SECS * 2, "{at:?}");
     }
 
     #[test]

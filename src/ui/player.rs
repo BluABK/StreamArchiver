@@ -95,7 +95,15 @@ pub(super) enum ProbeJob {
     /// Streams grid's take-row/stream-row size display on an active take.
     LiveLen(std::path::PathBuf),
     Target(String),
+    /// `(archive folder, broadcast id)` — a subscriber-only broadcast's CDN
+    /// parts, which is a `read_dir` of a folder holding a whole channel's
+    /// archive and so belongs on the worker like every other scan.
+    CdnParts(CdnPartsKey),
 }
+
+/// What identifies one broadcast's CDN parts: the folder to scan and the
+/// broadcast id its takes' filenames all carry.
+pub(super) type CdnPartsKey = (std::path::PathBuf, String);
 
 /// A finished probe shipped back from the worker.
 pub(super) enum ProbeResult {
@@ -104,6 +112,7 @@ pub(super) enum ProbeResult {
     Len(std::path::PathBuf, u64),
     LiveLen(std::path::PathBuf, u64),
     Target(String, Option<StreamTarget>),
+    CdnParts(CdnPartsKey, Vec<std::path::PathBuf>),
 }
 
 pub(super) struct ProbeSlot<V> {
@@ -139,6 +148,7 @@ pub(super) struct FsProbes {
     pub(super) sizes: HashMap<std::path::PathBuf, ProbeSlot<u64>>,
     pub(super) live_sizes: HashMap<std::path::PathBuf, ProbeSlot<u64>>,
     pub(super) targets: HashMap<String, ProbeSlot<Option<StreamTarget>>>,
+    pub(super) cdn_parts: HashMap<CdnPartsKey, ProbeSlot<Vec<std::path::PathBuf>>>,
     pub(super) tx: std::sync::mpsc::Sender<ProbeJob>,
     pub(super) rx: std::sync::mpsc::Receiver<ProbeResult>,
 }
@@ -213,6 +223,10 @@ impl FsProbes {
                             let t = stream_target_for_active(&s);
                             ProbeResult::Target(s, t)
                         }
+                        ProbeJob::CdnParts(key) => {
+                            let parts = cdn_parts_for_broadcast(&key.0, &key.1);
+                            ProbeResult::CdnParts(key, parts)
+                        }
                     };
                     if res_tx.send(res).is_err() {
                         break; // FsProbes dropped — app shutting down
@@ -229,6 +243,7 @@ impl FsProbes {
             sizes: HashMap::new(),
             live_sizes: HashMap::new(),
             targets: HashMap::new(),
+            cdn_parts: HashMap::new(),
             tx: job_tx,
             rx: res_rx,
         }
@@ -262,6 +277,17 @@ impl FsProbes {
         probe_lookup(&self.tx, &mut self.targets, output_path, None, ProbeJob::Target)
     }
 
+    /// Last-known CDN parts for one subscriber-only broadcast (empty until the
+    /// first probe lands) — see [`cdn_parts_for_broadcast`].
+    pub(super) fn cdn_parts(
+        &mut self,
+        dir: &std::path::Path,
+        stream_id: &str,
+    ) -> Vec<std::path::PathBuf> {
+        let key = (dir.to_path_buf(), stream_id.to_string());
+        probe_lookup(&self.tx, &mut self.cdn_parts, &key, Vec::new(), ProbeJob::CdnParts)
+    }
+
     /// Install finished worker results. Called once per frame from `logic()`;
     /// results for keys evicted in the meantime are simply dropped.
     pub(super) fn drain_results(&mut self) {
@@ -285,6 +311,7 @@ impl FsProbes {
                 ProbeResult::Len(p, v) => install(&mut self.sizes, &p, v, now),
                 ProbeResult::LiveLen(p, v) => install(&mut self.live_sizes, &p, v, now),
                 ProbeResult::Target(s, t) => install(&mut self.targets, &s, t, now),
+                ProbeResult::CdnParts(k, v) => install(&mut self.cdn_parts, &k, v, now),
             }
         }
     }
@@ -298,6 +325,7 @@ impl FsProbes {
         self.sizes.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
         self.live_sizes.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
         self.targets.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
+        self.cdn_parts.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
     }
 }
 
@@ -421,7 +449,7 @@ pub(super) fn stream_target_for_active(output_path: &str) -> Option<StreamTarget
     let mut parts: Vec<(std::path::PathBuf, u64)> =
         best.into_values().map(|(_, p, len)| (p, len)).collect();
     match parts.len() {
-        0 => cdn_parts_target(final_path, &stem),
+        0 => None,
         1 => Some(StreamTarget::Growing(parts.remove(0).0)),
         _ => {
             parts.sort_by_key(|p| std::cmp::Reverse(p.1)); // video (largest) first
@@ -430,7 +458,7 @@ pub(super) fn stream_target_for_active(output_path: &str) -> Option<StreamTarget
     }
 }
 
-/// A subscriber-only broadcast's CDN parts next to `final_path`, in order.
+/// One subscriber-only broadcast's CDN parts in `dir`, in play order.
 ///
 /// The archive folder, not the capture cache: a refused take never captured
 /// anything, so there is nothing in the cache to find — the parts are written
@@ -438,10 +466,20 @@ pub(super) fn stream_target_for_active(output_path: &str) -> Option<StreamTarget
 /// `downloader::sub_only`). Without this, "Play local recording" is greyed out
 /// for precisely the broadcasts where the app *is* archiving something, just
 /// not from the live edge.
-fn cdn_parts_target(final_path: &std::path::Path, stem: &str) -> Option<StreamTarget> {
-    use crate::downloader::sub_only::{PART_INFIX, part_index};
-    let dir = final_path.parent()?;
-    let prefix = format!("{stem}{PART_INFIX}");
+///
+/// Matched by **broadcast id, not by take**, exactly as
+/// `sub_only::adopt_sub_only_parts` matches when it resumes. One broadcast can
+/// end up with parts under several takes' names — every time a doomed capture
+/// spawns, the next part is written under that take's stem — and the index
+/// continues across them. Scoping this to one take's stem would silently play
+/// a fraction of the broadcast and call it the recording.
+pub(super) fn cdn_parts_for_broadcast(
+    dir: &std::path::Path,
+    stream_id: &str,
+) -> Vec<std::path::PathBuf> {
+    if stream_id.is_empty() {
+        return Vec::new();
+    }
     let mut parts: Vec<(usize, std::path::PathBuf)> =
         crate::iomon::fs::read_dir_sync(crate::iomon::Cat::FsProbe, dir)
             .into_iter()
@@ -449,17 +487,19 @@ fn cdn_parts_target(final_path: &std::path::Path, stem: &str) -> Option<StreamTa
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                name.starts_with(&prefix).then(|| part_index(&name).map(|i| (i, e.path())))?
+                if !name.contains(stream_id) {
+                    return None;
+                }
+                crate::downloader::sub_only::part_index(&name).map(|i| (i, e.path()))
             })
             .collect();
-    if parts.is_empty() {
-        return None;
-    }
-    // By index, not by name: the numbering is per BROADCAST and continues
-    // across restarts, so lexical order and capture order agree only while the
-    // zero-padding holds.
+    // By parsed index, not by name: the numbering is per broadcast and
+    // continues across takes and restarts, so lexical order only coincidentally
+    // agrees. Dedup because a part can exist in both the archive folder and an
+    // older layout's cache.
     parts.sort_by_key(|(i, _)| *i);
-    Some(StreamTarget::Sequence(parts.into_iter().map(|(_, p)| p).collect()))
+    parts.dedup_by_key(|(i, _)| *i);
+    parts.into_iter().map(|(_, p)| p).collect()
 }
 
 /// True when the configured player binary is mpv (or an mpv front-end like
@@ -1920,36 +1960,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A subscriber-only take has NOTHING in the capture cache — the live edge
-    /// was refused, so no tool ever wrote there. Its archive is the CDN parts
-    /// beside the output path, and "Play local recording" has to find them or
-    /// it stays greyed out for exactly the broadcasts that need it.
+    /// CDN parts belong to a BROADCAST, not to the take that happened to write
+    /// them.
+    ///
+    /// Every time a doomed capture spawns, the next part is written under that
+    /// new take's name while the index keeps counting for the broadcast — so
+    /// one stream really does end up with `…01-05-45…cdnpart-001` and
+    /// `…02-11-57…cdnpart-007` side by side (observed 2026-08-09). Matching on
+    /// one take's stem would offer a fraction of the stream and present it as
+    /// the recording; this matches the broadcast id, exactly as the capture
+    /// side matches when it resumes.
     #[test]
-    fn probe_falls_back_to_cdn_parts_in_the_archive_folder() {
+    fn cdn_parts_are_collected_per_broadcast_across_takes() {
         let (dir, _cache) = probe_dir("cdn");
-        let out = dir.join("Chan - 2026.mkv");
-        // Deliberately out of lexical order relative to creation order.
-        for i in [2usize, 0, 1] {
-            std::fs::write(dir.join(format!("Chan - 2026.cdnpart-{i:03}.mkv")), b"x").unwrap();
+        // Two takes of ONE broadcast, indices continuing across them, written
+        // out of order to prove the sort isn't accidental.
+        for (stem, i) in [
+            ("Chan - 01-05-45 - [Twitch 320826528858]", 7usize),
+            ("Chan - 02-11-57 - [Twitch 320826528858]", 2),
+            ("Chan - 01-05-45 - [Twitch 320826528858]", 1),
+        ] {
+            std::fs::write(dir.join(format!("{stem}.cdnpart-{i:03}.mkv")), b"x").unwrap();
         }
-        // A sibling recording's parts must not be swept in.
-        std::fs::write(dir.join("Other - 2026.cdnpart-000.mkv"), b"x").unwrap();
-        let Some(StreamTarget::Sequence(parts)) =
-            stream_target_for_active(&out.to_string_lossy())
-        else {
-            panic!("expected a Sequence of CDN parts");
-        };
+        // A different broadcast in the same folder must not leak in.
+        std::fs::write(dir.join("Chan - 00-00-00 - [Twitch 999].cdnpart-001.mkv"), b"x").unwrap();
+        // Neither must a take's ordinary head backfill, which is not a part.
+        std::fs::write(dir.join("Chan - 01-05-45 - [Twitch 320826528858].head.mkv"), b"x").unwrap();
+
+        let parts = cdn_parts_for_broadcast(&dir, "320826528858");
         let names: Vec<String> =
             parts.iter().map(|p| p.file_name().unwrap().to_string_lossy().into()).collect();
         assert_eq!(
             names,
             [
-                "Chan - 2026.cdnpart-000.mkv",
-                "Chan - 2026.cdnpart-001.mkv",
-                "Chan - 2026.cdnpart-002.mkv"
+                "Chan - 01-05-45 - [Twitch 320826528858].cdnpart-001.mkv",
+                "Chan - 02-11-57 - [Twitch 320826528858].cdnpart-002.mkv",
+                "Chan - 01-05-45 - [Twitch 320826528858].cdnpart-007.mkv",
             ],
-            "parts must play in index order"
+            "parts play in broadcast index order, whichever take wrote them"
         );
+        // No broadcast id to key on: offer nothing rather than everything.
+        assert!(cdn_parts_for_broadcast(&dir, "").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

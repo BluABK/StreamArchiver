@@ -2107,7 +2107,23 @@ capture session** for that broadcast:
   everything exactly where it was.
 - **It resumes.** Parts carry the broadcast id in their name, so a restart
   mid-stream adopts what's on disk — including a head an earlier take had
-  already fetched — and continues from there rather than starting over.
+  already fetched — and continues from there rather than starting over. That
+  id, not the take's name, is also what groups them: a broadcast accumulates
+  parts under whichever take was current when each was written, and they play
+  and join as one stream.
+- **The end of the broadcast is confirmed, never assumed.** A single
+  "not live" reading is not evidence: finalizing a refused take leaves the
+  monitor at `ended` for about a minute — including the take that opened the
+  session — and two pollers can disagree for a cycle. A session that believed
+  one reading exited mid-stream, which let the retry cadence spawn another
+  doomed capture, which queued its own **full head backfill** of the broadcast
+  so far. So a non-live reading is re-asked every 20 s for three minutes before
+  it counts.
+- **A broadcast already refused is not attempted again**, whether or not a
+  session happens to be running at that moment — and the check *revives* the
+  session on the original take rather than only declining, so a restart
+  mid-broadcast picks archiving back up on the row it started on instead of
+  leaving the stream uncaptured.
 
 - **It reads as a capture, because it is one.** A CDN session runs no capture
   tool, so the monitor is absent from every "currently recording" list and the

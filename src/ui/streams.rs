@@ -3992,11 +3992,7 @@ impl StreamArchiverApp {
             .into_iter()
             .flatten()
             .flat_map(|g| g.takes.iter())
-            .filter(|t| t.gated && !t.output_path.is_empty())
-            .find_map(|t| match fs.target(&t.output_path) {
-                Some(t @ StreamTarget::Sequence(_)) => Some(t),
-                _ => None,
-            })
+            .find_map(|t| Self::take_stream_target(t, false, fs))
     }
 
     /// What "Play local recording" should open for ONE take.
@@ -4020,11 +4016,19 @@ impl StreamArchiverApp {
         // parts beside where that file would go, and they are complete and
         // playable now. Without this the one take that IS being archived is
         // also the one whose Play button is greyed out.
-        if t.gated && !t.output_path.is_empty() {
-            return match fs.target(&t.output_path) {
-                Some(st @ StreamTarget::Sequence(_)) => Some(st),
-                _ => None,
-            };
+        //
+        // Looked up by BROADCAST, not by this take: a broadcast accumulates
+        // parts under whichever take's name was current when each was written,
+        // so scoping to one take would offer a fraction of the stream and
+        // present it as the recording.
+        if t.gated
+            && let Some(sid) = t.stream_id.as_deref().filter(|s| !s.is_empty())
+            && let Some(dir) = std::path::Path::new(&t.output_path).parent()
+        {
+            let parts = fs.cdn_parts(dir, sid);
+            if !parts.is_empty() {
+                return Some(StreamTarget::Sequence(parts));
+            }
         }
         None
     }

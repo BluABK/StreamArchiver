@@ -2094,6 +2094,46 @@ progress_info: None,
             );
             return false;
         }
+        // …and the same suppression from the DB, for the gap where no session
+        // happens to be running: between one ending and the next opening, on a
+        // restart before the session is re-established, or while it waits on an
+        // in-flight head backfill. That gap is what let a single broadcast
+        // collect two refused takes and two full head backfills (2026-08-09) —
+        // and a head backfill re-fetches the stream from its start, so the cost
+        // is the whole broadcast again, each time.
+        //
+        // Keyed on the BROADCAST: a new stream id is a new question, and a
+        // forced start still goes through.
+        //
+        // Suppressing alone would be worse than the churn: after a restart
+        // nothing else opens a session, so the broadcast would go unarchived
+        // entirely. So this REVIVES the session on the original anchor take
+        // rather than only declining — which is also how a restart mid-
+        // broadcast picks its archiving back up on the row it started on.
+        if !forced
+            && let Some(sid) = stream_id.as_deref().filter(|s| !s.is_empty())
+            && let Ok(Some((anchor_id, anchor_path))) =
+                self.store.gated_take_for_stream(monitor_id, sid)
+        {
+            tracing::debug!(
+                monitor_id,
+                stream_id = sid,
+                anchor_id,
+                "auto start suppressed: this broadcast was already refused (not entitled)"
+            );
+            if !self.sub_only_session_active(monitor_id)
+                && let Ok(Some(row)) = self.store.get_monitor_with_channel(monitor_id)
+            {
+                self.maybe_start_sub_only_session(
+                    &row,
+                    anchor_id,
+                    Some(sid),
+                    went_live_at,
+                    Path::new(&anchor_path),
+                );
+            }
+            return false;
+        }
         {
             let mut active = self.active.lock().unwrap();
             if active.contains_key(&monitor_id) {

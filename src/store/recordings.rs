@@ -1068,6 +1068,36 @@ impl Store {
         Ok(rows)
     }
 
+    /// The first take of this broadcast that was refused for lack of
+    /// entitlement (subscriber-only / members-only): `(id, output_path)`.
+    ///
+    /// Being refused is a fact about the BROADCAST, not about the attempt, so
+    /// once one take of a stream carries it every further automatic attempt at
+    /// the same stream is refused identically. Two callers need that: the retry
+    /// cadence, to stop spawning captures (each of which queues a full head
+    /// backfill) for a broadcast the CDN path already owns, and the CDN session
+    /// itself, which adopts the FIRST such take as its anchor so a broadcast
+    /// keeps one row in the archive across restarts instead of one per attempt.
+    pub fn gated_take_for_stream(
+        &self,
+        monitor_id: i64,
+        stream_id: &str,
+    ) -> Result<Option<(i64, String)>> {
+        if stream_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT id, output_path FROM recording
+                  WHERE monitor_id = ?1 AND stream_id = ?2 AND gated = 1
+                  ORDER BY started_at LIMIT 1",
+                params![monitor_id, stream_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Recordings with a backfilled head that still lacks the final concat
     /// (crash healing — the join is idempotent and re-runnable).
     pub fn recordings_pending_head_concat(&self) -> Result<Vec<i64>> {
@@ -2925,6 +2955,49 @@ mod tests {
         assert!(store.earlier_takes_for_stream(mid, "s1", 1_000).unwrap().is_empty());
         // take2 itself isn't included when querying strictly before its own start.
         assert!(!earlier.iter().any(|(id, ..)| *id == take2));
+    }
+
+    /// The anchor a suppressed retry revives the CDN session on.
+    ///
+    /// It must be the FIRST refused take of the broadcast, not the newest: the
+    /// whole point is that one broadcast keeps one row in the archive, and
+    /// anchoring on the newest attempt would create a fresh row every time the
+    /// retry cadence came round — which is exactly what happened before the
+    /// suppression existed.
+    #[test]
+    fn gated_take_for_stream_finds_the_first_refused_take_of_that_broadcast() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // An ordinary take of the same broadcast is not an anchor.
+        let ok = store
+            .insert_recording(mid, 900, "C:/rec/ok.mkv", Some(900), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(ok, 950, 10, Some(0), "completed", "C:/rec/ok.mkv", "").unwrap();
+        assert_eq!(store.gated_take_for_stream(mid, "s1").unwrap(), None);
+
+        let first = store
+            .insert_recording(mid, 1_000, "C:/rec/a.ts", Some(900), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.set_recording_gated(first).unwrap();
+        let second = store
+            .insert_recording(mid, 5_000, "C:/rec/b.ts", Some(900), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.set_recording_gated(second).unwrap();
+
+        assert_eq!(
+            store.gated_take_for_stream(mid, "s1").unwrap(),
+            Some((first, "C:/rec/a.ts".to_string())),
+            "the oldest refused take anchors the broadcast"
+        );
+        // A different broadcast is a different question — a new stream may
+        // well not be subscriber-only.
+        assert_eq!(store.gated_take_for_stream(mid, "s2").unwrap(), None);
+        // No broadcast id: nothing to key on, so never suppress.
+        assert_eq!(store.gated_take_for_stream(mid, "").unwrap(), None);
     }
 
     #[test]
