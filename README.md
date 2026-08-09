@@ -611,7 +611,12 @@ on-disk change. The channel and instance rows are the one exception: expanding
 every channel just to keep their totals live isn't affordable, so those two
 levels show a **stored** total instead (refreshed whenever the grid reloads,
 not confirmed against disk) — hover either for the distinction, and expand
-down to a stream/take for the exact, disk-confirmed figure. A take finalized
+down to a stream/take for the exact, disk-confirmed figure. Since nothing
+watches the filesystem, a file deleted (or moved) **outside** the app leaves
+that stored total wrong until something checks — right-click a channel or
+instance row and choose **🔄 Rescan disk usage** to check every one of its
+takes against disk and clear any that are gone; it runs in the background and
+the status bar reports what it found. A take finalized
 before 2026-07-26 may show a **⚠** on its Duration cell (and in the take's
 Properties window): a since-fixed bug stamped the end time *after* its remux
 finished rather than when the capture actually stopped, so a take whose remux

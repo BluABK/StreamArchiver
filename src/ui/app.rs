@@ -793,6 +793,7 @@ impl StreamArchiverApp {
             raid_out_cache: None,
             rolling_counts_cache: None,
             disk_usage_cache: None,
+            rescan_disk_usage: None,
             saved_layouts_cache: None,
             schedule_day_popup: None,
             show_schedule_sources: false,

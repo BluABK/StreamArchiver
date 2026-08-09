@@ -2808,6 +2808,39 @@ mod tests {
         assert!(!store.monitor_disk_usage().unwrap().contains_key(&mid3));
     }
 
+    /// The "🔄 Rescan disk usage" action's whole point: once a take's file is
+    /// confirmed gone (deleted outside the app — nothing else notices this on
+    /// its own), `clear_recording_capture` is what makes `monitor_disk_usage`
+    /// stop counting it, same as it already does for a take whose path was
+    /// always empty.
+    #[test]
+    fn clear_recording_capture_removes_it_from_disk_usage() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let r1 = store
+            .insert_recording(mid, 1_000, "C:/rec/a.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(r1, 1_100, 1_000, Some(0), "completed", "C:/rec/a.mkv", "").unwrap();
+        let r2 = store
+            .insert_recording(mid, 2_000, "C:/rec/b.mkv", Some(2_000), false, Some("s2"), None, "", "")
+            .unwrap();
+        store.finish_recording(r2, 2_100, 2_000, Some(0), "completed", "C:/rec/b.mkv", "").unwrap();
+        assert_eq!(store.monitor_disk_usage().unwrap().get(&mid), Some(&3_000));
+
+        // r1's file was found gone by a rescan.
+        store.clear_recording_capture(r1).unwrap();
+        assert_eq!(
+            store.monitor_disk_usage().unwrap().get(&mid),
+            Some(&2_000),
+            "cleared take drops out, the other survives"
+        );
+        let rec = store.recordings_for_monitor(mid).unwrap();
+        assert!(rec.iter().find(|r| r.id == r1).unwrap().output_path.is_empty());
+    }
+
     #[test]
     fn err_ack_excludes_from_issues_but_survives_in_db() {
         let store = Store::open_in_memory().unwrap();

@@ -299,6 +299,10 @@ struct StreamsOut {
     /// A capture-alert badge (🚨/🩹/⚠ on a take or stream row) was clicked —
     /// open the Warnings window.
     open_warnings: bool,
+    /// "🔄 Rescan disk usage" on a channel row's context menu — every
+    /// monitor id under that channel. The instance-row version routes
+    /// through `acts.rescan_disk_usage` instead (one monitor id).
+    rescan_channel_disk_usage: Option<Vec<i64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2456,6 +2460,7 @@ impl StreamArchiverApp {
             open_stream_stats,
             mark_hype,
             open_warnings,
+            rescan_channel_disk_usage,
         } = out;
         if open_warnings {
             self.show_warnings = true;
@@ -2829,6 +2834,14 @@ impl StreamArchiverApp {
                 self.reload_rows();
             }
         }
+        if let Some(mids) = rescan_channel_disk_usage {
+            self.status = "Rescanning disk usage…".into();
+            self.start_rescan_disk_usage(mids);
+        }
+        if let Some(mid) = acts.rescan_disk_usage {
+            self.status = "Rescanning disk usage…".into();
+            self.start_rescan_disk_usage(vec![mid]);
+        }
         if let Some(cid) = open_channel_props.or(acts.open_channel_props) {
             self.open_channel_properties(cid);
         }
@@ -3102,6 +3115,78 @@ impl StreamArchiverApp {
         let cur = self.core.store.stream_watch_state(key).ok().flatten().map(|(s, _)| s);
         if history::should_advance_to_started(cur.as_deref()) {
             let _ = self.core.store.set_stream_watch_state(key, mid, "started");
+        }
+    }
+
+    /// "🔄 Rescan disk usage" — the manual fix for a file deleted (or moved)
+    /// outside the app: nothing watches the filesystem for that on its own,
+    /// so a take's stored `bytes`/`output_path` survive until something
+    /// checks. Runs off-thread — one `exists_sync` per finished take can
+    /// block for a while on a stalled drive, same reasoning as
+    /// `issues-missing-check` (`ui/issues.rs`), whose candidate set and probe
+    /// category (`Cat::FsProbe`) this mirrors. A no-op while a scan from
+    /// ANY row is already running, so mashing the action across several
+    /// channels queues harmlessly instead of piling up threads.
+    pub(super) fn start_rescan_disk_usage(&mut self, monitor_ids: Vec<i64>) {
+        if self.rescan_disk_usage.is_some() {
+            return;
+        }
+        let core = self.core.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rescan-disk-usage".into())
+            .spawn(move || {
+                let mut gone = Vec::new();
+                for mid in monitor_ids {
+                    let Ok(recs) = core.store.recordings_for_monitor(mid) else { continue };
+                    for r in recs {
+                        if r.bytes > 0
+                            && !r.output_path.is_empty()
+                            && !crate::iomon::fs::exists_sync(
+                                crate::iomon::Cat::FsProbe,
+                                std::path::Path::new(&r.output_path),
+                            )
+                        {
+                            gone.push(r.id);
+                        }
+                    }
+                }
+                let _ = tx.send(gone);
+            })
+            .expect("spawn rescan-disk-usage thread");
+        self.rescan_disk_usage = Some(rx);
+    }
+
+    /// Apply a finished [`Self::start_rescan_disk_usage`] scan, if one has
+    /// landed: clear the stale path on every confirmed-gone recording (same
+    /// `Store::clear_recording_capture` the Issues panel's own "Clear path"
+    /// uses) and force a full Streams-grid refresh — same cache drop F5 does
+    /// — so the corrected total (and the now-pathless take's size) shows
+    /// immediately instead of waiting for an unrelated reload. Called once
+    /// per frame from `logic()`.
+    pub(super) fn drain_rescan_disk_usage(&mut self) {
+        let Some(rx) = &self.rescan_disk_usage else { return };
+        match rx.try_recv() {
+            Ok(gone) => {
+                for id in &gone {
+                    let _ = self.core.store.clear_recording_capture(*id);
+                }
+                self.status = if gone.is_empty() {
+                    "Rescan complete — nothing missing.".into()
+                } else {
+                    self.rec_cache.clear();
+                    self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                    format!(
+                        "Rescan complete — {} file(s) confirmed missing, cleared.",
+                        gone.len()
+                    )
+                };
+                self.rescan_disk_usage = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rescan_disk_usage = None;
+            }
         }
     }
 
@@ -3908,6 +3993,19 @@ impl StreamArchiverApp {
                 ui.separator();
                 if ui.button("📁  Re-organize all recordings").on_hover_text("Move all recordings for this channel into/out of subdirectories.").clicked() {
                     out.acts.reorganize_channel = Some(cid);
+                    ui.close();
+                }
+                if ui
+                    .button("🔄  Rescan disk usage")
+                    .on_hover_text(
+                        "Check every stored take of every instance against disk and \
+                         clear any whose file is gone (e.g. deleted outside the app) — \
+                         the 💾 Disk use column otherwise keeps counting it.",
+                    )
+                    .clicked()
+                {
+                    out.rescan_channel_disk_usage =
+                        Some(mons.iter().map(|m| m.monitor.id).collect());
                     ui.close();
                 }
                 if ui

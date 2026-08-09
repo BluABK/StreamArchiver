@@ -2137,6 +2137,16 @@ pub struct StreamArchiverApp {
     /// period/stream/take rows below them use `take_size_bytes` instead,
     /// which confirms each file still exists.
     disk_usage_cache: Option<(u64, HashMap<i64, i64>)>,
+    /// An in-flight "🔄 Rescan disk usage" scan (channel/instance context menu,
+    /// or the Streams toolbar for every monitor) — `None` while idle. The
+    /// scan runs off-thread (one `exists_sync` per finished take can block on
+    /// a stalled drive, same reasoning as `issues-missing-check`) and reports
+    /// back the recording ids whose file is confirmed gone; `drain_rescan_disk_usage`
+    /// clears their stored path (`Store::clear_recording_capture`) and forces
+    /// a full Streams-grid refresh so the corrected total shows immediately.
+    /// The manual fix for a file deleted outside the app, since nothing
+    /// watches the filesystem for that on its own.
+    rescan_disk_usage: Option<std::sync::mpsc::Receiver<Vec<i64>>>,
     /// Saved custom window layouts for the collab-play "Layout ▸" submenu,
     /// cached against `streams_cache_rev` — read once per grid rebuild instead
     /// of once per frame (it is a settings-table read, not a hot query, but
@@ -2892,6 +2902,7 @@ impl eframe::App for StreamArchiverApp {
         // Install filesystem-probe results the background worker finished
         // since last frame (never blocks — see `FsProbes`).
         self.fs_probes.lock().unwrap().drain_results();
+        self.drain_rescan_disk_usage();
         self.drain_pending_browse();
         self.drain_pending_save();
         self.drain_pending_reload();

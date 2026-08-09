@@ -2554,6 +2554,10 @@ pub(super) struct RowActions {
     /// Name of a saved layout to delete (set by the "×" next to it in either
     /// Layout submenu's saved-layouts list).
     pub(super) delete_saved_layout: Option<String>,
+    /// "🔄 Rescan disk usage" on an instance row's context menu — this
+    /// monitor's id. See `StreamsOut::rescan_channel_disk_usage` for the
+    /// channel-row (multi-monitor) version.
+    pub(super) rescan_disk_usage: Option<i64>,
 }
 
 /// What a Custom layout editor session plays once applied — the same two
@@ -3101,6 +3105,18 @@ pub(super) fn render_instance_row(
         ui.separator();
         if ui.button("📁  Re-organize recordings").on_hover_text("Move all recordings for this monitor into/out of subdirectories.").clicked() {
             a.reorganize_monitor = Some(m.id);
+            ui.close();
+        }
+        if ui
+            .button("🔄  Rescan disk usage")
+            .on_hover_text(
+                "Check every stored take of this instance against disk and clear \
+                 any whose file is gone (e.g. deleted outside the app) — the \
+                 💾 Disk use column otherwise keeps counting it.",
+            )
+            .clicked()
+        {
+            a.rescan_disk_usage = Some(m.id);
             ui.close();
         }
         if ui
