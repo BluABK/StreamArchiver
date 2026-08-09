@@ -2109,6 +2109,19 @@ capture session** for that broadcast:
   mid-stream adopts what's on disk — including a head an earlier take had
   already fetched — and continues from there rather than starting over.
 
+- **It reads as a capture, because it is one.** A CDN session runs no capture
+  tool, so the monitor is absent from every "currently recording" list and the
+  refused takes below it are all `failed`. Left alone, that renders as a
+  channel that is merely *live* while gigabytes land on disk. Instead the
+  instance row carries a **🔒 subs** marker and a **⭳ CDN** badge while a
+  session is running, the broadcast's stream row shows the recording state, and
+  the anchor take wears ⭳ CDN too — so "which stream is the subscriber-only
+  one" has an answer on the row you are looking at.
+- **You can watch what has been captured, before it is joined.** The parts are
+  complete files, so ⏵ **Play local recording** on a refused take opens them as
+  a playlist in order rather than being greyed out. (▶ **Open file** stays
+  disabled: there genuinely is no single file until the join.)
+
 **What this costs you.** The archive is assembled behind the live edge by
 definition: it lags by up to one refresh interval, and the last minutes before
 the stream ends may be missing (the CDN can't serve what hasn't been segmented

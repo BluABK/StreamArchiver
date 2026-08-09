@@ -57,14 +57,20 @@ const RESOLVE_ATTEMPTS: usize = 5;
 /// The index is **per broadcast, not per take**: adoption continues from the
 /// highest index already on disk, so parts written by an earlier session (or
 /// before a restart) stay in order with the ones written after it.
-fn part_name(stem: &str, index: usize) -> String {
-    format!("{stem}.cdnpart-{index:03}.mkv")
+pub(crate) fn part_name(stem: &str, index: usize) -> String {
+    format!("{stem}{PART_INFIX}{index:03}.mkv")
 }
+
+/// What marks a file as one of a broadcast's CDN parts. Shared with the media
+/// player, which offers the parts as a playlist while the session is still
+/// running — the two must recognise the same files or "Play local recording"
+/// silently finds nothing for exactly the takes that need it most.
+pub(crate) const PART_INFIX: &str = ".cdnpart-";
 
 /// Pull the index back out of a part filename, for ordering and for continuing
 /// the numbering after a restart.
-fn part_index(name: &str) -> Option<usize> {
-    let tail = name.rsplit_once(".cdnpart-")?.1;
+pub(crate) fn part_index(name: &str) -> Option<usize> {
+    let tail = name.rsplit_once(PART_INFIX)?.1;
     tail.strip_suffix(".mkv")?.parse().ok()
 }
 
@@ -126,7 +132,7 @@ impl Supervisor {
             if sessions.contains_key(&monitor_id) {
                 return; // already covered
             }
-            sessions.insert(monitor_id, abort.clone());
+            sessions.insert(monitor_id, CdnCapture { rec_id, abort: abort.clone() });
         }
         info!(
             monitor_id,
@@ -153,8 +159,8 @@ impl Supervisor {
     /// Stop a monitor's CDN session (manual Stop, shutdown). The session
     /// finishes its current pass, joins what it has, and exits.
     pub(super) fn abort_sub_only_session(&self, monitor_id: i64) {
-        if let Some(flag) = self.sub_only_sessions.lock().unwrap().get(&monitor_id) {
-            flag.store(true, Ordering::SeqCst);
+        if let Some(s) = self.sub_only_sessions.lock().unwrap().get(&monitor_id) {
+            s.abort.store(true, Ordering::SeqCst);
             info!(monitor_id, "sub-only: CDN session asked to wrap up");
         }
     }

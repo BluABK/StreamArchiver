@@ -123,6 +123,11 @@ pub struct AppCore {
     /// (remux, possibly gate-queued for hours) is still pending. Read by the
     /// Streams grid to show "finalizing" instead of a stale "recording".
     pub finalizing: crate::downloader::Finalizing,
+    /// monitor_id -> the subscriber-only CDN capture session archiving that
+    /// monitor's current broadcast. Read by the Streams grid: nothing is being
+    /// captured from the live edge (Twitch refused it), but the broadcast IS
+    /// being archived, and a row that just says "live" hides that.
+    pub cdn_captures: crate::downloader::CdnCaptures,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
     /// Set by a "Quit & stop recordings" action so the exit path kills the tool
@@ -196,6 +201,7 @@ impl AppCore {
             ad_active: Arc::new(Mutex::new(HashMap::new())),
             stop_holds: Arc::new(Mutex::new(HashMap::new())),
             finalizing: Arc::new(Mutex::new(HashMap::new())),
+            cdn_captures: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             force_stop_on_quit: AtomicBool::new(false),
             manual_tx: Mutex::new(None),
@@ -444,6 +450,7 @@ impl AppCore {
             max_concurrent,
             self.stop_holds.clone(),
             self.finalizing.clone(),
+            self.cdn_captures.clone(),
         );
         // Crash/restart recovery, in two synchronous passes so reservations land
         // before detection can fire:

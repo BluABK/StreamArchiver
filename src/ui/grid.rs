@@ -103,6 +103,25 @@ pub(super) fn fmt_ad_count(n: i64) -> String {
 /// stream isn't a fault, it's a broadcast we aren't entitled to.
 pub(super) const SUB_ONLY_COLOR: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x93, 0xe0);
 
+/// The instance row's subscriber-only marker.
+///
+/// A word, not a bare glyph. The lone 🔒 that used to sit here was a
+/// small-sized outline (egui rasterizes emoji monochrome — see `crate::fonts`)
+/// in a muted purple, beside a bright state dot: it read as a speck. This is
+/// the fact that explains why a live channel is being archived from the CDN
+/// instead of the live edge, so it has to survive a glance.
+pub(super) const SUB_ONLY_BADGE: &str = "🔒 subs";
+
+/// Hover text for the ⭳ **CDN capture** badge on an instance row.
+pub(super) const CDN_CAPTURE_HOVER: &str =
+    "Being archived from Twitch's CDN. The live edge was refused (subscriber-only), so instead \
+     of a capture tool this monitor runs a CDN session: every few minutes it fetches the video \
+     published since the last pass and writes it as a numbered part beside the take's output \
+     file.\n\n\
+     This is a real capture — the parts are on disk now and \"Play local recording\" opens them \
+     in order. They are joined into the take's single file when the broadcast ends. The archive \
+     necessarily lags the live edge, because the CDN cannot serve video it hasn't segmented yet.";
+
 /// Hover text for the 🔒 **subscriber-only** badge.
 ///
 /// `covers_until` is how far the CDN head backfill has archived this broadcast
@@ -2566,6 +2585,10 @@ pub(super) fn render_instance_row(
     // Capture ended, finalize (remux/promote, possibly disk-gate-queued) still
     // pending — overrides the "recording" state display.
     finalizing: bool,
+    // A subscriber-only CDN session is archiving this monitor's current
+    // broadcast (see `crate::downloader::CdnCaptures`). Not "recording" —
+    // there is no capture process — but very much not idle either.
+    cdn_capture: bool,
     chat_active: bool,
     tint: Option<egui::Color32>,
     // TTL-cached `output_dir` existence (menus re-run per frame while open).
@@ -3344,8 +3367,20 @@ pub(super) fn render_instance_row(
                         && (crate::models::sub_only_rejected(&row.last_recording_log)
                             || crate::models::members_only_rejected(&row.last_recording_log))
                     {
-                        ui.colored_label(SUB_ONLY_COLOR, egui::RichText::new("🔒").small())
-                            .on_hover_text(sub_only_hover(m.platform(), row.last_recording_started, now));
+                        ui.colored_label(SUB_ONLY_COLOR, SUB_ONLY_BADGE).on_hover_text(
+                            sub_only_hover(m.platform(), row.last_recording_started, now),
+                        );
+                    }
+                    // A CDN session IS a capture, just not from the live edge.
+                    // Without this the row said plain "live" while gigabytes
+                    // were landing on disk — the one state where "are we
+                    // recording this?" has a non-obvious answer.
+                    if cdn_capture {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x6e, 0xc0, 0x8a),
+                            "⭳ CDN",
+                        )
+                        .on_hover_text(CDN_CAPTURE_HOVER);
                     }
                     if let Some(platform) = standby_for {
                         ui.colored_label(

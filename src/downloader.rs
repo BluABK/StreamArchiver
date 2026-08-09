@@ -83,6 +83,26 @@ pub type AdActive = Arc<Mutex<HashMap<i64, i64>>>;
 /// grid to show "finalizing" instead.
 pub type Finalizing = Arc<Mutex<HashMap<i64, i64>>>;
 
+/// A subscriber-only broadcast being archived from the CDN instead of the live
+/// edge, keyed by monitor id.
+#[derive(Clone)]
+pub struct CdnCapture {
+    /// The take that owns the parts and, eventually, the joined file.
+    pub rec_id: i64,
+    /// Set to ask the session to finish its pass, join what it has, and exit.
+    pub abort: Arc<AtomicBool>,
+}
+
+/// monitor_id -> the CDN capture session archiving that monitor's current
+/// subscriber-only broadcast.
+///
+/// Presence IS "this broadcast is being archived from the CDN instead of the
+/// live edge": `try_begin` reads it to stop spawning captures Twitch will only
+/// refuse, and the Streams grid reads it to show the monitor as capturing
+/// rather than merely live — nothing is being recorded from the live edge, but
+/// something very much is being recorded. See [`sub_only`].
+pub type CdnCaptures = Arc<Mutex<HashMap<i64, CdnCapture>>>;
+
 /// Key for the per-stream SABR stall maps: `(monitor_id, stream_id)`. Fully
 /// per-stream when a video ID is known; degrades to per-monitor otherwise.
 type SabrKey = (i64, Option<String>);
@@ -167,7 +187,7 @@ mod plan;
 mod process;
 mod raid_follow;
 mod remux;
-mod sub_only;
+pub(crate) mod sub_only;
 mod supervisor;
 mod tools;
 pub(crate) mod vod;
@@ -415,12 +435,9 @@ pub struct Supervisor {
     /// presence in this map IS "a backfill is running for this rec_id",
     /// shared with the UI via `Supervisor::abort_head_backfill`.
     head_backfill_aborts: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
-    /// Monitors with a subscriber-only CDN capture session running, each
-    /// holding the flag that session polls to wrap up early. Presence IS "this
-    /// broadcast is being archived from the CDN instead of the live edge" —
-    /// `try_begin` reads it to stop spawning captures Twitch will only refuse.
-    /// See [`sub_only`].
-    sub_only_sessions: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    /// Subscriber-only CDN capture sessions — see [`CdnCaptures`]. Shared
+    /// with AppCore so the UI can show them.
+    sub_only_sessions: CdnCaptures,
     /// rec_ids with a chapters-embed job in flight — `maybe_spawn_chapters`
     /// is called speculatively from several places, same shape as
     /// `gap_jobs`/`gap_splice_jobs`.

@@ -62,6 +62,14 @@ pub(super) enum StreamTarget {
     /// tracks but keeps zero seconds of demuxer readahead and bakes the
     /// total duration at open — video freezes and growth is not followed.)
     SplitAv(Vec<std::path::PathBuf>),
+    /// A subscriber-only broadcast's CDN parts, oldest first.
+    ///
+    /// Nothing was captured from the live edge — Twitch refused it — so these
+    /// numbered files *are* the archive until the session ends and joins them
+    /// into the take's real file. Opened as a playlist, which every player
+    /// takes: each part is complete before it's moved into place, so none of
+    /// them needs growth-following.
+    Sequence(Vec<std::path::PathBuf>),
 }
 
 /// SABR growing per-format files only need moderately-sized init data before
@@ -413,13 +421,45 @@ pub(super) fn stream_target_for_active(output_path: &str) -> Option<StreamTarget
     let mut parts: Vec<(std::path::PathBuf, u64)> =
         best.into_values().map(|(_, p, len)| (p, len)).collect();
     match parts.len() {
-        0 => None,
+        0 => cdn_parts_target(final_path, &stem),
         1 => Some(StreamTarget::Growing(parts.remove(0).0)),
         _ => {
             parts.sort_by_key(|p| std::cmp::Reverse(p.1)); // video (largest) first
             Some(StreamTarget::SplitAv(parts.into_iter().map(|(p, _)| p).collect()))
         }
     }
+}
+
+/// A subscriber-only broadcast's CDN parts next to `final_path`, in order.
+///
+/// The archive folder, not the capture cache: a refused take never captured
+/// anything, so there is nothing in the cache to find — the parts are written
+/// straight into the output folder as finished files (see
+/// `downloader::sub_only`). Without this, "Play local recording" is greyed out
+/// for precisely the broadcasts where the app *is* archiving something, just
+/// not from the live edge.
+fn cdn_parts_target(final_path: &std::path::Path, stem: &str) -> Option<StreamTarget> {
+    use crate::downloader::sub_only::{PART_INFIX, part_index};
+    let dir = final_path.parent()?;
+    let prefix = format!("{stem}{PART_INFIX}");
+    let mut parts: Vec<(usize, std::path::PathBuf)> =
+        crate::iomon::fs::read_dir_sync(crate::iomon::Cat::FsProbe, dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with(&prefix).then(|| part_index(&name).map(|i| (i, e.path())))?
+            })
+            .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    // By index, not by name: the numbering is per BROADCAST and continues
+    // across restarts, so lexical order and capture order agree only while the
+    // zero-padding holds.
+    parts.sort_by_key(|(i, _)| *i);
+    Some(StreamTarget::Sequence(parts.into_iter().map(|(_, p)| p).collect()))
 }
 
 /// True when the configured player binary is mpv (or an mpv front-end like
@@ -435,7 +475,9 @@ pub(super) fn player_is_mpv(player_path: &str) -> bool {
 /// need mpv; everything else is a plain file any player opens.
 pub(super) fn playable_with(t: &StreamTarget, player: &str) -> bool {
     match t {
-        StreamTarget::Finished(_) | StreamTarget::Growing(_) => true,
+        // A `Sequence` is just several complete files handed over in order —
+        // mpv, VLC and MPC all treat extra arguments as a playlist.
+        StreamTarget::Finished(_) | StreamTarget::Growing(_) | StreamTarget::Sequence(_) => true,
         StreamTarget::SplitAv(_) => player_is_mpv(player),
     }
 }
@@ -480,6 +522,14 @@ pub(super) fn build_player_command(player: &str, t: &StreamTarget) -> std::proce
             }
             for p in parts {
                 cmd.arg(format!("--audio-file=appending://{}", fwd_slashes(p)));
+            }
+        }
+        StreamTarget::Sequence(parts) => {
+            // Plain paths in order: a playlist, not a merge. Each part is
+            // already complete, so no `appending://` and no live flags — this
+            // is finished material that simply hasn't been concatenated yet.
+            for p in parts {
+                cmd.arg(p);
             }
         }
     }
@@ -1868,6 +1918,61 @@ mod tests {
             Some(StreamTarget::Growing(cache.join("Chan - 2026.dash.ts")))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A subscriber-only take has NOTHING in the capture cache — the live edge
+    /// was refused, so no tool ever wrote there. Its archive is the CDN parts
+    /// beside the output path, and "Play local recording" has to find them or
+    /// it stays greyed out for exactly the broadcasts that need it.
+    #[test]
+    fn probe_falls_back_to_cdn_parts_in_the_archive_folder() {
+        let (dir, _cache) = probe_dir("cdn");
+        let out = dir.join("Chan - 2026.mkv");
+        // Deliberately out of lexical order relative to creation order.
+        for i in [2usize, 0, 1] {
+            std::fs::write(dir.join(format!("Chan - 2026.cdnpart-{i:03}.mkv")), b"x").unwrap();
+        }
+        // A sibling recording's parts must not be swept in.
+        std::fs::write(dir.join("Other - 2026.cdnpart-000.mkv"), b"x").unwrap();
+        let Some(StreamTarget::Sequence(parts)) =
+            stream_target_for_active(&out.to_string_lossy())
+        else {
+            panic!("expected a Sequence of CDN parts");
+        };
+        let names: Vec<String> =
+            parts.iter().map(|p| p.file_name().unwrap().to_string_lossy().into()).collect();
+        assert_eq!(
+            names,
+            [
+                "Chan - 2026.cdnpart-000.mkv",
+                "Chan - 2026.cdnpart-001.mkv",
+                "Chan - 2026.cdnpart-002.mkv"
+            ],
+            "parts must play in index order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The parts are a playlist for ANY player — unlike a split SABR capture,
+    /// which genuinely needs mpv. Getting this wrong would grey the button out
+    /// again for everyone not using mpv.
+    #[test]
+    fn cdn_part_sequences_play_in_any_player_and_open_plainly() {
+        let t = StreamTarget::Sequence(vec![
+            std::path::PathBuf::from("a.mkv"),
+            std::path::PathBuf::from("b.mkv"),
+        ]);
+        assert!(playable_with(&t, "vlc.exe"));
+        assert!(playable_with(&t, "mpv.exe"));
+
+        // Complete files: plain paths in order, and none of the growth-following
+        // flags a live capture needs.
+        for player in ["mpv.exe", "vlc.exe"] {
+            let cmd = build_player_command(player, &t);
+            let args: Vec<String> =
+                cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            assert_eq!(args, ["a.mkv", "b.mkv"], "{player}");
+        }
     }
 
     #[test]

@@ -148,6 +148,7 @@ impl Supervisor {
         max_concurrent: usize,
         stop_holds: StopHolds,
         finalizing: Finalizing,
+        sub_only_sessions: CdnCaptures,
     ) -> Supervisor {
         // Restore the persisted holds into the shared map (the UI reads it).
         *stop_holds.lock().unwrap() = load_stop_holds(&store);
@@ -166,7 +167,7 @@ impl Supervisor {
             gap_jobs: Arc::new(Mutex::new(HashSet::new())),
             gap_splice_jobs: Arc::new(Mutex::new(HashSet::new())),
             head_backfill_aborts: Arc::new(Mutex::new(HashMap::new())),
-            sub_only_sessions: Arc::new(Mutex::new(HashMap::new())),
+            sub_only_sessions,
             chapter_jobs: Arc::new(Mutex::new(HashSet::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,

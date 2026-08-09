@@ -96,6 +96,28 @@ pub struct RecAlertBadge {
     pub gated: bool,
 }
 
+impl RecAlertBadge {
+    /// Fold another take's badge into this one — how a stream row sums the
+    /// takes below it.
+    ///
+    /// Lives here, beside the fields, rather than being spelled out at the
+    /// call site. It was spelled out, and when `gated` was added it was the
+    /// one field the rollup forgot: every take of a subscriber-only broadcast
+    /// wore its 🔒, and the stream row above them showed "⚠ tool warnings" —
+    /// so the one row you actually look at was the one that couldn't tell you
+    /// the broadcast wasn't ours to capture.
+    pub fn merge(&mut self, other: &RecAlertBadge) {
+        self.errors |= other.errors;
+        self.warnings |= other.warnings;
+        self.lost_segments += other.lost_segments;
+        self.ranges_total += other.ranges_total;
+        self.recovered += other.recovered;
+        self.muted += other.muted;
+        self.superseded |= other.superseded;
+        self.gated |= other.gated;
+    }
+}
+
 /// Lifetime capture-health rollup (the App Stats "Capture health" totals).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AlertHealthTotals {
@@ -1035,6 +1057,38 @@ mod tests {
         let b2 = badges.get(&rid2).expect("the second take has a badge too");
         assert!(b2.gated, "every gated take wears the lock, not just the first");
         assert!(!b2.errors);
+    }
+
+    /// The stream row sums its takes' badges. Every field has to survive that
+    /// sum — `gated` did not, so a subscriber-only broadcast's takes each wore
+    /// 🔒 while the stream row above them said "⚠ tool warnings", which is
+    /// both wrong and the row people actually read.
+    #[test]
+    fn rolling_up_takes_keeps_every_reason_including_gated() {
+        let mut agg = RecAlertBadge::default();
+        agg.merge(&RecAlertBadge {
+            warnings: true,
+            lost_segments: 3,
+            ranges_total: 1,
+            recovered: 1,
+            ..Default::default()
+        });
+        agg.merge(&RecAlertBadge {
+            gated: true,
+            errors: true,
+            lost_segments: 4,
+            muted: 2,
+            superseded: true,
+            ..Default::default()
+        });
+
+        assert!(agg.gated, "a gated take anywhere in the stream marks the stream");
+        assert!(agg.errors);
+        assert!(agg.warnings);
+        assert!(agg.superseded);
+        // Counts sum, flags OR — nothing is dropped and nothing is overwritten
+        // by the last take merged.
+        assert_eq!((agg.lost_segments, agg.ranges_total, agg.recovered, agg.muted), (7, 1, 1, 2));
     }
 
     #[test]

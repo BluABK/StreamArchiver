@@ -1967,6 +1967,15 @@ impl StreamArchiverApp {
         let finalizing_mons: HashMap<i64, i64> = self.core.finalizing.lock().unwrap().clone();
         let finalizing_ids: HashSet<i64> = finalizing_mons.keys().copied().collect();
         let finalizing_recs: HashSet<i64> = finalizing_mons.values().copied().collect();
+        // Subscriber-only broadcasts being archived from the CDN — no capture
+        // process, so they are absent from `active_ids`, but they are being
+        // recorded and the row has to say so.
+        let cdn_captures = self.core.cdn_captures.lock().unwrap().clone();
+        let cdn_capture_ids: HashSet<i64> = cdn_captures.keys().copied().collect();
+        // …and the anchor TAKE of each, so the stream row for the broadcast
+        // actually being extended can say so. `gated` alone marks every
+        // subscriber-only stream ever archived; this marks the live one.
+        let cdn_capture_recs: HashSet<i64> = cdn_captures.values().map(|c| c.rec_id).collect();
         // Snapshot which monitors have a live-chat download running (💬 badge on
         // instance rows, bubbled up to their channel row while active).
         let active_chat_ids: HashSet<i64> =
@@ -2194,7 +2203,8 @@ impl StreamArchiverApp {
                                     &self.rows, channel_name_colors, latest_raid_out,
                                     &mut self.fs_probes.lock().unwrap(), &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
-                                    &finalizing_ids, &active_chat_ids, selected_monitor,
+                                    &finalizing_ids, &cdn_capture_ids, &active_chat_ids,
+                                    selected_monitor,
                                     &exp_instances, instance_avatars,
                                     cache.rolling_counts.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
                                     cache
@@ -2220,7 +2230,8 @@ impl StreamArchiverApp {
                                 Self::stream_row(
                                     &mut tr, &groups[&mid][gi], mid, depth, &self.rows,
                                     &mut self.fs_probes.lock().unwrap(), &self.settings,
-                                    &self.background_tasks, &finalizing_recs, ad_breaks,
+                                    &self.background_tasks, &finalizing_recs,
+                                    &cdn_capture_recs, ad_breaks,
                                     meta_logs, &self.collab_by_stream, &exp_streams,
                                     &selected_streams, sel_color,
                                     current_recording_group.as_ref().map(|(id, name)| (*id, name.as_str())),
@@ -2235,7 +2246,8 @@ impl StreamArchiverApp {
                                     &mut tr, &groups[&mid][gi], ti, depth, &self.rows,
                                     mid, &self.core, &mut self.status,
                                     &mut self.fs_probes.lock().unwrap(), &self.settings,
-                                    &self.background_tasks, &finalizing_recs, ad_breaks,
+                                    &self.background_tasks, &finalizing_recs,
+                                    &cdn_capture_recs, ad_breaks,
                                     meta_logs, &self.collab_by_stream,
                                     &mut self.rename_rec_id, &mut self.rename_draft,
                                     &mut self.rename_preview,
@@ -3962,12 +3974,59 @@ impl StreamArchiverApp {
         }
         // Most recent finished take (only known once the row's been
         // expanded at least once — `groups` isn't populated otherwise).
-        group_takes
+        if let Some(t) = group_takes
             .into_iter()
             .flatten()
             .flat_map(|g| g.takes.iter())
             .find(|t| !t.output_path.is_empty() && fs.is_file(std::path::Path::new(&t.output_path)))
-            .map(|t| StreamTarget::Finished(std::path::PathBuf::from(&t.output_path)))
+        {
+            return Some(StreamTarget::Finished(std::path::PathBuf::from(&t.output_path)));
+        }
+        // A subscriber-only broadcast: every take was refused, so none of them
+        // has an output file — but the CDN session has been writing numbered
+        // parts beside where that file would go, and those are playable now.
+        // Checked last so a real capture always wins, and only for GATED takes
+        // so this costs one directory scan on the rows that can benefit rather
+        // than on every take in the archive.
+        group_takes
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g.takes.iter())
+            .filter(|t| t.gated && !t.output_path.is_empty())
+            .find_map(|t| match fs.target(&t.output_path) {
+                Some(t @ StreamTarget::Sequence(_)) => Some(t),
+                _ => None,
+            })
+    }
+
+    /// What "Play local recording" should open for ONE take.
+    ///
+    /// One function because there are two call sites per take — the row's ⏵
+    /// button and its context-menu entry — which have to agree about what is
+    /// playable, or a button is enabled and the menu entry beside it isn't.
+    fn take_stream_target(
+        t: &crate::models::Recording,
+        file_ok: bool,
+        fs: &mut FsProbes,
+    ) -> Option<StreamTarget> {
+        if t.is_active() {
+            return fs.target(&t.output_path);
+        }
+        if file_ok {
+            return Some(StreamTarget::Finished(std::path::PathBuf::from(&t.output_path)));
+        }
+        // Subscriber-only: Twitch refused the live edge, so this take has no
+        // output file and never will — but the CDN session writes numbered
+        // parts beside where that file would go, and they are complete and
+        // playable now. Without this the one take that IS being archived is
+        // also the one whose Play button is greyed out.
+        if t.gated && !t.output_path.is_empty() {
+            return match fs.target(&t.output_path) {
+                Some(st @ StreamTarget::Sequence(_)) => Some(st),
+                _ => None,
+            };
+        }
+        None
     }
 
     /// Render one capture-instance row (the cells live in
@@ -3991,6 +4050,8 @@ impl StreamArchiverApp {
         now: i64,
         active_ids: &HashSet<i64>,
         finalizing_ids: &HashSet<i64>,
+        // Monitors with a subscriber-only CDN capture session running.
+        cdn_capture_ids: &HashSet<i64>,
         active_chat_ids: &HashSet<i64>,
         selected_monitor: Option<i64>,
         exp_instances: &HashSet<i64>,
@@ -4027,6 +4088,7 @@ impl StreamArchiverApp {
         // "Recording" = a live capture process; a finalize-pending take still
         // occupies `active` but its capture has ended.
         let recording = active_ids.contains(&mid) && !finalizing;
+        let cdn_capture = cdn_capture_ids.contains(&mid);
         let chat_active = active_chat_ids.contains(&mid);
         let is_selected = selected_monitor == Some(mid);
         let has_hist = row.recording_count > 0;
@@ -4124,7 +4186,7 @@ impl StreamArchiverApp {
             s
         });
         if render_instance_row(
-            tr, row, ptex, now, recording, finalizing, chat_active,
+            tr, row, ptex, now, recording, finalizing, cdn_capture, chat_active,
             tint, output_dir_ok, depth, has_hist, expanded,
             inst_needs_remux,
             inst_stream_target.as_ref(), &media_player,
@@ -4332,6 +4394,9 @@ impl StreamArchiverApp {
         settings: &SettingsForm,
         background_tasks: &[crate::events::BackgroundTask],
         finalizing_recs: &HashSet<i64>,
+        // Anchor takes of running subscriber-only CDN sessions — see
+        // `crate::downloader::CdnCaptures`.
+        cdn_capture_recs: &HashSet<i64>,
         ad_breaks: &HashMap<i64, Vec<AdBreak>>,
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
         collab_by_stream: &HashMap<(i64, String), String>,
@@ -4533,8 +4598,20 @@ impl StreamArchiverApp {
                     "state" => {
                         let finalizing = g.status() == "recording"
                             && g.takes.iter().any(|t| finalizing_recs.contains(&t.id));
+                        // A subscriber-only broadcast whose CDN session is
+                        // still running. Its takes are all `failed` — Twitch
+                        // refused every one — so the group's own status says
+                        // "failed" while parts are actively landing on disk.
+                        let cdn_running =
+                            g.takes.iter().any(|t| cdn_capture_recs.contains(&t.id));
                         let last_err_ack = g.takes.last().is_some_and(|t| t.err_ack);
-                        let shown = if finalizing { "finalizing" } else { g.status() };
+                        let shown = if finalizing {
+                            "finalizing"
+                        } else if cdn_running {
+                            "recording"
+                        } else {
+                            g.status()
+                        };
                         let (icon, color) = state_icon_ack(shown, last_err_ack);
                         let resp = ui.colored_label(color, icon);
                         if finalizing {
@@ -4605,13 +4682,7 @@ impl StreamArchiverApp {
                             for t in &g.takes {
                                 if let Some(a) = rec_alerts.get(&t.id) {
                                     any = true;
-                                    agg.errors |= a.errors;
-                                    agg.warnings |= a.warnings;
-                                    agg.lost_segments += a.lost_segments;
-                                    agg.ranges_total += a.ranges_total;
-                                    agg.recovered += a.recovered;
-                                    agg.muted += a.muted;
-                                    agg.superseded |= a.superseded;
+                                    agg.merge(a);
                                 }
                             }
                             any.then_some(agg)
@@ -5130,6 +5201,9 @@ impl StreamArchiverApp {
         settings: &SettingsForm,
         background_tasks: &[crate::events::BackgroundTask],
         finalizing_recs: &HashSet<i64>,
+        // Anchor takes of running subscriber-only CDN sessions — see
+        // `crate::downloader::CdnCaptures`.
+        cdn_capture_recs: &HashSet<i64>,
         ad_breaks: &HashMap<i64, Vec<AdBreak>>,
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
         collab_by_stream: &HashMap<(i64, String), String>,
@@ -5196,15 +5270,8 @@ impl StreamArchiverApp {
                                     Some(std::path::PathBuf::from(&t.output_path));
                                 out.mark_started_stream = Some((g.key.clone(), mid));
                             }
-                            let stream_target = if t.is_active() {
-                                fs_probes.target(&t.output_path)
-                            } else if file_ok {
-                                Some(StreamTarget::Finished(
-                                    std::path::PathBuf::from(&t.output_path),
-                                ))
-                            } else {
-                                None
-                            };
+                            let stream_target =
+                                Self::take_stream_target(t, file_ok, fs_probes);
                             let player_ok = !media_player.is_empty()
                                 && stream_target
                                     .as_ref()
@@ -5217,6 +5284,8 @@ impl StreamArchiverApp {
                                 )
                                 .on_hover_text(if t.is_active() {
                                     "Play local recording (start) — opens the live capture"
+                                } else if matches!(stream_target, Some(StreamTarget::Sequence(_))) {
+                                    "Play the subscriber-only CDN parts captured so far, in order — this broadcast was refused at the live edge, so the numbered parts ARE the archive until they are joined when it ends."
                                 } else {
                                     "Open in player"
                                 })
@@ -5297,6 +5366,10 @@ impl StreamArchiverApp {
                     "state" => {
                         let finalizing =
                             t.status == "recording" && finalizing_recs.contains(&t.id);
+                        // This take is the anchor of a running CDN session:
+                        // its own status is `failed` (Twitch refused the live
+                        // edge) while parts are landing on disk right now.
+                        let cdn_running = cdn_capture_recs.contains(&t.id);
                         let shown = if finalizing { "finalizing" } else { t.status.as_str() };
                         let (icon, color) = state_icon_ack(shown, t.err_ack);
                         let sub_only = crate::models::sub_only_rejected(&t.log_excerpt)
@@ -5310,6 +5383,13 @@ impl StreamArchiverApp {
                         } else {
                             ui.colored_label(color, icon)
                         };
+                        if cdn_running {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0x6e, 0xc0, 0x8a),
+                                "⭳ CDN",
+                            )
+                            .on_hover_text(grid::CDN_CAPTURE_HOVER);
+                        }
                         if finalizing {
                             resp.on_hover_text(FINALIZING_HOVER);
                         } else if t.status == "failed" {
@@ -5584,15 +5664,7 @@ impl StreamArchiverApp {
                     ui.close();
                 }
                 {
-                    let stream_target = if t.is_active() {
-                        fs_probes.target(&t.output_path)
-                    } else if file_ok {
-                        Some(StreamTarget::Finished(
-                            std::path::PathBuf::from(&t.output_path),
-                        ))
-                    } else {
-                        None
-                    };
+                    let stream_target = Self::take_stream_target(t, file_ok, fs_probes);
                     let player_ok = !media_player.is_empty()
                         && stream_target
                             .as_ref()
@@ -5605,6 +5677,8 @@ impl StreamArchiverApp {
                         )
                         .on_hover_text(if t.is_active() {
                             "Open live capture in the configured media player"
+                        } else if matches!(stream_target, Some(StreamTarget::Sequence(_))) {
+                            "Play the subscriber-only CDN parts captured so far, in order — this broadcast was refused at the live edge, so the numbered parts ARE the archive until they are joined when it ends."
                         } else {
                             "Open in the configured media player"
                         })
