@@ -615,8 +615,9 @@ down to a stream/take for the exact, disk-confirmed figure. Since nothing
 watches the filesystem, a file deleted (or moved) **outside** the app leaves
 that stored total wrong until something checks — right-click a channel or
 instance row and choose **🔄 Rescan disk usage** to check every one of its
-takes against disk and clear any that are gone; it runs in the background and
-the status bar reports what it found. A take finalized
+takes against disk and clear any that are gone, or use the same-named button
+in the Streams toolbar to check every channel at once; either runs in the
+background and the status bar reports what it found. A take finalized
 before 2026-07-26 may show a **⚠** on its Duration cell (and in the take's
 Properties window): a since-fixed bug stamped the end time *after* its remux
 finished rather than when the capture actually stopped, so a take whose remux

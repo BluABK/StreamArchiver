@@ -3673,6 +3673,21 @@ impl eframe::App for StreamArchiverApp {
                     {
                         self.reset_streams_columns = true;
                     }
+                    if ui
+                        .button("🔄 Rescan disk usage")
+                        .on_hover_text(
+                            "Check every stored take of every channel against disk and \
+                             clear any whose file is gone (e.g. deleted outside the app) \
+                             — the 💾 Disk use column otherwise keeps counting it. Runs \
+                             in the background; a single channel/instance can be rescanned \
+                             on its own from its right-click menu instead.",
+                        )
+                        .clicked()
+                    {
+                        let mids: Vec<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
+                        self.status = "Rescanning disk usage…".into();
+                        self.start_rescan_disk_usage(mids);
+                    }
                 });
             });
         }
