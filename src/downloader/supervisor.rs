@@ -1728,7 +1728,7 @@ progress_info: None,
                 return;
             }
             if self.store.job_enabled("job_asset_refresh") {
-                self.refresh_stale_assets_once();
+                self.refresh_stale_assets_once().await;
                 crate::events::mark_job(&jobs, "Channel asset refresh", TICK_SECS as i64);
             }
             crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
@@ -1737,7 +1737,19 @@ progress_info: None,
 
     /// One asset-refresh pass: trigger a (staleness-gated) fetch for each eligible
     /// channel, de-duplicated across instances that share an asset dir.
-    fn refresh_stale_assets_once(&self) {
+    ///
+    /// Staggered, not fired all at once: channels tend to cross the 24h
+    /// staleness window in clusters (they were typically all last fetched
+    /// together — at startup, or a previous mass sweep), so an unthrottled
+    /// loop here spawns dozens of `fetch_channel_assets` tasks within the
+    /// same instant. Each one hits BTTV/FFZ/7TV — services with tight
+    /// per-IP limits, unlike Twitch's own Helix quota — from this single
+    /// machine's one IP, and a cluster that size blows straight through
+    /// them (observed: dozens of channels' BTTV/FFZ calls 429ing back to
+    /// back). `ASSET_SWEEP_STAGGER` spaces the per-channel spawns out so a
+    /// large cluster fans out over the sweep instead of landing in one burst.
+    async fn refresh_stale_assets_once(&self) {
+        const ASSET_SWEEP_STAGGER: Duration = Duration::from_millis(500);
         let rows = match self.store.list_monitors_with_channels() {
             Ok(r) => r,
             Err(e) => {
@@ -1785,6 +1797,7 @@ progress_info: None,
             }
             // force=false: a no-op when the channel's assets are still fresh.
             self.fetch_channel_assets(row, None, false);
+            tokio::time::sleep(ASSET_SWEEP_STAGGER).await;
         }
     }
 
