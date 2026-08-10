@@ -460,6 +460,7 @@ impl StreamArchiverApp {
                 cs.animate_emotes,
                 ChatAppearance {
                     font_pt: cs.font_pt,
+                    ts_pt: (cs.font_pt + cs.ts_size_offset).max(6.0),
                     emote_pt: cs.emote_pt,
                     ts_color: cs.ts_color,
                     text_color: cs.text_color,
@@ -532,6 +533,12 @@ impl StreamArchiverApp {
                             // currently-loaded log. Same "read off popup first"
                             // reason as `catalog`/`channel` above.
                             let recent_logins = recent_chat_authors(&popup.load_state, 60);
+                            let send_color = popup
+                                .settings
+                                .lock()
+                                .unwrap()
+                                .send_button_color
+                                .resolve(popup.channel_color);
                             let Some(bar) = popup.send.as_mut() else { return };
                             let now_ms = crate::models::now_unix() * 1000;
                             let bid = bar.broadcaster_id.lock().unwrap().clone();
@@ -569,10 +576,26 @@ impl StreamArchiverApp {
                                 set_draft_caret(ctx, edit_id, bar.draft.chars().count());
                             }
                             ui.horizontal(|ui| {
-                                let out = egui::TextEdit::singleline(&mut bar.draft)
+                                // Multiline, not singleline: a long message
+                                // otherwise scrolled off to the right instead
+                                // of wrapping, hiding everything past the
+                                // edge of the box. `return_key` moves the
+                                // newline-insert binding off plain Enter
+                                // (which multiline treats as "insert a
+                                // newline" by default) onto Shift+Enter, so
+                                // Enter alone still sends — Twitch messages
+                                // are fundamentally one line; this is about
+                                // SEEING a long one while typing it, not
+                                // composing a multi-line message.
+                                let out = egui::TextEdit::multiline(&mut bar.draft)
                                     .id(edit_id)
                                     .hint_text("Send a message")
                                     .desired_width(ui.available_width() - 120.0)
+                                    .desired_rows(1)
+                                    .return_key(egui::KeyboardShortcut::new(
+                                        egui::Modifiers::SHIFT,
+                                        egui::Key::Enter,
+                                    ))
                                     .show(ui);
                                 let resp = out.response;
                                 let caret = out.cursor_range.map(|c| c.primary.index);
@@ -606,14 +629,26 @@ impl StreamArchiverApp {
                                     // NOT send a half-typed `:spin`.
                                     Completion::Open => {}
                                     Completion::None => {
-                                        // Enter sends, then keeps focus so a
-                                        // conversation doesn't need a click
-                                        // per line.
-                                        if resp.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        // Enter sends. Checked directly against
+                                        // focus + the key press rather than
+                                        // `lost_focus()`: singleline's Enter
+                                        // surrendered focus on its own, which is
+                                        // what `lost_focus()` used to key off of,
+                                        // but multiline only loses focus on
+                                        // Tab/Escape/click-away now that plain
+                                        // Enter no longer inserts a newline
+                                        // (`return_key` moved that to
+                                        // Shift+Enter above) — it wouldn't fire
+                                        // at all otherwise. Focus is already kept
+                                        // by not losing it, so no explicit
+                                        // `request_focus()` needed either.
+                                        if resp.has_focus()
+                                            && ui.input(|i| {
+                                                i.key_pressed(egui::Key::Enter)
+                                                    && !i.modifiers.shift
+                                            })
                                         {
                                             submit = true;
-                                            resp.request_focus();
                                         }
                                     }
                                 }
@@ -629,8 +664,20 @@ impl StreamArchiverApp {
                                 {
                                     bar.picker_open = !bar.picker_open;
                                 }
+                                // Twitch-style: a large filled pill, not a
+                                // default-grey button — the same weight as
+                                // its own "Chat" button. Colour is
+                                // configurable in Settings → Interface →
+                                // Display (fixed, or inherit the channel's
+                                // own accent, same option the goal bar has).
+                                let send_btn = egui::Button::new(
+                                    egui::RichText::new("Send").strong().color(egui::Color32::WHITE),
+                                )
+                                .fill(send_color)
+                                .corner_radius(16.0)
+                                .min_size(egui::vec2(72.0, 30.0));
                                 submit |= ui
-                                    .add_enabled(ready, egui::Button::new("Send"))
+                                    .add_enabled(ready, send_btn)
                                     .on_disabled_hover_text(match (&bid, busy, &block) {
                                         (None, ..) => {
                                             "Still looking up this channel on Twitch.".to_string()
@@ -981,9 +1028,9 @@ impl StreamArchiverApp {
                     ui.separator();
 
                     if popup.show_appearance {
-                        let (mut font_pt, mut emote_pt, mut ts_color, mut text_color) = {
+                        let (mut font_pt, mut ts_size_offset, mut emote_pt, mut ts_color, mut text_color) = {
                             let cs = popup.settings.lock().unwrap();
-                            (cs.font_pt, cs.emote_pt, cs.ts_color, cs.text_color)
+                            (cs.font_pt, cs.ts_size_offset, cs.emote_pt, cs.ts_color, cs.text_color)
                         };
                         egui::Window::new("Chat Appearance")
                             .id(egui::Id::new(("chat_appearance_win", popup.monitor_id)))
@@ -1009,6 +1056,31 @@ impl StreamArchiverApp {
                                         let _ = shared.core.store.set_setting(
                                             K_CHAT_FONT_PT,
                                             &font_pt.to_string(),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Timestamp size:");
+                                    let sign = if ts_size_offset >= 0.0 { "+" } else { "" };
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut ts_size_offset)
+                                                .range(-6.0..=6.0)
+                                                .prefix(sign)
+                                                .suffix(" pt vs. text"),
+                                        )
+                                        .on_hover_text(
+                                            "Timestamp size relative to the message text — \
+                                             negative reads as a timestamp, not a fourth column \
+                                             of body text. 0 matches Twitch's own popout, which \
+                                             renders both at the same size.",
+                                        )
+                                        .changed()
+                                    {
+                                        popup.settings.lock().unwrap().ts_size_offset = ts_size_offset;
+                                        let _ = shared.core.store.set_setting(
+                                            K_CHAT_TS_SIZE_OFFSET,
+                                            &ts_size_offset.to_string(),
                                         );
                                     }
                                 });
@@ -1122,6 +1194,7 @@ impl StreamArchiverApp {
                                     {
                                         let mut cs = popup.settings.lock().unwrap();
                                         cs.font_pt = CHAT_FONT_PT_DEFAULT;
+                                        cs.ts_size_offset = CHAT_TS_SIZE_OFFSET_DEFAULT;
                                         cs.emote_pt = CHAT_EMOTE_PT_DEFAULT;
                                         cs.ts_color = egui::Color32::WHITE;
                                         cs.text_color = egui::Color32::WHITE;
@@ -1131,6 +1204,10 @@ impl StreamArchiverApp {
                                     let _ = shared.core.store.set_setting(
                                         K_CHAT_FONT_PT,
                                         &CHAT_FONT_PT_DEFAULT.to_string(),
+                                    );
+                                    let _ = shared.core.store.set_setting(
+                                        K_CHAT_TS_SIZE_OFFSET,
+                                        &CHAT_TS_SIZE_OFFSET_DEFAULT.to_string(),
                                     );
                                     let _ = shared.core.store.set_setting(
                                         K_CHAT_EMOTE_PT,
@@ -1765,6 +1842,20 @@ impl StreamArchiverApp {
                                                     })
                                                     .corner_radius(2.0)
                                                     .show(ui, |ui| {
+                                                        // A Frame sizes its
+                                                        // fill to its
+                                                        // content's actual
+                                                        // bounding box —
+                                                        // without this, a
+                                                        // short message's
+                                                        // highlight/accent
+                                                        // fill stops right
+                                                        // after the text
+                                                        // instead of
+                                                        // spanning the row
+                                                        // like Twitch's own
+                                                        // popout.
+                                                        ui.set_min_width(ui.available_width());
                                                         ui.scope(|ui| {
                                                             render_chat_message(
                                                                 ui,
@@ -1800,6 +1891,24 @@ impl StreamArchiverApp {
                                                 ),
                                                 1.0,
                                                 c,
+                                            );
+                                        }
+                                        // "FIRST MESSAGE" etc.: a corner tag,
+                                        // Twitch-style, not inline with the
+                                        // message text — same "paint from the
+                                        // measured rect after the fact"
+                                        // reason as the accent bar above.
+                                        if let Some((label, color)) = decor.corner_label {
+                                            let rect = r.response.rect;
+                                            ui.painter().text(
+                                                rect.right_top() + egui::vec2(-4.0, 2.0),
+                                                egui::Align2::RIGHT_TOP,
+                                                label,
+                                                egui::FontId::new(
+                                                    (appearance.font_pt * 0.7).max(8.0),
+                                                    egui::FontFamily::Proportional,
+                                                ),
+                                                color,
                                             );
                                         }
                                         let (row_click, row_menu) = r.inner.inner;

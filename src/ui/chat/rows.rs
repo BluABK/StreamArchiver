@@ -10,6 +10,11 @@ use super::*;
 /// chat window rather than the global Settings dialog.
 pub(in crate::ui) struct ChatAppearance {
     pub(in crate::ui) font_pt: f32,
+    /// `font_pt + ts_size_offset`, clamped so it can never reach zero/negative
+    /// — the size actually applied to the timestamp. Precomputed here rather
+    /// than in the renderer so a `layout_key` change (offset edited) and the
+    /// drawn size can never drift apart.
+    pub(in crate::ui) ts_pt: f32,
     /// Emote/emoji pixel size, independent of `font_pt` — see
     /// `StreamArchiverApp::chat_emote_pt`'s doc.
     pub(in crate::ui) emote_pt: f32,
@@ -143,6 +148,12 @@ pub(in crate::ui) struct RowDecor {
     pub(in crate::ui) fill: egui::Color32,
     /// The 3px bar down the left edge, Twitch-style. `None` = ordinary row.
     pub(in crate::ui) accent: Option<egui::Color32>,
+    /// A small tag drawn in the row's upper-right corner (Twitch's own
+    /// "FIRST MESSAGE" chip lives here, not inline with the message text —
+    /// only computable once the row's full rect is known, so the caller
+    /// paints it after the row is laid out rather than `render_chat_message`
+    /// drawing it itself.
+    pub(in crate::ui) corner_label: Option<(&'static str, egui::Color32)>,
 }
 
 /// Twitch's own purple, used for first-message and redemption accents.
@@ -186,30 +197,43 @@ pub(in crate::ui) fn row_decor(
     emphasis: RowEmphasis,
     visuals: &egui::Visuals,
 ) -> RowDecor {
+    // Independent of emphasis/fill: "this account's first-ever message here"
+    // is a fact about the message, not a substitute for a hit or watched-
+    // chatter accent, so it still shows even when one of those wins the row.
+    let corner_label = matches!(msg.notice.as_deref(), Some(ChatNotice::FirstMessage))
+        .then_some(("FIRST MESSAGE", TWITCH_PURPLE));
     match emphasis {
         RowEmphasis::Hit => {
             return RowDecor {
                 fill: HIT_COLOR.gamma_multiply(0.22),
                 accent: Some(HIT_COLOR),
+                corner_label,
             };
         }
         RowEmphasis::Chatter => {
             return RowDecor {
                 fill: visuals.selection.bg_fill.gamma_multiply(0.35),
                 accent: Some(visuals.selection.bg_fill),
+                corner_label,
             };
         }
         RowEmphasis::None => {}
     }
     let Some(notice) = msg.notice.as_deref() else {
-        return RowDecor { fill: egui::Color32::TRANSPARENT, accent: None };
+        return RowDecor { fill: egui::Color32::TRANSPARENT, accent: None, corner_label };
     };
-    let tinted = |c: egui::Color32| RowDecor { fill: c.gamma_multiply(0.16), accent: Some(c) };
+    let tinted = |c: egui::Color32| RowDecor {
+        fill: c.gamma_multiply(0.16),
+        accent: Some(c),
+        corner_label,
+    };
     match notice {
         // The muted informational line keeps its plain look — it is already
         // visually distinct (italic, weak, no author) and an accent bar would
         // give routine room events more weight than a sub.
-        ChatNotice::System => RowDecor { fill: egui::Color32::TRANSPARENT, accent: None },
+        ChatNotice::System => {
+            RowDecor { fill: egui::Color32::TRANSPARENT, accent: None, corner_label }
+        }
         ChatNotice::FirstMessage | ChatNotice::Redemption { .. } => tinted(TWITCH_PURPLE),
         ChatNotice::Sub { .. } | ChatNotice::WatchStreak { .. } => {
             tinted(egui::Color32::from_rgb(0x3e, 0x9b, 0xd6))
@@ -293,6 +317,7 @@ impl ChatAppearance {
     pub(in crate::ui) fn layout_key(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&self.font_pt.to_bits(), &mut h);
+        std::hash::Hash::hash(&self.ts_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.emote_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.font_id, &mut h);
         // `[00:40:10]` and `19:30` are different widths, which changes where
@@ -369,10 +394,25 @@ pub(in crate::ui) fn render_chat_message(
     can_send: bool,
 ) -> (Option<UserCardClick>, Option<RowMenuAction>) {
     let (shown_ts, other_ts) = fmt_chat_ts_mode(msg, appearance.ts_mode);
-    ui.horizontal_wrapped(|ui| {
+    // Bottom-aligned, not `horizontal_wrapped`'s default vertical centering:
+    // Twitch anchors every item in a chat line to the text's baseline, so an
+    // oversized emote grows UPWARD from that shared line rather than being
+    // centered in a box tall enough to fit it — which is what centering an
+    // image (no descender, fills its whole box) against text (whose visible
+    // glyphs sit above the geometric middle of ITS box, to leave descender
+    // room) actually looks like: the image reads as pushed down relative to
+    // the text even though both are numerically centered correctly. Bottom-
+    // aligning everything to a shared line puts both flush against the same
+    // edge instead, matching Twitch's own popout.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_size_before_wrap().x, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Max).with_main_wrap(true),
+        |ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         // Timestamp — monospace, sized/colored to match the message body
-        // (Twitch's own popout renders both at the same size).
+        // (Twitch's own popout renders both at the same size), just
+        // `ts_size_offset` points smaller by default (configurable in the
+        // ⚙ Chat Appearance panel).
         ui.label(
             // Monospace on purpose, and NOT the chat family: the bracketed
             // stream-relative timestamp is a column, and a proportional face
@@ -380,7 +420,7 @@ pub(in crate::ui) fn render_chat_message(
             // form keeps it too, so switching modes doesn't shuffle the layout.
             egui::RichText::new(shown_ts)
                 .monospace()
-                .size(appearance.font_pt)
+                .size(appearance.ts_pt)
                 .color(appearance.ts_color),
         )
         .on_hover_text(other_ts);
@@ -565,12 +605,18 @@ pub(in crate::ui) fn render_chat_message(
                 None => ui.label(name_text),
             };
         }
-        // Reply-thread prefix (Twitch): who this message answers.
+        // Reply-thread prefix (Twitch): who this message answers. Twitch's
+        // reply tags carry only the target's name, not their USERCOLOR, so
+        // this is the same deterministic default-colour fallback an
+        // untagged sender's own name would get — a real colour rather than
+        // a flat grey, even without knowing whether they ever set one.
         if !msg.reply_to.is_empty() {
             let weak = ui.visuals().weak_text_color();
+            let reply_color =
+                readable_color(twitch_username_color(&msg.reply_to), ui.visuals().panel_fill);
             ui_icon(ui, icons, ICON_REPLY, appearance.font_pt * 0.85, weak)
                 .on_hover_text("This message is a reply in a thread");
-            ui.label(egui::RichText::new(&msg.reply_to).small().color(weak))
+            ui.label(egui::RichText::new(&msg.reply_to).small().color(reply_color))
                 .on_hover_text("This message is a reply in a thread");
         }
         // A moderator-struck message: the archived original renders
@@ -688,16 +734,12 @@ pub(in crate::ui) fn render_chat_message(
                 }
             }
         }
-        // Twitch tags a first-ever message in the channel. Trailing rather
-        // than right-aligned: this is a wrapped inline layout, so a
-        // right-aligned chip would need its own pass to place and would
-        // collide with a long message's last line anyway.
-        if matches!(msg.notice.as_deref(), Some(ChatNotice::FirstMessage)) {
-            ui.label(egui::RichText::new("FIRST MESSAGE").small().strong().color(TWITCH_PURPLE))
-                .on_hover_text("The first message this account has ever sent in this channel");
-        }
+        // "FIRST MESSAGE" renders as a corner chip, not inline here — see
+        // `RowDecor::corner_label` and its caller in `window.rs`, which
+        // paints it once the row's full rect is known.
         (click, menu_action)
-    })
+        },
+    )
     .inner
 }
 

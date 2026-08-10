@@ -67,7 +67,16 @@ pub(in crate::ui) fn chat_card<R>(
         .fill(card_fill(ui.visuals()))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(9, 6))
-        .show(ui, add);
+        .show(ui, |ui| {
+            // A Frame sizes its fill to its content's actual bounding box —
+            // without this, a card whose content doesn't reach the right
+            // edge (a short goal description, a one-line supporters list)
+            // renders narrower than the window instead of spanning it the
+            // way Twitch's own popout cards do. Same fix as the message
+            // rows' highlight fill (`window.rs`'s virtualized loop).
+            ui.set_min_width(ui.available_width());
+            add(ui)
+        });
     ui.add_space(4.0);
     r
 }

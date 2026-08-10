@@ -134,6 +134,12 @@ const CHAT_FONT_PT_DEFAULT: f32 = 14.0;
 /// the font size instead (see `ui::chat::render_chat_message`).
 const K_CHAT_EMOTE_PT: &str = "chat_emote_size_px";
 const CHAT_EMOTE_PT_DEFAULT: f32 = 24.0;
+/// Timestamp size relative to `K_CHAT_FONT_PT` (points, can be negative).
+/// Default -1: a hair smaller than the message body reads as a timestamp,
+/// not a fourth column of body text — configurable because that's a
+/// preference, not a fact about what's "correct".
+const K_CHAT_TS_SIZE_OFFSET: &str = "chat_ts_size_offset_pt";
+const CHAT_TS_SIZE_OFFSET_DEFAULT: f32 = -1.0;
 /// Chat-replay timestamp color (hex `#RRGGBB`). Default white — the previous
 /// hardcoded `weak_text_color()` rendered too dark-grey to read comfortably.
 const K_CHAT_TS_COLOR: &str = "chat_ts_color";
@@ -180,6 +186,10 @@ const K_CHAT_TS_MODE: &str = "chat_timestamp_mode";
 /// muted version of it — and the whole thing is configurable because "how
 /// loud" is a matter of taste, not correctness.
 const K_CHAT_GOAL_COLOR: &str = "chat_goal_color";
+/// Send button fill: a hex colour, or `"channel"` to inherit the channel's
+/// own display colour — same `"channel"`-or-hex shape as [`K_CHAT_GOAL_COLOR`].
+/// Default: Twitch's own send-button purple.
+const K_CHAT_SEND_BUTTON_COLOR: &str = "chat_send_button_color";
 /// Per-instance timestamp-mode overrides, as `{"<monitor id>": "clock"}`.
 /// An instance absent from the map INHERITS [`K_CHAT_TS_MODE`] — the same
 /// delete-not-store shape the scoped capture settings use, so "follow the

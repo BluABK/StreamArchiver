@@ -326,6 +326,8 @@ pub(super) struct ChatSettingsState {
     pub(super) fetch_unknown_emotes: bool,
     pub(super) fetch_usercard_info: bool,
     pub(super) font_pt: f32,
+    /// Timestamp size relative to `font_pt` — see [`K_CHAT_TS_SIZE_OFFSET`].
+    pub(super) ts_size_offset: f32,
     pub(super) emote_pt: f32,
     pub(super) ts_color: egui::Color32,
     pub(super) text_color: egui::Color32,
@@ -350,6 +352,8 @@ pub(super) struct ChatSettingsState {
     pub(super) render_paints: bool,
     /// Where the Creator Goal bar's fill comes from — see [`GoalColor`].
     pub(super) goal_color: GoalColor,
+    /// Where the send button's fill comes from — see [`SendButtonColor`].
+    pub(super) send_button_color: SendButtonColor,
     /// The custom highlight rules. Live here rather than snapshotted per
     /// window: a rule added while a chat window is open has to start
     /// accenting rows immediately, without reopening it.
@@ -388,6 +392,12 @@ impl ChatSettingsState {
                 .flatten()
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(CHAT_EMOTE_PT_DEFAULT),
+            ts_size_offset: store
+                .get_setting(K_CHAT_TS_SIZE_OFFSET)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(CHAT_TS_SIZE_OFFSET_DEFAULT),
             ts_color: store
                 .get_setting(K_CHAT_TS_COLOR)
                 .ok()
@@ -410,6 +420,9 @@ impl ChatSettingsState {
             highlight_rules: crate::chat_highlight::load_rules(store),
             goal_color: GoalColor::parse(
                 &store.get_setting(K_CHAT_GOAL_COLOR).ok().flatten().unwrap_or_default(),
+            ),
+            send_button_color: SendButtonColor::parse(
+                &store.get_setting(K_CHAT_SEND_BUTTON_COLOR).ok().flatten().unwrap_or_default(),
             ),
             ts_mode: ChatTsMode::parse(
                 store.get_setting(K_CHAT_TS_MODE).ok().flatten().unwrap_or_default().as_str(),
@@ -534,6 +547,50 @@ pub(super) const CHAT_LAG_HOVER: &str =
      The replay reads a file rather than holding its own connection — chat is captured by      an IRC client that buffers to disk every 2s, and this window re-reads that file every      3s — so a couple of seconds is normal and unavoidable without changing that design.      Notifications do NOT go through this path: a mention pings from the capture client      immediately, even though its row shows up here a moment later.
 
      Measured only when new messages land, so a quiet chat shows the last real      measurement rather than counting up. It compares this machine's clock against      Twitch's, so a badly-set system clock will show here as lag that isn't real.";
+
+/// Twitch's own send-button purple — the default fill for the "Chat"-style
+/// send button, same tone as `rows::TWITCH_PURPLE`.
+pub(super) const SEND_BUTTON_COLOR: egui::Color32 = egui::Color32::from_rgb(0x91, 0x47, 0xff);
+
+/// Where the send button's fill colour comes from — same idiom as
+/// [`GoalColor`], one flavour of "Fixed | inherit the channel's accent" per
+/// customizable chat accent rather than a single generic type, matching how
+/// the rest of this module keeps each setting's meaning explicit in its own
+/// name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SendButtonColor {
+    Fixed(egui::Color32),
+    /// The channel's own display colour — the same one the Streams grid, the
+    /// notifications feed, and (optionally) the goal bar give it.
+    Channel,
+}
+
+impl SendButtonColor {
+    pub(super) fn parse(s: &str) -> SendButtonColor {
+        match s.trim() {
+            "channel" => SendButtonColor::Channel,
+            hex => SendButtonColor::Fixed(parse_chat_hex_color(hex).unwrap_or(SEND_BUTTON_COLOR)),
+        }
+    }
+
+    pub(super) fn as_setting(self) -> String {
+        match self {
+            SendButtonColor::Channel => "channel".to_string(),
+            SendButtonColor::Fixed(c) => hex_color_string(c),
+        }
+    }
+
+    /// Resolve to an actual colour — `channel` is this window's channel
+    /// colour, snapshotted at open (see `ChatPopup::channel_color`'s doc for
+    /// why: computing it needs `&mut self`, which the deferred render
+    /// closure doesn't have).
+    pub(super) fn resolve(self, channel: egui::Color32) -> egui::Color32 {
+        match self {
+            SendButtonColor::Fixed(c) => c,
+            SendButtonColor::Channel => channel,
+        }
+    }
+}
 
 /// The chat window's send bar. See [`crate::chat_send`] for the transport and
 /// the rate policy; this is only what the window needs to draw and drive it.
@@ -1038,6 +1095,25 @@ mod tests {
         );
     }
 
+    /// The "FIRST MESSAGE" corner chip is a fact about the message, not a
+    /// substitute for a hit/chatter accent — it must survive even when one
+    /// of those wins the row's fill and accent bar.
+    #[test]
+    fn first_message_corner_label_survives_an_emphasis_override() {
+        let v = egui::Visuals::dark();
+        let mut m = plain_msg(1.0, "bob", "id1", "hi");
+        m.notice = Some(Box::new(ChatNotice::FirstMessage));
+
+        assert_eq!(row_decor(&m, RowEmphasis::None, &v).corner_label.unwrap().0, "FIRST MESSAGE");
+        assert_eq!(row_decor(&m, RowEmphasis::Hit, &v).corner_label.unwrap().0, "FIRST MESSAGE");
+        assert_eq!(row_decor(&m, RowEmphasis::Chatter, &v).corner_label.unwrap().0, "FIRST MESSAGE");
+
+        // An ordinary message never gets one, regardless of emphasis.
+        let mut ordinary = plain_msg(1.0, "bob", "id2", "hi");
+        ordinary.notice = None;
+        assert!(row_decor(&ordinary, RowEmphasis::Hit, &v).corner_label.is_none());
+    }
+
     /// A matched trigger and a watched chatter must not look the same, and the
     /// trigger must win.
     ///
@@ -1275,6 +1351,7 @@ mod tests {
     fn layout_key_tracks_sizes_and_ignores_colors() {
         let base = ChatAppearance {
             font_pt: 14.0,
+            ts_pt: 13.0,
             emote_pt: 24.0,
             ts_color: egui::Color32::WHITE,
             text_color: egui::Color32::WHITE,
@@ -1284,6 +1361,7 @@ mod tests {
         let key = base.layout_key();
         assert_eq!(ChatAppearance { font_pt: 14.0, ..base }.layout_key(), key, "same settings");
         assert_ne!(ChatAppearance { font_pt: 20.0, ..base }.layout_key(), key, "font size");
+        assert_ne!(ChatAppearance { ts_pt: 20.0, ..base }.layout_key(), key, "timestamp size");
         assert_ne!(ChatAppearance { emote_pt: 40.0, ..base }.layout_key(), key, "emote size");
         assert_eq!(
             ChatAppearance { ts_color: egui::Color32::RED, text_color: egui::Color32::BLUE, ..base }

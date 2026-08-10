@@ -1905,6 +1905,58 @@ impl StreamArchiverApp {
                             .set_setting(K_CHAT_GOAL_COLOR, &cs.goal_color.as_setting());
                     }
                 });
+                // Send button colour: same "fixed / channel" idiom as the
+                // goal bar just above.
+                ui.horizontal(|ui| {
+                    let mut use_channel = cs.send_button_color == SendButtonColor::Channel;
+                    let mut fixed = match cs.send_button_color {
+                        SendButtonColor::Fixed(c) => c,
+                        SendButtonColor::Channel => SEND_BUTTON_COLOR,
+                    };
+                    ui.label("Send button colour").on_hover_text(
+                        "Fill colour for the chat window's Send button. Defaults to Twitch's own                          send-button purple.",
+                    );
+                    let mut changed = ui
+                        .add_enabled_ui(!use_channel, |ui| {
+                            egui::color_picker::color_edit_button_srgba(
+                                ui,
+                                &mut fixed,
+                                egui::color_picker::Alpha::Opaque,
+                            )
+                            .changed()
+                        })
+                        .inner;
+                    let mut hex = hex_color_string(fixed);
+                    if ui
+                        .add_enabled(
+                            !use_channel,
+                            egui::TextEdit::singleline(&mut hex).desired_width(80.0),
+                        )
+                        .on_hover_text("#RRGGBB — type or paste.")
+                        .changed()
+                        && let Some(c) = parse_chat_hex_color(&hex)
+                    {
+                        fixed = c;
+                        changed = true;
+                    }
+                    changed |= ui
+                        .checkbox(&mut use_channel, "Use channel colour")
+                        .on_hover_text(
+                            "Fill the Send button with the channel's own display colour instead                              of a fixed one — the same option the goal bar above has.",
+                        )
+                        .changed();
+                    if changed {
+                        cs.send_button_color = if use_channel {
+                            SendButtonColor::Channel
+                        } else {
+                            SendButtonColor::Fixed(fixed)
+                        };
+                        let _ = self.core.store.set_setting(
+                            K_CHAT_SEND_BUTTON_COLOR,
+                            &cs.send_button_color.as_setting(),
+                        );
+                    }
+                });
                 if ui
                     .checkbox(&mut cs.show_channel_info, "Channel info card in chat")
                     .on_hover_text(
