@@ -3741,9 +3741,22 @@ stream"*.
 **Sending messages.** A live Twitch take's chat window gets a **Send a
 message** bar at the bottom, via Twitch's supported `POST
 /helix/chat/messages` — the archival chat capture stays anonymous and
-read-only, untouched. Enter sends and keeps focus. The bar is **absent
-entirely** on archived takes and non-Twitch channels rather than sitting
-permanently disabled on every historical view.
+read-only, untouched. The box is multiline and grows with wrapped content
+instead of scrolling a long message off to the right; Enter still sends
+(Shift+Enter inserts a literal newline) since a Twitch message is
+fundamentally one line — this is about seeing what you're typing, not
+composing multi-line messages. The **Send** button is a large filled pill
+(Twitch's own "Chat" button weight), with a configurable colour including an
+option to inherit the channel's own accent (*Settings → Interface →
+Display*, same idiom as the Creator Goal bar's colour setting). The bar is
+**absent entirely** on archived takes and non-Twitch channels rather than
+sitting permanently disabled on every historical view.
+
+**Message history.** Up/Down recalls previously sent messages from this
+window while the box is empty. Once there's text, plain arrows move within
+it instead — Alt+Up/Alt+Down recall history regardless of content. Paging up
+away from an unfinished draft stashes it, so paging back down past the
+newest sent message restores exactly what you were typing.
 
 **Emotes, two ways.** The 🙂 button opens a picker of every emote cached for
 this channel — its own Twitch, 7TV, BTTV and FFZ sets, then each provider's
@@ -3759,6 +3772,16 @@ word-matches those (it renders them from the tags Twitch sends instead) — you
 can genuinely type them, so leaving them out would be the wrong kind of
 consistency. It is virtualized: a channel with every provider's globals runs
 past a thousand emotes, and only the rows on screen are decoded.
+
+**Click an emote to Gigantify it** — shows it much larger right there in the
+row; click again to shrink it back. This is a local echo of Twitch's
+Bits-powered Gigantify effect, not a replay of real historical ones: Twitch
+only signals an actual Gigantify over the newer EventSub API
+(`channel.chat.message`'s `power_ups_gigantified_emote`), which the anonymous
+IRC capture this app uses never receives, so there's no way to know which
+messages were genuinely gigantified live. It's also just "bigger" — no
+zoom/bounce transition. Toggle in *Settings → Interface → Display*, on by
+default.
 
 **@mentions** work the same way: type `@` and a list of chatters who've
 recently spoken in the currently-loaded log opens, ranked by prefix/substring
@@ -3943,15 +3966,27 @@ Each icon keeps its original emoji as a declared fallback next to it in the
 table, for any path that renders before the textures are uploaded.
 
 A **⚙** button on the chat window's toolbar opens **Chat Appearance**: an
-exact point-size field for the timestamp/message/username text (not a preset
-slider), a separate pixel-size field for emotes/emoji (independent of the
-text size — go big text/small emotes or vice versa), and separate color
-pickers for the timestamp and the message body (default white for both — the
-old hardcoded grey read too dark to follow comfortably; each color picker
-also has a `#RRGGBB` field beside it you can type or **paste** into, since
-egui's own color wheel only offers a *copy* button with no matching paste
-target). These are shared preferences, so a change applies instantly to
-every open chat window; **Reset to defaults** restores 14pt / 24px white/white.
+exact point-size field for the message/username text (not a preset slider), a
+separate timestamp-size field expressed *relative* to that (default -1pt — a
+hair smaller reads as a timestamp, not a fourth column of body text; 0
+matches Twitch's own popout, which renders both the same size), a separate
+pixel-size field for emotes/emoji (independent of the text size — go big
+text/small emotes or vice versa), a row-spacing field (default 6px — Twitch's
+own popout gives each line noticeably more breathing room than a hairline
+gap), and separate color pickers for the timestamp and the message body
+(default white for both — the old hardcoded grey read too dark to follow
+comfortably; each color picker also has a `#RRGGBB` field beside it you can
+type or **paste** into, since egui's own color wheel only offers a *copy*
+button with no matching paste target). These are shared preferences, so a
+change applies instantly to every open chat window; **Reset to defaults**
+restores 14pt text / -1pt timestamp / 24px emotes / 6px spacing / white/white.
+
+Chat rows are laid out **bottom-aligned**, not vertically centered — Twitch
+anchors every item on a line to the text's baseline, so an oversized emote
+grows upward from that shared line instead of being centered in a box tall
+enough to fit it (which, next to text that has extra "descender" space baked
+into its own line box, reads as the image being pushed down even though both
+are numerically centered correctly).
 
 **Hide shared**, next to *View full*, filters a merged Shared Chat session
 down to just this channel's own messages — useful when the combined chat is
