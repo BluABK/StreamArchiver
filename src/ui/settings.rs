@@ -1779,6 +1779,24 @@ impl StreamArchiverApp {
                         if cs.animate_emotes { "1" } else { "0" },
                     );
                 }
+                if ui
+                    .checkbox(&mut cs.gigantify_enabled, "Click an emote to Gigantify it")
+                    .on_hover_text(
+                        "Click any emote in chat to show it much larger, right there in the \
+                         row — a local echo of Twitch's Bits-powered Gigantify effect. Real \
+                         Gigantify events aren't recoverable from an archived log (Twitch only \
+                         signals them over the newer EventSub API, which the anonymous IRC \
+                         capture here never receives), so this doesn't know which messages were \
+                         actually gigantified live — it just lets you make any one big \
+                         yourself. Click again to shrink it back. Applies immediately.",
+                    )
+                    .changed()
+                {
+                    let _ = self.core.store.set_setting(
+                        K_CHAT_GIGANTIFY,
+                        if cs.gigantify_enabled { "1" } else { "0" },
+                    );
+                }
                 // Chat font lives beside the other chat settings so both this
                 // dialog and each window's ⚙ panel see the same shared state.
                 let mut chat_font = cs.chat_font.clone();

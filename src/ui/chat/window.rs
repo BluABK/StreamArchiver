@@ -220,6 +220,9 @@ impl StreamArchiverApp {
                         complete_dismissed: String::new(),
                         mention_sel: 0,
                         mention_dismissed: String::new(),
+                        history: Vec::new(),
+                        history_pos: None,
+                        history_stash: String::new(),
                     }
                 })
             },
@@ -262,6 +265,7 @@ impl StreamArchiverApp {
             decode_misses: Vec::new(),
             usercard_click: None,
             row_action: None,
+            gigantified: std::collections::HashSet::new(),
             channel_by_login,
             pause_stick_until: 0.0,
         };
@@ -453,11 +457,12 @@ impl StreamArchiverApp {
         // Snapshotted once per frame, not per row: this is read for every
         // rendered message and a lock per row on a busy channel would show.
         let highlight_rules = self.chat_settings.lock().unwrap().highlight_rules.clone();
-        let (render_emotes, animate_emotes, appearance) = {
+        let (render_emotes, animate_emotes, gigantify_enabled, appearance) = {
             let cs = self.chat_settings.lock().unwrap();
             (
                 cs.render_emotes,
                 cs.animate_emotes,
+                cs.gigantify_enabled,
                 ChatAppearance {
                     font_pt: cs.font_pt,
                     ts_pt: (cs.font_pt + cs.ts_size_offset).max(6.0),
@@ -688,6 +693,39 @@ impl StreamArchiverApp {
                                         {
                                             submit = true;
                                         }
+                                        // Sent-message history: bare Up/Down
+                                        // recall while the box is empty (an
+                                        // empty box has nothing to navigate
+                                        // WITHIN, so there's no ambiguity to
+                                        // resolve with a modifier); once
+                                        // there's text, Alt+Up/Alt+Down is
+                                        // required so plain arrows stay free
+                                        // for moving within the message.
+                                        if resp.has_focus() {
+                                            let (up, down, alt) = ui.input(|i| {
+                                                (
+                                                    i.key_pressed(egui::Key::ArrowUp),
+                                                    i.key_pressed(egui::Key::ArrowDown),
+                                                    i.modifiers.alt,
+                                                )
+                                            });
+                                            let allowed = bar.draft.is_empty() || alt;
+                                            if allowed && up {
+                                                history_up(bar);
+                                                set_draft_caret(
+                                                    ctx,
+                                                    edit_id,
+                                                    bar.draft.chars().count(),
+                                                );
+                                            } else if allowed && down {
+                                                history_down(bar);
+                                                set_draft_caret(
+                                                    ctx,
+                                                    edit_id,
+                                                    bar.draft.chars().count(),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 if ui
@@ -758,6 +796,8 @@ impl StreamArchiverApp {
                                 let text = bar.draft.trim().to_string();
                                 bar.limiter.record(&text, now_ms);
                                 bar.draft.clear();
+                                bar.history.push(text.clone());
+                                bar.history_pos = None;
                                 // Optimistic row: the real round trip is IRC →
                                 // the logger's 2s flush → this window's 3s tail
                                 // poll, i.e. 2-5s of apparent silence.
@@ -1909,6 +1949,8 @@ impl StreamArchiverApp {
                                                                 &appearance,
                                                                 &popup.channel_by_login,
                                                                 can_send,
+                                                                gigantify_enabled,
+                                                                &mut popup.gigantified,
                                                             )
                                                         })
                                                     })

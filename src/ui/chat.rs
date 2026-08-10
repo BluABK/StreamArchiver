@@ -323,6 +323,9 @@ pub(super) struct UsersPanelState {
 pub(super) struct ChatSettingsState {
     pub(super) render_emotes: bool,
     pub(super) animate_emotes: bool,
+    /// Whether clicking an emote in chat Gigantifies it — see
+    /// [`K_CHAT_GIGANTIFY`]'s doc for what that means and doesn't mean here.
+    pub(super) gigantify_enabled: bool,
     pub(super) fetch_unknown_emotes: bool,
     pub(super) fetch_usercard_info: bool,
     pub(super) font_pt: f32,
@@ -375,6 +378,7 @@ impl ChatSettingsState {
             // default on; only an explicit "0" disables each.
             render_emotes: flag(K_RENDER_EMOTES, true),
             animate_emotes: flag(K_ANIMATE_EMOTES, true),
+            gigantify_enabled: flag(K_CHAT_GIGANTIFY, true),
             fetch_unknown_emotes: flag(K_FETCH_UNKNOWN_EMOTES, true),
             // Live Twitch usercard lookup defaults OFF — unlike the emote/
             // badge fetchers this hits the network on every usercard open,
@@ -626,6 +630,16 @@ pub(super) struct SendBar {
     pub(super) mention_sel: usize,
     /// Same as `complete_dismissed`, for the mention autocomplete.
     pub(super) mention_dismissed: String,
+    /// Sent messages from this window, oldest first — Up/Down recall.
+    pub(super) history: Vec<String>,
+    /// Index into `history` currently shown in the draft box. `None` means
+    /// "not browsing": the box holds either the live unsent draft, or
+    /// nothing has been recalled yet this session.
+    pub(super) history_pos: Option<usize>,
+    /// The draft as it was the moment history browsing started (the first
+    /// Up press), so paging back down past the newest entry restores
+    /// exactly what was being typed instead of losing it.
+    pub(super) history_stash: String,
 }
 
 /// How long a pending row waits for its own message to come back before it
@@ -819,6 +833,16 @@ pub(super) struct ChatPopup {
     /// A username context-menu action this render pass ("Reply" / "Open
     /// Properties") — same stash-then-consume shape as `usercard_click`.
     pub(super) row_action: Option<RowMenuAction>,
+    /// Emote occurrences the user has clicked to Gigantify, keyed by
+    /// `(msg_id, segment index within that message)` — the segment index
+    /// disambiguates the same emote code repeated in one message ("Kappa
+    /// Kappa Kappa"), toggling only the one actually clicked. Per-window,
+    /// ephemeral: unlike almost everything else here this isn't behind
+    /// `ChatSettingsState`, since it's "I want to look at THIS one bigger
+    /// right now", not a preference to remember. Mutated directly inside the
+    /// deferred render closure — unlike `row_action`, nothing here needs
+    /// `&mut self`, so there's no stash-and-consume-later step.
+    pub(super) gigantified: std::collections::HashSet<(String, usize)>,
     /// Twitch login (lowercased) -> monitor id, for every Twitch channel this
     /// app monitors. Built ONCE on popup-open from `self.rows`, like
     /// `emote_map` — decides whether a username's context menu offers "Open

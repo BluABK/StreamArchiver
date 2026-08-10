@@ -113,6 +113,11 @@ const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
 /// Whether animated emotes play (off ⇒ a static first frame). Default on; only an
 /// explicit `"0"` disables. Off is the perf/RAM escape hatch for heavy channels.
 const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
+/// Whether clicking an emote in chat shows it much larger inline — a local
+/// echo of Twitch's Bits-powered Gigantify effect (see the checkbox's own
+/// hover text for why this can't replay REAL historical Gigantify events).
+/// Default on; only an explicit `"0"` disables.
+const K_CHAT_GIGANTIFY: &str = "chat_gigantify_enabled";
 /// Whether a first-party Twitch emote id missing from every locally-cached
 /// channel (this app's own monitored channels) gets fetched straight from
 /// Twitch's public CDN by id, for a poster whose home channel isn't

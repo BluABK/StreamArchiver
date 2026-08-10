@@ -392,6 +392,12 @@ pub(in crate::ui) fn render_chat_message(
     // account) — "Reply" is hidden rather than shown disabled on a window
     // that can never send.
     can_send: bool,
+    // Feature switch for click-to-Gigantify — see `K_CHAT_GIGANTIFY`'s doc.
+    gigantify_enabled: bool,
+    // Which emote occurrences in THIS message are currently Gigantified —
+    // see `ChatPopup::gigantified`'s doc for the key shape and why this is
+    // mutated directly rather than bubbled up through the return value.
+    gigantified: &mut std::collections::HashSet<(String, usize)>,
 ) -> (Option<UserCardClick>, Option<RowMenuAction>) {
     let (shown_ts, other_ts) = fmt_chat_ts_mode(msg, appearance.ts_mode);
     // Bottom-aligned, not `horizontal_wrapped`'s default vertical centering:
@@ -643,7 +649,7 @@ pub(in crate::ui) fn render_chat_message(
         }
         // Message body — text runs and (when enabled & on disk) inline emote images.
         let emote_h = appearance.emote_pt;
-        for seg in &msg.segments {
+        for (seg_idx, seg) in msg.segments.iter().enumerate() {
             match seg {
                 ChatSegment::Text(t) => {
                     // One label per run: egui wraps a multi-word galley at word
@@ -695,15 +701,37 @@ pub(in crate::ui) fn render_chat_message(
                     }
                 }
                 ChatSegment::Emote { name, file, fallback_text, .. } => {
+                    // Disambiguates a repeated code in one message ("Kappa
+                    // Kappa Kappa") so clicking one only Gigantifies that
+                    // occurrence, not every instance of the emote in the row.
+                    let giga_key = (msg.msg_id.clone(), seg_idx);
+                    let is_giga = gigantify_enabled && gigantified.contains(&giga_key);
+                    // Just bigger — Twitch's Gigantify has no zoom/bounce
+                    // transition of its own, so neither does this.
+                    let draw_h = if is_giga { emote_h * 3.0 } else { emote_h };
                     let drawn = render_emotes
                         && file.as_ref().is_some_and(|f| {
-                            match draw_cached_emote(ui, cache, f, animate, emote_h, now, misses, ctx)
+                            match draw_cached_emote(ui, cache, f, animate, draw_h, now, misses, ctx)
                             {
                                 Some((resp, tex)) => {
                                     queue_alt_image_preview(ctx, &resp, &tex);
-                                    let resp = resp.on_hover_text(format!(
-                                        "{name}\nAlt: preview full size · right-click: more"
-                                    ));
+                                    if gigantify_enabled
+                                        && resp.clicked()
+                                        && !gigantified.remove(&giga_key)
+                                    {
+                                        gigantified.insert(giga_key.clone());
+                                    }
+                                    let resp = resp.on_hover_text(if gigantify_enabled {
+                                        format!(
+                                            "{name}\nClick: {} · Alt: preview full size · \
+                                             right-click: more",
+                                            if is_giga { "shrink back" } else { "Gigantify" }
+                                        )
+                                    } else {
+                                        format!(
+                                            "{name}\nAlt: preview full size · right-click: more"
+                                        )
+                                    });
                                     let path = f.clone();
                                     resp.context_menu(|ui| {
                                         if ui.button("Copy Image").clicked() {

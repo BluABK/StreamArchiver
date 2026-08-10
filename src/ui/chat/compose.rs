@@ -439,6 +439,41 @@ pub(in crate::ui) fn mention_autocomplete(
     Completion::Open
 }
 
+/// Recall the previous (older) sent message into the draft box, stashing
+/// the in-progress draft first if this is the start of a browsing session.
+/// No-op with an empty history or already at the oldest entry.
+pub(in crate::ui) fn history_up(bar: &mut SendBar) {
+    if bar.history.is_empty() {
+        return;
+    }
+    match bar.history_pos {
+        None => {
+            bar.history_stash = std::mem::take(&mut bar.draft);
+            bar.history_pos = Some(bar.history.len() - 1);
+        }
+        Some(0) => return,
+        Some(i) => bar.history_pos = Some(i - 1),
+    }
+    bar.draft = bar.history[bar.history_pos.expect("just set above")].clone();
+}
+
+/// Recall the next (newer) sent message, or — once past the newest one —
+/// restore the stashed in-progress draft from before browsing started.
+/// No-op when not currently browsing.
+pub(in crate::ui) fn history_down(bar: &mut SendBar) {
+    match bar.history_pos {
+        None => {}
+        Some(i) if i + 1 < bar.history.len() => {
+            bar.history_pos = Some(i + 1);
+            bar.draft = bar.history[i + 1].clone();
+        }
+        Some(_) => {
+            bar.history_pos = None;
+            bar.draft = std::mem::take(&mut bar.history_stash);
+        }
+    }
+}
+
 /// What the autocomplete decided this frame.
 pub(in crate::ui) enum Completion {
     /// Nothing to offer — the caller sends on Enter as usual.
@@ -570,6 +605,78 @@ pub(in crate::ui) fn emote_autocomplete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bar(draft: &str, history: &[&str]) -> SendBar {
+        SendBar {
+            draft: draft.to_string(),
+            limiter: Default::default(),
+            broadcaster_id: Arc::new(Mutex::new(None)),
+            status: Arc::new(Mutex::new(None)),
+            sending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending: Vec::new(),
+            picker_open: false,
+            picker_filter: String::new(),
+            complete_sel: 0,
+            complete_dismissed: String::new(),
+            mention_sel: 0,
+            mention_dismissed: String::new(),
+            history: history.iter().map(|s| s.to_string()).collect(),
+            history_pos: None,
+            history_stash: String::new(),
+        }
+    }
+
+    /// The core shell-history shape: paging up through older messages,
+    /// stashing the in-progress draft, then paging back down through them
+    /// and finally restoring exactly what was being typed.
+    #[test]
+    fn history_up_then_down_round_trips_through_the_stash() {
+        let mut b = bar("unfinished draft", &["msg1", "msg2", "msg3"]);
+        history_up(&mut b);
+        assert_eq!(b.draft, "msg3", "oldest-to-newest: Up starts at the newest");
+        history_up(&mut b);
+        assert_eq!(b.draft, "msg2");
+        history_up(&mut b);
+        assert_eq!(b.draft, "msg1");
+        // Already at the oldest — one more Up does nothing.
+        history_up(&mut b);
+        assert_eq!(b.draft, "msg1");
+
+        history_down(&mut b);
+        assert_eq!(b.draft, "msg2");
+        history_down(&mut b);
+        assert_eq!(b.draft, "msg3");
+        history_down(&mut b);
+        assert_eq!(b.draft, "unfinished draft", "past the newest: the stash comes back");
+        assert_eq!(b.history_pos, None);
+
+        // Fully round-tripped: one more Down is a no-op, not a crash.
+        history_down(&mut b);
+        assert_eq!(b.draft, "unfinished draft");
+    }
+
+    #[test]
+    fn history_up_is_a_no_op_with_no_sent_messages() {
+        let mut b = bar("typing something", &[]);
+        history_up(&mut b);
+        assert_eq!(b.draft, "typing something");
+        assert_eq!(b.history_pos, None);
+    }
+
+    /// Editing while browsing (not exercised here, since these are pure
+    /// index moves) is out of scope — but the stash itself must not be
+    /// clobbered by a SECOND Up press once already browsing.
+    #[test]
+    fn a_second_history_up_does_not_re_stash() {
+        let mut b = bar("original draft", &["only"]);
+        history_up(&mut b);
+        assert_eq!(b.draft, "only");
+        assert_eq!(b.history_stash, "original draft");
+        // Only one entry, so this Up is a no-op — but critically, it must
+        // not overwrite `history_stash` with "only" (the current draft).
+        history_up(&mut b);
+        assert_eq!(b.history_stash, "original draft");
+    }
 
     fn cat(codes: &[(&str, bool)]) -> Vec<CatalogEmote> {
         codes
