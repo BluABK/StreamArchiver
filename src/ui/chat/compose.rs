@@ -18,6 +18,12 @@ pub(in crate::ui) const MIN_COMPLETE_CHARS: usize = 2;
 /// slower to scan than typing another character.
 pub(in crate::ui) const MAX_COMPLETIONS: usize = 8;
 
+/// Row height and emote thumbnail size for the `:code`/`@name` suggestion
+/// popups — sized closer to Twitch's own autocomplete (which reads
+/// comfortably at a glance) rather than the cramped picker-grid scale.
+const SUGGEST_ROW_H: f32 = 34.0;
+const SUGGEST_EMOTE_PX: f32 = 28.0;
+
 /// The `:partial` emote token immediately before the caret.
 ///
 /// Returns the **character** range to replace (including the `:`) and the
@@ -398,22 +404,26 @@ pub(in crate::ui) fn mention_autocomplete(
             ui.set_min_width(180.0);
             for (i, name) in matches.iter().enumerate() {
                 let selected = i == bar.mention_sel;
-                let resp = ui
-                    .scope_builder(
-                        egui::UiBuilder::new().sense(egui::Sense::click()),
-                        |ui| {
-                            if selected {
-                                let r = ui.available_rect_before_wrap();
-                                ui.painter().rect_filled(
-                                    r,
-                                    3.0,
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.5),
-                                );
-                            }
-                            ui.label(format!("@{name}"));
-                        },
-                    )
-                    .response;
+                // Same fixed-rect fix as the emote popup — see its comment.
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), SUGGEST_ROW_H),
+                    egui::Sense::click(),
+                );
+                if selected {
+                    ui.painter().rect_filled(
+                        rect,
+                        3.0,
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.5),
+                    );
+                }
+                if ui.is_rect_visible(rect) {
+                    let mut row = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(egui::vec2(6.0, 2.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    row.label(egui::RichText::new(format!("@{name}")).size(15.0));
+                }
                 if resp.clicked() {
                     clicked = Some((*name).to_string());
                 }
@@ -503,33 +513,45 @@ pub(in crate::ui) fn emote_autocomplete(
         // clicking away is already handled by the token check above.
         .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
         .show(|ui| {
-            ui.set_min_width(220.0);
+            ui.set_min_width(260.0);
             for (i, e) in matches.iter().enumerate() {
                 let selected = i == bar.complete_sel;
-                let resp = ui
-                    .scope_builder(
-                        egui::UiBuilder::new().sense(egui::Sense::click()),
-                        |ui| {
-                            if selected {
-                                let r = ui.available_rect_before_wrap();
-                                ui.painter().rect_filled(
-                                    r,
-                                    3.0,
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.5),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                draw_cached_emote(
-                                    ui, cache, &e.path, false, 22.0, now, misses, ctx,
-                                );
-                                ui.label(&e.code);
-                                ui.weak(
-                                    egui::RichText::new(e.group.source.label()).small(),
-                                );
-                            });
-                        },
-                    )
-                    .response;
+                // A fixed-size allocation, not `available_rect_before_wrap`
+                // inside a `scope_builder` (which returns however much space
+                // is left in the WHOLE popup, not this one row) — that made
+                // the selected row's highlight balloon down to cover every
+                // row below it too, and made a click's hit-test rect balloon
+                // the same way, so a click could resolve to the wrong row's
+                // `Response` (or the completion silently not applying at
+                // all). Same "paint into a rect you actually measured"
+                // fix as the chat rows' accent bar.
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), SUGGEST_ROW_H),
+                    egui::Sense::click(),
+                );
+                if selected {
+                    ui.painter().rect_filled(
+                        rect,
+                        3.0,
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.5),
+                    );
+                }
+                if ui.is_rect_visible(rect) {
+                    let mut row = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(egui::vec2(6.0, 2.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    row.spacing_mut().item_spacing.x = 8.0;
+                    draw_cached_emote(
+                        &mut row, cache, &e.path, false, SUGGEST_EMOTE_PX, now, misses, ctx,
+                    );
+                    row.label(egui::RichText::new(&e.code).size(15.0));
+                    row.colored_label(
+                        e.group.source.color(),
+                        egui::RichText::new(e.group.source.label()).small(),
+                    );
+                }
                 if resp.clicked() {
                     clicked = Some(e.code.clone());
                 }

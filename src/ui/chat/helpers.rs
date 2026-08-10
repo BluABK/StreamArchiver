@@ -134,6 +134,19 @@ impl EmoteSource {
             EmoteSource::Ffz => "FFZ",
         }
     }
+
+    /// Each provider's own brand colour, for the small source tag in the
+    /// `:code` suggestion popup — Twitch's own autocomplete colours these
+    /// the same way rather than leaving every provider looking the same
+    /// muted grey.
+    pub(in crate::ui) fn color(self) -> egui::Color32 {
+        match self {
+            EmoteSource::Twitch => egui::Color32::from_rgb(0x91, 0x47, 0xff),
+            EmoteSource::SevenTv => egui::Color32::from_rgb(0x4f, 0xc3, 0xf7),
+            EmoteSource::Bttv => egui::Color32::from_rgb(0xf2, 0xa9, 0x22),
+            EmoteSource::Ffz => egui::Color32::from_rgb(0x5c, 0xb8, 0x5c),
+        }
+    }
 }
 
 /// Which set an emote came from. Derived `Ord` sorts channel sets before

@@ -576,6 +576,44 @@ impl StreamArchiverApp {
                                 set_draft_caret(ctx, edit_id, bar.draft.chars().count());
                             }
                             ui.horizontal(|ui| {
+                                // Whether a `:code`/`@name` suggestion list was
+                                // showing as of LAST frame's cursor position —
+                                // read before `.show()` runs, from the same
+                                // persisted cursor state `set_draft_caret`
+                                // writes to. Needed because `TextEdit`
+                                // processes ArrowUp/ArrowDown for its OWN
+                                // cursor movement INSIDE `.show()`, before
+                                // `emote_autocomplete`/`mention_autocomplete`
+                                // ever see the key — and for a single-row
+                                // box, egui's `cursor_up_one_row` jumps
+                                // straight to character 0 on Up (there's no
+                                // row above to move to), which then makes the
+                                // token check fail on the very next line and
+                                // the list reads as "Up cancelled it". Down
+                                // is a same-row no-op so it isn't affected,
+                                // but stripping both here is one rule instead
+                                // of two.
+                                let had_token = egui::TextEdit::load_state(ctx, edit_id)
+                                    .and_then(|st| st.cursor.char_range())
+                                    .is_some_and(|r| {
+                                        let c = r.primary.index;
+                                        emote_token(&bar.draft, c).is_some()
+                                            || mention_token(&bar.draft, c).is_some()
+                                    });
+                                if had_token {
+                                    ui.input_mut(|i| {
+                                        i.events.retain(|e| {
+                                            !matches!(
+                                                e,
+                                                egui::Event::Key {
+                                                    key: egui::Key::ArrowUp
+                                                        | egui::Key::ArrowDown,
+                                                    ..
+                                                }
+                                            )
+                                        });
+                                    });
+                                }
                                 // Multiline, not singleline: a long message
                                 // otherwise scrolled off to the right instead
                                 // of wrapping, hiding everything past the
