@@ -3971,15 +3971,20 @@ separate timestamp-size field expressed *relative* to that (default -1pt — a
 hair smaller reads as a timestamp, not a fourth column of body text; 0
 matches Twitch's own popout, which renders both the same size), a separate
 pixel-size field for emotes/emoji (independent of the text size — go big
-text/small emotes or vice versa), a row-spacing field (default 6px — Twitch's
-own popout gives each line noticeably more breathing room than a hairline
-gap), and separate color pickers for the timestamp and the message body
-(default white for both — the old hardcoded grey read too dark to follow
-comfortably; each color picker also has a `#RRGGBB` field beside it you can
-type or **paste** into, since egui's own color wheel only offers a *copy*
-button with no matching paste target). These are shared preferences, so a
-change applies instantly to every open chat window; **Reset to defaults**
-restores 14pt text / -1pt timestamp / 24px emotes / 6px spacing / white/white.
+text/small emotes or vice versa), a **second** size field just for "wide"
+emotes (7TV's walk-cycle/banner-style emotes, commonly 2-4:1 width:height —
+without a separate target, a single size + a flat max-width cap crushes a
+wide emote's HEIGHT short of the configured size long before a regular one
+is affected, since the cap binds first), a row-spacing field (default 6px —
+Twitch's own popout gives each line noticeably more breathing room than a
+hairline gap), and separate color pickers for the timestamp and the message
+body (default white for both — the old hardcoded grey read too dark to
+follow comfortably; each color picker also has a `#RRGGBB` field beside it
+you can type or **paste** into, since egui's own color wheel only offers a
+*copy* button with no matching paste target). These are shared preferences,
+so a change applies instantly to every open chat window; **Reset to
+defaults** restores 14pt text / -1pt timestamp / 24px emotes (both sizes) /
+6px spacing / white/white.
 
 Chat rows are laid out **bottom-aligned**, not vertically centered — Twitch
 anchors every item on a line to the text's baseline, so an oversized emote

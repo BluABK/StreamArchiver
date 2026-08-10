@@ -18,6 +18,8 @@ pub(in crate::ui) struct ChatAppearance {
     /// Emote/emoji pixel size, independent of `font_pt` — see
     /// `StreamArchiverApp::chat_emote_pt`'s doc.
     pub(in crate::ui) emote_pt: f32,
+    /// Target height for "wide" emotes — see `ChatSettingsState::emote_wide_pt`.
+    pub(in crate::ui) emote_wide_pt: f32,
     pub(in crate::ui) ts_color: egui::Color32,
     pub(in crate::ui) text_color: egui::Color32,
     /// Hash of the chosen chat font family's name. The family itself is
@@ -319,6 +321,7 @@ impl ChatAppearance {
         std::hash::Hash::hash(&self.font_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.ts_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.emote_pt.to_bits(), &mut h);
+        std::hash::Hash::hash(&self.emote_wide_pt.to_bits(), &mut h);
         std::hash::Hash::hash(&self.font_id, &mut h);
         // `[00:40:10]` and `19:30` are different widths, which changes where
         // a long message wraps and therefore how tall its row is.
@@ -507,7 +510,7 @@ pub(in crate::ui) fn render_chat_message(
                 for (i, badge) in msg.badges.iter().enumerate() {
                     let icon = msg.badge_icons.get(i).and_then(|o| o.as_ref());
                     let drawn = icon.and_then(|path| {
-                        draw_cached_emote(ui, cache, path, false, badge_h, now, misses, ctx)
+                        draw_cached_emote(ui, cache, path, false, badge_h, None, now, misses, ctx)
                     });
                     if let Some((resp, _tex)) = drawn {
                         resp.on_hover_text(badge_label(badge));
@@ -709,10 +712,26 @@ pub(in crate::ui) fn render_chat_message(
                     // Just bigger — Twitch's Gigantify has no zoom/bounce
                     // transition of its own, so neither does this.
                     let draw_h = if is_giga { emote_h * 3.0 } else { emote_h };
+                    let draw_wide_h =
+                        if is_giga { appearance.emote_wide_pt * 3.0 } else { appearance.emote_wide_pt };
+                    // Generous relative to the target height, not a flat
+                    // pixel value, so it scales with the user's own wide-
+                    // emote size setting — 7TV's walk-cycle/banner-style
+                    // emotes are commonly up to ~4:1.
+                    let wide_max_w = draw_wide_h * 6.0;
                     let drawn = render_emotes
                         && file.as_ref().is_some_and(|f| {
-                            match draw_cached_emote(ui, cache, f, animate, draw_h, now, misses, ctx)
-                            {
+                            match draw_cached_emote(
+                                ui,
+                                cache,
+                                f,
+                                animate,
+                                draw_h,
+                                Some((draw_wide_h, wide_max_w)),
+                                now,
+                                misses,
+                                ctx,
+                            ) {
                                 Some((resp, tex)) => {
                                     queue_alt_image_preview(ctx, &resp, &tex);
                                     if gigantify_enabled

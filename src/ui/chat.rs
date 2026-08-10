@@ -334,6 +334,12 @@ pub(super) struct ChatSettingsState {
     /// Vertical gap between rows, in pixels — see [`K_CHAT_ROW_SPACING`].
     pub(super) row_spacing: f32,
     pub(super) emote_pt: f32,
+    /// Target height for "wide" emotes (decoded aspect ratio over
+    /// [`crate::ui::chat::emotes::WIDE_EMOTE_ASPECT_THRESHOLD`]) — separate
+    /// from `emote_pt` because a single size + a fixed max-width cap
+    /// crushes wide emotes short of their configured height before regular
+    /// ones are affected at all. See [`K_CHAT_EMOTE_WIDE_PT`].
+    pub(super) emote_wide_pt: f32,
     pub(super) ts_color: egui::Color32,
     pub(super) text_color: egui::Color32,
     /// Feature switch for the Hype Train card — see [`K_CHAT_SHOW_HYPE`].
@@ -398,6 +404,12 @@ impl ChatSettingsState {
                 .flatten()
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(CHAT_EMOTE_PT_DEFAULT),
+            emote_wide_pt: store
+                .get_setting(K_CHAT_EMOTE_WIDE_PT)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(CHAT_EMOTE_WIDE_PT_DEFAULT),
             ts_size_offset: store
                 .get_setting(K_CHAT_TS_SIZE_OFFSET)
                 .ok()
@@ -1385,6 +1397,7 @@ mod tests {
             font_pt: 14.0,
             ts_pt: 13.0,
             emote_pt: 24.0,
+            emote_wide_pt: 24.0,
             ts_color: egui::Color32::WHITE,
             text_color: egui::Color32::WHITE,
             font_id: font_name_key(""),
@@ -1395,6 +1408,11 @@ mod tests {
         assert_ne!(ChatAppearance { font_pt: 20.0, ..base }.layout_key(), key, "font size");
         assert_ne!(ChatAppearance { ts_pt: 20.0, ..base }.layout_key(), key, "timestamp size");
         assert_ne!(ChatAppearance { emote_pt: 40.0, ..base }.layout_key(), key, "emote size");
+        assert_ne!(
+            ChatAppearance { emote_wide_pt: 40.0, ..base }.layout_key(),
+            key,
+            "wide emote size"
+        );
         assert_eq!(
             ChatAppearance { ts_color: egui::Color32::RED, text_color: egui::Color32::BLUE, ..base }
                 .layout_key(),

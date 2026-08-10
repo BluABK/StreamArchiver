@@ -468,6 +468,7 @@ impl StreamArchiverApp {
                     font_pt: cs.font_pt,
                     ts_pt: (cs.font_pt + cs.ts_size_offset).max(6.0),
                     emote_pt: cs.emote_pt,
+                    emote_wide_pt: cs.emote_wide_pt,
                     ts_color: cs.ts_color,
                     text_color: cs.text_color,
                     font_id: font_name_key(&cs.chat_font),
@@ -1111,6 +1112,7 @@ impl StreamArchiverApp {
                             mut font_pt,
                             mut ts_size_offset,
                             mut emote_pt,
+                            mut emote_wide_pt,
                             mut row_spacing,
                             mut ts_color,
                             mut text_color,
@@ -1120,6 +1122,7 @@ impl StreamArchiverApp {
                                 cs.font_pt,
                                 cs.ts_size_offset,
                                 cs.emote_pt,
+                                cs.emote_wide_pt,
                                 cs.row_spacing,
                                 cs.ts_color,
                                 cs.text_color,
@@ -1196,6 +1199,32 @@ impl StreamArchiverApp {
                                         let _ = shared.core.store.set_setting(
                                             K_CHAT_EMOTE_PT,
                                             &emote_pt.to_string(),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Wide emote size:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut emote_wide_pt)
+                                                .range(12.0..=64.0)
+                                                .suffix(" px"),
+                                        )
+                                        .on_hover_text(
+                                            "Target height for emotes noticeably wider than \
+                                             tall (7TV's walk-cycle/banner-style emotes, \
+                                             commonly) — separate from the regular emote size \
+                                             because one size with one width cap otherwise \
+                                             crushes a wide emote's HEIGHT too, short of what \
+                                             you set above, well before a regular one is \
+                                             affected at all.",
+                                        )
+                                        .changed()
+                                    {
+                                        popup.settings.lock().unwrap().emote_wide_pt = emote_wide_pt;
+                                        let _ = shared.core.store.set_setting(
+                                            K_CHAT_EMOTE_WIDE_PT,
+                                            &emote_wide_pt.to_string(),
                                         );
                                     }
                                 });
@@ -1311,6 +1340,7 @@ impl StreamArchiverApp {
                                         cs.font_pt = CHAT_FONT_PT_DEFAULT;
                                         cs.ts_size_offset = CHAT_TS_SIZE_OFFSET_DEFAULT;
                                         cs.emote_pt = CHAT_EMOTE_PT_DEFAULT;
+                                        cs.emote_wide_pt = CHAT_EMOTE_WIDE_PT_DEFAULT;
                                         cs.row_spacing = CHAT_ROW_SPACING_DEFAULT;
                                         cs.ts_color = egui::Color32::WHITE;
                                         cs.text_color = egui::Color32::WHITE;
@@ -1328,6 +1358,10 @@ impl StreamArchiverApp {
                                     let _ = shared.core.store.set_setting(
                                         K_CHAT_EMOTE_PT,
                                         &CHAT_EMOTE_PT_DEFAULT.to_string(),
+                                    );
+                                    let _ = shared.core.store.set_setting(
+                                        K_CHAT_EMOTE_WIDE_PT,
+                                        &CHAT_EMOTE_WIDE_PT_DEFAULT.to_string(),
                                     );
                                     let _ = shared.core.store.set_setting(
                                         K_CHAT_ROW_SPACING,
@@ -1366,6 +1400,7 @@ impl StreamArchiverApp {
                                             p,
                                             false,
                                             64.0,
+                                            None,
                                             now,
                                             &mut decode_misses,
                                             ctx,
@@ -1409,6 +1444,7 @@ impl StreamArchiverApp {
                                                         path,
                                                         false,
                                                         18.0,
+                                                        None,
                                                         now,
                                                         &mut decode_misses,
                                                         ctx,

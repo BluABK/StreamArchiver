@@ -230,6 +230,7 @@ pub(in crate::ui) fn emote_picker(
                                     &e.path,
                                     animate,
                                     CELL - 6.0,
+                                    None,
                                     now,
                                     misses,
                                     ctx,
@@ -579,7 +580,7 @@ pub(in crate::ui) fn emote_autocomplete(
                     );
                     row.spacing_mut().item_spacing.x = 8.0;
                     draw_cached_emote(
-                        &mut row, cache, &e.path, false, SUGGEST_EMOTE_PX, now, misses, ctx,
+                        &mut row, cache, &e.path, false, SUGGEST_EMOTE_PX, None, now, misses, ctx,
                     );
                     row.label(egui::RichText::new(&e.code).size(15.0));
                     row.colored_label(

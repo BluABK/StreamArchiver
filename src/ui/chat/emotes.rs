@@ -100,7 +100,8 @@ pub(in crate::ui) fn emote_viewer_grid(
                         ui.add_space(IMG_H);
                         None
                     } else {
-                        let r = draw_cached_emote(ui, cache, &e.path, animate, IMG_H, now, misses, ctx);
+                        let r =
+                            draw_cached_emote(ui, cache, &e.path, animate, IMG_H, None, now, misses, ctx);
                         if r.is_none() {
                             ui.add_space(IMG_H / 2.0 - 6.0);
                             ui.weak("…");
@@ -125,7 +126,7 @@ pub(in crate::ui) fn emote_viewer_grid(
                                 // Render cached texture at 3-4× cell size.
                                 // The cache caps decode at 56 px so no re-upload.
                                 draw_cached_emote(
-                                    ui, cache, &epath, false, 160.0, now,
+                                    ui, cache, &epath, false, 160.0, None, now,
                                     &mut Vec::new(), ctx,
                                 );
                                 ui.separator();
@@ -201,21 +202,54 @@ pub(in crate::ui) fn emote_viewer_grid(
     });
 }
 
+/// A decoded image at least this many times wider than tall is treated as a
+/// "wide" emote (7TV's walk-cycle/banner-style emotes are commonly 2-4:1) —
+/// see [`draw_cached_emote`]'s `wide` parameter for why that distinction
+/// exists at all.
+pub(in crate::ui) const WIDE_EMOTE_ASPECT_THRESHOLD: f32 = 1.5;
+
+/// The on-screen size to draw a decoded emote at, given its native
+/// (already-downscaled-to-≤56px) size. Pure and separate from
+/// [`draw_cached_emote`] so the "a wide emote's HEIGHT gets crushed by the
+/// width cap" fix is directly testable without a live `egui::Ui`.
+///
+/// Height ≤ the chosen target, width capped at the chosen max, aspect
+/// preserved. Never upscales (`.min(1.0)`) — a small emote keeps its native
+/// size, matching the prior loader behaviour.
+fn emote_draw_size(native: egui::Vec2, emote_h: f32, wide: Option<(f32, f32)>) -> egui::Vec2 {
+    let (target_h, max_w) = match (wide, native.x > native.y * WIDE_EMOTE_ASPECT_THRESHOLD) {
+        (Some((wide_h, wide_max_w)), true) => (wide_h, wide_max_w),
+        _ => (emote_h, 112.0),
+    };
+    let scale = (target_h / native.y.max(1.0)).min(max_w / native.x.max(1.0)).min(1.0);
+    native * scale
+}
+
 /// Draw an emote from the decode cache. Returns the image `Response` when drawn, or
 /// `None` (caller shows the text fallback) when the emote is still loading / failed.
 /// Promotes a freshly-decoded entry to GPU textures (UI-thread upload), advances
 /// the animation against the global clock `now`, and records `last_drawn` for LRU.
 #[allow(clippy::too_many_arguments)]
-/// Draws the emote and returns its `Response` plus a clone of the texture it
-/// drew — the clone lets callers queue the standard Alt-hover full-resolution
-/// preview ([`queue_alt_image_preview`]) without reaching back into the
-/// mutex-guarded cache.
 pub(in crate::ui) fn draw_cached_emote(
     ui: &mut egui::Ui,
     cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
     path: &Path,
     animate: bool,
     emote_h: f32,
+    // `(target height, max width)` to use INSTEAD of `emote_h`/112px when
+    // the decoded image clears `WIDE_EMOTE_ASPECT_THRESHOLD` — `None` for
+    // every caller that doesn't distinguish (badges, the picker grid, the
+    // usercard preview), which keeps their behaviour exactly as before.
+    //
+    // Why this exists: `emote_h` alone isn't enough for a genuinely wide
+    // emote. The old single-cap formula was `min(emote_h / height,
+    // 112px / width, 1.0)` — for a wide-aspect image that 112px width cap
+    // routinely binds BEFORE the emote reaches `emote_h` tall at all, so a
+    // 500×80px source at emote_h=24 came out ~112×18px: both dimensions
+    // shrunk below the configured size, not just clipped narrower. A
+    // separate, more generous cap for the wide case lets it actually reach
+    // its own configured height instead.
+    wide: Option<(f32, f32)>,
     now: f64,
     misses: &mut Vec<std::path::PathBuf>,
     ctx: &egui::Context,
@@ -240,11 +274,7 @@ pub(in crate::ui) fn draw_cached_emote(
         Some(EmoteLoad::Ready(anim)) => {
             anim.last_drawn = now;
             let s = anim.size();
-            // Height ≤ emote_h, width capped at 112, aspect preserved. Never upscale
-            // (`.min(1.0)`) — a small emote keeps its native size, matching the prior
-            // loader behaviour. `s` is already downscaled to ≤56px at decode time.
-            let scale = (emote_h / s.y.max(1.0)).min(112.0 / s.x.max(1.0)).min(1.0);
-            let size = egui::vec2(s.x * scale, s.y * scale);
+            let size = emote_draw_size(s, emote_h, wide);
             if animate && anim.is_animated() {
                 let (tex, remaining) = anim.frame_at(now);
                 let tex = tex.clone();
@@ -469,4 +499,75 @@ pub(in crate::ui) fn url_ext(url: &str) -> &str {
         .and_then(|p| p.rsplit('.').next())
         .filter(|e| matches!(*e, "png" | "gif" | "webp" | "jpg" | "jpeg"))
         .unwrap_or("png")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A roughly-square emote isn't affected by `wide` at all, `Some` or not
+    /// — it only ever applies to a genuinely wide-aspect image.
+    #[test]
+    fn a_square_emote_ignores_the_wide_allowance() {
+        let native = egui::vec2(56.0, 56.0);
+        let plain = emote_draw_size(native, 24.0, None);
+        let with_wide = emote_draw_size(native, 24.0, Some((48.0, 400.0)));
+        assert_eq!(plain, with_wide);
+        assert_eq!(plain, egui::vec2(24.0, 24.0));
+    }
+
+    /// The bug this was written to fix: a wide-aspect image, sized by the
+    /// regular path (`wide: None`, or a caller that doesn't clear the
+    /// threshold), gets its HEIGHT crushed well below the configured
+    /// target because the flat 112px width cap binds first.
+    #[test]
+    fn without_the_wide_allowance_a_wide_emote_is_crushed_short() {
+        let native = egui::vec2(500.0, 80.0); // 6.25:1
+        let size = emote_draw_size(native, 24.0, None);
+        // Naively scaling to 24pt tall would need 500 * (24/80) = 150px
+        // wide, over the 112px cap — so the cap binds and the emote comes
+        // out well under 24px tall too, not just narrower.
+        assert!(size.y < 20.0, "expected the height to be crushed, got {size:?}");
+        assert!(size.x <= 112.0);
+    }
+
+    /// The fix: given a wide-specific target + a correspondingly generous
+    /// max width, a realistically-proportioned wide emote (7TV's
+    /// walk-cycle/banner style — up to ~4:1) reaches its OWN configured
+    /// height instead of being cut short by the regular 112px cap.
+    #[test]
+    fn the_wide_allowance_lets_a_wide_emote_reach_its_own_target_height() {
+        let native = egui::vec2(320.0, 80.0); // 4:1
+        let size = emote_draw_size(native, 24.0, Some((24.0, 24.0 * 6.0)));
+        assert_eq!(size.y, 24.0, "reaches the wide target height exactly");
+        assert_eq!(size.x, 320.0 * (24.0 / 80.0));
+    }
+
+    /// Even the generous wide max-width is still a cap, not a blank
+    /// cheque — an extreme outlier aspect ratio still gets bounded rather
+    /// than being allowed to stretch across the whole row.
+    #[test]
+    fn the_wide_max_width_still_caps_an_extreme_outlier() {
+        let native = egui::vec2(500.0, 80.0); // 6.25:1
+        let size = emote_draw_size(native, 24.0, Some((24.0, 24.0 * 6.0)));
+        assert_eq!(size.x, 24.0 * 6.0, "width cap binds");
+        assert!(size.y < 24.0, "so the height comes in a little under target");
+    }
+
+    /// A small emote is never upscaled, wide or not — matches the
+    /// pre-existing (non-wide) behaviour.
+    #[test]
+    fn a_small_emote_is_never_upscaled() {
+        let native = egui::vec2(200.0, 20.0); // 10:1, but tiny
+        let size = emote_draw_size(native, 64.0, Some((64.0, 400.0)));
+        assert_eq!(size, native, "already smaller than every target — kept as-is");
+    }
+
+    #[test]
+    fn url_ext_reads_the_extension_and_ignores_query_strings() {
+        assert_eq!(url_ext("https://cdn.example/e.webp?v=2"), "webp");
+        assert_eq!(url_ext("https://cdn.example/e.gif#frag"), "gif");
+        assert_eq!(url_ext("https://cdn.example/e.bogus"), "png");
+        assert_eq!(url_ext("https://cdn.example/e"), "png");
+    }
 }

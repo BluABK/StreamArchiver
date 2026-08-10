@@ -139,6 +139,13 @@ const CHAT_FONT_PT_DEFAULT: f32 = 14.0;
 /// the font size instead (see `ui::chat::render_chat_message`).
 const K_CHAT_EMOTE_PT: &str = "chat_emote_size_px";
 const CHAT_EMOTE_PT_DEFAULT: f32 = 24.0;
+/// Target height for "wide" emotes specifically (decoded aspect ratio well
+/// over 1:1 — 7TV's walk-cycle/banner-style emotes commonly). Separate from
+/// `K_CHAT_EMOTE_PT` because a single size + a fixed max-width cap crushes a
+/// wide emote's height too, not just its width — see
+/// `ui::chat::emotes::draw_cached_emote`'s `wide` parameter doc.
+const K_CHAT_EMOTE_WIDE_PT: &str = "chat_emote_wide_size_px";
+const CHAT_EMOTE_WIDE_PT_DEFAULT: f32 = 24.0;
 /// Timestamp size relative to `K_CHAT_FONT_PT` (points, can be negative).
 /// Default -1: a hair smaller than the message body reads as a timestamp,
 /// not a fourth column of body text — configurable because that's a
