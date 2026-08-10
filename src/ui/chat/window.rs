@@ -457,12 +457,13 @@ impl StreamArchiverApp {
         // Snapshotted once per frame, not per row: this is read for every
         // rendered message and a lock per row on a busy channel would show.
         let highlight_rules = self.chat_settings.lock().unwrap().highlight_rules.clone();
-        let (render_emotes, animate_emotes, gigantify_enabled, appearance) = {
+        let (render_emotes, animate_emotes, gigantify_enabled, row_spacing, appearance) = {
             let cs = self.chat_settings.lock().unwrap();
             (
                 cs.render_emotes,
                 cs.animate_emotes,
                 cs.gigantify_enabled,
+                cs.row_spacing,
                 ChatAppearance {
                     font_pt: cs.font_pt,
                     ts_pt: (cs.font_pt + cs.ts_size_offset).max(6.0),
@@ -1106,9 +1107,23 @@ impl StreamArchiverApp {
                     ui.separator();
 
                     if popup.show_appearance {
-                        let (mut font_pt, mut ts_size_offset, mut emote_pt, mut ts_color, mut text_color) = {
+                        let (
+                            mut font_pt,
+                            mut ts_size_offset,
+                            mut emote_pt,
+                            mut row_spacing,
+                            mut ts_color,
+                            mut text_color,
+                        ) = {
                             let cs = popup.settings.lock().unwrap();
-                            (cs.font_pt, cs.ts_size_offset, cs.emote_pt, cs.ts_color, cs.text_color)
+                            (
+                                cs.font_pt,
+                                cs.ts_size_offset,
+                                cs.emote_pt,
+                                cs.row_spacing,
+                                cs.ts_color,
+                                cs.text_color,
+                            )
                         };
                         egui::Window::new("Chat Appearance")
                             .id(egui::Id::new(("chat_appearance_win", popup.monitor_id)))
@@ -1181,6 +1196,28 @@ impl StreamArchiverApp {
                                         let _ = shared.core.store.set_setting(
                                             K_CHAT_EMOTE_PT,
                                             &emote_pt.to_string(),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Row spacing:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut row_spacing)
+                                                .range(0.0..=16.0)
+                                                .suffix(" px"),
+                                        )
+                                        .on_hover_text(
+                                            "Vertical gap between chat rows. Twitch's own popout \
+                                             gives each line noticeably more room to breathe than \
+                                             a hairline gap.",
+                                        )
+                                        .changed()
+                                    {
+                                        popup.settings.lock().unwrap().row_spacing = row_spacing;
+                                        let _ = shared.core.store.set_setting(
+                                            K_CHAT_ROW_SPACING,
+                                            &row_spacing.to_string(),
                                         );
                                     }
                                 });
@@ -1274,6 +1311,7 @@ impl StreamArchiverApp {
                                         cs.font_pt = CHAT_FONT_PT_DEFAULT;
                                         cs.ts_size_offset = CHAT_TS_SIZE_OFFSET_DEFAULT;
                                         cs.emote_pt = CHAT_EMOTE_PT_DEFAULT;
+                                        cs.row_spacing = CHAT_ROW_SPACING_DEFAULT;
                                         cs.ts_color = egui::Color32::WHITE;
                                         cs.text_color = egui::Color32::WHITE;
                                     }
@@ -1290,6 +1328,10 @@ impl StreamArchiverApp {
                                     let _ = shared.core.store.set_setting(
                                         K_CHAT_EMOTE_PT,
                                         &CHAT_EMOTE_PT_DEFAULT.to_string(),
+                                    );
+                                    let _ = shared.core.store.set_setting(
+                                        K_CHAT_ROW_SPACING,
+                                        &CHAT_ROW_SPACING_DEFAULT.to_string(),
                                     );
                                     let _ = shared.core.store.set_setting(K_CHAT_TS_COLOR, "#FFFFFF");
                                     let _ = shared.core.store.set_setting(K_CHAT_TEXT_COLOR, "#FFFFFF");
@@ -1802,7 +1844,7 @@ impl StreamArchiverApp {
                             let stick = q.is_empty()
                                 && !popup.full_view
                                 && now_t >= popup.pause_stick_until;
-                            const GAP: f32 = 2.0;
+                            let gap = row_spacing;
                             const OVERSCAN: f32 = 300.0;
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
@@ -1842,7 +1884,7 @@ impl StreamArchiverApp {
                                     let mut last_y = 0.0f64;
                                     for di in 0..count {
                                         let mi = filtered.map_or(di, |v| v[di] as usize);
-                                        let h = f64::from(log.row_heights[mi] + GAP);
+                                        let h = f64::from(log.row_heights[mi] + gap);
                                         if first == count && y + h > top {
                                             first = di;
                                             offset = y;
@@ -2003,7 +2045,7 @@ impl StreamArchiverApp {
                                             log.row_heights[mi] = h;
                                             mismeasured = true;
                                         }
-                                        ui.add_space(GAP);
+                                        ui.add_space(gap);
                                     }
                                     // Reserve the space of everything below
                                     // the rendered window so the scrollbar

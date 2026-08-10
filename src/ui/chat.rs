@@ -331,6 +331,8 @@ pub(super) struct ChatSettingsState {
     pub(super) font_pt: f32,
     /// Timestamp size relative to `font_pt` — see [`K_CHAT_TS_SIZE_OFFSET`].
     pub(super) ts_size_offset: f32,
+    /// Vertical gap between rows, in pixels — see [`K_CHAT_ROW_SPACING`].
+    pub(super) row_spacing: f32,
     pub(super) emote_pt: f32,
     pub(super) ts_color: egui::Color32,
     pub(super) text_color: egui::Color32,
@@ -402,6 +404,12 @@ impl ChatSettingsState {
                 .flatten()
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(CHAT_TS_SIZE_OFFSET_DEFAULT),
+            row_spacing: store
+                .get_setting(K_CHAT_ROW_SPACING)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(CHAT_ROW_SPACING_DEFAULT),
             ts_color: store
                 .get_setting(K_CHAT_TS_COLOR)
                 .ok()

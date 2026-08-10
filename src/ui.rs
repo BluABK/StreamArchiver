@@ -145,6 +145,12 @@ const CHAT_EMOTE_PT_DEFAULT: f32 = 24.0;
 /// preference, not a fact about what's "correct".
 const K_CHAT_TS_SIZE_OFFSET: &str = "chat_ts_size_offset_pt";
 const CHAT_TS_SIZE_OFFSET_DEFAULT: f32 = -1.0;
+/// Vertical gap between chat rows, in pixels. Twitch's own popout gives
+/// each line noticeably more breathing room than a 2px hairline; the
+/// default here splits the difference rather than matching either exactly,
+/// and it's configurable because "how much" is a preference.
+const K_CHAT_ROW_SPACING: &str = "chat_row_spacing_px";
+const CHAT_ROW_SPACING_DEFAULT: f32 = 6.0;
 /// Chat-replay timestamp color (hex `#RRGGBB`). Default white — the previous
 /// hardcoded `weak_text_color()` rendered too dark-grey to read comfortably.
 const K_CHAT_TS_COLOR: &str = "chat_ts_color";
