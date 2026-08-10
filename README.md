@@ -3760,6 +3760,13 @@ can genuinely type them, so leaving them out would be the wrong kind of
 consistency. It is virtualized: a channel with every provider's globals runs
 past a thousand emotes, and only the rows on screen are decoded.
 
+**@mentions** work the same way: type `@` and a list of chatters who've
+recently spoken in the currently-loaded log opens, ranked by prefix/substring
+match against what you've typed so far — or, on a bare `@` with nothing typed
+yet, just the most recent chatters first. Same keyboard controls as the emote
+list (↑/↓, Tab/Enter, Esc), and the two never conflict since a `:` token and
+an `@` token can't both sit immediately before the caret.
+
 This needs the `user:write:chat` scope, and Twitch cannot widen an existing
 grant — **a Twitch account connected before this must be reconnected once**
 (*Settings → Accounts*) before the box appears. Everything else about the
@@ -3950,6 +3957,19 @@ every open chat window; **Reset to defaults** restores 14pt / 24px white/white.
 down to just this channel's own messages — useful when the combined chat is
 too noisy to follow (see *Chat replay source indicator* above for how a
 message's origin channel is determined).
+
+**A URL in a message renders as a clickable link** (underlined, opens in your
+default browser), not plain text — trailing sentence punctuation (`.`, `,`,
+`)`, …) is trimmed off first, so "check this out: https://example.com/x." doesn't
+turn the closing period into part of the address. Right-click a link for
+**Copy Link** / **Open in Browser**.
+
+**Right-click a username** for a context menu: **View user info** (the same
+card a left click opens), **Reply to @name** (inserts `@name ` into the send
+box — only offered on a window that has one at all), and — only when that
+chatter is themselves one of this app's own monitored channels, e.g. a fellow
+streamer chatting during a raid or a Shared Chat collab, not just any viewer —
+**Open Properties** for their channel directly from the chat window.
 
 **Click a username** to open its usercard: a decorative color banner (Twitch
 exposes no per-viewer banner image via its public API, so this is generated
@@ -5019,8 +5039,8 @@ holding the core type(s) and re-exports, with the implementation spread over
   message/log/popup types) over `window` (toolbar, panels, message list),
   `rows` (one message drawn), `parse` (sidecar → messages), `emotes`,
   `helpers` (asset lookups, segment building), `colors`, `usercard`, `strips`
-  (top supporters / Hype Train), `compose` (emote picker + `:code`
-  autocomplete).
+  (top supporters / Hype Train), `compose` (emote picker + `:code` and
+  `@mention` autocomplete).
 
 `src/chat_index.rs` is the app's **second** SQLite database (see
 [Users](#users--who-chatted-where)) — its own file, migrations and connection
