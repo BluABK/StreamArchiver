@@ -192,6 +192,14 @@ pub fn parse_paint(node: &serde_json::Value) -> Option<Paint> {
     None
 }
 
+/// The first message in a GraphQL response's top-level `errors` array, if
+/// any — 7TV (like Twitch's own GQL) answers a genuine query error with an
+/// ordinary HTTP 200 and `"data": null`, so this is the only way to tell
+/// "nobody in this batch has a paint" apart from "the query itself failed".
+fn gql_error(v: &serde_json::Value) -> Option<&str> {
+    v["errors"].as_array().filter(|e| !e.is_empty())?[0]["message"].as_str().or(Some("?"))
+}
+
 /// Fetch the active paints for a batch of Twitch user ids.
 ///
 /// Returns only the users who HAVE one; the caller records everything it asked
@@ -224,6 +232,15 @@ pub async fn fetch_paints(
             anyhow::bail!("7tv gql {}", resp.status());
         }
         let v: serde_json::Value = resp.json().await?;
+        // A GraphQL error is still an HTTP 200 with `data: null` — anything
+        // in `chunk` would then read back as "asked, no paint" and get
+        // negative-cached for `PAINTS_TTL_SECS` (24h) by the caller, even
+        // though nobody in this batch was actually checked. Bailing here
+        // instead means the caller's `asked` set is untouched and the next
+        // sweep retries the same chunk.
+        if let Some(e) = gql_error(&v) {
+            anyhow::bail!("7tv gql: {e}");
+        }
         for (i, id) in chunk.iter().enumerate() {
             let node = &v["data"]["users"][format!("u{i}")]["style"]["activePaint"];
             if let Some(p) = parse_paint(node) {
@@ -299,6 +316,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parse_paint(&bad), None);
+    }
+
+    /// 7TV answers a genuine query error with an ordinary HTTP 200 and
+    /// `"data": null` — the real shape returned for a malformed query
+    /// (verified live against `7tv.io/v4/gql`, 2026-08-10). Without checking
+    /// for this, every id in that batch reads back as "no paint" and gets
+    /// negative-cached for `PAINTS_TTL_SECS`, silently hiding a real paint
+    /// for up to a day.
+    #[test]
+    fn gql_error_finds_a_top_level_graphql_error() {
+        let v: serde_json::Value = serde_json::from_str(
+            r##"{"data":null,"errors":[{"message":"Unknown field \"idz\" on type \"Paint\".",
+                "locations":[{"line":1,"column":91}]}]}"##,
+        )
+        .unwrap();
+        assert_eq!(gql_error(&v), Some("Unknown field \"idz\" on type \"Paint\"."));
+    }
+
+    #[test]
+    fn gql_error_is_none_for_an_ordinary_successful_response() {
+        let v: serde_json::Value =
+            serde_json::from_str(r##"{"data":{"users":{"u0":null}}}"##).unwrap();
+        assert_eq!(gql_error(&v), None);
+        // An empty `errors` array (some servers always include the key) is
+        // not an error either.
+        let v: serde_json::Value =
+            serde_json::from_str(r##"{"data":{},"errors":[]}"##).unwrap();
+        assert_eq!(gql_error(&v), None);
     }
 
     #[test]
