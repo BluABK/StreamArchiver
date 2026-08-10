@@ -564,6 +564,11 @@ pub(super) struct SendBar {
     /// The query Esc dismissed, so the list stays down for THAT word but
     /// comes back for the next one. Empty = nothing dismissed.
     pub(super) complete_dismissed: String,
+    /// Which `@name` suggestion is selected — same shape as `complete_sel`,
+    /// for the mention autocomplete instead of the emote one.
+    pub(super) mention_sel: usize,
+    /// Same as `complete_dismissed`, for the mention autocomplete.
+    pub(super) mention_dismissed: String,
 }
 
 /// How long a pending row waits for its own message to come back before it
@@ -754,6 +759,25 @@ pub(super) struct ChatPopup {
     /// the (optional) live usercard lookup — same "mutate inside the
     /// closure, consume after" shape `decode_misses` already used.
     pub(super) usercard_click: Option<UserCardClick>,
+    /// A username context-menu action this render pass ("Reply" / "Open
+    /// Properties") — same stash-then-consume shape as `usercard_click`.
+    pub(super) row_action: Option<RowMenuAction>,
+    /// Twitch login (lowercased) -> monitor id, for every Twitch channel this
+    /// app monitors. Built ONCE on popup-open from `self.rows`, like
+    /// `emote_map` — decides whether a username's context menu offers "Open
+    /// Properties" (only chatters who are themselves a monitored channel,
+    /// e.g. during a raid or a Shared Chat collab, get the option).
+    pub(super) channel_by_login: Arc<HashMap<String, i64>>,
+    /// `egui::InputState::time` up to which the log's stick-to-bottom is held
+    /// off, even though it would otherwise engage. Refreshed to "now + a
+    /// short grace" on every frame the primary mouse button is down anywhere
+    /// — a live chat that keeps snapping to the newest message the instant
+    /// one arrives yanks the viewport (and any in-progress drag-selection)
+    /// out from under a user who's mid-select, which reads as "chat cancels
+    /// my highlighted text." The grace period after release, not just while
+    /// held, gives a completed selection time to survive long enough to
+    /// Ctrl+C before the next message re-engages the snap.
+    pub(super) pause_stick_until: f64,
 }
 
 /// The deferred viewport one monitor's chat window lives in.

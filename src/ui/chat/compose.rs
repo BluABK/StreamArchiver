@@ -258,6 +258,177 @@ pub(in crate::ui) fn emote_picker(
     picked
 }
 
+/// Up to `limit` distinct display names that have spoken recently in this
+/// log, newest first — the candidate list for `@` mention autocomplete.
+/// Bounded to a short scan of the tail regardless of the log's total size,
+/// the same shape as the usercard's "recent activity" scan — this runs every
+/// frame the send bar is visible, not just when a mention is being typed
+/// (`popup.send` is a disjoint field from `popup.load_state`, and reading the
+/// latter after `popup.send.as_mut()` has already been taken fights the
+/// borrow checker, so the candidate list is built unconditionally, cheaply,
+/// before that borrow starts).
+pub(in crate::ui) fn recent_chat_authors(state: &Mutex<ChatLoadState>, limit: usize) -> Vec<String> {
+    const SCAN_MESSAGES: usize = 300;
+    let guard = state.lock().unwrap();
+    let ChatLoadState::Loaded(log) = &*guard else { return Vec::new() };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in log.messages.iter().rev().take(SCAN_MESSAGES) {
+        if m.author.is_empty() || !seen.insert(m.author.clone()) {
+            continue;
+        }
+        out.push(m.author.clone());
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// The `@partial` mention token immediately before the caret — same
+/// contract as [`emote_token`], triggered by `@` instead of `:`, with no
+/// minimum query length: Twitch's own mention list opens on a bare `@`, and
+/// showing recent chatters immediately (rather than after N characters) is
+/// the whole point for a name you can't quite remember the spelling of.
+///
+/// The `@` must start a word: `foo@bar` reads as an email/handle, not the
+/// start of a mention.
+pub(in crate::ui) fn mention_token(
+    text: &str,
+    caret: usize,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let caret = caret.min(chars.len());
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = caret;
+    while start > 0 && is_word(chars[start - 1]) {
+        start -= 1;
+    }
+    let at = start.checked_sub(1)?;
+    if chars[at] != '@' {
+        return None;
+    }
+    if at > 0 && is_word(chars[at - 1]) {
+        return None;
+    }
+    Some((at..caret, chars[start..caret].iter().collect()))
+}
+
+/// Candidate names matching `query`, best first. An empty query (a bare `@`)
+/// returns `candidates` as given — the caller already orders that
+/// newest-first, and ranking it here by length/prefix would scramble that
+/// recency order for the one case (nothing typed yet) where recency is the
+/// only signal available.
+pub(in crate::ui) fn rank_mention_matches<'a>(
+    query: &str,
+    candidates: &'a [String],
+    limit: usize,
+) -> Vec<&'a str> {
+    if query.is_empty() {
+        return candidates.iter().map(String::as_str).take(limit).collect();
+    }
+    let q = query.to_lowercase();
+    let mut hits: Vec<(bool, usize, usize, &str)> = Vec::new();
+    for (i, name) in candidates.iter().enumerate() {
+        let n = name.to_lowercase();
+        let prefix = n.starts_with(&q);
+        if prefix || n.contains(&q) {
+            hits.push((!prefix, name.chars().count(), i, name.as_str()));
+        }
+    }
+    hits.sort_by_key(|&(substring, len, idx, _)| (substring, len, idx));
+    hits.into_iter().map(|(.., n)| n).take(limit).collect()
+}
+
+/// The `@name` autocomplete list, drawn above the message box. Same
+/// keyboard-first shape as [`emote_autocomplete`] (↑/↓ move, Tab/Enter
+/// accepts, Esc dismisses) and its own selection state on `SendBar` so the
+/// two lists don't fight over which suggestion index is "selected" — only
+/// one can be open at a time (an `@` token and a `:` token can't both be
+/// immediately before the caret), but keeping the state separate means
+/// switching from one to the other never shows a stale highlight.
+pub(in crate::ui) fn mention_autocomplete(
+    ui: &mut egui::Ui,
+    bar: &mut SendBar,
+    edit: &egui::Response,
+    caret: Option<usize>,
+    candidates: &[String],
+) -> Completion {
+    let Some((range, query)) = caret.and_then(|c| mention_token(&bar.draft, c)) else {
+        bar.mention_sel = 0;
+        bar.mention_dismissed.clear();
+        return Completion::None;
+    };
+    if bar.mention_dismissed == query {
+        return Completion::None;
+    }
+    let matches = rank_mention_matches(&query, candidates, MAX_COMPLETIONS);
+    if matches.is_empty() {
+        bar.mention_sel = 0;
+        return Completion::None;
+    }
+    bar.mention_sel = bar.mention_sel.min(matches.len() - 1);
+
+    let (up, down, accept, dismiss) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Tab) || i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    if dismiss {
+        bar.mention_dismissed = query;
+        return Completion::None;
+    }
+    if up {
+        bar.mention_sel = bar.mention_sel.checked_sub(1).unwrap_or(matches.len() - 1);
+    }
+    if down {
+        bar.mention_sel = (bar.mention_sel + 1) % matches.len();
+    }
+
+    let mut clicked: Option<String> = None;
+    egui::Popup::from_response(edit)
+        .id(egui::Id::new(("chat_mention_complete", edit.id)))
+        .align(egui::RectAlign::TOP_START)
+        .open(true)
+        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+        .show(|ui| {
+            ui.set_min_width(180.0);
+            for (i, name) in matches.iter().enumerate() {
+                let selected = i == bar.mention_sel;
+                let resp = ui
+                    .scope_builder(
+                        egui::UiBuilder::new().sense(egui::Sense::click()),
+                        |ui| {
+                            if selected {
+                                let r = ui.available_rect_before_wrap();
+                                ui.painter().rect_filled(
+                                    r,
+                                    3.0,
+                                    ui.visuals().selection.bg_fill.gamma_multiply(0.5),
+                                );
+                            }
+                            ui.label(format!("@{name}"));
+                        },
+                    )
+                    .response;
+                if resp.clicked() {
+                    clicked = Some((*name).to_string());
+                }
+            }
+        });
+
+    if let Some(name) = clicked {
+        return Completion::Accept(range, format!("@{name}"));
+    }
+    if accept {
+        return Completion::Accept(range, format!("@{}", matches[bar.mention_sel]));
+    }
+    Completion::Open
+}
+
 /// What the autocomplete decided this frame.
 pub(in crate::ui) enum Completion {
     /// Nothing to offer — the caller sends on Enter as usual.
@@ -467,6 +638,54 @@ mod tests {
         let got = rank_emote_matches("xdx", &c, 10);
         assert_eq!(got.len(), 1);
         assert!(!got[0].group.global);
+    }
+
+    /// Same shape of coverage as `emote_token_finds_a_colon_word_before_the_caret`:
+    /// every way of NOT being a mention token matters as much as the happy path.
+    #[test]
+    fn mention_token_finds_an_at_word_before_the_caret() {
+        assert_eq!(mention_token("hi @Blu", 7), Some((3..7, "Blu".to_string())));
+        // Zero characters after `@` still opens — unlike emotes, a bare `@`
+        // is meant to list recent chatters immediately.
+        assert_eq!(mention_token("@", 1), Some((0..1, String::new())));
+        assert_eq!(mention_token("hi @", 4), Some((3..4, String::new())));
+
+        // `@` preceded by a word character reads as an email/handle, not a
+        // mention: "foo@bar" must not pop a list.
+        assert_eq!(mention_token("foo@bar", 7), None);
+
+        // No `@` at all, and a caret that isn't at the token's end.
+        assert_eq!(mention_token("Blu", 3), None);
+        assert_eq!(mention_token("@Blu ok", 7), None);
+    }
+
+    #[test]
+    fn mention_token_is_character_indexed() {
+        assert_eq!(mention_token("떡볶이 @Blu", 8), Some((4..8, "Blu".to_string())));
+    }
+
+    #[test]
+    fn mention_matches_rank_prefix_over_substring_then_by_length() {
+        let names: Vec<String> = ["Bluey", "SubluCoolBoi", "Blu", "IsraBluTeam"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = rank_mention_matches("blu", &names, 10);
+        // Prefix tier first (`Blu`, `Bluey`), then substring by length
+        // (`IsraBluTeam` is 11 characters, `SubluCoolBoi` is 12).
+        assert_eq!(got, ["Blu", "Bluey", "IsraBluTeam", "SubluCoolBoi"]);
+        assert!(rank_mention_matches("nothinglikethis", &names, 10).is_empty());
+    }
+
+    /// A bare `@` (empty query) is the one case with no ranking signal but
+    /// recency — it must pass the candidate list through as given rather
+    /// than resorting it by name length.
+    #[test]
+    fn an_empty_mention_query_preserves_the_recency_order() {
+        let names: Vec<String> =
+            ["Zzz", "Newest", "A"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(rank_mention_matches("", &names, 10), names.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(rank_mention_matches("", &names, 2), vec!["Zzz", "Newest"]);
     }
 
     /// Sections come out in catalogue order with their emotes packed into

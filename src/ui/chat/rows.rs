@@ -333,6 +333,19 @@ impl UserCardClick {
     }
 }
 
+/// A context-menu action chosen from a message's username. Applied by the
+/// wrapper (`chat_popup_window`), not here: inserting into the send box's
+/// draft and opening a Properties window both need `&mut self`, which the
+/// deferred render closure doesn't have — same "stash on the struct, consume
+/// after" shape [`UserCardClick`] already uses via `usercard_click`.
+pub(in crate::ui) enum RowMenuAction {
+    /// `@{name} ` should be inserted into the send box's draft.
+    Reply(String),
+    /// Open this Twitch channel's Properties window — offered only when the
+    /// message's login matches one of the app's own monitored channels.
+    OpenProperties(i64),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn render_chat_message(
     ui: &mut egui::Ui,
@@ -346,7 +359,15 @@ pub(in crate::ui) fn render_chat_message(
     paints: &HashMap<String, crate::cosmetics::Paint>,
     ctx: &egui::Context,
     appearance: &ChatAppearance,
-) -> Option<UserCardClick> {
+    // Twitch login (lowercased) -> monitor id, for every channel this app
+    // monitors — decides whether "Open Properties" appears in a username's
+    // context menu. Built once at popup-open, not per row.
+    channel_by_login: &HashMap<String, i64>,
+    // Whether this window has a send box at all (live Twitch take, connected
+    // account) — "Reply" is hidden rather than shown disabled on a window
+    // that can never send.
+    can_send: bool,
+) -> (Option<UserCardClick>, Option<RowMenuAction>) {
     let (shown_ts, other_ts) = fmt_chat_ts_mode(msg, appearance.ts_mode);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
@@ -377,7 +398,7 @@ pub(in crate::ui) fn render_chat_message(
             .on_hover_text(
                 "Moderation/room event captured live from Twitch chat while recording",
             );
-            return None;
+            return (None, None);
         }
         // Standalone event rows (sub / resub / gift / raid / announcement /
         // watch streak): Twitch's own `system-msg` copy verbatim, on its own
@@ -395,7 +416,7 @@ pub(in crate::ui) fn render_chat_message(
             // row; one that carries a message falls through and renders the
             // sender beneath it.
             if msg.text.is_empty() {
-                return None;
+                return (None, None);
             }
             ui.end_row();
         }
@@ -483,6 +504,26 @@ pub(in crate::ui) fn render_chat_message(
             .font(name_font)
             .color(name_color);
         let mut click: Option<UserCardClick> = None;
+        let mut menu_action: Option<RowMenuAction> = None;
+        // Shared by the left-click handler and the "View user info"
+        // context-menu item — building the card needs no per-caller state,
+        // so both just call this.
+        let build_click = || UserCardClick {
+            login: msg.login.clone(),
+            display_name: msg.author.clone(),
+            color: msg.color_override,
+            badges: msg.badges.clone(),
+            badge_icons: msg.badge_icons.clone(),
+            badge_info: msg.badge_info.clone(),
+            // Twitch numeric id, or YouTube's channel id — whichever this
+            // platform gave us.
+            user_id: if msg.user_id.is_empty() {
+                msg.author_id.clone()
+            } else {
+                msg.user_id.clone()
+            },
+            platform: msg.platform.clone(),
+        };
         if !msg.purge_key().is_empty() {
             let resp = ui
                 .add(match painted {
@@ -492,26 +533,32 @@ pub(in crate::ui) fn render_chat_message(
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(
                     "Click for user info — messages in this log, what this channel has \
-                     recorded about them, and any moderation actions against them",
+                     recorded about them, and any moderation actions against them. \
+                     Right-click for more.",
                 );
             if resp.clicked() {
-                click = Some(UserCardClick {
-                    login: msg.login.clone(),
-                    display_name: msg.author.clone(),
-                    color: msg.color_override,
-                    badges: msg.badges.clone(),
-                    badge_icons: msg.badge_icons.clone(),
-                    badge_info: msg.badge_info.clone(),
-                    // Twitch numeric id, or YouTube's channel id — whichever
-                    // this platform gave us.
-                    user_id: if msg.user_id.is_empty() {
-                        msg.author_id.clone()
-                    } else {
-                        msg.user_id.clone()
-                    },
-                    platform: msg.platform.clone(),
-                });
+                click = Some(build_click());
             }
+            let monitor_id = channel_by_login.get(&msg.login.to_lowercase()).copied();
+            resp.context_menu(|ui| {
+                if ui.button("View user info").clicked() {
+                    click = Some(build_click());
+                    ui.close();
+                }
+                if can_send && ui.button(format!("Reply to @{}", msg.author)).clicked() {
+                    menu_action = Some(RowMenuAction::Reply(msg.author.clone()));
+                    ui.close();
+                }
+                // Only offered when this chatter IS one of the app's own
+                // monitored channels (e.g. a fellow streamer chatting during
+                // a raid or a Shared Chat collab) — not every viewer.
+                if let Some(mid) = monitor_id
+                    && ui.button("Open Properties").clicked()
+                {
+                    menu_action = Some(RowMenuAction::OpenProperties(mid));
+                    ui.close();
+                }
+            });
         } else {
             match painted {
                 Some(job) => ui.label(job),
@@ -546,7 +593,7 @@ pub(in crate::ui) fn render_chat_message(
                     .on_hover_text(reason);
             }
             ui.label(egui::RichText::new(format!("({reason})")).small().weak().italics());
-            return click;
+            return (click, menu_action);
         }
         // Message body — text runs and (when enabled & on disk) inline emote images.
         let emote_h = appearance.emote_pt;
@@ -555,12 +602,51 @@ pub(in crate::ui) fn render_chat_message(
                 ChatSegment::Text(t) => {
                     // One label per run: egui wraps a multi-word galley at word
                     // boundaries inside horizontal_wrapped while preserving the run's
-                    // internal/leading/trailing whitespace verbatim.
-                    ui.label(
-                        egui::RichText::new(t.as_str())
-                            .font(egui::FontId::new(appearance.font_pt, chat_family()))
-                            .color(appearance.text_color),
-                    );
+                    // internal/leading/trailing whitespace verbatim. A run
+                    // containing a URL is split further so the link renders as
+                    // its own clickable widget; everything around it keeps
+                    // going through the plain-text path unchanged.
+                    for part in split_text_urls(t) {
+                        match part {
+                            TextPart::Plain(s) => {
+                                ui.label(
+                                    egui::RichText::new(s)
+                                        .font(egui::FontId::new(appearance.font_pt, chat_family()))
+                                        .color(appearance.text_color),
+                                );
+                            }
+                            TextPart::Url(url) => {
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(url)
+                                                .font(egui::FontId::new(
+                                                    appearance.font_pt,
+                                                    chat_family(),
+                                                ))
+                                                .color(ui.visuals().hyperlink_color)
+                                                .underline(),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(url);
+                                if resp.clicked() {
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Copy Link").clicked() {
+                                        ui.ctx().copy_text(url.to_string());
+                                        ui.close();
+                                    }
+                                    if ui.button("Open in Browser").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        }
+                    }
                 }
                 ChatSegment::Emote { name, file, fallback_text, .. } => {
                     let drawn = render_emotes
@@ -610,7 +696,122 @@ pub(in crate::ui) fn render_chat_message(
             ui.label(egui::RichText::new("FIRST MESSAGE").small().strong().color(TWITCH_PURPLE))
                 .on_hover_text("The first message this account has ever sent in this channel");
         }
-        click
+        (click, menu_action)
     })
     .inner
+}
+
+/// One piece of a text run after pulling any URLs out of it — a message can
+/// mix ordinary words and links freely, and everything BUT the URL still goes
+/// through the same plain-text label as before.
+enum TextPart<'a> {
+    Plain(&'a str),
+    Url(&'a str),
+}
+
+/// Split a chat message's text run at `http://`/`https://` URLs. A URL runs
+/// to the next whitespace, then sheds trailing punctuation (`.`, `,`, `)`, …)
+/// that's almost always sentence punctuation rather than part of the link —
+/// "check this out: https://example.com/x." must not turn the trailing `.`
+/// into part of the address.
+fn split_text_urls(text: &str) -> Vec<TextPart<'_>> {
+    let mut parts = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = next_url_start(text, pos) {
+        if start > pos {
+            parts.push(TextPart::Plain(&text[pos..start]));
+        }
+        let rest = &text[start..];
+        let end_rel = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let mut end = start + end_rel;
+        // "https://" is the longer of the two schemes (8 bytes) — never trim
+        // into either scheme while stripping trailing punctuation.
+        while end > start + 8 {
+            let c = text[..end].chars().next_back().expect("end > start implies a prior char");
+            if matches!(c, '.' | ',' | '!' | '?' | ')' | ';' | ':' | '\'' | '"') {
+                end -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        parts.push(TextPart::Url(&text[start..end]));
+        pos = end;
+    }
+    if pos < text.len() {
+        parts.push(TextPart::Plain(&text[pos..]));
+    }
+    parts
+}
+
+/// The byte offset of the next `http://` or `https://` in `text` at or after
+/// `from`, whichever comes first.
+fn next_url_start(text: &str, from: usize) -> Option<usize> {
+    let https = text[from..].find("https://").map(|p| p + from);
+    let http = text[from..].find("http://").map(|p| p + from);
+    match (https, http) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod url_split_tests {
+    use super::*;
+
+    fn plains<'a>(parts: &'a [TextPart<'a>]) -> Vec<&'a str> {
+        parts
+            .iter()
+            .filter_map(|p| match p {
+                TextPart::Plain(s) => Some(*s),
+                TextPart::Url(_) => None,
+            })
+            .collect()
+    }
+
+    fn urls<'a>(parts: &'a [TextPart<'a>]) -> Vec<&'a str> {
+        parts
+            .iter()
+            .filter_map(|p| match p {
+                TextPart::Url(s) => Some(*s),
+                TextPart::Plain(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_text_with_no_url_is_untouched() {
+        let parts = split_text_urls("just chatting, no links here");
+        assert_eq!(urls(&parts), Vec::<&str>::new());
+        assert_eq!(plains(&parts), vec!["just chatting, no links here"]);
+    }
+
+    #[test]
+    fn a_bare_url_becomes_its_own_part() {
+        let parts = split_text_urls("check https://example.com/x out");
+        assert_eq!(plains(&parts), vec!["check ", " out"]);
+        assert_eq!(urls(&parts), vec!["https://example.com/x"]);
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_not_part_of_the_link() {
+        let parts = split_text_urls("go here: http://example.com/a.");
+        assert_eq!(urls(&parts), vec!["http://example.com/a"]);
+        assert_eq!(plains(&parts), vec!["go here: ", "."]);
+    }
+
+    #[test]
+    fn a_url_at_the_very_start_or_end_keeps_no_empty_plain_part() {
+        let parts = split_text_urls("https://example.com");
+        assert_eq!(urls(&parts), vec!["https://example.com"]);
+        assert!(plains(&parts).is_empty());
+    }
+
+    #[test]
+    fn two_urls_in_one_run_both_split_out() {
+        let parts = split_text_urls("https://a.com and https://b.com");
+        assert_eq!(urls(&parts), vec!["https://a.com", "https://b.com"]);
+        assert_eq!(plains(&parts), vec![" and "]);
+    }
 }

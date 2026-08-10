@@ -62,6 +62,22 @@ impl StreamArchiverApp {
             TwitchBadgeDirs { channel: None, global: twitch_global_badge_dir() }
         });
 
+        // Every Twitch channel this app monitors, keyed by lowercased login —
+        // decides whether a chatter's username context menu offers "Open
+        // Properties" (a fellow monitored streamer chatting here during a
+        // raid or Shared Chat collab, not just any viewer). Built once here
+        // rather than per row: `self.rows` isn't reachable from the deferred
+        // render closure at all.
+        let channel_by_login: Arc<HashMap<String, i64>> = Arc::new(
+            self.rows
+                .iter()
+                .filter(|r| r.monitor.platform() == Platform::Twitch)
+                .filter_map(|r| {
+                    crate::detectors::twitch_login(&r.monitor.url).map(|l| (l, r.monitor.id))
+                })
+                .collect(),
+        );
+
         let recs = self
             .core
             .store
@@ -202,6 +218,8 @@ impl StreamArchiverApp {
                         picker_filter: String::new(),
                         complete_sel: 0,
                         complete_dismissed: String::new(),
+                        mention_sel: 0,
+                        mention_dismissed: String::new(),
                     }
                 })
             },
@@ -243,6 +261,9 @@ impl StreamArchiverApp {
             closed: false,
             decode_misses: Vec::new(),
             usercard_click: None,
+            row_action: None,
+            channel_by_login,
+            pause_stick_until: 0.0,
         };
         // One chat window per monitor: re-targeting an already-open window
         // (e.g. "View chat" on another take) replaces its content in place;
@@ -485,6 +506,12 @@ impl StreamArchiverApp {
                 // captured locals the wrapper reads back after the call returns.
                 let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
                 let mut usercard_click: Option<UserCardClick> = None;
+                let mut row_action: Option<RowMenuAction> = None;
+                // Whether a username's context menu offers "Reply" — this
+                // window has a send box at all (live Twitch take, connected
+                // account), not whether one particular chatter can be
+                // replied to.
+                let can_send = popup.send.is_some();
                 // ── Send bar ─────────────────────────────────────────────
                 // Declared BEFORE the CentralPanel: panel order allocates the
                 // space, and the message list's ScrollArea has
@@ -501,6 +528,10 @@ impl StreamArchiverApp {
                             let catalog = popup.emote_catalog.clone();
                             let channel = popup.monitor_name.clone();
                             let edit_id = egui::Id::new(("chat_send_edit", popup.monitor_id));
+                            // `@` mention candidates: recent chatters in the
+                            // currently-loaded log. Same "read off popup first"
+                            // reason as `catalog`/`channel` above.
+                            let recent_logins = recent_chat_authors(&popup.load_state, 60);
                             let Some(bar) = popup.send.as_mut() else { return };
                             let now_ms = crate::models::now_unix() * 1000;
                             let bid = bar.broadcaster_id.lock().unwrap().clone();
@@ -545,7 +576,7 @@ impl StreamArchiverApp {
                                     .show(ui);
                                 let resp = out.response;
                                 let caret = out.cursor_range.map(|c| c.primary.index);
-                                let completion = emote_autocomplete(
+                                let mut completion = emote_autocomplete(
                                     ui,
                                     bar,
                                     &resp,
@@ -556,6 +587,14 @@ impl StreamArchiverApp {
                                     now,
                                     ctx,
                                 );
+                                // `:` and `@` tokens can't both be immediately
+                                // before the caret, so trying the mention list
+                                // only when the emote one found nothing never
+                                // masks a real emote completion.
+                                if matches!(completion, Completion::None) {
+                                    completion =
+                                        mention_autocomplete(ui, bar, &resp, caret, &recent_logins);
+                                }
                                 match completion {
                                     Completion::Accept(range, code) => {
                                         let (text, at) =
@@ -1589,7 +1628,25 @@ impl StreamArchiverApp {
                                 }
                             });
 
-                            let stick = q.is_empty() && !popup.full_view;
+                            // Selecting text is a multi-frame mouse-down drag with
+                            // no scroll movement of its own, so plain
+                            // `stick_to_bottom` (which only backs off once the
+                            // scroll offset itself has moved) doesn't notice a
+                            // selection in progress: a new message arriving mid-
+                            // drag still yanks the log down to follow it,
+                            // scrolling the very rows being selected out of the
+                            // virtualized window and cancelling the selection.
+                            // Held off for a short grace period after the mouse
+                            // last went down anywhere, so a finished selection
+                            // also survives long enough to Ctrl+C.
+                            const STICK_PAUSE_GRACE_SECS: f64 = 3.0;
+                            let now_t = ui.ctx().input(|i| i.time);
+                            if ui.ctx().input(|i| i.pointer.primary_down()) {
+                                popup.pause_stick_until = now_t + STICK_PAUSE_GRACE_SECS;
+                            }
+                            let stick = q.is_empty()
+                                && !popup.full_view
+                                && now_t >= popup.pause_stick_until;
                             const GAP: f32 = 2.0;
                             const OVERSCAN: f32 = 300.0;
                             egui::ScrollArea::vertical()
@@ -1682,32 +1739,52 @@ impl StreamArchiverApp {
                                         // Room for the accent bar on the left. Reserved
                                         // on EVERY row, not just accented ones, so text
                                         // doesn't shift sideways as notices scroll past.
-                                        let r = egui::Frame::new()
-                                            .fill(decor.fill)
-                                            .inner_margin(egui::Margin {
-                                                left: 7,
-                                                right: 2,
-                                                top: 1,
-                                                bottom: 1,
+                                        //
+                                        // Scoped under `mi` (the message's own index,
+                                        // not its position in this frame's rendered
+                                        // slice) so every widget's id tracks the
+                                        // MESSAGE across frames rather than the screen
+                                        // row it happens to land on. Without this, a
+                                        // virtualizer boundary that shifts by one row
+                                        // between frames (a row's measured height
+                                        // crossing the 0.5px re-cache threshold) has
+                                        // widget N suddenly backing a different
+                                        // message than it did last frame — same id,
+                                        // different galley — which egui's cross-label
+                                        // text selection reads as "the selected text
+                                        // is gone" and drops it.
+                                        let r = ui
+                                            .push_id(mi, |ui| {
+                                                egui::Frame::new()
+                                                    .fill(decor.fill)
+                                                    .inner_margin(egui::Margin {
+                                                        left: 7,
+                                                        right: 2,
+                                                        top: 1,
+                                                        bottom: 1,
+                                                    })
+                                                    .corner_radius(2.0)
+                                                    .show(ui, |ui| {
+                                                        ui.scope(|ui| {
+                                                            render_chat_message(
+                                                                ui,
+                                                                &log.messages[mi],
+                                                                &anim_cache,
+                                                                render_emotes,
+                                                                animate_emotes,
+                                                                now,
+                                                                &mut decode_misses,
+                                                                Some(&ui_tex),
+                                                                &paints.lock().unwrap(),
+                                                                ctx,
+                                                                &appearance,
+                                                                &popup.channel_by_login,
+                                                                can_send,
+                                                            )
+                                                        })
+                                                    })
                                             })
-                                            .corner_radius(2.0)
-                                            .show(ui, |ui| {
-                                                ui.scope(|ui| {
-                                                    render_chat_message(
-                                                        ui,
-                                                        &log.messages[mi],
-                                                        &anim_cache,
-                                                        render_emotes,
-                                                        animate_emotes,
-                                                        now,
-                                                        &mut decode_misses,
-                                                        Some(&ui_tex),
-                                                        &paints.lock().unwrap(),
-                                                        ctx,
-                                                        &appearance,
-                                                    )
-                                                })
-                                            });
+                                            .inner;
                                         // egui's Frame has no per-side border, so the
                                         // Twitch-style accent is painted from the
                                         // frame's own rect after the fact. Doing it
@@ -1725,8 +1802,12 @@ impl StreamArchiverApp {
                                                 c,
                                             );
                                         }
-                                        if let Some(req) = r.inner.inner {
+                                        let (row_click, row_menu) = r.inner.inner;
+                                        if let Some(req) = row_click {
                                             usercard_click = Some(req);
+                                        }
+                                        if let Some(a) = row_menu {
+                                            row_action = Some(a);
                                         }
                                         let h = r.response.rect.height();
                                         if (h - log.row_heights[mi]).abs() > 0.5 {
@@ -1797,6 +1878,9 @@ impl StreamArchiverApp {
                 popup.decode_misses.extend(decode_misses);
                 if usercard_click.is_some() {
                     popup.usercard_click = usercard_click;
+                }
+                if row_action.is_some() {
+                    popup.row_action = row_action;
                 }
             },
         );
@@ -1943,6 +2027,37 @@ impl StreamArchiverApp {
                 mod_summary,
                 fetch,
             });
+        }
+
+        // A username's context menu chose "Reply" or "Open Properties" this
+        // frame. Both need `&mut self` (writing the draft box's memory-held
+        // caret / pushing onto `properties_popups`), which the deferred
+        // render closure doesn't have — same stash-then-consume shape as
+        // `usercard_click` just above.
+        let row_action = popup_arc.lock().unwrap().row_action.take();
+        match row_action {
+            Some(RowMenuAction::Reply(name)) => {
+                let mut p = popup_arc.lock().unwrap();
+                let monitor_id = p.monitor_id;
+                if let Some(bar) = p.send.as_mut() {
+                    if !bar.draft.is_empty() && !bar.draft.ends_with(' ') {
+                        bar.draft.push(' ');
+                    }
+                    bar.draft.push('@');
+                    bar.draft.push_str(&name);
+                    bar.draft.push(' ');
+                    let caret = bar.draft.chars().count();
+                    let edit_id = egui::Id::new(("chat_send_edit", monitor_id));
+                    drop(p);
+                    set_draft_caret(ctx, edit_id, caret);
+                }
+            }
+            Some(RowMenuAction::OpenProperties(mid))
+                if !self.properties_popups.contains(&mid) =>
+            {
+                self.properties_popups.push(mid);
+            }
+            Some(RowMenuAction::OpenProperties(_)) | None => {}
         }
 
         // Tail-reload: while the recording is live, parse only the bytes
