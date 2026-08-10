@@ -1001,28 +1001,36 @@ pub(crate) fn global_twitch_emote_dir() -> PathBuf {
     crate::app_paths::platform_assets_dir().join("twitch").join("global_emotes")
 }
 
-/// `(dest, url)` for fetching a first-party Twitch emote directly by numeric
-/// id, with no broadcaster/channel context at all — Twitch's emote CDN
-/// serves images keyed purely by id. This is how an emote whose home channel
-/// isn't monitored here (e.g. a poster's own sub emote, used in some OTHER
-/// channel's chat — Twitch lets any subscriber use their emotes anywhere) can
-/// still render 1:1 without adding that channel.
+/// `(dest, candidate urls)` for fetching a first-party Twitch emote directly
+/// by numeric id, with no broadcaster/channel context at all — Twitch's
+/// emote CDN serves images keyed purely by id. This is how an emote whose
+/// home channel isn't monitored here (e.g. a poster's own sub emote, used in
+/// some OTHER channel's chat — Twitch lets any subscriber use their emotes
+/// anywhere) can still render 1:1 without adding that channel.
 ///
-/// Always the `static/dark/3.0` CDN variant: without a Helix "Get Channel
-/// Emotes" call (which needs a broadcaster id we don't have for an unknown
-/// channel) there's no way to know ahead of time whether an id is animated
-/// or static, and `EmojiFetch` writes one fixed destination per queued fetch
-/// — guessing wrong would write mismatched bytes under the wrong extension.
-/// A purely-animated-only unknown emote 404s on this URL and stays text;
-/// that's a smaller regression than today's "never renders cross-channel at
-/// all". `dest` is deterministic in `(id, name)` so repeat occurrences of the
-/// same code in one log collapse to a single fetch (see
-/// `parse_chat_chunk`'s `fetches.dedup()`), and every occurrence's
-/// independently-set `pending` promotes together once that one file lands.
-pub(crate) fn twitch_emote_cdn_fetch(id: &str, name: &str) -> (PathBuf, String) {
+/// Two candidates, animated first: without a Helix "Get Channel Emotes" call
+/// (which needs a broadcaster id we don't have for an unknown channel)
+/// there's no way to know ahead of time whether an id is animated or
+/// static — but the CDN itself answers that for free, since `animated/`
+/// 404s outright for a static-only id rather than degrading to a still
+/// frame (confirmed against the live CDN: id 25 "Kappa" 404s there). Same
+/// try-in-order, first-success-wins shape `EmojiFetch`/`download_emoji_images`
+/// already use for Twemoji's irregular FE0F naming — no architecture change
+/// needed, just more candidates. `dest` stays a fixed `.png` regardless of
+/// which candidate lands: the renderer sniffs actual image format from
+/// bytes (`emote_anim::decode`), never from the extension, so a `.png`
+/// holding GIF bytes decodes and animates correctly. `dest` is deterministic
+/// in `(id, name)` so repeat occurrences of the same code in one log
+/// collapse to a single fetch (see `parse_chat_chunk`'s `fetches.dedup()`),
+/// and every occurrence's independently-set `pending` promotes together once
+/// that one file lands.
+pub(crate) fn twitch_emote_cdn_fetch(id: &str, name: &str) -> (PathBuf, Vec<String>) {
     let dest = global_twitch_emote_dir().join(format!("{id}_{}.png", sanitize_emote_name(name)));
-    let url = format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/3.0");
-    (dest, url)
+    let urls = vec![
+        format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/animated/dark/3.0"),
+        format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/3.0"),
+    ];
+    (dest, urls)
 }
 
 // ---------- Asset change history ----------
@@ -3338,14 +3346,21 @@ mod tests {
 
     #[test]
     fn twitch_emote_cdn_fetch_is_deterministic_and_sanitizes_the_name() {
-        let (dest1, url1) = twitch_emote_cdn_fetch("425618", "thonkListen");
-        let (dest2, url2) = twitch_emote_cdn_fetch("425618", "thonkListen");
-        // Same input twice -> identical dest/url, so repeat chat occurrences
+        let (dest1, urls1) = twitch_emote_cdn_fetch("425618", "thonkListen");
+        let (dest2, urls2) = twitch_emote_cdn_fetch("425618", "thonkListen");
+        // Same input twice -> identical dest/urls, so repeat chat occurrences
         // of the same emote collapse to one fetch via `fetches.dedup()`.
         assert_eq!(dest1, dest2);
-        assert_eq!(url1, url2);
+        assert_eq!(urls1, urls2);
         assert_eq!(dest1, global_twitch_emote_dir().join("425618_thonkListen.png"));
-        assert_eq!(url1, "https://static-cdn.jtvnw.net/emoticons/v2/425618/static/dark/3.0");
+        // Animated tried first, static as the fallback candidate.
+        assert_eq!(
+            urls1,
+            vec![
+                "https://static-cdn.jtvnw.net/emoticons/v2/425618/animated/dark/3.0",
+                "https://static-cdn.jtvnw.net/emoticons/v2/425618/static/dark/3.0",
+            ]
+        );
 
         // A name needing sanitization matches `sanitize_emote_name` exactly,
         // consistent with every other reader/writer of this filename scheme.

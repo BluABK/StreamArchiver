@@ -1982,12 +1982,12 @@ mod tests {
         };
         assert_eq!(name, "brandNewEmoteCode");
         assert!(file.is_none(), "not on disk yet");
-        let (expected_dest, expected_url) =
+        let (expected_dest, expected_urls) =
             crate::assets::twitch_emote_cdn_fetch("8675309", "brandNewEmoteCode");
         assert_eq!(pending.as_deref(), Some(expected_dest.as_path()));
         assert_eq!(fetches.len(), 1);
         assert_eq!(fetches[0].dest, expected_dest);
-        assert_eq!(fetches[0].urls, vec![expected_url]);
+        assert_eq!(fetches[0].urls, expected_urls);
     }
 
     /// The same total miss, with the toggle off: no fetch queued, no `pending`

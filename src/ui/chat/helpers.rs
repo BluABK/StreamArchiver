@@ -355,14 +355,14 @@ pub(in crate::ui) fn build_twitch_segments(
         let (file, pending) = if file.is_some() {
             (file, None)
         } else if fetch_unknown_emotes {
-            let (dest, url) = crate::assets::twitch_emote_cdn_fetch(&id, &name);
+            let (dest, urls) = crate::assets::twitch_emote_cdn_fetch(&id, &name);
             if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &dest) {
                 (Some(dest), None)
             } else if !crate::iomon::fs::exists_sync(
                 crate::iomon::Cat::AssetCache,
                 dest.with_extension("404"),
             ) {
-                fetches.push(EmojiFetch { dest: dest.clone(), urls: vec![url] });
+                fetches.push(EmojiFetch { dest: dest.clone(), urls });
                 (None, Some(dest))
             } else {
                 (None, None)
