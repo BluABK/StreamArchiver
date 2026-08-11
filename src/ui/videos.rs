@@ -1205,11 +1205,13 @@ impl StreamArchiverApp {
             &global_browser,
         );
 
+        let pot_args = crate::downloader::load_ytdlp_bins(&self.core.store).sabr.pot_args;
+
         let probe = self.format_probe.clone();
         *probe.lock().unwrap() = FormatProbe::Running;
         self.status = "Listing formats…".into();
         self.core.rt.spawn(async move {
-            let result = crate::downloader::probe_formats(tool, &url, &auth).await;
+            let result = crate::downloader::probe_formats(tool, &url, &auth, &pot_args).await;
             *probe.lock().unwrap() = match result {
                 Ok(s) => FormatProbe::Done(s),
                 Err(e) => FormatProbe::Failed(e),

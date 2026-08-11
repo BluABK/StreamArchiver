@@ -522,6 +522,10 @@ unset/no-longer-valid falls back to the system yt-dlp at download time.
 **List formats.** Click **List formats** to probe the URL with the selected tool
 (`yt-dlp --list-formats`, streamlink's stream list, or `ffprobe`) and show the
 available formats/qualities in a window — handy for picking a **Quality** value.
+For YouTube this probe uses the same `mweb` + PO-token client-mix fix as the
+actual download (above); without it, yt-dlp's default client (`tv_downgraded`)
+fails the probe outright with `ERROR: The page needs to be reloaded.` even
+though the download itself would have worked.
 
 **Auto-detect title + channel.** Tick **Auto-detect** to look up the real
 title *and* channel/uploader (via yt-dlp) at download time. These populate the

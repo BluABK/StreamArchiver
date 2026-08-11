@@ -106,7 +106,15 @@ pub(super) async fn best_available_rendition(url: &str) -> Option<(i64, i64, Str
 /// Probe available formats/qualities for a URL with the given tool, returning
 /// combined stdout+stderr for the Videos-tab "List formats" window. yt-dlp gets
 /// `--list-formats`, streamlink lists its stream qualities, ffmpeg uses ffprobe.
-pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<String, String> {
+///
+/// `pot_args` is the PO-token-provider `--extractor-args` value (see
+/// [`super::plan::build_video_plan`]) — empty ⇒ not passed. For YouTube this
+/// mirrors `build_video_plan`'s client-mix workaround: the stock build's
+/// default client (`tv_downgraded`) fails extraction entirely ("The page
+/// needs to be reloaded") even with a valid PO token, so `mweb` is forced
+/// here too, otherwise this probe fails on URLs the actual download handles
+/// fine.
+pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource, pot_args: &str) -> Result<String, String> {
     let (program, mut args): (&str, Vec<String>) = match tool {
         Tool::YtDlp => (
             "yt-dlp",
@@ -126,6 +134,14 @@ pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<S
                 args.push(p.clone());
             }
             _ => {}
+        }
+        if Platform::detect(url) == Platform::YouTube {
+            args.push("--extractor-args".into());
+            args.push("youtube:player_client=mweb".into());
+            if !pot_args.is_empty() {
+                args.push("--extractor-args".into());
+                args.push(pot_args.to_string());
+            }
         }
     }
     args.push(url.to_string());
