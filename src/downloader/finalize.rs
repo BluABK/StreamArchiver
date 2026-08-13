@@ -1424,10 +1424,19 @@ pub(super) fn stream_ended_or_unavailable(log: &str) -> bool {
 /// True when SABR live-from-start failed because YouTube's DVR window (~4h)
 /// no longer covers the beginning of a long-running stream. The tool downloads
 /// a few dozen initial segments then the server goes silent and raises
-/// `StreamStallError: … not near live head`. Retrying from-start will always
-/// hit the same wall; the next attempt should capture the live edge instead.
+/// `StreamStallError: … not near broadcast head`. Retrying from-start will
+/// always hit the same wall; the next attempt should capture the live edge
+/// instead.
+///
+/// Matches both wordings: `stream.py`'s `_check_broadcast_stall` (formerly
+/// `_check_live_stall`) was renamed upstream and its suffix changed from
+/// "not near live head" to "not near broadcast head" as part of the
+/// 2026-08 live-adaptive-fragments rework — matching only the old string
+/// silently broke this detector, so every from-start stall retried forever
+/// instead of falling back to the live edge (observed: Mori Calliope,
+/// 2026-08-13, 9 consecutive stalls with no fallback).
 pub(super) fn sabr_dvr_window_exceeded(log: &str) -> bool {
-    log.contains("not near live head")
+    log.contains("not near live head") || log.contains("not near broadcast head")
 }
 
 /// True when a from-start SABR capture is worth retrying **in the same take**
@@ -1918,6 +1927,16 @@ mod tests {
         assert!(
             !sabr_resumable_failure(true, true, true, "StreamStallError: not near live head"),
             "DVR window exceeded has its own recovery (fall back to live edge), not a same-take retry"
+        );
+        assert!(
+            !sabr_resumable_failure(
+                true,
+                true,
+                true,
+                "yt_dlp.utils.DownloadError: Stream stalled; no activity detected in 3 \
+                 requests and 11.1 seconds and not near broadcast head."
+            ),
+            "current yt-dlp wording (renamed from 'not near live head') must gate the same way"
         );
         // The 2026-07-20 Maid Mint deaths: deep-rewind segment desync after a
         // connection reset. Resuming genuinely progresses (each retry grew the
