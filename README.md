@@ -819,6 +819,13 @@ only trace is a traceback in a per-capture log. The cap stays at 15 minutes on p
 lose the held-off minutes for good once the wave lifts, so waiting longer
 would trade take clutter for real footage.
 
+**🍪 Expired cookies.** yt-dlp's own check ("*The provided YouTube account
+cookies are no longer valid*") files as a red **error**, not a plain warning —
+a rotated/expired browser cookie means every subsequent capture attempt for
+that monitor fails identically until you re-authenticate in the browser, so it
+gets the same treatment as a PO token rejection instead of blending into
+"Other warnings" where it's easy to miss while takes keep failing.
+
 **Rejection storms are detected and named.** When ≥2 takes have been refused
 within 15 minutes, the app declares a **🎫 rejection storm**: one 🔔
 notification (and a WARN in the log) explains that YouTube is refusing

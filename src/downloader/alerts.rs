@@ -95,6 +95,17 @@ pub(super) fn classify_line(line: &str) -> Option<LineHit> {
         return Some(LineHit { kind: "tool_warning", severity: "warning", lost: None });
     }
 
+    // Expired/rotated browser cookies — yt-dlp still emits this as a plain
+    // `WARNING:` line, but it isn't a minor hiccup: every subsequent capture
+    // attempt for this monitor (and any other monitor sharing the auth
+    // source) fails identically until the browser is re-authenticated, so it
+    // gets its own error-severity kind instead of blending into "Other
+    // warnings" (2026-08-13: sat unnoticed as a warning while girl_dm_ kept
+    // failing). Matched BEFORE the generic warnish fallback below.
+    if l.contains("account cookies are no longer valid") {
+        return Some(LineHit { kind: "cookies_invalid", severity: "error", lost: None });
+    }
+
     // GVS PO-token rejections, matched BEFORE the generic hard-error rule
     // (the PoTokenError traceback contains `yt_dlp.utils.DownloadError` and
     // would otherwise toast as a raw "Capture tool error" — observed
@@ -154,6 +165,7 @@ pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static st
         "ad_probe_degraded" => return ("🛰", "Ad probe degraded"),
         "po_token_rejected" => return ("🎫", "PO token rejected"),
         "youtube_experiment" => return ("🧪", "Platform experiment"),
+        "cookies_invalid" => return ("🍪", "Cookies expired"),
         "offline_drive" => return ("💽", "Drive offline"),
         _ => {}
     }
@@ -751,6 +763,16 @@ fn alert_message(
             )
         }
         "tool_error" => (format!("Capture tool error — {label}"), last_line.to_string()),
+        "cookies_invalid" => (
+            format!("🍪 Cookies expired — {label}"),
+            format!(
+                "YouTube rejected this monitor's stored browser cookies as no longer valid \
+                 — they were likely rotated by a sign-out/sign-in in that browser profile. \
+                 Every capture attempt keeps failing identically until you re-authenticate \
+                 in the browser (Settings → Accounts to check which cookie source is \
+                 configured).\n{last_line}"
+            ),
+        ),
         "po_token_rejected" => (
             format!("🎫 PO token rejected — {label}"),
             format!(
@@ -974,6 +996,21 @@ mod tests {
             let hit = classify_line(line).unwrap();
             assert_eq!((hit.kind, hit.severity), ("tool_warning", "warning"), "{line}");
         }
+    }
+
+    #[test]
+    fn expired_cookies_are_an_error_not_a_plain_warning() {
+        // Real line (2026-08-13, girl_dm_): sat unclassified as generic
+        // "Other warnings" while the take kept failing on every retry.
+        for line in [
+            "WARNING: [youtube] The provided YouTube account cookies are no longer valid. \
+             They have likely been rotated in the browser as a security measure.",
+            "WARNING: [youtube:tab] The provided YouTube account cookies are no longer valid.",
+        ] {
+            let hit = classify_line(line).unwrap();
+            assert_eq!((hit.kind, hit.severity), ("cookies_invalid", "error"), "{line}");
+        }
+        assert_eq!(alert_category("cookies_invalid", "").0, "🍪");
     }
 
     #[test]

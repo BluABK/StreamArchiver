@@ -164,6 +164,7 @@ fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
         "capture_failed" => ("⛔", "Capture failed"),
         "po_token_rejected" => ("🎫", "PO token rejected"),
         "youtube_experiment" => ("🧪", "Platform experiment"),
+        "cookies_invalid" => ("🍪", "Cookies expired"),
         _ => ("⚠", "Tool warnings"),
     }
 }
