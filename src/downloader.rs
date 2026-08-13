@@ -365,6 +365,15 @@ pub struct Supervisor {
     /// suppression expires with the broadcast instead of needing to be
     /// cleared: the channel's *next* stream is a different `rec_id`.
     chat_only_user_stopped: Arc<Mutex<HashMap<i64, i64>>>,
+    /// monitor_id -> earliest `Instant` a chat-only attempt may retry, set
+    /// when yt-dlp exits on its own within seconds of spawning (see
+    /// `chat_only::CHAT_ONLY_FAST_FAIL_THRESHOLD`) — a broadcast some other
+    /// detection method still considers live but yt-dlp categorically can't
+    /// see (members-only content the configured account has no entitlement
+    /// to is the observed case, 2026-08-13: Panko Ch., 62 identical attempts
+    /// in 70 minutes at the ordinary ~65s poll cadence). Self-expiring, so
+    /// nothing needs to clear it on a later success.
+    chat_only_backoff: Arc<Mutex<HashMap<i64, Instant>>>,
     shutdown: Arc<AtomicBool>,
     /// A clone of the manual-command sender, so background poller tasks (the VOD
     /// archivers) can enqueue+start a Video download without a Supervisor handle.

@@ -44,6 +44,28 @@ const SESSION_POLL_SECS: u64 = 15;
 /// drains, and a chat-only Twitch session occupies a slot in it.
 const TICK: Duration = Duration::from_secs(1);
 
+/// A YouTube chat-only attempt that exits (unprompted — see
+/// `run_ytdlp_chat_only`'s `select!`) within this long of spawning is treated
+/// as a fast failure rather than a legitimately short-lived chat, and backs
+/// off. Comfortably above yt-dlp's own near-instant "channel is not currently
+/// live" exit (~1-2s observed), comfortably below any real chat session.
+const CHAT_ONLY_FAST_FAIL_THRESHOLD: Duration = Duration::from_secs(15);
+/// How long a fast-failing monitor waits before the next chat-only attempt,
+/// instead of retrying on every ordinary poll (~65-70s). Covers the observed
+/// case — a broadcast some other detection method still considers live but
+/// yt-dlp categorically can't see (no membership entitlement) for its whole
+/// runtime — without needing to positively identify *why* yt-dlp can't see
+/// it.
+const CHAT_ONLY_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Whether a finished chat-only attempt should trip the backoff: it must have
+/// ended because the child process exited on its own (not because we stopped
+/// it — shutdown, user action, or the not-recorded session closing), and it
+/// must have done so quickly.
+fn chat_only_fast_fail(exited_on_its_own: bool, elapsed: Duration) -> bool {
+    exited_on_its_own && elapsed < CHAT_ONLY_FAST_FAIL_THRESHOLD
+}
+
 impl Supervisor {
     /// Start a chat-only capture for a live-but-not-recorded broadcast, if one
     /// is wanted and isn't already running. Called from `try_begin`'s Auto-off
@@ -96,6 +118,13 @@ impl Supervisor {
         // The user stopped this broadcast's chat capture by hand — respect it
         // for the rest of the broadcast rather than restarting on this poll.
         if self.chat_only_user_stopped.lock().unwrap().get(&monitor_id) == Some(&rec_id) {
+            return;
+        }
+        // A recent attempt failed fast (see CHAT_ONLY_FAST_FAIL_THRESHOLD) —
+        // don't hammer the same wall on every poll until the cooldown lifts.
+        if let Some(&until) = self.chat_only_backoff.lock().unwrap().get(&monitor_id)
+            && Instant::now() < until
+        {
             return;
         }
         if !self.chat_only.lock().unwrap().insert(monitor_id) {
@@ -348,9 +377,31 @@ impl Supervisor {
         // decides the session is over and we kill it. Dropping the join handle
         // in the second arm only detaches the task (it isn't cancelled), so
         // `run_chat_download` still runs its cleanup after the kill.
-        tokio::select! {
-            _ = chat => {}
-            _ = self.watch_chat_only_session(monitor_id) => self.stop_chat_download(monitor_id),
+        let started = Instant::now();
+        let exited_on_its_own = tokio::select! {
+            _ = chat => true,
+            _ = self.watch_chat_only_session(monitor_id) => {
+                self.stop_chat_download(monitor_id);
+                false
+            }
+        };
+        // yt-dlp died on its own within seconds of spawning — not stopped by
+        // us, not a chat session that ran for a while and then wound down.
+        // Some other detection method still thinks this broadcast is live
+        // (the not-recorded session is still open, or this wouldn't have been
+        // called), but yt-dlp categorically can't see it — back off instead
+        // of repeating the same failed spawn on every poll for the rest of
+        // the broadcast.
+        if chat_only_fast_fail(exited_on_its_own, started.elapsed()) {
+            self.chat_only_backoff
+                .lock()
+                .unwrap()
+                .insert(monitor_id, Instant::now() + CHAT_ONLY_BACKOFF);
+            warn!(
+                monitor_id,
+                "chat-only: yt-dlp exited immediately; backing off {CHAT_ONLY_BACKOFF:?} \
+                 before the next attempt"
+            );
         }
     }
 
@@ -431,6 +482,20 @@ fn chat_only_stem(
 mod tests {
     #![allow(clippy::disallowed_methods)] // test fixtures, not app I/O paths
     use super::*;
+
+    #[test]
+    fn fast_fail_only_trips_on_an_unprompted_quick_exit() {
+        // The Panko Ch. case (2026-08-13): yt-dlp itself exits in ~1-2s
+        // because the account can't see the (members-only) broadcast.
+        assert!(chat_only_fast_fail(true, Duration::from_secs(1)));
+        // A long-lived session that eventually wound down on its own (the
+        // broadcast genuinely ended) must not back off the next one.
+        assert!(!chat_only_fast_fail(true, Duration::from_secs(60)));
+        // We stopped it ourselves (shutdown/user/session-closed) — however
+        // fast, that's not yt-dlp failing.
+        assert!(!chat_only_fast_fail(false, Duration::from_millis(500)));
+        assert!(!chat_only_fast_fail(false, Duration::from_secs(60)));
+    }
 
     #[test]
     fn chat_without_recording_default_on_and_opt_out() {

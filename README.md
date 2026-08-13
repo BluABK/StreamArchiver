@@ -3633,6 +3633,15 @@ captured on its own. This is on by default and switched off under
 - Deliberately **not** applied when a **blacklist trigger** vetoed the
   recording or a **Stop hold** is active: those both mean "skip this
   broadcast", not "save the disk".
+- If the YouTube sidecar's yt-dlp exits on its own within 15s of spawning —
+  rather than being stopped by a shutdown, a user action, or the broadcast
+  ending — the next attempt backs off **5 minutes** instead of retrying on
+  every ordinary poll (~65-70s). Covers a broadcast some *other* detection
+  method still considers live but yt-dlp categorically can't see for its
+  whole runtime (observed cause: members-only content the configured account
+  has no entitlement to) — without that, a multi-hour broadcast burned a
+  failed spawn (and a browser cookie re-extraction) every poll for its
+  entire length.
 
 **Moderation is archived too.** On **Twitch** the logger records single-message
 **deletions**, **timeouts/bans** and **full chat clears**, chat-mode changes

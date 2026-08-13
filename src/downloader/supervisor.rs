@@ -175,6 +175,7 @@ impl Supervisor {
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
             chat_only: Arc::new(Mutex::new(HashSet::new())),
             chat_only_user_stopped: Arc::new(Mutex::new(HashMap::new())),
+            chat_only_backoff: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             manual_tx,
             ctx,
