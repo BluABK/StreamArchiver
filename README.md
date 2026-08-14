@@ -1734,11 +1734,16 @@ outstanding lost ranges keep their normal recovered/unrecovered rendering;
 this only applies where a sibling take genuinely covers the broadcast.)
 
 **💽 Drive offline.** Unrelated to log scanning: if the chapters-embed or
-gap-splice startup sweep finds a finalized recording whose output file lives
-on a drive that's currently disconnected (an unplugged USB enclosure, say),
-it doesn't spam one deferral line per recording — it files one red **Drive
+gap-splice sweep finds a finalized recording whose output file lives on a
+drive that's currently disconnected (an unplugged USB enclosure, say), it
+doesn't spam one deferral line per recording — it files one red **Drive
 offline** alert per drive (growing the same row's count as more recordings
 on that drive are found) and defers them until the drive reconnects.
+Chapters retries hourly (below) and gap-splice does too — a deferred
+recording no longer needs an app restart to be reconsidered once the drive
+comes back mid-session (2026-08-14 fix; previously only the one-shot
+app-startup sweep ever revisited it, so a mid-session reconnect could sit
+until the next restart).
 
 **In-tree badges & trends.** The Streams grid mirrors the alert state right
 on the rows (all clickable — they open the Warnings window): a take (and its
@@ -1944,9 +1949,12 @@ much blunter tool — it re-runs every eligible recording regardless of
 `chapters_state`, "even ones that already have them," so it's for a
 deliberate full-library redo (e.g. after changing which chapter kinds are
 enabled), not for nudging a handful of stuck ones: it would needlessly
-re-copy every already-embedded recording along the way.) A one-time
-migration (v76) also requeued every recording that was already stuck at
-`"failed"` from before this retry system existed, so a pre-existing backlog
+re-copy every already-embedded recording along the way.) Gap-splice gets
+the same hourly self-heal (*Gap-splice retry* in the same Background
+section) for its own stuck case: a recording deferred by a **💽 Drive
+offline** alert. A one-time migration (v76) also requeued every recording
+that was already stuck at `"failed"` from before this retry system existed,
+so a pre-existing backlog
 self-heals the same way instead of needing that bulk button either.
 
 **If the app closes mid-embed** (crash, forced quit, power loss): the

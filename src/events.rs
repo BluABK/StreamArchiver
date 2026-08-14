@@ -214,6 +214,7 @@ pub const TOGGLEABLE_JOBS: &[(&str, &str)] = &[
     ("YouTube posts refresh", "job_community_posts"),
     ("Scheduled recordings", "job_scheduled_recordings"),
     ("Chapters retry", "job_chapters_retry"),
+    ("Gap-splice retry", "job_gap_splice_retry"),
 ];
 
 pub fn job_registry() -> JobRegistry {

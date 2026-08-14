@@ -161,6 +161,35 @@ impl Supervisor {
         }
     }
 
+    /// Periodic retry for gap-splice candidates left at `gap_splice_state =
+    /// ""` by a transient block — chiefly `defer_for_offline_drive`, which
+    /// (unlike a chapters-embed failure) never sets a terminal or "queued"
+    /// state, so a candidate deferred while a drive was disconnected was
+    /// otherwise only ever reconsidered by the app-startup sweep. A restart
+    /// picked it back up once the drive returned; without one it sat
+    /// deferred for the rest of the app's runtime (found 2026-08-14: Nihmune
+    /// rec #3212, drive B: reconnected mid-session, nothing retried it).
+    /// Same hourly cadence and rationale as `retry_queued_chapters_loop`,
+    /// and `sweep_pending_gap_splices` already processes its (normally tiny)
+    /// candidate list sequentially, so a periodic call carries the same
+    /// no-flood-risk guarantee the startup sweep does.
+    pub async fn retry_pending_gap_splices_loop(&self, shutdown: Arc<AtomicBool>, jobs: crate::events::JobRegistry) {
+        const INITIAL_DELAY_SECS: u64 = 90;
+        const TICK_SECS: u64 = 3600;
+
+        crate::app_core::sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.store.job_enabled("job_gap_splice_retry") {
+                self.sweep_pending_gap_splices().await;
+                crate::events::mark_job(&jobs, "Gap-splice retry", TICK_SECS as i64);
+            }
+            crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
+        }
+    }
+
     /// Returns the completed splice's per-gap `(local_start, local_end,
     /// orig_start, orig_end, muted_segs)` data on a successful `"done"`
     /// outcome (`orig_*` in the raw, broadcast-relative frame `gap_range`

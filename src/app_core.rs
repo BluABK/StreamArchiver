@@ -600,6 +600,19 @@ impl AppCore {
                 .await;
         });
 
+        // Periodic retry for gap-splice candidates a drive-offline defer left
+        // stuck (see retry_pending_gap_splices_loop) — the startup-only sweep
+        // otherwise needs a full app restart to reconsider them once the
+        // drive reconnects mid-session.
+        let gap_splice_retry_sup = supervisor.clone();
+        let gap_splice_retry_shutdown = self.shutdown.clone();
+        let gap_splice_retry_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            gap_splice_retry_sup
+                .retry_pending_gap_splices_loop(gap_splice_retry_shutdown, gap_splice_retry_jobs)
+                .await;
+        });
+
         // Follow raid: EventSub raid-out pushes -> force-start/ad-hoc-capture
         // orchestration (idles cheaply — the channel just never sends
         // anything unless raid_eventsub + conduit mode are actually active).
