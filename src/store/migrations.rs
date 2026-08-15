@@ -1849,7 +1849,21 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 93)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 93);
+        if version < 94 {
+            // User-defined quality presets for the video downloader's Quality
+            // dropdown (raw yt-dlp selectors saved under a name), the same
+            // shape as `filename_preset` — a separate table so quality
+            // selectors never show up in the filename-template dropdowns.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS quality_preset (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     selector TEXT NOT NULL
+                 );",
+            )?;
+            conn.pragma_update(None, "user_version", 94)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 94);
         Ok(())
     }
 }

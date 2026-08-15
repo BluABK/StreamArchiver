@@ -527,8 +527,9 @@ impl StreamArchiverApp {
                 .iter()
                 .map(|(_, key)| (key.to_string(), core.store.job_enabled(key)))
                 .collect();
-        // Load user-defined filename presets before `core` is moved.
+        // Load user-defined filename + quality presets before `core` is moved.
         let initial_custom_presets = core.store.get_filename_presets().unwrap_or_default();
+        let initial_quality_presets = core.store.get_quality_presets().unwrap_or_default();
         // Load every grid table's persisted column order/visibility + sort
         // before `core` is moved; see `crate::grid_columns`.
         let mut streams_grid = GridState::load(&core.store, GridTableId::Streams, &STREAM_COLUMNS);
@@ -815,6 +816,7 @@ impl StreamArchiverApp {
             schedule_merge_labels: HashMap::new(),
             schedule_auto_secondary: HashSet::new(),
             custom_presets: initial_custom_presets,
+            quality_presets: initial_quality_presets,
             save_preset_dialog: None,
             chat_popups: Vec::new(),
             platform_tex: None,

@@ -519,6 +519,33 @@ unset/no-longer-valid falls back to the system yt-dlp at download time.
 > args, so a per-download or global `--extractor-args youtube:…` can override
 > them if YouTube's client landscape shifts again.
 
+**Quality.** The Quality dropdown offers **auto-best presets** — the app builds
+the right format selector and the tool resolves the actual best formats per
+video, so you never have to list format IDs by hand:
+
+- **Auto — best available**: the highest resolution the site offers, no cap
+  (8K included), merged with the best audio.
+- **Auto — up to 2160p/1440p/1080p/720p/480p**: best video no taller than the
+  cap, merged with the best audio. (Every preset also degrades gracefully on
+  sites that only publish pre-merged files.)
+- **Audio only**: best audio track, no video.
+- **My presets**: any value can be saved as a named preset with **💾** (stored
+  in the database; **×** in the dropdown deletes one). The text field beside
+  the dropdown always shows the value actually used and accepts `best`, `<N>p`
+  (e.g. `1080p`), `audio`, or any **raw yt-dlp `-f` selector** as the full
+  escape hatch — a raw selector wins over the *Audio tracks* field, since
+  yt-dlp only honours one `-f`.
+
+The symbolic values combine with **Audio tracks**: e.g. `1080p` + `all`
+downloads ≤1080p video with one audio track *per language* (dubs). For
+streamlink the same presets translate to its rendition names
+(`1080p60,1080p,best`; `audio` → `audio_only`).
+
+> Historical note: quality `best` + audio tracks `all` (the form default)
+> previously produced an invalid yt-dlp selector whose fallback silently
+> picked the best *pre-merged* format — **360p on YouTube**. The presets
+> above generate verified selectors; `best` now always means best.
+
 **List formats.** Click **List formats** to probe the URL with the selected tool
 (`yt-dlp --list-formats`, streamlink's stream list, or `ffprobe`) and show the
 available formats/qualities in a window — handy for picking a **Quality** value.

@@ -176,8 +176,11 @@ impl StreamArchiverApp {
         // Preset actions collected inside the loop and applied after all borrows end.
         let mut preset_delete: Option<i64> = None;
         let mut preset_save_tmpl: Option<String> = None;
+        let mut quality_delete: Option<i64> = None;
+        let mut quality_save: Option<String> = None;
         // Snapshot custom presets as a slice; separate from `defs` borrow (different field).
         let custom_presets = self.custom_presets.as_slice();
+        let quality_presets = self.quality_presets.as_slice();
         // Borrow the defaults (not `self`) so the nested egui closures don't
         // alias `self`; persist afterwards.
         let defs = &mut self.download_defaults;
@@ -237,10 +240,27 @@ impl StreamArchiverApp {
                                 ui.end_row();
                             }
 
-                            ui.label("Quality");
-                            if ui.text_edit_singleline(&mut d.quality).changed() {
-                                dirty = true;
-                            }
+                            ui.label("Quality").on_hover_text(
+                                "Auto presets pick the actual best formats per \
+                                 video; the text field takes best · <N>p · audio \
+                                 · or a raw yt-dlp -f selector.",
+                            );
+                            ui.horizontal(|ui| {
+                                let before = d.quality.clone();
+                                let (del, save) = quality_preset_combo(
+                                    ui,
+                                    &format!("dl_quality_{}", platform.as_str()),
+                                    &mut d.quality,
+                                    quality_presets,
+                                );
+                                if del.is_some() { quality_delete = del; }
+                                if save { quality_save = Some(d.quality.clone()); }
+                                if ui.text_edit_singleline(&mut d.quality).changed()
+                                    || before != d.quality
+                                {
+                                    dirty = true;
+                                }
+                            });
                             ui.end_row();
 
                             ui.label("Auth");
@@ -361,7 +381,25 @@ impl StreamArchiverApp {
         }
         if let Some(tmpl) = preset_save_tmpl {
             self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
+                kind: PresetKind::Filename,
                 template: tmpl,
+                name: String::new(),
+                error: String::new(),
+                do_save: false,
+                closed: false,
+            })));
+        }
+        if let Some(id) = quality_delete {
+            if let Err(e) = self.core.store.delete_quality_preset(id) {
+                self.status = format!("Error deleting preset: {e:#}");
+            } else {
+                self.quality_presets = self.core.store.get_quality_presets().unwrap_or_default();
+            }
+        }
+        if let Some(sel) = quality_save {
+            self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
+                kind: PresetKind::Quality,
+                template: sel,
                 name: String::new(),
                 error: String::new(),
                 do_save: false,
@@ -805,9 +843,12 @@ impl StreamArchiverApp {
         let mut open_vf_designer = false;
         let mut vf_preset_delete: Option<i64> = None;
         let mut vf_preset_save_tmpl: Option<String> = None;
+        let mut vf_quality_delete: Option<i64> = None;
+        let mut vf_quality_save: Option<String> = None;
 
         {
             let custom_presets = self.custom_presets.as_slice();
+            let quality_presets = self.quality_presets.as_slice();
             let custom_tool_aliases: Vec<String> =
                 self.settings.custom_tools.iter().map(|t| t.alias.clone()).collect();
             let vf = &mut self.video_form;
@@ -938,11 +979,33 @@ impl StreamArchiverApp {
                     }
 
                     // Quality + Auth.
-                    ui.label("Quality");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut vf.quality)
-                            .hint_text("best, 1080p, or a yt-dlp -f selector"),
+                    ui.label("Quality").on_hover_text(
+                        "Auto presets pick the actual best formats for you \
+                         (yt-dlp resolves them per video) — no need to list \
+                         format IDs. The text field takes a raw yt-dlp -f \
+                         selector as a full escape hatch; 💾 saves it as a \
+                         named preset.",
                     );
+                    ui.horizontal(|ui| {
+                        let (del, save) = quality_preset_combo(
+                            ui,
+                            "video_form_quality",
+                            &mut vf.quality,
+                            quality_presets,
+                        );
+                        if del.is_some() { vf_quality_delete = del; }
+                        if save { vf_quality_save = Some(vf.quality.clone()); }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut vf.quality)
+                                .desired_width(150.0)
+                                .hint_text("best, 1080p, or -f selector"),
+                        )
+                        .on_hover_text(
+                            "The value actually used: best · <N>p (max height) \
+                             · audio · or any raw yt-dlp -f format selector \
+                             (raw selectors override the Audio tracks field).",
+                        );
+                    });
                     ui.label("Auth");
                     let auth_text = match vf.auth_override {
                         None => "Default (per-platform)".to_string(),
@@ -1114,7 +1177,25 @@ impl StreamArchiverApp {
         }
         if let Some(tmpl) = vf_preset_save_tmpl {
             self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
+                kind: PresetKind::Filename,
                 template: tmpl,
+                name: String::new(),
+                error: String::new(),
+                do_save: false,
+                closed: false,
+            })));
+        }
+        if let Some(id) = vf_quality_delete {
+            if let Err(e) = self.core.store.delete_quality_preset(id) {
+                self.status = format!("Error deleting preset: {e:#}");
+            } else {
+                self.quality_presets = self.core.store.get_quality_presets().unwrap_or_default();
+            }
+        }
+        if let Some(sel) = vf_quality_save {
+            self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
+                kind: PresetKind::Quality,
+                template: sel,
                 name: String::new(),
                 error: String::new(),
                 do_save: false,
@@ -2139,6 +2220,7 @@ impl StreamArchiverApp {
 
         if fd_save_preset {
             self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
+                kind: PresetKind::Filename,
                 template: new_template.clone(),
                 name: String::new(),
                 error: String::new(),

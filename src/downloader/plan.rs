@@ -68,40 +68,140 @@ pub(crate) fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, s
     }
 }
 
-/// Build a yt-dlp `-f` format selector implementing on-demand `audio_tracks`
-/// selection for the Video downloader — YouTube VODs can carry multiple audio
-/// tracks (the original plus dubbed languages, or descriptive audio), and
-/// yt-dlp's own default format selection only ever picks one. Returns `None`
-/// when `audio` is empty (no override — the tool's/`quality` field's own
-/// default wins). The second element is whether `--audio-multistreams` is
-/// required (whenever more than one audio format could be muxed in, so
-/// yt-dlp doesn't silently keep only the highest-priority one).
+/// Max-height cap parsed from a symbolic quality preset: `"1080p"` → 1080,
+/// `"720p60"` → 720 (streamlink-style fps suffixes accepted so a monitor's
+/// Twitch quality string reused for a VOD download still translates).
+/// `None` for `"best"`, `"audio"`, raw selector strings, or anything else.
+pub(crate) fn quality_height_cap(q: &str) -> Option<u32> {
+    let q = q.trim();
+    let (h, fps) = q.split_once(['p', 'P'])?;
+    if h.is_empty() || !h.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !fps.is_empty() && !fps.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    h.parse().ok()
+}
+
+/// Whether a quality string is one of the symbolic preset values the app
+/// translates itself (`best` / `audio` / `<N>p[fps]`) rather than a raw
+/// yt-dlp `-f` selector passed through verbatim.
+pub(crate) fn quality_is_symbolic(q: &str) -> bool {
+    let q = q.trim();
+    q.eq_ignore_ascii_case("best")
+        || q.eq_ignore_ascii_case("audio")
+        || quality_height_cap(q).is_some()
+}
+
+/// "All audio languages" selector part: exactly one opus track per language.
+/// YouTube publishes each language at several bitrate tiers (249/250/251) plus
+/// `-drc` loudness variants; dubs get `-<n>` suffixes (`251-0`, `251-1`, …)
+/// while the original is plain `251`. The anchored regex keeps only the top
+/// opus tier of each language and drops the DRC duplicates — `mergeall` over
+/// an unfiltered `[vcodec=none]` would mux every tier of every language
+/// (9 copies of the audio on a single-language video, verified live).
+const YT_ALL_AUDIO: &str = "mergeall[vcodec=none][format_id~='^251(-[0-9]+)?$']";
+
+/// Build the yt-dlp `-f` selector for an on-demand video download from the
+/// symbolic `quality` preset + `audio_tracks` selection. Returns `None` when
+/// yt-dlp's own default (`bv*+ba/b` — best video merged with best audio) is
+/// already exactly right; the second element is whether `--audio-multistreams`
+/// is required (more than one audio track could be muxed in).
+///
+/// `quality` semantics:
+/// - `best` — best available video, no cap (8K included), merged with audio.
+/// - `<N>p` (e.g. `2160p`, `1080p`, `720p60`) — best video capped at N
+///   pixels tall (`height<=?N`: formats with unknown height still pass, so
+///   odd sites don't dead-end).
+/// - `audio` — best audio only, no video.
+/// - anything else — a raw yt-dlp selector, passed through verbatim;
+///   `audio_tracks` is then ignored (two `-f` flags would silently discard
+///   one — the hand-written selector is the full escape hatch and wins).
+///
+/// Every generated selector ends in a muxed-format fallback (`/b`): the
+/// split-stream forms only match sites exposing separate audio-only formats
+/// (YouTube, Twitch VODs); muxed-only sites (NRK video) and audio-only sites
+/// (NRK radio) would otherwise die with "Requested format is not available".
+/// The `all`-languages form additionally falls back through plain `bv*+ba`
+/// first, so a site without opus-251 audio still gets the best split pair.
+/// (The old `bv*+ba.*/b` selector's first branch NEVER matched — `ba.*` is
+/// not valid yt-dlp syntax, `.N` needs a number — so every download with
+/// audio "all" silently landed on `/b`, the best PRE-merged single format:
+/// 360p on YouTube.)
 ///
 /// `[language^=<code>]` (prefix match, not `=` exact match) so a plain "en"
 /// still matches a track tagged "en-US"/"en-GB" — YouTube's exact codes vary
 /// and aren't predictable from the UI alone.
-pub(super) fn yt_audio_format_selector(audio: &str) -> Option<(String, bool)> {
+pub(super) fn yt_format_selector(quality: &str, audio: &str) -> Option<(String, bool)> {
+    let q = quality.trim();
+    // Raw selector escape hatch: passed through untouched, audio ignored.
+    if !quality_is_symbolic(q) {
+        return Some((q.to_string(), false));
+    }
     let audio = audio.trim();
-    if audio.is_empty() {
-        return None;
+    let all_audio = audio.eq_ignore_ascii_case("all") || audio == "*";
+    let lang_parts: Vec<String> = if all_audio {
+        Vec::new()
+    } else {
+        audio
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|c| format!("ba[language^={c}]"))
+            .collect()
+    };
+    if q.eq_ignore_ascii_case("audio") {
+        return Some(if all_audio {
+            (format!("{YT_ALL_AUDIO}/ba/b"), true)
+        } else if !lang_parts.is_empty() {
+            (format!("{}/ba/b", lang_parts.join("+")), lang_parts.len() > 1)
+        } else {
+            ("ba/b".to_string(), false)
+        });
     }
-    // Every selector gets a `/b` fallback: the split-stream form (`bv*+ba…`)
-    // only matches sites that expose separate audio-only formats (YouTube,
-    // Twitch VODs). Sites with only muxed formats (NRK video) have no `ba.*`,
-    // and audio-only sites (NRK radio/podcasts) have no `bv*` — without the
-    // fallback yt-dlp dies with "Requested format is not available" instead
-    // of just taking the best it can get (verified against real NRK URLs:
-    // `bv*+ba.*/b` picks the best muxed rendition / the best audio).
-    if audio.eq_ignore_ascii_case("all") || audio == "*" {
-        // Every audio-only format (every language) as separate muxed streams.
-        return Some(("bv*+ba.*/b".to_string(), true));
+    // `best` or a height cap: best-video part + audio part + muxed fallback.
+    let cap = quality_height_cap(q);
+    let (vp, fb) = match cap {
+        Some(n) => (format!("bv*[height<=?{n}]"), format!("b[height<=?{n}]")),
+        None => ("bv*".to_string(), "b".to_string()),
+    };
+    if all_audio {
+        Some((format!("{vp}+{YT_ALL_AUDIO}/{vp}+ba/{fb}"), true))
+    } else if !lang_parts.is_empty() {
+        Some((
+            format!("{vp}+{}/{vp}+ba/{fb}", lang_parts.join("+")),
+            lang_parts.len() > 1,
+        ))
+    } else if cap.is_some() {
+        Some((format!("{vp}+ba/{fb}"), false))
+    } else {
+        // best + no audio override: yt-dlp's own default IS `bv*+ba/b`.
+        None
     }
-    let codes: Vec<&str> = audio.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-    if codes.is_empty() {
-        return None;
+}
+
+/// Translate a symbolic quality preset into a streamlink stream-name chain.
+/// Streamlink names renditions (`1080p60`, `720p`, `audio_only`) and accepts
+/// a comma-separated fallback list; raw strings (already streamlink syntax)
+/// pass through untouched.
+pub(super) fn streamlink_quality(q: &str) -> String {
+    let q = q.trim();
+    if q.eq_ignore_ascii_case("audio") {
+        return "audio_only,best".to_string();
     }
-    let parts: Vec<String> = codes.iter().map(|c| format!("ba[language^={c}]")).collect();
-    Some((format!("bv*+{}/b", parts.join("+")), codes.len() > 1))
+    match quality_height_cap(q) {
+        Some(n) if q.to_ascii_lowercase().ends_with('p') => {
+            // "1080p": try the 60fps rendition too, then anything at that
+            // height, then whatever is best.
+            format!("{n}p60,{n}p,best")
+        }
+        Some(n) => {
+            // "720p60" is already an exact rendition name; keep it first.
+            format!("{q},{n}p,best")
+        }
+        None => q.to_string(),
+    }
 }
 
 /// Returns the URL yt-dlp should receive for a live YouTube recording.
@@ -674,19 +774,14 @@ pub fn build_video_plan(
                 args.push("--limit-rate".into());
                 args.push(rate);
             }
-            // `quality` is a full escape hatch (a user can type any yt-dlp format
-            // string there) and always wins if set; audio-track selection only
-            // synthesizes its own `-f` when `quality` is left at the default, since
-            // yt-dlp's `-f` isn't cumulative — two of them would just have the last
-            // one win, silently discarding whichever was meant to combine with it.
-            let audio_sel = yt_audio_format_selector(&v.audio_tracks);
-            if quality != "best" {
+            // One `-f` combining the quality preset (best / height cap / audio
+            // / raw escape hatch) with the audio-track selection — yt-dlp's
+            // `-f` isn't cumulative, two of them would just have the last one
+            // win, silently discarding whichever was meant to combine with it.
+            if let Some((sel, multistream)) = yt_format_selector(&quality, &v.audio_tracks) {
                 args.push("-f".into());
-                args.push(quality);
-            } else if let Some((sel, multistream)) = &audio_sel {
-                args.push("-f".into());
-                args.push(sel.clone());
-                if *multistream {
+                args.push(sel);
+                if multistream {
                     args.push("--audio-multistreams".into());
                 }
             }
@@ -772,7 +867,7 @@ pub fn build_video_plan(
             args.push("-o".into());
             args.push(ts_path.to_string_lossy().into_owned());
             args.push(v.url.clone());
-            args.push(quality);
+            args.push(streamlink_quality(&quality));
             DownloadPlan {
                 program: "streamlink".to_string(),
                 args,
@@ -1374,29 +1469,80 @@ mod tests {
     }
 
     #[test]
-    fn yt_audio_format_selector_builds_expected_selectors() {
-        assert_eq!(yt_audio_format_selector(""), None);
-        assert_eq!(yt_audio_format_selector("   "), None);
-        // The `/b` fallback keeps sites without split audio/video streams
-        // working (NRK video = muxed-only, NRK radio = audio-only).
+    fn yt_format_selector_builds_expected_selectors() {
+        // best + no audio override: yt-dlp's own default (`bv*+ba/b`) is right.
+        assert_eq!(yt_format_selector("best", ""), None);
+        assert_eq!(yt_format_selector("best", "   "), None);
+        // All languages: one opus track per language, falling back to a plain
+        // best-video+best-audio pair, then a muxed single format.
         assert_eq!(
-            yt_audio_format_selector("all"),
-            Some(("bv*+ba.*/b".to_string(), true))
+            yt_format_selector("best", "all"),
+            Some((format!("bv*+{YT_ALL_AUDIO}/bv*+ba/b"), true))
         );
         assert_eq!(
-            yt_audio_format_selector("*"),
-            Some(("bv*+ba.*/b".to_string(), true))
+            yt_format_selector("best", "*"),
+            Some((format!("bv*+{YT_ALL_AUDIO}/bv*+ba/b"), true))
         );
-        // A single language: no --audio-multistreams needed.
+        // A single language: no --audio-multistreams needed, but the plain
+        // `bv*+ba` middle fallback keeps a missing language from silently
+        // degrading to the muxed 360p format.
         assert_eq!(
-            yt_audio_format_selector("en"),
-            Some(("bv*+ba[language^=en]/b".to_string(), false))
+            yt_format_selector("best", "en"),
+            Some(("bv*+ba[language^=en]/bv*+ba/b".to_string(), false))
         );
         // Multiple languages: muxed together, needs --audio-multistreams.
         assert_eq!(
-            yt_audio_format_selector("en, de"),
-            Some(("bv*+ba[language^=en]+ba[language^=de]/b".to_string(), true))
+            yt_format_selector("best", "en, de"),
+            Some((
+                "bv*+ba[language^=en]+ba[language^=de]/bv*+ba/b".to_string(),
+                true
+            ))
         );
+        // Height caps: `<=?` so unknown-height formats still pass.
+        assert_eq!(
+            yt_format_selector("1080p", ""),
+            Some(("bv*[height<=?1080]+ba/b[height<=?1080]".to_string(), false))
+        );
+        assert_eq!(
+            yt_format_selector("720p60", "all"),
+            Some((
+                format!("bv*[height<=?720]+{YT_ALL_AUDIO}/bv*[height<=?720]+ba/b[height<=?720]"),
+                true
+            ))
+        );
+        // Audio-only preset.
+        assert_eq!(yt_format_selector("audio", ""), Some(("ba/b".to_string(), false)));
+        assert_eq!(
+            yt_format_selector("audio", "all"),
+            Some((format!("{YT_ALL_AUDIO}/ba/b"), true))
+        );
+        // Raw selector escape hatch: verbatim, audio ignored.
+        assert_eq!(
+            yt_format_selector("bestvideo[height<=720]+bestaudio", "all"),
+            Some(("bestvideo[height<=720]+bestaudio".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn quality_height_cap_parses_presets() {
+        assert_eq!(quality_height_cap("best"), None);
+        assert_eq!(quality_height_cap("audio"), None);
+        assert_eq!(quality_height_cap("1080p"), Some(1080));
+        assert_eq!(quality_height_cap("2160p"), Some(2160));
+        assert_eq!(quality_height_cap("720p60"), Some(720));
+        assert_eq!(quality_height_cap("bv*+ba/b"), None);
+        assert_eq!(quality_height_cap("b[height<=720]"), None);
+        assert_eq!(quality_height_cap("137+140"), None);
+    }
+
+    #[test]
+    fn streamlink_quality_translates_presets() {
+        assert_eq!(streamlink_quality("best"), "best");
+        assert_eq!(streamlink_quality("1080p"), "1080p60,1080p,best");
+        assert_eq!(streamlink_quality("720p60"), "720p60,720p,best");
+        assert_eq!(streamlink_quality("audio"), "audio_only,best");
+        // Raw streamlink syntax passes through.
+        assert_eq!(streamlink_quality("worst,best"), "worst,best");
     }
 
     #[test]
@@ -1406,14 +1552,14 @@ mod tests {
         v.audio_tracks = "en".into();
         let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
         assert!(plan.args.iter().any(|a| a == "-f"));
-        assert!(plan.args.iter().any(|a| a == "bv*+ba[language^=en]/b"));
+        assert!(plan.args.iter().any(|a| a == "bv*+ba[language^=en]/bv*+ba/b"));
         assert!(!plan.args.iter().any(|a| a == "--audio-multistreams"));
 
         // Multiple languages need --audio-multistreams to keep them all.
         let mut v2 = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
         v2.audio_tracks = "en,de".into();
         let plan2 = build_video_plan(&v2, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
-        assert!(plan2.args.iter().any(|a| a == "bv*+ba[language^=en]+ba[language^=de]/b"));
+        assert!(plan2.args.iter().any(|a| a == "bv*+ba[language^=en]+ba[language^=de]/bv*+ba/b"));
         assert!(plan2.args.iter().any(|a| a == "--audio-multistreams"));
 
         // A custom `quality` format string always wins over audio_tracks — two

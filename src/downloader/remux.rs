@@ -1319,14 +1319,16 @@ pub(super) async fn resolve_play_url(
             }
             a.push("--stream-url".into());
             a.push(url.to_string());
-            a.push(quality);
+            a.push(super::plan::streamlink_quality(&quality));
             ("streamlink", a)
         }
         Tool::YtDlp => {
             let mut a = vec!["-g".to_string(), "--no-warnings".into(), "--no-playlist".into()];
-            if quality != "best" {
+            // Symbolic presets ("1080p") translate to a real selector — passing
+            // them raw would be an unknown format ID and fail the whole probe.
+            if let Some((sel, _)) = super::plan::yt_format_selector(&quality, "") {
                 a.push("-f".into());
-                a.push(quality);
+                a.push(sel);
             }
             match auth {
                 AuthSource::CookiesBrowser(b) => {

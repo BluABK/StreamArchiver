@@ -545,6 +545,32 @@ impl Store {
         Ok(())
     }
 
+    // ----- user-defined quality presets (video downloader Quality dropdown) -----
+
+    pub fn get_quality_presets(&self) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, selector FROM quality_preset ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn save_quality_preset(&self, name: &str, selector: &str) -> Result<i64> {
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO quality_preset (name, selector) VALUES (?1, ?2)",
+            params![name, selector],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_quality_preset(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("DELETE FROM quality_preset WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Bulk-set every monitor's `filename_template` column. Returns the number of rows updated.
     pub fn set_all_filename_templates(&self, template: &str) -> Result<usize> {
         let conn = self.db();

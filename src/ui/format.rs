@@ -64,6 +64,123 @@ pub(super) const FILENAME_PRESETS: &[(&str, &str)] = &[
     ("Date + name + title + game", "{date}_{time}_{name}_{title}_{games}"),
 ];
 
+/// Predefined quality presets for the video downloader's Quality dropdown.
+/// `(display_label, quality_value, tooltip)` — the value is the symbolic
+/// string stored in the quality field; `downloader::plan` translates it into
+/// the actual yt-dlp `-f` selector / streamlink stream-name chain, so the
+/// tool itself picks the real best formats and nobody has to list format IDs
+/// by hand.
+pub(super) const QUALITY_PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "Auto — best available",
+        "best",
+        "Highest resolution the site offers, no cap (8K included), \
+         merged with the best audio.",
+    ),
+    (
+        "Auto — up to 4K (2160p)",
+        "2160p",
+        "Best available video no taller than 2160 pixels, merged with the \
+         best audio.",
+    ),
+    (
+        "Auto — up to 1440p",
+        "1440p",
+        "Best available video no taller than 1440 pixels, merged with the \
+         best audio.",
+    ),
+    (
+        "Auto — up to 1080p",
+        "1080p",
+        "Best available video no taller than 1080 pixels, merged with the \
+         best audio.",
+    ),
+    (
+        "Auto — up to 720p",
+        "720p",
+        "Best available video no taller than 720 pixels, merged with the \
+         best audio.",
+    ),
+    (
+        "Auto — up to 480p",
+        "480p",
+        "Best available video no taller than 480 pixels, merged with the \
+         best audio.",
+    ),
+    (
+        "Audio only",
+        "audio",
+        "Best audio track only, no video (streamlink: the audio_only \
+         rendition where the site has one).",
+    ),
+];
+
+/// Render the Quality preset ComboBox: the built-in auto-best presets plus
+/// the user's saved custom selectors. Selecting an entry writes its value
+/// into `quality`; anything hand-typed in the companion text field shows as
+/// "Manual". Returns `(delete_id, open_save)` exactly like
+/// [`filename_preset_combo`].
+pub(super) fn quality_preset_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    quality: &mut String,
+    custom_presets: &[(i64, String, String)],
+) -> (Option<i64>, bool) {
+    let current = QUALITY_PRESETS
+        .iter()
+        .find(|(_, v, _)| *v == quality.as_str())
+        .map(|(l, _, _)| *l)
+        .or_else(|| {
+            custom_presets
+                .iter()
+                .find(|(_, _, v)| v.as_str() == quality.as_str())
+                .map(|(_, n, _)| n.as_str())
+        })
+        .unwrap_or("Manual");
+    let mut delete_id: Option<i64> = None;
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(current)
+        .width(180.0)
+        .show_ui(ui, |ui| {
+            for &(label, value, tip) in QUALITY_PRESETS {
+                if ui
+                    .selectable_label(quality.as_str() == value, label)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    *quality = value.to_string();
+                }
+            }
+            if !custom_presets.is_empty() {
+                ui.separator();
+                ui.add(egui::Label::new(egui::RichText::new("My presets").weak().small()));
+                for (id, name, value) in custom_presets {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(quality.as_str() == value.as_str(), name.as_str())
+                            .on_hover_text(value.as_str())
+                            .clicked()
+                        {
+                            *quality = value.clone();
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Delete this preset")
+                            .clicked()
+                        {
+                            delete_id = Some(*id);
+                        }
+                    });
+                }
+            }
+        });
+    let open_save = ui
+        .button("💾")
+        .on_hover_text("Save the current quality value as a named preset")
+        .clicked();
+    (delete_id, open_save)
+}
+
 /// Render a filename-template preset ComboBox with both built-in and user-defined
 /// presets. Selecting a preset writes its template into `template`.
 ///

@@ -2234,6 +2234,9 @@ pub struct StreamArchiverApp {
     schedule_auto_secondary: HashSet<i64>,
     /// User-defined filename template presets loaded from the DB.
     custom_presets: Vec<(i64, String, String)>,
+    /// User-defined video-download quality presets (name → yt-dlp selector)
+    /// loaded from the DB, shown in the Quality dropdowns.
+    quality_presets: Vec<(i64, String, String)>,
     /// Open "Save preset" naming dialog (None = closed).
     save_preset_dialog: Option<Arc<Mutex<SavePresetDraft>>>,
     /// Chat log viewer popup (None = closed).

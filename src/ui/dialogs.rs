@@ -309,7 +309,18 @@ pub(super) struct MergePreviewDraft {
     pub(super) cancel: bool,
 }
 
+/// Which preset table a [`SavePresetDraft`] saves into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PresetKind {
+    /// Filename template (`filename_preset` table).
+    Filename,
+    /// Video-download quality selector (`quality_preset` table).
+    Quality,
+}
+
 pub(super) struct SavePresetDraft {
+    /// Preset table this draft saves into.
+    pub(super) kind: PresetKind,
     /// Template string to be saved.
     pub(super) template: String,
     /// Name the user has typed for this preset.
@@ -2956,14 +2967,30 @@ impl StreamArchiverApp {
             (d.do_save, d.closed)
         };
         if do_save {
-            let (name, template) = {
+            let (kind, name, template) = {
                 let d = state.lock().unwrap();
-                (d.name.trim().to_string(), d.template.clone())
+                (d.kind, d.name.trim().to_string(), d.template.clone())
             };
-            match self.core.store.save_filename_preset(&name, &template) {
-                Ok(_) => {
-                    self.custom_presets =
-                        self.core.store.get_filename_presets().unwrap_or_default();
+            let saved = match kind {
+                PresetKind::Filename => self
+                    .core
+                    .store
+                    .save_filename_preset(&name, &template)
+                    .map(|_| {
+                        self.custom_presets =
+                            self.core.store.get_filename_presets().unwrap_or_default();
+                    }),
+                PresetKind::Quality => self
+                    .core
+                    .store
+                    .save_quality_preset(&name, &template)
+                    .map(|_| {
+                        self.quality_presets =
+                            self.core.store.get_quality_presets().unwrap_or_default();
+                    }),
+            };
+            match saved {
+                Ok(()) => {
                     self.status = format!("Preset \"{name}\" saved.");
                     self.save_preset_dialog = None;
                 }
@@ -4124,6 +4151,7 @@ impl StreamArchiverApp {
         }
         if let Some(tmpl) = preset_save_tmpl {
             self.save_preset_dialog = Some(Arc::new(Mutex::new(SavePresetDraft {
+                kind: PresetKind::Filename,
                 template: tmpl,
                 name: String::new(),
                 error: String::new(),
