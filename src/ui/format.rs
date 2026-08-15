@@ -115,17 +115,30 @@ pub(super) const QUALITY_PRESETS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Render the Quality preset ComboBox: the built-in auto-best presets plus
-/// the user's saved custom selectors. Selecting an entry writes its value
-/// into `quality`; anything hand-typed in the companion text field shows as
-/// "Manual". Returns `(delete_id, open_save)` exactly like
-/// [`filename_preset_combo`].
-pub(super) fn quality_preset_combo(
+/// Actions requested from a [`quality_preset_row`] this frame, applied by the
+/// caller once its borrows end.
+#[derive(Default)]
+pub(super) struct QualityPresetActions {
+    /// A custom preset the user clicked "×" on (delete + reload).
+    pub(super) delete: Option<i64>,
+    /// 💾 clicked: open the save-preset dialog for the current value.
+    pub(super) save: bool,
+    /// ✏ clicked: open the quality-preset manager (edit names/selectors).
+    pub(super) manage: bool,
+}
+
+/// Render the full Quality row: preset ComboBox (built-in auto-best presets +
+/// the user's saved selectors) · editable value field · 💾 save · ✏ manage.
+/// Selecting a preset writes its value into `quality`; the text field edits
+/// the same value directly (hand-typed values show as "Manual" in the combo)
+/// and is the raw escape hatch for any yt-dlp `-f` selector.
+pub(super) fn quality_preset_row(
     ui: &mut egui::Ui,
     id_salt: &str,
     quality: &mut String,
     custom_presets: &[(i64, String, String)],
-) -> (Option<i64>, bool) {
+) -> QualityPresetActions {
+    let mut actions = QualityPresetActions::default();
     let current = QUALITY_PRESETS
         .iter()
         .find(|(_, v, _)| *v == quality.as_str())
@@ -137,7 +150,6 @@ pub(super) fn quality_preset_combo(
                 .map(|(_, n, _)| n.as_str())
         })
         .unwrap_or("Manual");
-    let mut delete_id: Option<i64> = None;
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(current)
         .width(180.0)
@@ -168,17 +180,38 @@ pub(super) fn quality_preset_combo(
                             .on_hover_text("Delete this preset")
                             .clicked()
                         {
-                            delete_id = Some(*id);
+                            actions.delete = Some(*id);
                         }
                     });
                 }
             }
         });
-    let open_save = ui
+    ui.add(
+        egui::TextEdit::singleline(quality)
+            .desired_width(170.0)
+            .hint_text("e.g. 1080p or 137+140"),
+    )
+    .on_hover_text(
+        "The value actually used — type anything here: best · <N>p (max \
+         height) · audio · a format ID pair like 137+140 · or any raw yt-dlp \
+         -f selector. Raw selectors override the Audio tracks field. 💾 saves \
+         the current value as a named preset; ✏ edits your saved presets.",
+    );
+    if ui
         .button("💾")
-        .on_hover_text("Save the current quality value as a named preset")
-        .clicked();
-    (delete_id, open_save)
+        .on_hover_text("Save the current value as a named preset")
+        .clicked()
+    {
+        actions.save = true;
+    }
+    if ui
+        .button("✏")
+        .on_hover_text("Manage saved quality presets (rename, edit selector, add, delete)")
+        .clicked()
+    {
+        actions.manage = true;
+    }
+    actions
 }
 
 /// Render a filename-template preset ComboBox with both built-in and user-defined

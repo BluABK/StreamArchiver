@@ -537,11 +537,14 @@ video, so you never have to list format IDs by hand:
   sites that only publish pre-merged files.)
 - **Audio only**: best audio track, no video.
 - **My presets**: any value can be saved as a named preset with **💾** (stored
-  in the database; **×** in the dropdown deletes one). The text field beside
-  the dropdown always shows the value actually used and accepts `best`, `<N>p`
-  (e.g. `1080p`), `audio`, or any **raw yt-dlp `-f` selector** as the full
-  escape hatch — a raw selector wins over the *Audio tracks* field, since
-  yt-dlp only honours one `-f`.
+  in the database; **×** in the dropdown deletes one), and **✏** opens the
+  preset manager where saved presets can be renamed, their selectors edited in
+  place, added, or deleted. The text field beside the dropdown always shows
+  the value actually used and accepts `best`, `<N>p` (e.g. `1080p`), `audio`,
+  plain format IDs (`137+140`), or any **raw yt-dlp `-f` selector** as the
+  full escape hatch — a raw selector wins over the *Audio tracks* field,
+  since yt-dlp only honours one `-f`. Typical custom-preset flow: pick an
+  Auto preset, tweak the value in the text field, 💾 under your own name.
 
 The symbolic values combine with **Audio tracks**: e.g. `1080p` + `all`
 downloads ≤1080p video with one audio track *per language* (dubs). For

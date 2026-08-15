@@ -565,6 +565,15 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn update_quality_preset(&self, id: i64, name: &str, selector: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE quality_preset SET name = ?2, selector = ?3 WHERE id = ?1",
+            params![id, name, selector],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_quality_preset(&self, id: i64) -> Result<()> {
         let conn = self.db();
         conn.execute("DELETE FROM quality_preset WHERE id = ?1", params![id])?;

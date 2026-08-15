@@ -3331,9 +3331,24 @@ progress_info: None,
             &outcome.log,
         );
         if status == "failed" {
+            // A YouTube 403 on the media URL usually means a PO-token
+            // attestation rejection wave (they pass on their own, from a few
+            // minutes up to hours) — say so instead of a bare "failed", and
+            // point at the row's ↻ Retry for when it clears.
+            let yt_403 = Platform::detect(&video.url) == Platform::YouTube
+                && outcome.log.contains("HTTP Error 403");
+            let message = if yt_403 {
+                format!(
+                    "{label}: download failed — YouTube rejected the media URL \
+                     (HTTP 403; PO-token attestation waves pass on their own). \
+                     Retry later with ↻ on the row."
+                )
+            } else {
+                format!("{label}: download failed")
+            };
             let _ = self.events.send(AppEvent::Error {
                 context: "Video".into(),
-                message: format!("{label}: download failed"),
+                message,
             });
         }
         // If this download was a post-stream VOD archive, file it on the recording

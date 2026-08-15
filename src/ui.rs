@@ -2239,6 +2239,8 @@ pub struct StreamArchiverApp {
     quality_presets: Vec<(i64, String, String)>,
     /// Open "Save preset" naming dialog (None = closed).
     save_preset_dialog: Option<Arc<Mutex<SavePresetDraft>>>,
+    /// Open "✏ Quality presets" manager window (None = closed).
+    quality_preset_manager: Option<Arc<Mutex<QualityPresetManager>>>,
     /// Chat log viewer popup (None = closed).
     /// Open chat windows, one per monitor (each is its own OS viewport).
     chat_popups: Vec<Arc<Mutex<ChatPopup>>>,
@@ -2812,6 +2814,7 @@ impl StreamArchiverApp {
         self.merge_preview_window(ctx);
         self.confirm_delete_segments_window(ctx);
         self.save_preset_window(ctx);
+        self.quality_preset_manager_window(ctx);
         self.format_probe_window(ctx);
         self.layout_editor_window(ctx);
         self.recover_vod_window(ctx);

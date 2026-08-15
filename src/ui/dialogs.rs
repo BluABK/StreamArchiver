@@ -318,6 +318,21 @@ pub(super) enum PresetKind {
     Quality,
 }
 
+/// Deferred-viewport state for the quality-preset manager: a working copy of
+/// every saved preset, editable in place, committed only on Save.
+pub(super) struct QualityPresetManager {
+    /// `(id, name, selector)` — `id == 0` marks a not-yet-saved new row.
+    pub(super) rows: Vec<(i64, String, String)>,
+    /// Existing preset ids the user removed (deleted from the DB on Save).
+    pub(super) deleted: Vec<i64>,
+    /// Set by the deferred closure on Save; read back by the wrapper.
+    pub(super) do_save: bool,
+    /// Set by the deferred closure on Cancel/close.
+    pub(super) closed: bool,
+    /// Save error message (empty = none).
+    pub(super) error: String,
+}
+
 pub(super) struct SavePresetDraft {
     /// Preset table this draft saves into.
     pub(super) kind: PresetKind,
@@ -3004,6 +3019,143 @@ impl StreamArchiverApp {
             self.save_preset_dialog = None;
         }
     }
+    /// The "✏ Quality presets" manager: edits a working COPY of the saved
+    /// quality presets (rename, edit selector, add, delete) and commits all
+    /// changes in one Save. Closing the window discards the draft.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    pub(super) fn quality_preset_manager_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.quality_preset_manager.clone() else {
+            return;
+        };
+        let shared = self.popup_shared();
+        show_deferred_popup(
+            ctx,
+            egui::ViewportId::from_hash_of("quality_preset_mgr_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Quality presets")
+                .with_inner_size([560.0, 320.0]),
+            state.clone(),
+            shared,
+            |ctx, d, _shared| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    d.closed = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(
+                        "Your saved quality presets. The selector is any value the \
+                         Quality field accepts: best · <N>p · audio · or a raw \
+                         yt-dlp -f format selector (e.g. 137+140).",
+                    );
+                    ui.add_space(6.0);
+                    let mut remove: Option<usize> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(ui.available_height() - 40.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("quality_preset_mgr_grid")
+                                .num_columns(3)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Name").weak().small());
+                                    ui.label(egui::RichText::new("Selector").weak().small());
+                                    ui.label("");
+                                    ui.end_row();
+                                    for (i, (_, name, selector)) in d.rows.iter_mut().enumerate() {
+                                        ui.add(
+                                            egui::TextEdit::singleline(name)
+                                                .desired_width(160.0)
+                                                .hint_text("name"),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(selector)
+                                                .desired_width(280.0)
+                                                .hint_text("e.g. 137+140 or bv*[height<=?1080]+ba"),
+                                        );
+                                        if ui
+                                            .small_button("🗑")
+                                            .on_hover_text("Remove this preset")
+                                            .clicked()
+                                        {
+                                            remove = Some(i);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            if ui.button("➕  Add preset").clicked() {
+                                d.rows.push((0, String::new(), String::new()));
+                            }
+                        });
+                    if let Some(i) = remove {
+                        let (id, _, _) = d.rows.remove(i);
+                        if id > 0 {
+                            d.deleted.push(id);
+                        }
+                    }
+                    if !d.error.is_empty() {
+                        ui.colored_label(HL_ERROR_TEXT, &d.error);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("💾  Save").clicked() {
+                            d.do_save = true;
+                        }
+                        if ui.button("✖  Cancel").clicked() {
+                            d.closed = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        let (do_save, closed) = {
+            let d = state.lock().unwrap();
+            (d.do_save, d.closed)
+        };
+        if do_save {
+            let (rows, deleted) = {
+                let d = state.lock().unwrap();
+                (d.rows.clone(), d.deleted.clone())
+            };
+            let mut result: anyhow::Result<()> = Ok(());
+            for id in &deleted {
+                if let Err(e) = self.core.store.delete_quality_preset(*id) {
+                    result = Err(e);
+                }
+            }
+            for (id, name, selector) in &rows {
+                let (name, selector) = (name.trim(), selector.trim());
+                // Blank rows (e.g. an unused "Add preset" line) are skipped,
+                // not errors.
+                if name.is_empty() && selector.is_empty() {
+                    continue;
+                }
+                let r = if *id > 0 {
+                    self.core.store.update_quality_preset(*id, name, selector)
+                } else {
+                    self.core.store.save_quality_preset(name, selector).map(|_| ())
+                };
+                if let Err(e) = r {
+                    result = Err(e);
+                }
+            }
+            match result {
+                Ok(()) => {
+                    self.quality_presets =
+                        self.core.store.get_quality_presets().unwrap_or_default();
+                    self.status = "Quality presets saved.".into();
+                    self.quality_preset_manager = None;
+                }
+                Err(e) => {
+                    let mut d = state.lock().unwrap();
+                    d.error = format!("Error saving: {e:#}");
+                    d.do_save = false;
+                }
+            }
+        } else if closed {
+            self.quality_preset_manager = None;
+        }
+    }
+
     /// The "⇕ Reorder columns…" window: edits a working COPY of one table's
     /// entries (checkbox + ▲/▼, reorder enabled unlike the inline header
     /// popup) and only commits — one save, one table reset — on Apply.

@@ -178,6 +178,7 @@ impl StreamArchiverApp {
         let mut preset_save_tmpl: Option<String> = None;
         let mut quality_delete: Option<i64> = None;
         let mut quality_save: Option<String> = None;
+        let mut quality_manage = false;
         // Snapshot custom presets as a slice; separate from `defs` borrow (different field).
         let custom_presets = self.custom_presets.as_slice();
         let quality_presets = self.quality_presets.as_slice();
@@ -243,21 +244,20 @@ impl StreamArchiverApp {
                             ui.label("Quality").on_hover_text(
                                 "Auto presets pick the actual best formats per \
                                  video; the text field takes best · <N>p · audio \
-                                 · or a raw yt-dlp -f selector.",
+                                 · format IDs · or a raw yt-dlp -f selector.",
                             );
                             ui.horizontal(|ui| {
                                 let before = d.quality.clone();
-                                let (del, save) = quality_preset_combo(
+                                let actions = quality_preset_row(
                                     ui,
                                     &format!("dl_quality_{}", platform.as_str()),
                                     &mut d.quality,
                                     quality_presets,
                                 );
-                                if del.is_some() { quality_delete = del; }
-                                if save { quality_save = Some(d.quality.clone()); }
-                                if ui.text_edit_singleline(&mut d.quality).changed()
-                                    || before != d.quality
-                                {
+                                if actions.delete.is_some() { quality_delete = actions.delete; }
+                                if actions.save { quality_save = Some(d.quality.clone()); }
+                                if actions.manage { quality_manage = true; }
+                                if before != d.quality {
                                     dirty = true;
                                 }
                             });
@@ -405,6 +405,9 @@ impl StreamArchiverApp {
                 do_save: false,
                 closed: false,
             })));
+        }
+        if quality_manage {
+            self.open_quality_preset_manager();
         }
         if let Some((is_folder, plat, current)) = browse_req {
             self.pending_browse = Some(if is_folder {
@@ -845,6 +848,7 @@ impl StreamArchiverApp {
         let mut vf_preset_save_tmpl: Option<String> = None;
         let mut vf_quality_delete: Option<i64> = None;
         let mut vf_quality_save: Option<String> = None;
+        let mut vf_quality_manage = false;
 
         {
             let custom_presets = self.custom_presets.as_slice();
@@ -982,29 +986,20 @@ impl StreamArchiverApp {
                     ui.label("Quality").on_hover_text(
                         "Auto presets pick the actual best formats for you \
                          (yt-dlp resolves them per video) — no need to list \
-                         format IDs. The text field takes a raw yt-dlp -f \
-                         selector as a full escape hatch; 💾 saves it as a \
-                         named preset.",
+                         format IDs. The text field beside the dropdown takes \
+                         any manual value (format IDs, raw -f selectors); \
+                         💾 saves it as a named preset, ✏ edits your presets.",
                     );
                     ui.horizontal(|ui| {
-                        let (del, save) = quality_preset_combo(
+                        let actions = quality_preset_row(
                             ui,
                             "video_form_quality",
                             &mut vf.quality,
                             quality_presets,
                         );
-                        if del.is_some() { vf_quality_delete = del; }
-                        if save { vf_quality_save = Some(vf.quality.clone()); }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut vf.quality)
-                                .desired_width(150.0)
-                                .hint_text("best, 1080p, or -f selector"),
-                        )
-                        .on_hover_text(
-                            "The value actually used: best · <N>p (max height) \
-                             · audio · or any raw yt-dlp -f format selector \
-                             (raw selectors override the Audio tracks field).",
-                        );
+                        if actions.delete.is_some() { vf_quality_delete = actions.delete; }
+                        if actions.save { vf_quality_save = Some(vf.quality.clone()); }
+                        if actions.manage { vf_quality_manage = true; }
                     });
                     ui.label("Auth");
                     let auth_text = match vf.auth_override {
@@ -1202,6 +1197,20 @@ impl StreamArchiverApp {
                 closed: false,
             })));
         }
+        if vf_quality_manage {
+            self.open_quality_preset_manager();
+        }
+    }
+
+    /// Open the "✏ Quality presets" manager seeded with the saved presets.
+    pub(super) fn open_quality_preset_manager(&mut self) {
+        self.quality_preset_manager = Some(Arc::new(Mutex::new(QualityPresetManager {
+            rows: self.quality_presets.clone(),
+            deleted: Vec::new(),
+            do_save: false,
+            closed: false,
+            error: String::new(),
+        })));
     }
 
     /// Insert the form's video as a queued download and kick off the supervisor.

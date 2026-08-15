@@ -818,6 +818,7 @@ impl StreamArchiverApp {
             custom_presets: initial_custom_presets,
             quality_presets: initial_quality_presets,
             save_preset_dialog: None,
+            quality_preset_manager: None,
             chat_popups: Vec::new(),
             platform_tex: None,
             ui_tex: None,
