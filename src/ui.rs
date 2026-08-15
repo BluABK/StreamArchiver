@@ -581,6 +581,7 @@ mod history;
 pub(crate) mod io_view;
 mod issues;
 mod layout_editor;
+mod log_view;
 pub(crate) mod player;
 mod popup;
 mod posts;
@@ -1636,6 +1637,13 @@ pub struct StreamArchiverApp {
     /// Deferred-viewport state while the PO token server log window is open
     /// (None = closed) — see [`pot_log::PotLogPopupState`].
     pot_log_popup: Option<Arc<Mutex<pot_log::PotLogPopupState>>>,
+    /// The 🖹 Log view: a live, filterable window over the app's own tracing
+    /// output (`crate::log_capture`). Unlike the other popups here it has no
+    /// off-thread refresh throttle — its data source is an in-memory ring
+    /// buffer, cheap enough to poll every frame — so there's nothing to
+    /// track beyond whether it's open and its deferred-viewport state.
+    show_log_view: bool,
+    log_view_popup: Option<Arc<Mutex<log_view::LogViewPopupState>>>,
     notif_refreshed: Option<std::time::Instant>,
     notif_unread: i64,
     /// Unread `youtube_post`-kind notifications — the 📣 Posts tab badge.
@@ -2838,6 +2846,7 @@ impl StreamArchiverApp {
         self.notifications_window(ctx);
         self.warnings_window(ctx);
         self.pot_server_log_window(ctx);
+        self.log_view_window(ctx);
         self.posts_window(ctx);
         self.posts_excluded_window(ctx);
         self.format_designer_window(ctx);
@@ -3419,6 +3428,17 @@ impl eframe::App for StreamArchiverApp {
                                 self.show_notifications = true;
                                 self.notif_refreshed = None; // force an immediate refresh
                             }
+                        }
+                        if ui
+                            .button("🖹")
+                            .on_hover_text(
+                                "Log\nLive, filterable, colored view of the app's own tracing \
+                                 output — search, minimum severity, platform filter. Same \
+                                 events as the console/file log, without needing either open.",
+                            )
+                            .clicked()
+                        {
+                            self.show_log_view = true;
                         }
                         {
                             let n = self.scheduled_recordings.iter().filter(|r| r.rec.enabled).count();

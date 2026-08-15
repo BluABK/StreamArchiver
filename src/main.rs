@@ -35,6 +35,7 @@ mod inspector;
 mod io_gate;
 mod iomon;
 mod layout;
+mod log_capture;
 mod logfmt;
 mod manual_delete;
 mod models;
@@ -803,6 +804,11 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
         .with(filter)
         .with(file_layer)
         .with(stderr_layer)
+        // In-memory ring buffer feeding the in-app 🖹 Log view (log_capture.rs)
+        // — sees exactly the same events as the two layers above, under the
+        // same EnvFilter, so "what the Log view can show" always matches
+        // "what's in the console/file log" for this session.
+        .with(log_capture::LogCaptureLayer)
         .init();
 
     guard

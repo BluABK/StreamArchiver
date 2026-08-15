@@ -605,6 +605,8 @@ impl StreamArchiverApp {
             pot_log_text: String::new(),
             pot_log_refreshed: None,
             pot_log_popup: None,
+            show_log_view: false,
+            log_view_popup: None,
             notif_refreshed: None,
             notif_unread: 0,
             posts_unread: 0,
