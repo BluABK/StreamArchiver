@@ -3171,26 +3171,55 @@ progress_info: None,
         };
         info!(video = id, program = %plan.program, "downloading video -> {}", plan.final_path.display());
 
-        let outcome = self
-            .run_process(
-                &self.active_videos,
-                id,
-                &plan,
-                Some(self.video_progress.clone()),
-                Some(self.video_speed.clone()),
-                None, // on-demand downloads don't track ad breaks
-                DetachReg {
-                    kind: DetachedKind::Video,
-                    ref_id: id,
-                    monitor_id: None,
-                    take_group: None,
-                    started_at,
-                    secondary: false,
-                    stream_id: None,
-                    went_live_at: None,
-                },
-            )
-            .await;
+        // Up to 3 attempts: YouTube 403s googlevideo URLs mid-download when it
+        // rotates/revokes them (PO-token waves — one attempt died at 18% of the
+        // video track, leaving a no-audio `.f399.mp4`). A re-run is cheap and
+        // effective: fresh extraction mints new URLs + PO token, and yt-dlp's
+        // default `--continue` resumes the partial still sitting in `.cache\`.
+        // Same idea as live captures' in-flight retry. User stops, shutdown,
+        // and gone/ended sources never retry.
+        const VIDEO_DL_ATTEMPTS: u32 = 3;
+        let mut outcome = None;
+        for attempt in 1..=VIDEO_DL_ATTEMPTS {
+            let o = self
+                .run_process(
+                    &self.active_videos,
+                    id,
+                    &plan,
+                    Some(self.video_progress.clone()),
+                    Some(self.video_speed.clone()),
+                    None, // on-demand downloads don't track ad breaks
+                    DetachReg {
+                        kind: DetachedKind::Video,
+                        ref_id: id,
+                        monitor_id: None,
+                        take_group: None,
+                        started_at,
+                        secondary: false,
+                        stream_id: None,
+                        went_live_at: None,
+                    },
+                )
+                .await;
+            let failed = matches!(o.exit_code, Some(c) if c != 0);
+            let retry = failed
+                && attempt < VIDEO_DL_ATTEMPTS
+                && !self.shutdown.load(Ordering::SeqCst)
+                && !self.stopping_videos.lock().unwrap().contains(&id)
+                && !stream_ended_or_unavailable(&o.log);
+            outcome = Some(o);
+            if !retry {
+                break;
+            }
+            warn!(
+                video = id,
+                attempt,
+                "video download failed — retrying with fresh extraction \
+                 (resumes the partial in the capture cache)"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        let outcome = outcome.expect("at least one download attempt ran");
 
         // Promote from .cache\ to the output dir. streamlink/ffmpeg remux .ts→.mkv;
         // yt-dlp already produced the (M)KV in .cache — but its extension may differ

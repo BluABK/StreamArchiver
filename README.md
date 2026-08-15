@@ -518,6 +518,13 @@ unset/no-longer-valid falls back to the system yt-dlp at download time.
 > still-served player client (`mweb`). Both are appended *before* your extra
 > args, so a per-download or global `--extractor-args youtube:…` can override
 > them if YouTube's client landscape shifts again.
+>
+> YouTube also sometimes **revokes a media URL mid-download** (HTTP 403 partway
+> through a track). Downloads automatically retry up to 3 attempts — each re-run
+> re-extracts fresh URLs + PO token and resumes the partial file from the
+> capture cache. A download whose merge never completed (only a per-format
+> `.fNNN.*` intermediate exists — e.g. video downloaded, audio died) is marked
+> **failed**, never promoted as a finished video.
 
 **Quality.** The Quality dropdown offers **auto-best presets** — the app builds
 the right format selector and the tool resolves the actual best formats per

@@ -1393,6 +1393,20 @@ pub(super) fn plausible_media_output(rest: &str) -> bool {
     if NEVER.iter().any(|s| lower.ends_with(s)) || lower.contains(".temp.") {
         return false;
     }
+    // yt-dlp per-format intermediates (`{stem}.f399.mp4`, `.f251-3.webm`) are
+    // pre-merge working files. Promoting one as the final output means the
+    // merge never ran — the other track died mid-download — so what looks
+    // like a playable video is missing its audio (or vice versa). Seen live
+    // 2026-08-16: a mid-download CDN 403 left an 18%-truncated `.f399.mp4`
+    // that ffprobe happily read a full duration from.
+    if let Some((pre, _ext)) = lower.rsplit_once('.')
+        && let Some((_, marker)) = pre.rsplit_once('.')
+        && let Some(digits) = marker.strip_prefix('f')
+        && digits.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        && digits.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    {
+        return false;
+    }
     const MEDIA_EXTS: [&str; 8] = ["mkv", "mp4", "webm", "ts", "mov", "flv", "m4a", "opus"];
     match lower.rsplit_once('.') {
         Some((_, ext)) => MEDIA_EXTS.contains(&ext),
@@ -2025,8 +2039,17 @@ mod tests {
         ] {
             assert!(!plausible_media_output(rest), "{rest:?} accepted");
         }
+        // yt-dlp pre-merge per-format intermediates: promoting one means the
+        // merge never ran (video with no audio). Dub tracks carry `-N` ids.
+        for rest in [".f399.mp4", ".f251.webm", ".f251-3.webm", ".f140.m4a"] {
+            assert!(!plausible_media_output(rest), "{rest:?} accepted");
+        }
         // Real media outputs (incl. collision variants and differing exts).
         for rest in [".mkv", ".vod.mkv", ".webm", ".mp4", ".ts", " (2).mkv", ".m4a"] {
+            assert!(plausible_media_output(rest), "{rest:?} rejected");
+        }
+        // Non-fragment dotted stems still pass (`f` + non-digit, digits w/o f).
+        for rest in [".final.mkv", ".v2.mkv", ".2024.mkv", ".fhd.mp4"] {
             assert!(plausible_media_output(rest), "{rest:?} rejected");
         }
     }
