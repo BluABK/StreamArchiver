@@ -28,7 +28,7 @@ fn quota_date_today() -> String {
 }
 
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DailyRecordingStat, DetachedKind, DetachedRow,
+    AdBreak, AuthKind, Channel, Clip, Container, DailyRecordingStat, DetachedKind, DetachedRow,
     DetectionMethod, FfmpegJobKind, FfmpegJobRow, GlobalStats, Monitor, MonitorStreamChange,
     MonitorWithChannel, Platform, PollBucket, RecurrenceKind, SabrCodecPref, ScheduleSegment,
     ScheduledRecording, ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video,
@@ -36,7 +36,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 94;
+const SCHEMA_VERSION: i64 = 95;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -153,6 +153,9 @@ pub use alerts::{
     AlertDailyStat, AlertHealthTotals, CaptureAlertRow, GapRangeRow, NewCaptureAlert, RecAlertBadge,
 };
 mod channel_groups;
+mod clips;
+// `ClipSweepState` / `VodCdnRow` are re-exported when the sweep and recovery
+// phases first consume them; re-exporting now would only be an unused import.
 mod collab;
 pub use collab::PartnerSessionRow;
 mod disposal_records;

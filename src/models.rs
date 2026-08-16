@@ -1845,6 +1845,151 @@ impl Video {
     }
 }
 
+/// One archived clip (schema v95 `clip`), keyed by `(platform, slug)`.
+///
+/// Lifecycle fields are plain strings, matching `Recording`'s `status` /
+/// `recovery_state` / `vod_dl_state` rather than the `ALL`/`id()`/`label()` enum
+/// shape — these are DB state machines, not user-facing filter categories.
+// Fields land here ahead of the Clips view that renders them, same allowance as
+// `store::clips`. Remove once phases 2-7 have landed.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct Clip {
+    pub id: i64,
+    pub platform: Platform,
+    /// Twitch clip slug, or YouTube clip id. Unique per platform.
+    pub slug: String,
+    /// Our channel/instance, when the broadcaster is one we monitor. Both stay
+    /// `None` for a clip harvested from chat that belongs to someone else — the
+    /// catalogue still records it, it just has no local home.
+    pub channel_id: Option<i64>,
+    pub monitor_id: Option<i64>,
+    pub broadcaster_id: String,
+    /// The CDN folder's login component, kept even if we stop monitoring the
+    /// channel — see [`Clip::has_recovery_keys`].
+    pub broadcaster_login: String,
+    pub creator_login: String,
+    pub title: String,
+    pub game: String,
+    pub language: String,
+    pub view_count: i64,
+    /// Helix reports a float (`43.90`); stored as milliseconds so the recovery
+    /// window is never silently rounded.
+    pub duration_ms: i64,
+    pub created_at: i64,
+    pub url: String,
+    pub thumbnail_url: String,
+    /// Parent VOD: Twitch `/videos/<id>`, or the YouTube parent video id.
+    /// **Perishable** — Twitch empties it when the VOD expires.
+    pub vod_id: String,
+    /// Seconds into the parent VOD where the clip starts. **Perishable**, and
+    /// the single field that decides whether a lost clip can be reconstructed.
+    pub vod_offset_secs: Option<i64>,
+    /// When the two keys above were first captured (0 = never held any).
+    pub keys_captured_at: i64,
+    /// Local take covering this clip, resolved from `vod_id`.
+    pub recording_id: Option<i64>,
+    /// `indexed|queued|downloading|archived|gone|unrecoverable|failed`.
+    pub state: String,
+    /// `helix|chat|manual` — how we came to know about it.
+    pub source: String,
+    /// Which ladder tier produced the local file:
+    /// `live|cdn-vod|local-cut|cdn-clip|local-guess`.
+    pub recovery_method: String,
+    /// `exact|approx` for cut/reconstructed media; empty for a real clip
+    /// download. Never claim a reconstructed cut is frame-accurate.
+    pub offset_confidence: String,
+    /// The `video.id` job ticket while a download is in flight. Deleted on
+    /// success so the Videos tab is not drowned by tens of thousands of rows.
+    pub dl_video_id: Option<i64>,
+    pub dl_attempts: i64,
+    pub output_path: String,
+    pub bytes: i64,
+    pub first_seen_at: i64,
+    /// Last sweep that saw the clip still alive upstream.
+    pub last_seen_at: i64,
+    /// First sweep that found it missing (0 = still present as far as we know).
+    pub gone_at: i64,
+    pub err: String,
+}
+
+impl Default for Clip {
+    /// A freshly-discovered, not-yet-downloaded clip. `Platform` has no
+    /// `Default` of its own (an unknown platform string is a real signal there,
+    /// not a blank), so it is spelled out here rather than derived.
+    fn default() -> Self {
+        Clip {
+            id: 0,
+            platform: Platform::Twitch,
+            slug: String::new(),
+            channel_id: None,
+            monitor_id: None,
+            broadcaster_id: String::new(),
+            broadcaster_login: String::new(),
+            creator_login: String::new(),
+            title: String::new(),
+            game: String::new(),
+            language: String::new(),
+            view_count: 0,
+            duration_ms: 0,
+            created_at: 0,
+            url: String::new(),
+            thumbnail_url: String::new(),
+            vod_id: String::new(),
+            vod_offset_secs: None,
+            keys_captured_at: 0,
+            recording_id: None,
+            state: "indexed".into(),
+            source: "helix".into(),
+            recovery_method: String::new(),
+            offset_confidence: String::new(),
+            dl_video_id: None,
+            dl_attempts: 0,
+            output_path: String::new(),
+            bytes: 0,
+            first_seen_at: 0,
+            last_seen_at: 0,
+            gone_at: 0,
+            err: String::new(),
+        }
+    }
+}
+
+// Predicates written ahead of the Clips view / sweeps that call them, same
+// allowance as `store::clips`. Remove once those phases land.
+#[allow(dead_code)]
+impl Clip {
+    /// True when the media has been archived locally.
+    pub fn is_archived(&self) -> bool {
+        self.state == "archived" && !self.output_path.is_empty()
+    }
+
+    /// True while a download/recovery is queued or running.
+    pub fn is_active(&self) -> bool {
+        matches!(self.state.as_str(), "queued" | "downloading")
+    }
+
+    /// True when the clip has vanished upstream.
+    pub fn is_gone(&self) -> bool {
+        self.gone_at > 0
+    }
+
+    /// Whether this clip can be reconstructed from its parent broadcast at all.
+    ///
+    /// Both keys are needed: `vod_id` names the CDN folder (or matches a local
+    /// recording) and `vod_offset_secs` locates the cut within it. Without them
+    /// the only remaining hope is the clip's own CDN object, so the UI must not
+    /// offer a recovery action that cannot work.
+    pub fn has_recovery_keys(&self) -> bool {
+        !self.vod_id.is_empty() && self.vod_offset_secs.is_some()
+    }
+
+    /// Clip length in seconds, for the recovery window and UI display.
+    pub fn duration_secs(&self) -> f64 {
+        self.duration_ms as f64 / 1000.0
+    }
+}
+
 /// Default download settings for one platform, used to pre-fill the Videos-tab
 /// download form. The form copies these in when the pasted URL's platform
 /// changes; the user can then override any field per download.

@@ -1863,9 +1863,123 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 94)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 94);
+        if version < 95 {
+            // Clips: a catalogue first, media second.
+            //
+            // `vod_id` + `vod_offset_secs` are the *recovery keys* — with them a
+            // vanished clip can be cut back out of the parent VOD (or out of our
+            // own recording of it). They are PERISHABLE: measured against the
+            // live Helix API on 2026-08-16, they are present on 100% of clips up
+            // to 14 days old, 68% at 30 days, 19% at 90, and 5% at a year —
+            // Twitch nulls them once the parent VOD expires. So the only chance
+            // to capture them is to index a clip while its VOD still lives, and
+            // `upsert_clip` must never blank a key it already holds.
+            //
+            // `vod_cdn` is the same idea one level down: `gql_vod_info` resolves
+            // a VOD to its exact CDN host+folder in ONE request while the VOD is
+            // alive. Cached here, a later recovery needs zero host probing —
+            // which matters because the generic `find_live_playlist` fallback
+            // costs |CDN_HOSTS| x (2*window+1) ~= 2,400 HEADs, fine once for a
+            // VOD and utterly unacceptable per clip. Useful to the existing VOD
+            // recovery feature too.
+            //
+            // `recording.clip_sweep_stage` drives the post-broadcast sweeps
+            // (stage 0 -> +2h due, 1 -> +24h due, 2 -> done). Persisted rather
+            // than an in-process timer so a restart inside the 24h window does
+            // not lose the one sweep that can still capture the keys — same
+            // reasoning as v89's `chat_scanned_at`.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS clip (
+                     id INTEGER PRIMARY KEY,
+                     platform TEXT NOT NULL,
+                     slug TEXT NOT NULL,
+                     channel_id INTEGER,
+                     monitor_id INTEGER,
+                     broadcaster_id TEXT NOT NULL DEFAULT '',
+                     broadcaster_login TEXT NOT NULL DEFAULT '',
+                     creator_login TEXT NOT NULL DEFAULT '',
+                     title TEXT NOT NULL DEFAULT '',
+                     game TEXT NOT NULL DEFAULT '',
+                     language TEXT NOT NULL DEFAULT '',
+                     view_count INTEGER NOT NULL DEFAULT 0,
+                     duration_ms INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL DEFAULT 0,
+                     url TEXT NOT NULL DEFAULT '',
+                     thumbnail_url TEXT NOT NULL DEFAULT '',
+                     vod_id TEXT NOT NULL DEFAULT '',
+                     vod_offset_secs INTEGER,
+                     keys_captured_at INTEGER NOT NULL DEFAULT 0,
+                     recording_id INTEGER,
+                     state TEXT NOT NULL DEFAULT 'indexed',
+                     source TEXT NOT NULL DEFAULT 'helix',
+                     recovery_method TEXT NOT NULL DEFAULT '',
+                     offset_confidence TEXT NOT NULL DEFAULT '',
+                     dl_video_id INTEGER,
+                     dl_attempts INTEGER NOT NULL DEFAULT 0,
+                     output_path TEXT NOT NULL DEFAULT '',
+                     bytes INTEGER NOT NULL DEFAULT 0,
+                     first_seen_at INTEGER NOT NULL DEFAULT 0,
+                     last_seen_at INTEGER NOT NULL DEFAULT 0,
+                     gone_at INTEGER NOT NULL DEFAULT 0,
+                     err TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_clip_key ON clip(platform, slug);
+                 CREATE INDEX IF NOT EXISTS idx_clip_channel
+                     ON clip(channel_id, created_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_clip_vod
+                     ON clip(platform, vod_id) WHERE vod_id <> '';
+                 CREATE INDEX IF NOT EXISTS idx_clip_rec ON clip(recording_id);
+                 CREATE INDEX IF NOT EXISTS idx_clip_pending
+                     ON clip(state) WHERE state IN ('queued','downloading');
+
+                 CREATE TABLE IF NOT EXISTS clip_sweep (
+                     monitor_id INTEGER PRIMARY KEY,
+                     last_swept_at INTEGER NOT NULL DEFAULT 0,
+                     backfill_until INTEGER NOT NULL DEFAULT 0,
+                     backfill_done INTEGER NOT NULL DEFAULT 0,
+                     last_error TEXT NOT NULL DEFAULT ''
+                 );
+
+                 CREATE TABLE IF NOT EXISTS vod_cdn (
+                     vod_id TEXT PRIMARY KEY,
+                     host TEXT NOT NULL,
+                     folder TEXT NOT NULL,
+                     login TEXT NOT NULL,
+                     broadcast_id TEXT NOT NULL,
+                     start_epoch INTEGER NOT NULL,
+                     learned_at INTEGER NOT NULL
+                 );
+
+                 ALTER TABLE recording ADD COLUMN clip_sweep_stage INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS idx_recording_clip_sweep
+                     ON recording(ended_at) WHERE clip_sweep_stage < 2 AND ended_at IS NOT NULL;",
+            )?;
+            stamp_history_clip_swept(&conn)?;
+            conn.pragma_update(None, "user_version", 95)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 95);
         Ok(())
     }
+}
+
+/// Stamp every already-finished take as "post-broadcast clip sweep done" (v95).
+///
+/// `clip_sweep_stage` defaults to 0 so a *new* take sweeps for clips at
+/// `ended_at + 2h` and `+ 24h`. Leaving the existing archive at 0 would make
+/// every finished take instantly due on the first launch after upgrading —
+/// 3,425 of them on the development machine — thousands of Helix requests that
+/// could not succeed anyway: those VODs expired long ago and Twitch has already
+/// nulled the `video_id`/`vod_offset` keys the post-broadcast sweep exists to
+/// capture. Cataloguing history is the daily sweep's and the backfill's job.
+///
+/// Takes still in progress (`ended_at IS NULL`) are deliberately left at 0 so
+/// they sweep normally when they finish.
+fn stamp_history_clip_swept(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE recording SET clip_sweep_stage = 2 WHERE ended_at IS NOT NULL",
+        [],
+    )?;
+    Ok(n)
 }
 
 /// Replace a literal, never-expanded `{channel}` in stored paths with the
@@ -2165,6 +2279,41 @@ mod tests {
     /// A literal `{channel}` in stored paths is expanded per monitor, not
     /// globally — two channels sharing the same broken template must come out
     /// in two different folders, which is the whole point.
+    #[test]
+    fn migration_95_stamps_finished_takes_done_but_leaves_live_ones_due() {
+        // Guards the "an upgrade must not queue 3,425 doomed sweeps" property.
+        let store = Store::open_in_memory().unwrap();
+        let cid = store
+            .upsert_channel("Layna", "https://twitch.tv/laynalazar", Platform::Twitch)
+            .unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        let ended = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(100), false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(ended, 200, 1, Some(0), "completed", "C:/tmp/a.mkv", "")
+            .unwrap();
+        let live = store
+            .insert_recording(mid, 300, "C:/tmp/b.mkv", Some(300), false, None, None, "", "")
+            .unwrap();
+
+        // Re-running the stamp is what the migration does on an existing DB.
+        let conn = store.db();
+        let n = stamp_history_clip_swept(&conn).unwrap();
+        assert_eq!(n, 1, "only the finished take is stamped");
+        let stage = |id: i64| -> i64 {
+            conn.query_row(
+                "SELECT clip_sweep_stage FROM recording WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stage(ended), 2, "history is done, not due");
+        assert_eq!(stage(live), 0, "an in-progress take still sweeps when it ends");
+    }
+
     #[test]
     fn migration_93_expands_a_literal_channel_token_per_channel() {
         let store = Store::open_in_memory().unwrap();
