@@ -70,6 +70,42 @@ pub(crate) fn yt_anonymous_public(store: &Store) -> bool {
         _ => true,
     }
 }
+
+/// Apply the public/members-only client policy to a loaded SABR config for
+/// one YouTube monitor (callers gate on platform + `sabr.usable()`): a
+/// members-only monitor always gets `web` (entitlement lives on the
+/// account); a public one gets the configured primary client (default `tv`)
+/// unless the user hand-wrote custom extractor-args, which are respected
+/// verbatim. Shared by the capture path and the live-edge preview — the
+/// preview initially missed this policy and kept dying to PO-token waves
+/// that captures had already sidestepped.
+pub(crate) fn apply_yt_client_policy(store: &Store, monitor_id: i64, sabr: &mut SabrConfig) {
+    if store.monitor_members_only(monitor_id) {
+        sabr.extractor_args = with_player_client(&sabr.extractor_args, "web");
+        return;
+    }
+    let custom_xargs = !setting_str(store, "ytdlp_sabr_extractor_args").trim().is_empty();
+    let primary = sabr_primary_client(store);
+    if !custom_xargs && !primary.is_empty() {
+        sabr.extractor_args = with_player_client(&sabr.extractor_args, &primary);
+    }
+}
+
+/// Strip account cookies from a resolved auth for PUBLIC YouTube content
+/// when the 🕶 anonymous switch is on; members-only monitors keep theirs.
+/// Callers gate on platform. Returns whether the auth was anonymized so the
+/// caller can log it in its own context.
+pub(crate) fn yt_public_auth(store: &Store, monitor_id: i64, auth: &mut AuthSource) -> bool {
+    if !matches!(auth, AuthSource::None)
+        && yt_anonymous_public(store)
+        && !store.monitor_members_only(monitor_id)
+    {
+        *auth = AuthSource::None;
+        true
+    } else {
+        false
+    }
+}
 /// Settings key for the PO-token fallback client. Absent (never written) ⇒
 /// the default (`tv`); present but empty ⇒ fallback disabled (always web,
 /// with the escalating PO cooldown instead) — same present-vs-absent

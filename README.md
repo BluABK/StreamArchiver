@@ -1213,6 +1213,13 @@ are **mpv-only** and their buttons say so when disabled. Any player opens
 finished files. With no player configured the buttons are disabled and **Open
 file** falls back to the Windows file association.
 
+Live-edge plays and the SABR preview downloader follow the same YouTube
+client/cookies policy as captures (📺 tv client + 🕶 anonymous for public
+broadcasts, `web` + account cookies for members-only) — before 2026-08-16 the
+preview always ran `web` + cookies, so a PO-token rejection wave would kill
+its downloader a few seconds in and the player stalled at "Cache: 0s" while
+the capture itself, already on the tv fallback, kept recording fine.
+
 | Row state | ⏵ Play local recording (start) | ▷ Play stream (live edge) |
 |---|---|---|
 | Finished take | opens the output file (any player) | live-edge stream, if the channel is live |

@@ -3541,18 +3541,7 @@ progress_info: None,
         if row.monitor.platform() != Platform::YouTube || !bins.sabr.usable() {
             return;
         }
-        if self.store.monitor_members_only(row.monitor.id) {
-            bins.sabr.extractor_args = with_player_client(&bins.sabr.extractor_args, "web");
-            return;
-        }
-        let custom_xargs = !setting_str(&self.store, "ytdlp_sabr_extractor_args")
-            .trim()
-            .is_empty();
-        let primary = sabr_primary_client(&self.store);
-        if !custom_xargs && !primary.is_empty() {
-            bins.sabr.extractor_args =
-                with_player_client(&bins.sabr.extractor_args, &primary);
-        }
+        apply_yt_client_policy(&self.store, row.monitor.id, &mut bins.sabr);
     }
 
     /// Swap the PO-fallback client into the loaded SABR preset when this
@@ -4194,9 +4183,7 @@ progress_info: None,
         // YouTube's attestation experiments. Members-only broadcasts keep the
         // cookies — entitlement lives on the account.
         if row.monitor.platform() == Platform::YouTube
-            && !matches!(auth, AuthSource::None)
-            && yt_anonymous_public(&self.store)
-            && !self.store.monitor_members_only(row.monitor.id)
+            && yt_public_auth(&self.store, row.monitor.id, &mut auth)
         {
             info!(
                 monitor_id = row.monitor.id,
@@ -4204,7 +4191,6 @@ progress_info: None,
                  are reserved for members-only) {}",
                 row.monitor.platform().tag()
             );
-            auth = AuthSource::None;
         }
         // Filename media-info ({resolution}/{fps}/…): pre-probe the stream if the
         // template uses it and the mode asks for it. Do this BEFORE taking the

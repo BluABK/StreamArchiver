@@ -1264,8 +1264,14 @@ pub(super) fn spawn_live_preview(
     let m = &row.monitor;
     sweep_stale_previews();
 
-    let bins = load_ytdlp_bins(store);
+    let mut bins = load_ytdlp_bins(store);
     let use_sabr = m.platform() == Platform::YouTube && bins.sabr.usable();
+    // Same client policy as captures: public broadcasts preview via the
+    // no-PO-token primary client (default tv) so an attestation wave can't
+    // kill the preview downloader mid-watch; members-only stays on web.
+    if use_sabr {
+        crate::downloader::apply_yt_client_policy(store, m.id, &mut bins.sabr);
+    }
     if use_sabr && !player_is_mpv(player) {
         return Some("Live-edge preview of SABR streams requires mpv as the media player".into());
     }
@@ -1280,7 +1286,14 @@ pub(super) fn spawn_live_preview(
     // composed "browser:profile" form (a bare "firefox" would hit the
     // default profile, not the one holding the YouTube login).
     let cookies = compose_browser_profile(&settings.cookies_browser, &settings.cookies_profile);
-    let auth = resolve_auth(row, &settings.download_auth_method, &cookies);
+    let mut auth = resolve_auth(row, &settings.download_auth_method, &cookies);
+    // Anonymous public YouTube (same rule as captures): account cookies only
+    // for members-only monitors.
+    if m.platform() == Platform::YouTube
+        && crate::downloader::yt_public_auth(store, m.id, &mut auth)
+    {
+        tracing::info!(monitor_id = m.id, "live-preview: running anonymously (public broadcast)");
+    }
     let extra = split_args(&m.extra_args);
     let global_args = split_args(&settings.ytdlp_default_args);
     // Downloader writes into <tmp>\.cache\preview.*, matching the app's capture
@@ -1622,7 +1635,14 @@ pub(super) fn spawn_play_new_instance(
     // composed "browser:profile" form (a bare "firefox" would hit the
     // default profile, not the one holding the YouTube login).
     let cookies = compose_browser_profile(&settings.cookies_browser, &settings.cookies_profile);
-    let auth = resolve_auth(row, &settings.download_auth_method, &cookies);
+    let mut auth = resolve_auth(row, &settings.download_auth_method, &cookies);
+    // Anonymous public YouTube (same rule as captures): account cookies only
+    // for members-only monitors.
+    if m.platform() == Platform::YouTube
+        && crate::downloader::yt_public_auth(store, m.id, &mut auth)
+    {
+        tracing::info!(monitor_id = m.id, "play: running anonymously (public YouTube)");
+    }
     let extra: Vec<String> = split_args(&m.extra_args);
     // The global auto-update setting would otherwise poll this monitor's
     // CURRENT (possibly still-live) title/game into a VOD player's title —
