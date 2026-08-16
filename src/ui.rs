@@ -285,6 +285,9 @@ enum View {
     /// Who chatted where: search a chatter and see every stream they were in,
     /// what they said, gave, and what moderators did — see `users::users_view`.
     Users,
+    /// Catalogue of Twitch/YouTube clips — see `clips::clips_view`. Indexed for
+    /// every monitored channel; the media is downloaded only where enabled.
+    Clips,
     /// In-app manual (the embedded README, sectioned) + About (version/build
     /// info and data paths). Reached via the Help ▾ menu.
     Help,
@@ -591,6 +594,7 @@ mod popup;
 mod posts;
 mod pot_log;
 mod properties;
+mod clips;
 mod schedule;
 mod settings;
 mod streams;
@@ -2187,6 +2191,11 @@ pub struct StreamArchiverApp {
     /// channel/instance rows (the rows below them derive it from their own
     /// takes, which are already in memory).
     drives_cache: Option<(u64, HashMap<i64, Vec<char>>)>,
+    /// Per-broadcast clip counts `(total, archived)` keyed by parent VOD id,
+    /// cached against `streams_cache_rev` — same shape and reasoning as
+    /// [`Self::drives_cache`]. Backs the Streams tree's 🎞 summary row and
+    /// decides whether a single-take broadcast gains an expander at all.
+    clips_by_vod_cache: Option<(u64, HashMap<String, (i64, i64)>)>,
     /// Per-monitor sum of finished-take bytes, cached against
     /// `streams_cache_rev` — same shape and same reasoning as
     /// [`Self::rolling_rollup_cache`]. Backs the Streams grid's "Disk use"
@@ -2513,6 +2522,20 @@ pub struct StreamArchiverApp {
     /// kept, so Unkeep is reachable there. Session-only — the section is about
     /// what's at risk right now, and that's what it should open showing.
     backlog_show_kept: bool,
+    clips_grid: GridState,
+    /// Sort + per-column filters for the 🎞 Clips table.
+    clips_sort: SortState,
+    clips_filters: Vec<String>,
+    /// Clip rows for the current scope, rebuilt on entry / after an action
+    /// rather than per frame — a channel can hold tens of thousands.
+    clips_rows: Vec<crate::models::Clip>,
+    clips_loaded: bool,
+    /// What the Clips view is showing: everything, one channel, or the clips of
+    /// a single broadcast (set by the Streams tree's 🎞 summary row).
+    clips_scope: clips::ClipScope,
+    /// Total matching the scope before the display cap, so the view can say
+    /// "showing N of M" instead of silently truncating.
+    clips_total: usize,
     /// Backing state for the "⇕ Reorder columns…" window (`None` = closed) —
     /// a working copy of one table's entries, only written back + persisted
     /// (and only forcing one table reset, not one per intermediate move) when
@@ -3107,6 +3130,14 @@ impl eframe::App for StreamArchiverApp {
                             "👤",
                             "Users",
                             "Expanded user info.",
+                        ),
+                        (
+                            View::Clips,
+                            "🎞",
+                            "Clips",
+                            "Every clip of your monitored channels, and any found in \
+                             archived chat. Clips outlive the VOD they were cut from, \
+                             so the catalogue is kept even where the media isn't.",
                         ),
                         (
                             View::ChannelStats,
@@ -3796,6 +3827,7 @@ impl eframe::App for StreamArchiverApp {
             View::IoMonitor => self.io_view(ui),
             View::Debug => self.debug_view(ui),
             View::Users => self.users_view(ui),
+            View::Clips => self.clips_view(ui),
             View::Help => self.help_view(ui),
         });
 
@@ -3838,7 +3870,8 @@ impl eframe::App for StreamArchiverApp {
                 }
                 View::Videos | View::ChannelStats | View::Stats | View::IoMonitor
                 | View::Debug | View::Posts | View::Files | View::Help
-                | View::Backlog | View::StreamHistory | View::Trash | View::Users => {}
+                | View::Backlog | View::StreamHistory | View::Trash | View::Users
+                | View::Clips => {}
             }
         });
         if ctx_add_stream {

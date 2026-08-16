@@ -217,6 +217,9 @@ struct StreamsOut {
     toggle_period: Option<String>,
     /// A channel-group header's triangle was clicked — see `collapsed_channel_groups`.
     toggle_channel_group: Option<i64>,
+    /// The 🎞 clip summary row was clicked — switch to the Clips view scoped to
+    /// this broadcast's parent VOD id.
+    show_clips_for_vod: Option<String>,
     /// A channel-group header's bulk Auto/Enabled action — (group id, on).
     bulk_set_group_enabled: Option<(i64, bool)>,
     bulk_set_group_automation: Option<(i64, bool)>,
@@ -352,17 +355,37 @@ enum Vis {
     Stream { mid: i64, gi: usize, depth: usize },
     Take { mid: i64, gi: usize, ti: usize, depth: usize },
     VodJob { mid: i64, gi: usize, ti: usize, kind: VodJobKind, depth: usize },
+    /// One aggregate row per broadcast: "🎞 Clips · 47 · 43 archived".
+    ///
+    /// Deliberately a summary and not one row per clip — a popular stream has
+    /// hundreds, which would bury the takes the tree exists to show. Clicking it
+    /// opens the Clips view scoped to this broadcast, which is where a list
+    /// belongs.
+    ClipSummary { mid: i64, gi: usize, depth: usize },
 }
+
+/// The parent VOD id of a broadcast, if any of its takes recorded one. Clips
+/// are keyed by VOD, and every take of one broadcast shares it.
+fn group_vod_id(g: &crate::models::StreamGroup) -> Option<&str> {
+    g.takes
+        .iter()
+        .find_map(|t| t.vod_id.as_deref().filter(|v| !v.is_empty()))
+}
+
 // A stream is only expandable when it has more than one take,
-// or at least one take carries a VOD-recovery/backfill job —
-// the job row is the only depth-3 child a single-take stream
-// can have (its own take info stays folded into the Stream
-// row, same as today).
-fn stream_has_children(g: &crate::models::StreamGroup) -> bool {
+// or at least one take carries a VOD-recovery/backfill job, or
+// we know of clips cut from it — those rows are the only depth-3
+// children a single-take stream can have (its own take info
+// stays folded into the Stream row, same as today).
+fn stream_has_children(
+    g: &crate::models::StreamGroup,
+    clips: &std::collections::HashMap<String, (i64, i64)>,
+) -> bool {
     g.takes.len() > 1
         || g.takes
             .iter()
             .any(|t| t.recovery_state.is_some() || t.vod_dl_state.is_some())
+        || group_vod_id(g).is_some_and(|v| clips.contains_key(v))
 }
 
 /// The calendar date a stream is bucketed by: went-live time when known,
@@ -1745,6 +1768,23 @@ impl StreamArchiverApp {
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default();
+            // Per-broadcast clip counts, keyed by parent VOD id. Rev-keyed like
+            // its neighbours: one grouped query per rebuild, never per frame —
+            // the 🎞 summary row is drawn for every expanded broadcast.
+            if self.clips_by_vod_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
+            {
+                let fresh = self
+                    .core
+                    .store
+                    .clip_counts_by_vod(crate::models::Platform::Twitch)
+                    .unwrap_or_default();
+                self.clips_by_vod_cache = Some((self.streams_cache_rev, fresh));
+            }
+            let clips_by_vod = self
+                .clips_by_vod_cache
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
             // Same rev-keyed treatment as `rolling_rollup_cache` — backs the
             // channel/instance "Disk use" column, which has no per-take data
             // loaded to sum itself when collapsed (see `groups`, above).
@@ -1927,6 +1967,7 @@ impl StreamArchiverApp {
                 latest_raid_out,
                 rolling_rollups,
                 monitor_drives,
+                clips_by_vod,
                 monitor_disk_usage,
                 model,
                 platform_pref,
@@ -2170,6 +2211,7 @@ impl StreamArchiverApp {
                     self.streams_group_visually,
                     group_filter_members.as_ref().map(|(gid, members)| (*gid, members)),
                     recording_group_filter_members.as_ref(),
+                    &cache.clips_by_vod,
                 );
                 // Scroll a newly-added channel into view (rows are virtualized,
                 // so the in-cell scroll_to_cursor approach can't work — the
@@ -2315,7 +2357,8 @@ impl StreamArchiverApp {
                                     now,
                                     &col_order, &self.rec_alert_badges,
                                     active_ids, &finalizing_ids, fhits.as_ref(),
-                                    &self.core, &self.manual_delete_pending, &mut out,
+                                    &self.core, &self.manual_delete_pending,
+                                    &cache.clips_by_vod, &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -2339,6 +2382,12 @@ impl StreamArchiverApp {
                                     &mut tr, &groups[&mid][gi], ti, kind, depth,
                                     &self.background_tasks, &vid_progress,
                                     &mut self.fs_probes.lock().unwrap(), &col_order, &mut out,
+                                );
+                            }
+                            Vis::ClipSummary { mid, gi, depth } => {
+                                Self::clip_summary_row(
+                                    &mut tr, &groups[&mid][gi], depth,
+                                    &cache.clips_by_vod, &col_order, &mut out,
                                 );
                             }
                         }
@@ -2464,6 +2513,7 @@ impl StreamArchiverApp {
             toggle_stream,
             toggle_period,
             toggle_channel_group,
+            show_clips_for_vod,
             bulk_set_group_enabled,
             bulk_set_group_automation,
             toggle_select_stream,
@@ -2616,6 +2666,16 @@ impl StreamArchiverApp {
         if any_active {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
+        if let Some(vod_id) = show_clips_for_vod {
+            self.clips_scope = crate::ui::clips::ClipScope::Vod {
+                platform: crate::models::Platform::Twitch,
+                vod_id: vod_id.clone(),
+                label: format!("Broadcast {vod_id}"),
+            };
+            self.clips_loaded = false;
+            self.switch_view(View::Clips);
         }
 
         if toggle_channel.is_some()
@@ -3285,6 +3345,10 @@ impl StreamArchiverApp {
         // (there's no point showing a match and then hiding it behind a
         // collapsed triangle the user has to know to click).
         recording_group_filter: Option<&HashSet<i64>>,
+        // Per-broadcast clip counts keyed by parent VOD id: `(total, archived)`.
+        // Drives both the 🎞 summary row and whether a single-take stream is
+        // expandable at all.
+        clips_by_vod: &std::collections::HashMap<String, (i64, i64)>,
     ) -> Vec<Vis> {
         use chrono::Datelike;
         let mut order = ordered_rows(model, sort, filters);
@@ -3371,7 +3435,10 @@ impl StreamArchiverApp {
                             continue;
                         }
                         vis.push(Vis::Stream { mid, gi, depth: 2 });
-                        if stream_has_children(g) && exp_streams.contains(&g.key) {
+                        if stream_has_children(g, clips_by_vod) && exp_streams.contains(&g.key) {
+                            if group_vod_id(g).is_some_and(|v| clips_by_vod.contains_key(v)) {
+                                vis.push(Vis::ClipSummary { mid, gi, depth: 3 });
+                            }
                             for (ti, t) in g.takes.iter().enumerate() {
                                 if g.takes.len() > 1 {
                                     vis.push(Vis::Take { mid, gi, ti, depth: 3 });
@@ -3467,7 +3534,10 @@ impl StreamArchiverApp {
                             for (local_i, g) in week_chunk.iter().enumerate() {
                                 let gi = wi + local_i;
                                 vis.push(Vis::Stream { mid, gi, depth: stream_depth });
-                                if stream_has_children(g) && exp_streams.contains(&g.key) {
+                                if stream_has_children(g, clips_by_vod) && exp_streams.contains(&g.key) {
+                                    if group_vod_id(g).is_some_and(|v| clips_by_vod.contains_key(v)) {
+                                        vis.push(Vis::ClipSummary { mid, gi, depth: take_depth });
+                                    }
                                     for (ti, t) in g.takes.iter().enumerate() {
                                         if g.takes.len() > 1 {
                                             vis.push(Vis::Take { mid, gi, ti, depth: take_depth });
@@ -4671,6 +4741,9 @@ impl StreamArchiverApp {
         // Recording ids with a manual "Delete file from disk" in flight —
         // see `take_row`'s copy of this parameter.
         manual_delete_pending: &HashSet<i64>,
+        // Per-broadcast clip counts — only consulted to decide whether this row
+        // gains an expander (a single-take stream with clips has a 🎞 child).
+        clips_by_vod: &std::collections::HashMap<String, (i64, i64)>,
         out: &mut StreamsOut,
     ) {
         // The broadcast's stored collab names — shared by the collab cell
@@ -4706,7 +4779,7 @@ impl StreamArchiverApp {
         let is_live = owning_monitor
             .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
             .unwrap_or(false);
-        let has_takes = stream_has_children(g);
+        let has_takes = stream_has_children(g, clips_by_vod);
         let expanded = exp_streams.contains(&g.key);
         let when = fmt_went_live(g.went_live_at, g.went_live_approx);
         let ts_fn = |s| if short_ts_on() { fmt_datetime_compact(s) } else { fmt_datetime_short(s) };
@@ -6257,6 +6330,55 @@ impl StreamArchiverApp {
                     out.delete_recording_file = Some(t.id);
                     ui.close();
                 }
+            });
+        }
+    }
+
+    /// Render the 🎞 clip summary row under a broadcast.
+    ///
+    /// One row, not one per clip: a popular stream has hundreds and the tree is
+    /// not a list view. Clicking through scopes the Clips view to this
+    /// broadcast, which is where the list belongs.
+    fn clip_summary_row(
+        tr: &mut egui_extras::TableRow<'_, '_>,
+        g: &StreamGroup,
+        depth: usize,
+        clips_by_vod: &std::collections::HashMap<String, (i64, i64)>,
+        col_order: &[usize],
+        out: &mut StreamsOut,
+    ) {
+        let Some(vod) = group_vod_id(g) else {
+            return;
+        };
+        let (total, archived) = clips_by_vod.get(vod).copied().unwrap_or((0, 0));
+        let vod_id = vod.to_string();
+        for &ci2 in col_order {
+            tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                "name" => {
+                    tree_name(
+                        ui,
+                        depth,
+                        false,
+                        false,
+                        None,
+                        egui::RichText::new(format!("🎞 Clips · {total}")).weak(),
+                    );
+                }
+                "state" => {
+                    let label = if archived >= total {
+                        format!("{archived} archived")
+                    } else {
+                        format!("{archived} of {total} archived")
+                    };
+                    if ui
+                        .link(egui::RichText::new(label).weak())
+                        .on_hover_text("Open the Clips view filtered to this broadcast.")
+                        .clicked()
+                    {
+                        out.show_clips_for_vod = Some(vod_id.clone());
+                    }
+                }
+                _ => {}
             });
         }
     }

@@ -2079,7 +2079,7 @@ impl StreamArchiverApp {
                 .weak(),
             );
             ui.horizontal(|ui| {
-                let all_columns: [(GridTableId, &[GridCol]); 7] = [
+                let all_columns: [(GridTableId, &[GridCol]); 8] = [
                     (GridTableId::Streams, &STREAM_COLUMNS),
                     (GridTableId::Videos, &VIDEO_COLUMNS),
                     (GridTableId::BgActive, &BG_ACTIVE_COLUMNS),
@@ -2087,6 +2087,7 @@ impl StreamArchiverApp {
                     (GridTableId::Processes, &PROCESSES_COLUMNS),
                     (GridTableId::Issues, &ISSUES_COLUMNS),
                     (GridTableId::Backlog, &BACKLOG_COLUMNS),
+                    (GridTableId::Clips, &CLIP_COLUMNS),
                 ];
                 if ui
                     .button("Reset all columns")

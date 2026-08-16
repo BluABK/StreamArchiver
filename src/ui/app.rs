@@ -578,6 +578,8 @@ impl StreamArchiverApp {
         let issues_grid = GridState::load(&core.store, GridTableId::Issues, &ISSUES_COLUMNS);
         let backlog_grid = GridState::load(&core.store, GridTableId::Backlog, &BACKLOG_COLUMNS);
         let backlog_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Backlog);
+        let clips_grid = GridState::load(&core.store, GridTableId::Clips, &CLIP_COLUMNS);
+        let clips_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Clips);
         let settings_tab = SettingsTab::from_id(&setting_or_empty(&core, K_SETTINGS_TAB));
 
         let mut app = StreamArchiverApp {
@@ -818,6 +820,7 @@ impl StreamArchiverApp {
             raid_out_cache: None,
             rolling_rollup_cache: None,
             drives_cache: None,
+            clips_by_vod_cache: None,
             disk_usage_cache: None,
             rescan_disk_usage: None,
             saved_layouts_cache: None,
@@ -941,6 +944,18 @@ impl StreamArchiverApp {
             },
             backlog_filters: vec![String::new(); BACKLOG_COLUMNS.len()],
             backlog_show_kept: false,
+            clips_grid,
+            clips_sort: SortState {
+                keys: grid_columns::resolve_sort(&CLIP_COLUMNS, &clips_sort_persisted)
+                    .into_iter()
+                    .map(|(col, ascending)| SortLevel { col, ascending })
+                    .collect(),
+            },
+            clips_filters: vec![String::new(); CLIP_COLUMNS.len()],
+            clips_rows: Vec::new(),
+            clips_loaded: false,
+            clips_scope: Default::default(),
+            clips_total: 0,
             reorder_columns: None,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
@@ -2290,7 +2305,8 @@ impl StreamArchiverApp {
                 self.stats_snapshot = None; // force reload on open
                 self.stats_history = None;
             }
-            View::Trash => self.trash_loaded = false, // force reload on open
+            View::Trash => self.trash_loaded = false,
+            View::Clips => self.clips_loaded = false, // force reload on open
             _ => {}
         }
     }

@@ -2713,6 +2713,61 @@ downloaded VOD** or **Retry download**.
 > the archive `failed` without ever touching the live recording (use **📥 Download VOD
 > now** to retry later).
 
+### Clips 🎞
+
+A catalogue of every clip made from your monitored channels, and any clip URL
+found in archived chat. Reached from the **🎞 Clips** tab, and from the
+**🎞 Clips** row that appears under an expanded broadcast in Streams (which
+opens the view filtered to that one broadcast).
+
+**Why it's a catalogue first and a downloader second.** Clips outlive the VOD
+they were cut from and can vanish at any time — the channel gets banned, the
+clipper deletes it, Twitch prunes it. Knowing a clip *existed*, and holding the
+keys that could rebuild it, is worth keeping even where the media was never
+downloaded.
+
+**The 🔑 column is the important one.** It says whether a clip still carries its
+*recovery keys* — the parent VOD's id and the offset into it. With them, a clip
+that later disappears can be cut back out of the broadcast (from Twitch's CDN,
+or straight out of your own local recording if you have one). Without them, only
+the clip's own copy could ever be fetched, and if that's gone it's gone.
+
+Those keys are **perishable**. Twitch reports them only while the parent VOD
+still exists, then drops them permanently. Measured against the live API:
+
+| Clip age | Still reports its recovery keys |
+|---|---|
+| ≤ 14 days | 100% |
+| 30 days | 68% |
+| 90 days | 19% |
+| 1 year | 5% |
+
+That's the whole reason clips are swept **twice shortly after a broadcast ends**
+(at +2h and +24h, configurable) rather than only on a leisurely daily pass. A
+clip indexed inside that window keeps its keys forever; one indexed later never
+gets them. The daily sweep still runs — it catches clips someone made from an
+old VOD today — but those arrive keyless, and the catalogue says so honestly.
+
+**Indexing is on by default; downloading is not.** Metadata for the whole
+archive costs tens of megabytes. The media does not: a busy channel accumulates
+7,500–12,000 clips, roughly 200 GB. So downloading is gated per channel and off
+until you turn it on, and the catalogue is complete either way.
+
+**The ~1000 cap.** Twitch returns at most ~1000 clips per query however far you
+paginate, and it orders by view count *within* the queried window — so a
+truncated window silently drops the **least-viewed** clips, which for an archive
+is exactly backwards. The sweep detects truncation and recursively bisects the
+date range until each window fits. Where even an hour-wide window still caps,
+that's logged as a warning naming what couldn't be reached, rather than passed
+over in silence.
+
+> [!NOTE]
+> YouTube clips are catalogued but can't be enumerated — YouTube has no API to
+> list a video's or a channel's clips, so they're only found via URLs in archived
+> chat. A YouTube clip is also just an offset range into its parent video rather
+> than a file of its own, so if the parent goes, the clip goes; there's no CDN
+> fallback the way there is for Twitch.
+
 ### Missed-stream backfill
 
 Retroactively grabs whatever's still recoverable about a stream this app
@@ -5256,13 +5311,16 @@ holding the core type(s) and re-exports, with the implementation spread over
 
 - `src/store/` — SQLite persistence: `migrations`, plus per-domain query
   clusters (`recordings`, `monitors`, `scheduled`, `vod`, `posts`, `videos`,
-  `collab`, `stats_history`).
+  `clips`, `collab`, `stats_history`).
+- `src/clips/` — clip discovery (see [Clips](#clips-)): the Helix client and
+  date-window bisection in the `src/clips.rs` facade, sweep scheduling in
+  `sweep`.
 - `src/downloader/` — capture pipeline: `cache` (`.sa-cache` layout),
   `tools`, `plan`, `supervisor`, `process`, `backfill`, `vod`, `remux`,
   `naming`, `finalize`.
 - `src/ui/` — egui app: `app` (pump/persistence), one module per view
   (`streams`, `videos`, `schedule`, `settings`, `files`, `io_view`, `posts`,
-  `background`, `channel_stats`, `users`, `issues`, `debug`), window clusters
+  `background`, `channel_stats`, `users`, `clips`, `issues`, `debug`), window clusters
   (`dialogs`, `properties`, `chat`), and shared helpers (`grid`, `calendar`,
   `format`, `player`, `assets_helpers`).
 - `src/ui/chat/` — the chat window, itself a facade (`src/ui/chat.rs` holds the

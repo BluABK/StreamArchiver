@@ -875,6 +875,37 @@ pub(super) const VIDEO_COLUMNS: [GridCol; 10] = [
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 pub(super) const VIDEO_COLS: usize = 9;
 
+/// The 🎞 Clips columns, in DEFAULT display order.
+///
+/// Two of these exist for reasons that are not obvious from the name. **Keys**
+/// reports whether the clip still carries `video_id` + `vod_offset`: Twitch
+/// nulls both when the parent VOD expires, and without them a deleted clip can
+/// only be recovered from its own CDN object, never rebuilt from the broadcast.
+/// It is the single best predictor of whether this row is recoverable, so it is
+/// a column rather than a hover. **Offset** is where the clip sits inside that
+/// VOD, which is what a rebuild actually cuts on.
+///
+/// Each `id` is a stable persistence key: never reuse or change one once shipped.
+pub(super) const CLIP_COLUMNS: [GridCol; 14] = [
+    GridCol { id: "platform", title: "",         tooltip: "Source platform.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "title",    title: "Clip",     tooltip: "The clip's title. Hover for the full text; click a row's Actions to open it.", min_width: 200.0, initial: 260.0, sortable: true, stretch: false },
+    GridCol { id: "channel",  title: "Channel",  tooltip: "Broadcaster the clip is of. Blank means a clip of a channel you don't monitor (found in chat).", min_width: 110.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "clipper",  title: "Clipped by", tooltip: "Who made the clip.", min_width: 100.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "created",  title: "Created",  tooltip: "When the clip was made — not when the broadcast happened.", min_width: 88.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "length",   title: "Length",   tooltip: "Clip duration.", min_width: 62.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "views",    title: "Views",    tooltip: "View count at the last sweep.", min_width: 70.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "keys",     title: "🔑",        tooltip: "Whether this clip still carries its recovery keys (the parent VOD id + offset).\n\n🔑 = recoverable: if the clip is deleted it can be rebuilt from the broadcast.\n— = keys already expired: Twitch drops them when the parent VOD does, so only the clip's own CDN copy could ever be recovered.\n\nThey're captured within days of the broadcast or not at all.", min_width: 34.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "offset",   title: "At",       tooltip: "Where the clip starts inside the parent VOD — the point a rebuild cuts from.", min_width: 66.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "stream",   title: "Stream",   tooltip: "The local recording of the broadcast this clip came from, when we have one. That's what makes a lost clip cuttable without touching the network.", min_width: 100.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "state",    title: "State",    tooltip: "indexed / queued / downloading / archived / gone / failed. A 'gone' clip has vanished upstream.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "size",     title: "Size",     tooltip: "Size of the archived file.", min_width: 72.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "file",     title: "File",     tooltip: "Archived file path. Hover for the full path.", min_width: 150.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "actions",  title: "Actions",  tooltip: "Per-row actions: play, open the clip page, copy URL, download, recover, delete.", min_width: 150.0, initial: 0.0, sortable: false, stretch: true },
+];
+
+/// Sortable/filterable Clips columns (Platform..File; excludes Actions).
+pub(super) const CLIP_COLS: usize = 13;
+
 /// The 📥 Backlog columns, in DEFAULT display order — one row per *broadcast*
 /// (a `StreamGroup`), flat and newest-first across every channel.
 ///
@@ -963,6 +994,7 @@ pub(super) fn columns_for(table: GridTableId) -> &'static [GridCol] {
         GridTableId::Processes => &PROCESSES_COLUMNS,
         GridTableId::Issues => &ISSUES_COLUMNS,
         GridTableId::Backlog => &BACKLOG_COLUMNS,
+        GridTableId::Clips => &CLIP_COLUMNS,
     }
 }
 
@@ -978,6 +1010,7 @@ pub(super) fn table_display_name(table: GridTableId) -> &'static str {
         GridTableId::Processes => "Processes",
         GridTableId::Issues => "Issues",
         GridTableId::Backlog => "Backlog",
+        GridTableId::Clips => "Clips",
     }
 }
 
@@ -1137,6 +1170,10 @@ pub(super) struct StreamsViewCache {
     /// per-take data loaded to derive it themselves. A DB read, so it lives
     /// here rather than in the render path.
     pub(super) monitor_drives: HashMap<i64, Vec<char>>,
+    /// Clip counts `(total, archived)` per parent VOD id — the 🎞 summary row
+    /// under a broadcast, and whether a single-take broadcast is expandable at
+    /// all. A DB read, so it lives here rather than in the render path.
+    pub(super) clips_by_vod: HashMap<String, (i64, i64)>,
     /// Per-monitor sum of finished-take bytes — the "Disk use" column on
     /// channel/instance rows. See `Store::monitor_disk_usage`'s doc comment
     /// for why this is a coarser figure than what period/stream/take rows

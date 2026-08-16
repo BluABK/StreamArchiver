@@ -101,7 +101,7 @@ impl PersistedSort {
     }
 }
 
-/// Which of the six grid tables an operation applies to; also the JSON-map key
+/// Which of the grid tables an operation applies to; also the JSON-map key
 /// (`key()`) and the `TableBuilder::id_salt` for each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GridTableId {
@@ -112,10 +112,11 @@ pub enum GridTableId {
     Processes,
     Issues,
     Backlog,
+    Clips,
 }
 
 impl GridTableId {
-    pub const ALL: [GridTableId; 7] = [
+    pub const ALL: [GridTableId; 8] = [
         GridTableId::Streams,
         GridTableId::Videos,
         GridTableId::BgActive,
@@ -123,6 +124,7 @@ impl GridTableId {
         GridTableId::Processes,
         GridTableId::Issues,
         GridTableId::Backlog,
+        GridTableId::Clips,
     ];
 
     /// Stable string key: used as the map key inside `K_GRID_COLUMNS` /
@@ -136,6 +138,7 @@ impl GridTableId {
             GridTableId::Processes => "processes_table",
             GridTableId::Issues => "issues_table",
             GridTableId::Backlog => "backlog_table",
+            GridTableId::Clips => "clips_table",
         }
     }
 }

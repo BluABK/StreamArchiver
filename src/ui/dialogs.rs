@@ -3226,6 +3226,7 @@ impl StreamArchiverApp {
             GridTableId::Processes => &mut self.processes_grid.entries,
             GridTableId::Issues => &mut self.issues_grid.entries,
             GridTableId::Backlog => &mut self.backlog_grid.entries,
+            GridTableId::Clips => &mut self.clips_grid.entries,
         };
         *target = entries;
         grid_columns::save_columns(&self.core.store, table, target);

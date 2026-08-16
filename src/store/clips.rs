@@ -170,6 +170,34 @@ impl Store {
         Ok(rows)
     }
 
+    /// Newest clips across every channel — the Clips view's default scope.
+    pub fn recent_clips(&self, limit: i64) -> Result<Vec<Clip>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CLIP_COLS} FROM clip ORDER BY created_at DESC, id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt
+            .query_map(params![limit], Self::map_clip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// How many clips are catalogued in total, so a capped view can say
+    /// "showing N of M" rather than truncating silently.
+    pub fn clip_count(&self) -> Result<i64> {
+        let conn = self.db();
+        let n = conn.query_row("SELECT COUNT(*) FROM clip", [], |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// Drop a catalogue row. Never touches the file — media deletion goes
+    /// through `disposal::dispose_media` like every other archived artifact.
+    pub fn forget_clip(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("DELETE FROM clip WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
     /// Every clip cut from one VOD, in timeline order.
     ///
     /// This is the whole answer to "list a VOD's clips": Helix has no
