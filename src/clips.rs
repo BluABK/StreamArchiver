@@ -31,6 +31,8 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 mod fetch;
+mod harvest;
+pub use harvest::{extract_clip_refs, record_harvest};
 mod recover;
 pub use recover::recover_clip;
 // `download_allowed` / `enqueue_clip_download` join this list when the Clips

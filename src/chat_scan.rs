@@ -404,6 +404,19 @@ pub async fn maybe_sweep_chat_scan(
 
     let sweep_started = std::time::Instant::now();
     let (mut read, mut skipped, mut indexed_msgs, mut found_events) = (0u32, 0u32, 0i64, 0usize);
+    // Twitch login → (channel, instance), so a harvested clip of a channel we
+    // DO monitor gets a local home. Built once: the map is small and the loop
+    // below can run over hundreds of takes.
+    let mut harvested_clips = 0usize;
+    let clip_logins: std::collections::HashMap<String, (i64, i64)> = store
+        .list_monitors_with_channels()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            crate::detectors::twitch_login(&r.monitor.url)
+                .map(|l| (l, (r.channel.id, r.monitor.id)))
+        })
+        .collect();
     for t in due {
         // A capture in flight on the same drive outranks archival bookkeeping:
         // this is the load pattern that has knocked the USB enclosure off the
@@ -489,6 +502,19 @@ pub async fn maybe_sweep_chat_scan(
             }
         }
 
+        // Harvest clip links while the messages are in hand. This is the only
+        // way YouTube clips are ever discovered (there is no API to enumerate
+        // them), and it also finds Twitch clips of channels we don't monitor,
+        // which the Helix sweep structurally cannot see. Free here: the lines
+        // have already been read and parsed.
+        if !scan.messages.is_empty() {
+            let refs = crate::clips::extract_clip_refs(&scan.messages);
+            if !refs.is_empty() {
+                let n = crate::clips::record_harvest(store, &refs, &clip_logins, now);
+                harvested_clips += n;
+            }
+        }
+
         if let Some(idx) = index.filter(|_| t.wants.messages) {
             let parsed = crate::chat_index::ParsedSidecar {
                 messages: scan.messages,
@@ -552,6 +578,7 @@ pub async fn maybe_sweep_chat_scan(
             skipped,
             events = found_events,
             messages = indexed_msgs,
+            clips = harvested_clips,
             sweep_ms = sweep_started.elapsed().as_millis() as u64,
             "chat scan: sweep finished"
         );
