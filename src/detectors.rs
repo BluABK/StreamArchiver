@@ -5995,6 +5995,51 @@ pub(crate) fn extract_json_after(body: &str, marker: &str) -> Option<Value> {
     None
 }
 
+/// One-shot playability probe of a YouTube video's watch page: returns
+/// `(playabilityStatus.status, playabilityStatus.reason)` — e.g.
+/// `("OK", "")` for a healthy video, or `("UNPLAYABLE", "Stream suspended
+/// for policy violations")` / `("ERROR", "This video has been removed …")`
+/// for a takedown. Used post-broadcast to explain a live capture that ended
+/// abruptly because the platform pulled the stream — invisible to the
+/// capture tool, which just sees a clean end.
+pub(crate) async fn youtube_playability(
+    client: &reqwest::Client,
+    video_id: &str,
+) -> Option<(String, String)> {
+    let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let body = client
+        .get(&url)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let pr = extract_json_after(&body, "ytInitialPlayerResponse")?;
+    let status = pr["playabilityStatus"]["status"].as_str().unwrap_or_default().to_string();
+    let reason = pr["playabilityStatus"]["reason"].as_str().unwrap_or_default().to_string();
+    Some((status, reason))
+}
+
+/// Whether a playability status/reason pair describes a platform policy
+/// takedown or suspension (as opposed to an ordinary ended/private/upcoming
+/// state). Deliberately phrase-matched against the reason text — YouTube's
+/// wording ("Stream suspended for policy violations", "This video has been
+/// removed for violating YouTube's Community Guidelines", account
+/// terminations, copyright takedowns) is stable enough, and a healthy or
+/// merely-ended video reports status `OK`.
+pub(crate) fn policy_suspension_reason(status: &str, reason: &str) -> bool {
+    if status.eq_ignore_ascii_case("ok") {
+        return false;
+    }
+    let r = reason.to_ascii_lowercase();
+    ["suspend", "violat", "terminat", "community guidelines", "copyright", "removed"]
+        .iter()
+        .any(|p| r.contains(p))
+}
+
 /// Extract a *live* YouTube stream's title + content category from a `/live`
 /// watch page body. `Live` only for a genuinely-live watch page — the `/live`
 /// URL can also resolve to the channel page, a finished VOD, or an upcoming
@@ -6131,6 +6176,34 @@ fn parse_kick_meta(v: &Value) -> MetaFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_suspension_reason_classifies() {
+        // Real takedown/suspension phrasings → flagged.
+        assert!(policy_suspension_reason("UNPLAYABLE", "Stream suspended for policy violations"));
+        assert!(policy_suspension_reason(
+            "ERROR",
+            "This video has been removed for violating YouTube's Community Guidelines"
+        ));
+        assert!(policy_suspension_reason(
+            "ERROR",
+            "This video is no longer available because the YouTube account associated \
+             with this video has been terminated."
+        ));
+        assert!(policy_suspension_reason(
+            "UNPLAYABLE",
+            "This video contains content from A Studio, who has blocked it on copyright grounds"
+        ));
+        // Healthy / ordinary states → not flagged (OK always wins).
+        assert!(!policy_suspension_reason("OK", ""));
+        assert!(!policy_suspension_reason("OK", "Stream suspended for policy violations"));
+        assert!(!policy_suspension_reason(
+            "LIVE_STREAM_OFFLINE",
+            "This live event will begin in 7 days"
+        ));
+        assert!(!policy_suspension_reason("LOGIN_REQUIRED", "Sign in to confirm your age"));
+        assert!(!policy_suspension_reason("UNPLAYABLE", "Private video"));
+    }
 
     #[test]
     fn yt_watching_now_and_subscribers_parse() {

@@ -933,15 +933,27 @@ fn run_live_title_updater(
     let Some(mut pipe) = connect_mpv_ipc(&pipe_path, connect_timeout) else { return };
     tracing::debug!(monitor_id, "live-title: mpv IPC connected, pushing title");
     let mut pushed: Option<(String, String)> = None;
+    // Last non-empty broadcast title seen. When a stream ends — or the
+    // platform yanks it ("Stream suspended for policy violations") — the
+    // offline poll clears the monitor's last_title, and re-rendering the
+    // template with an empty {title} mangled the window title down to its
+    // static remnants ("Dokibird: 【】-"). The player is still showing that
+    // broadcast, so keep naming it.
+    let mut title_seen = String::new();
     loop {
         // Fresh render while the monitor row is readable; the last pushed
         // values once it isn't (monitor deleted mid-play) — something must go
         // down the pipe every round or the close goes unnoticed again.
         let value = match store.get_monitor_with_channel(monitor_id) {
-            Ok(Some(row)) => (
-                mpv_live_title_value(&template, &row.channel.name, &row.last_title, &row.last_game),
-                static_live_title(&template, &row.channel.name, &row.last_title, &row.last_game),
-            ),
+            Ok(Some(row)) => {
+                if !row.last_title.is_empty() {
+                    title_seen = row.last_title.clone();
+                }
+                (
+                    mpv_live_title_value(&template, &row.channel.name, &title_seen, &row.last_game),
+                    static_live_title(&template, &row.channel.name, &title_seen, &row.last_game),
+                )
+            }
             _ => match pushed.clone() {
                 Some(v) => v,
                 // Row unreadable before anything was ever pushed: no channel

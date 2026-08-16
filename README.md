@@ -863,6 +863,25 @@ only trace is a traceback in a per-capture log. The cap stays at 15 minutes on p
 lose the held-off minutes for good once the wave lifts, so waiting longer
 would trade take clutter for real footage.
 
+**🚫 Stream suspended by platform (YouTube).** A mid-stream policy takedown
+("Stream suspended for policy violations" — e.g. a copyright strike during
+the broadcast) is **invisible to the capture tool**: the live feed just ends
+(viewers get a violation slate) and yt-dlp exits cleanly, indistinguishable
+from a normal stream end. After every substantial YouTube capture ends on its
+own, the app probes the video's watch page once (a minute later) and reads
+`playabilityStatus` — if the reason is a policy takedown/suspension/account
+termination/copyright block, it files a **🚫 Stream suspended by platform**
+row in 🚨 Warnings with YouTube's verbatim reason. The row also carries the
+important archival guidance: takedowns are often temporary, and when the
+published VOD (re)appears it usually contains the **real content** for any
+span the live feed replaced with the slate (verified live 2026-08-16:
+Dokibird's copyright interruption — the whole "offline'd" segment was intact
+on the web VOD, including the streamer's reaction while "offline"), so **📥
+Download post-stream VOD** repairs the local capture; if the VOD stays down,
+the local capture may be the only surviving copy. The automatic
+[post-stream VOD archival](#post-stream-vod-download) covers this without any
+clicking when enabled.
+
 **🍪 Expired cookies.** yt-dlp's own check ("*The provided YouTube account
 cookies are no longer valid*") files as a red **error**, not a plain warning —
 a rotated/expired browser cookie means every subsequent capture attempt for

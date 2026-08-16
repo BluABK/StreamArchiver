@@ -4102,6 +4102,66 @@ progress_info: None,
             && (crate::models::sub_only_rejected(&outcome.log)
                 || crate::models::members_only_rejected(&outcome.log)
                 || self.store.monitor_members_only(monitor_id));
+        // Post-broadcast policy check (YouTube): a platform suspension mid-
+        // stream is INVISIBLE to the capture — the live feed just ends (or
+        // serves a "Stream suspended for policy violations" slate) and the
+        // tool exits cleanly, indistinguishable from a normal stream end
+        // (Dokibird 2026-08-16: copyright strike at 2h17 of 2h18; the take
+        // finalized "completed" with no trace of why it ended). One probe of
+        // the video's watch page a minute after a substantial capture ends
+        // reads playabilityStatus and files a 🚫 alert when the reason is a
+        // policy takedown — including the pointer that the published VOD, if
+        // it (re)appears, usually carries the REAL content for any span the
+        // live feed replaced with the slate.
+        if row.monitor.platform() == Platform::YouTube
+            && !manually_stopped
+            && !shutting_down
+            && ok
+            && duration > 300
+            && let Some(sid) = stream_id.clone().filter(|s| !s.is_empty())
+        {
+            let client = self.ctx.http_client();
+            let store = self.store.clone();
+            let channel = row.channel.name.clone();
+            tokio::spawn(async move {
+                // Let the platform settle the post-live state first.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let Some((status, reason)) =
+                    crate::detectors::youtube_playability(&client, &sid).await
+                else {
+                    return;
+                };
+                if !crate::detectors::policy_suspension_reason(&status, &reason) {
+                    return;
+                }
+                warn!(
+                    monitor_id, rec_id, %sid, %status, %reason,
+                    "post-broadcast playability: policy takedown/suspension detected"
+                );
+                let alert = crate::store::NewCaptureAlert {
+                    kind: "stream_suspended".to_string(),
+                    severity: "warn".to_string(),
+                    source: "capture".to_string(),
+                    take_key: format!("suspended:{sid}"),
+                    monitor_id: Some(monitor_id),
+                    recording_id: Some(rec_id),
+                    video_id: None,
+                    channel,
+                    count: 1,
+                    lost_segments: 0,
+                    last_line: format!(
+                        "YouTube reports this broadcast as suspended/removed right after it \
+                         ended: \"{reason}\" (status {status}). Takedowns are often \
+                         temporary — if the published VOD (re)appears, it usually contains \
+                         the REAL content for any span the live feed replaced with the \
+                         violation slate, so 📥 Download post-stream VOD can repair the \
+                         local capture. If the VOD stays down, your local capture may be \
+                         the only surviving copy."
+                    ),
+                };
+                let _ = store.upsert_capture_alert(&alert);
+            });
+        }
         // Twitch has somewhere to put a refused broadcast (the CDN segments);
         // nothing else does. That decides whether asking again is worth
         // anything, and so the retry cadence.

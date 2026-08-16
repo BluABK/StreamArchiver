@@ -165,6 +165,7 @@ pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static st
         "ad_probe_degraded" => return ("🛰", "Ad probe degraded"),
         "po_token_rejected" => return ("🎫", "PO token rejected"),
         "youtube_experiment" => return ("🧪", "Platform experiment"),
+        "stream_suspended" => return ("🚫", "Stream suspended by platform"),
         "cookies_invalid" => return ("🍪", "Cookies expired"),
         "offline_drive" => return ("💽", "Drive offline"),
         _ => {}
