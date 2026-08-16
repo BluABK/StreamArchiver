@@ -2251,6 +2251,45 @@ impl StreamArchiverApp {
             {
                 let _ = store.set_setting(crate::clips::K_CLIPS_DOWNLOAD, if dl_on { "1" } else { "0" });
             }
+            let mut auto_rec = store
+                .get_setting("clips_auto_recover")
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_none_or(|v| v != "0");
+            if ui
+                .checkbox(&mut auto_rec, "Try to rebuild clips that vanish")
+                .on_hover_text(
+                    "When a sweep finds a clip has been deleted upstream, attempt one rebuild \
+                     immediately — from the parent VOD's CDN segments, or by cutting it out of \
+                     our own recording of that broadcast. One attempt only; after that it's the \
+                     row's right-click menu. On by default because the window in which a \
+                     rebuild can still succeed closes when the parent VOD expires.",
+                )
+                .changed()
+            {
+                let _ = store.set_setting("clips_auto_recover", if auto_rec { "1" } else { "0" });
+            }
+            let mut backfill = matches!(
+                store.get_setting(crate::clips::K_CLIPS_BACKFILL).ok().flatten().as_deref(),
+                Some("1") | Some("true")
+            );
+            if ui
+                .checkbox(&mut backfill, "Backfill each channel's full clip history")
+                .on_hover_text(
+                    "Walk every channel's history a month at a time to get past Twitch's \
+                     ~1000-result cap — one channel measured 1,100 clips reachable normally \
+                     versus 7,588 with windowing. Thousands of requests per channel, paced one \
+                     window per visit over days, so it is off by default. The catalogue grows; \
+                     whether the media is downloaded still depends on the switches above.",
+                )
+                .changed()
+            {
+                let _ = store.set_setting(
+                    crate::clips::K_CLIPS_BACKFILL,
+                    if backfill { "1" } else { "0" },
+                );
+            }
             ui.add_enabled_ui(dl_on, |ui| {
                 ui.indent("clips_channels", |ui| {
                     ui.label(

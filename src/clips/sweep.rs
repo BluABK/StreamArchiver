@@ -343,6 +343,14 @@ pub async fn run_clip_sweep(
             Err(e) => warn!(channel = %row.channel.name, "clips: daily sweep failed: {e:#}"),
         }
 
+        // One historical window per pass, after the incremental sweep — the
+        // cheap, always-on work must never be starved by the expensive opt-in
+        // one, and pacing it a window per channel-visit spreads thousands of
+        // requests over days rather than minutes.
+        if backfill_on(&ctx.store) {
+            backfill_step(&ctx, &row, now).await;
+        }
+
         // Top the download queue up rather than enqueueing everything at once:
         // a channel can hold ten thousand pending clips, and the gate is
         // per-channel so most candidates are skipped anyway.
@@ -354,6 +362,89 @@ pub async fn run_clip_sweep(
         let gap = (CYCLE_SECS / total).max(MIN_GAP_SECS);
         crate::events::mark_job(&jobs, "Clip sweep", gap as i64);
         crate::app_core::sleep_cancellable(std::time::Duration::from_secs(gap), &shutdown).await;
+    }
+}
+
+/// How far back one backfill pass reaches. A month at a time keeps each pass
+/// bounded while rarely needing more than a split or two.
+const BACKFILL_STRIDE_SECS: i64 = 30 * 24 * 3600;
+/// Nothing on Twitch predates this, so it is the hard floor for a channel with
+/// no recorded creation date — an unbounded walk would never terminate.
+const TWITCH_EPOCH: i64 = 1_293_840_000; // 2011-01-01
+
+/// The next window a historical backfill should sweep, walking **newest first**.
+///
+/// Newest-first is deliberate: the recent windows are the only ones whose clips
+/// still carry recovery keys, so an interrupted or abandoned backfill has
+/// already captured everything that could still be rebuilt. `None` means the
+/// walk has reached the floor and the channel's history is complete.
+pub fn next_backfill_window(backfill_until: i64, floor: i64, now: i64) -> Option<Window> {
+    let floor = if floor > 0 { floor } else { TWITCH_EPOCH };
+    // First pass starts at "now" and works back.
+    let end = if backfill_until > 0 { backfill_until } else { now };
+    if end <= floor {
+        return None;
+    }
+    let start = (end - BACKFILL_STRIDE_SECS).max(floor);
+    Some(Window::new(start, end))
+}
+
+/// Is the expensive historical backfill enabled?
+///
+/// Off by default. The daily and post-broadcast sweeps are a handful of requests
+/// each; this walks a channel's entire history a month at a time, bisecting
+/// wherever the ~1000 cap truncates, and is thousands of requests per channel.
+fn backfill_on(store: &Store) -> bool {
+    matches!(
+        store.get_setting(K_CLIPS_BACKFILL).ok().flatten().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Advance one channel's historical backfill by a single window.
+///
+/// Resumable across restarts: progress lives in `clip_sweep.backfill_until`, and
+/// a window is only marked done once it has fully drained — a failure leaves the
+/// cursor where it was so the same window is retried rather than skipped.
+async fn backfill_step(ctx: &Arc<DetectContext>, row: &MonitorWithChannel, now: i64) -> usize {
+    let store = &ctx.store;
+    let state = store.clip_sweep_state(row.monitor.id).unwrap_or_default();
+    if state.backfill_done {
+        return 0;
+    }
+    let Some(window) = next_backfill_window(state.backfill_until, row.channel.created_at, now)
+    else {
+        let _ = store.set_clip_backfill(row.monitor.id, state.backfill_until, true);
+        info!(
+            channel = %row.channel.name,
+            "clips: historical backfill complete"
+        );
+        return 0;
+    };
+    let Some(t) = target_for(ctx, row).await else {
+        return 0;
+    };
+    match sweep_window_deep(ctx, store, &t, window, now).await {
+        Ok(res) => {
+            let _ = store.link_clips_to_recordings();
+            let _ = store.set_clip_backfill(row.monitor.id, window.start, false);
+            if res.seen > 0 {
+                info!(
+                    channel = %row.channel.name,
+                    clips = res.seen,
+                    from = %fmt_rfc3339(window.start),
+                    "clips: backfilled a window of history"
+                );
+            }
+            res.seen
+        }
+        Err(e) => {
+            // Cursor untouched: retry this window next pass rather than
+            // stepping over it and leaving a hole nothing revisits.
+            warn!(channel = %row.channel.name, "clips: backfill window failed: {e:#}");
+            let _ = store.set_clip_sweep_error(row.monitor.id, &format!("{e:#}"));
+            0
+        }
     }
 }
 
@@ -398,6 +489,45 @@ mod tests {
         // With no creation date, fall back to a bounded year rather than 1970.
         let w = incremental_window(0, 2_000_000, 0);
         assert_eq!(w.start, 2_000_000 - 365 * 24 * 3600);
+    }
+
+    #[test]
+    fn the_backfill_walks_newest_first_and_terminates_at_the_floor() {
+        // Newest-first matters: those windows hold the clips that still carry
+        // recovery keys, so an abandoned backfill has already got the valuable
+        // part.
+        let now = 1_000_000_000;
+        let floor = now - 90 * 24 * 3600;
+
+        let first = next_backfill_window(0, floor, now).unwrap();
+        assert_eq!(first.end, now, "the first pass starts at now");
+        assert_eq!(first.start, now - BACKFILL_STRIDE_SECS);
+
+        let second = next_backfill_window(first.start, floor, now).unwrap();
+        assert_eq!(second.end, first.start, "contiguous — no gap between passes");
+        assert!(second.start < second.end);
+
+        let third = next_backfill_window(second.start, floor, now).unwrap();
+        assert_eq!(third.start, floor, "clamped to the channel's own start");
+
+        // Reaching the floor ends the walk rather than looping forever.
+        assert!(next_backfill_window(third.start, floor, now).is_none());
+    }
+
+    #[test]
+    fn a_channel_with_no_creation_date_still_terminates() {
+        // An unbounded walk back to 1970 would never finish; Twitch itself
+        // predates nothing before 2011.
+        let now = 1_400_000_000;
+        let mut cursor = 0;
+        for _ in 0..1000 {
+            match next_backfill_window(cursor, 0, now) {
+                Some(w) => cursor = w.start,
+                None => break,
+            }
+        }
+        assert!(next_backfill_window(cursor, 0, now).is_none());
+        assert_eq!(cursor, TWITCH_EPOCH);
     }
 
     #[test]

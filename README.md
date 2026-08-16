@@ -2761,6 +2761,39 @@ date range until each window fits. Where even an hour-wide window still caps,
 that's logged as a warning naming what couldn't be reached, rather than passed
 over in silence.
 
+**Rebuilding a clip that's gone.** When a sweep notices a clip has vanished
+upstream it tries once, automatically, to rebuild it — then leaves it to the
+row's right-click menu. There are four routes, tried in the order that gives the
+best result:
+
+| Route | Accuracy | Lifetime |
+|---|---|---|
+| **Cut from the parent VOD's CDN segments** | frame-exact — `vod_offset` *is* the VOD's own clock, no conversion | dies with the VOD (~60 days) |
+| **Cut from your own recording** | approximate (see below) | free, instant, permanent, and higher quality than the clip ever was |
+| **The legacy standalone clip object** | exact if it works | usually 403s on modern clips; the only hope for old keyless ones |
+| **Bracket the clip's creation time** | a guess, labelled as one | last resort when there are no keys at all |
+
+An exact local cut wins outright. An approximate one only wins once the VOD has
+aged out and there's nothing better.
+
+**Why a local cut is approximate.** Your recording isn't on the same clock as
+the VOD: you joined after the broadcast started, head-backfill may have put the
+missed intro back, you may have captured ad filler the VOD omits, and you may be
+missing segments that were never spliced back in. All four are corrected for,
+but a cut is only marked **exact** when every term is known and safe — a real
+go-live time, no ad filler, no unspliced gap before the point. Otherwise it's
+marked **approx** and padded by 30 seconds instead of 3. A wide, obviously-rough
+clip is a useful archive; a narrow, confidently-wrong one is worse than nothing,
+so the row always says which you got.
+
+**Clips found in chat.** Every chat log the app scans is also swept for clip
+links — `clips.twitch.tv/…`, `twitch.tv/<channel>/clip/…` and
+`youtube.com/clip/…`. This costs nothing (the lines are already being read) and
+finds two things the Helix sweep structurally cannot: YouTube clips, and Twitch
+clips of channels you don't monitor. Those are catalogued without a local home
+and are never downloaded, but you'll know they existed. A clip spammed twenty
+times is one row, not twenty.
+
 > [!NOTE]
 > YouTube clips are catalogued but can't be enumerated — YouTube has no API to
 > list a video's or a channel's clips, so they're only found via URLs in archived
@@ -5312,9 +5345,10 @@ holding the core type(s) and re-exports, with the implementation spread over
 - `src/store/` — SQLite persistence: `migrations`, plus per-domain query
   clusters (`recordings`, `monitors`, `scheduled`, `vod`, `posts`, `videos`,
   `clips`, `collab`, `stats_history`).
-- `src/clips/` — clip discovery (see [Clips](#clips-)): the Helix client and
-  date-window bisection in the `src/clips.rs` facade, sweep scheduling in
-  `sweep`.
+- `src/clips/` — clips (see [Clips](#clips-)): the Helix client and date-window
+  bisection in the `src/clips.rs` facade, over `sweep` (scheduling, liveness,
+  historical backfill), `fetch` (downloads, gates, disposal), `recover` (the
+  rebuild ladder and its three time frames) and `harvest` (clip links in chat).
 - `src/downloader/` — capture pipeline: `cache` (`.sa-cache` layout),
   `tools`, `plan`, `supervisor`, `process`, `backfill`, `vod`, `remux`,
   `naming`, `finalize`.
