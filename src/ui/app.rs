@@ -240,6 +240,16 @@ impl StreamArchiverApp {
                 Ok(Some(v)) => !v.trim().is_empty(),
                 _ => true,
             },
+            // Absent ⇒ on ("tv" primary); present-but-empty ⇒ preset client (web).
+            sabr_tv_primary: match core.store.get_setting(K_SABR_PRIMARY) {
+                Ok(Some(v)) => !v.trim().is_empty(),
+                _ => true,
+            },
+            // Absent ⇒ on; "0" ⇒ off.
+            yt_anon_public: match core.store.get_setting(K_YT_ANON) {
+                Ok(Some(v)) => v != "0",
+                _ => true,
+            },
             // GLOBAL codec/quality default: unknown/absent ⇒ Auto (never Inherit —
             // there is nothing above the global to inherit from).
             sabr_codec_pref: match SabrCodecPref::parse(&setting_or_empty(&core, K_SABR_CODEC_PREF)) {
@@ -2009,6 +2019,15 @@ impl StreamArchiverApp {
                     ""
                 },
             ),
+            (
+                K_SABR_PRIMARY,
+                if s.sabr_tv_primary {
+                    crate::downloader::SABR_PRIMARY_DEFAULT_CLIENT
+                } else {
+                    ""
+                },
+            ),
+            (K_YT_ANON, if s.yt_anon_public { "1" } else { "0" }),
             (K_SABR_CODEC_PREF, s.sabr_codec_pref.id()),
             (K_SABR_CODEC_CUSTOM, s.sabr_codec_custom.trim()),
             (K_DASH_FORMAT, s.dash_format.trim()),

@@ -81,6 +81,10 @@ pub(crate) const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
 /// Absent ⇒ the `tv` default; explicit empty ⇒ disabled. Mirrors
 /// `downloader::K_SABR_PO_FALLBACK_CLIENT` — the supervisor reads it there.
 const K_SABR_PO_FALLBACK: &str = crate::downloader::K_SABR_PO_FALLBACK_CLIENT;
+/// `downloader::K_SABR_PRIMARY_CLIENT` — the supervisor reads it there.
+const K_SABR_PRIMARY: &str = crate::downloader::K_SABR_PRIMARY_CLIENT;
+/// `downloader::K_YT_ANON_PUBLIC` — the supervisor reads it there.
+const K_YT_ANON: &str = crate::downloader::K_YT_ANON_PUBLIC;
 /// Experimental: append `enable_live_deep_rewind=true` to the SABR extractor-args
 /// (rewinds past the normal DVR window; dev-build-only). Absent ⇒ off.
 const K_SABR_DEEP_REWIND: &str = "ytdlp_sabr_deep_rewind";
@@ -1195,6 +1199,14 @@ pub(crate) struct SettingsForm {
     /// Retry a PO-rejected take via the no-token `tv` client (stored as the
     /// client name in `K_SABR_PO_FALLBACK`, "" = disabled).
     sabr_po_fallback: bool,
+    /// Capture PUBLIC broadcasts via the no-PO-token `tv` client (stored as
+    /// the client name in `K_SABR_PRIMARY`, "" = keep the preset's `web`).
+    /// Members-only broadcasts always capture via `web` + cookies.
+    sabr_tv_primary: bool,
+    /// Public YouTube captures/downloads run without account cookies
+    /// (`K_YT_ANON`, "0" = off); cookies attach only for members-only
+    /// content or after an entitlement failure on a video download.
+    yt_anon_public: bool,
     /// GLOBAL default video codec/quality preference + its raw `-S` (when Custom).
     sabr_codec_pref: SabrCodecPref,
     sabr_codec_custom: String,

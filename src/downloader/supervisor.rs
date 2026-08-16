@@ -3110,12 +3110,30 @@ progress_info: None,
             .ok()
             .flatten()
             .unwrap_or_default();
-        let auth = resolve_auth_for(
+        let auth_full = resolve_auth_for(
             video.auth_kind,
             &video.auth_value,
             &global_method,
             &global_browser,
         );
+        // Public YouTube videos download anonymously (default on): cookies
+        // change the PO-token binding and put the account inside YouTube's
+        // attestation experiments. If the video actually needs entitlement,
+        // the retry loop below escalates to the configured cookies auth on a
+        // members-only / sign-in error.
+        let yt_anon = Platform::detect(&video.url) == Platform::YouTube
+            && !matches!(auth_full, AuthSource::None)
+            && yt_anonymous_public(&self.store);
+        let mut auth = if yt_anon {
+            info!(
+                video = id,
+                "downloading anonymously (public YouTube; cookies attach only if \
+                 the video turns out to need entitlement)"
+            );
+            AuthSource::None
+        } else {
+            auth_full.clone()
+        };
         // Optionally resolve the real title + channel + id (for
         // {title}/{channel}/{video_id}/{name} and the list display).
         let (title, channel, mut video_id) = if video.auto_title {
@@ -3151,7 +3169,7 @@ progress_info: None,
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let ytdlp_bins = load_ytdlp_bins(&self.store);
-        let plan = build_video_plan(
+        let mut plan = build_video_plan(
             &video, started_at, &title, &channel, &video_id, &auth, &ytdlp_global_args,
             pre_media.as_ref(), &ytdlp_bins,
         );
@@ -3202,22 +3220,44 @@ progress_info: None,
                 )
                 .await;
             let failed = matches!(o.exit_code, Some(c) if c != 0);
-            let retry = failed
+            let may_retry = failed
                 && attempt < VIDEO_DL_ATTEMPTS
                 && !self.shutdown.load(Ordering::SeqCst)
-                && !self.stopping_videos.lock().unwrap().contains(&id)
-                && !stream_ended_or_unavailable(&o.log);
+                && !self.stopping_videos.lock().unwrap().contains(&id);
+            // A members-only / sign-in failure on an anonymous attempt means
+            // the video needs entitlement after all: escalate to the
+            // configured cookies auth and rebuild the plan, instead of a
+            // plain same-args retry.
+            let escalate = may_retry
+                && matches!(auth, AuthSource::None)
+                && !matches!(auth_full, AuthSource::None)
+                && (crate::models::members_only_rejected(&o.log)
+                    || o.log.contains("Sign in to confirm"));
+            let retry = escalate || (may_retry && !stream_ended_or_unavailable(&o.log));
             outcome = Some(o);
             if !retry {
                 break;
             }
-            warn!(
-                video = id,
-                attempt,
-                "video download failed — retrying with fresh extraction \
-                 (resumes the partial in the capture cache)"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if escalate {
+                info!(
+                    video = id,
+                    "retrying with account cookies — the video needs entitlement \
+                     (members-only / sign-in required)"
+                );
+                auth = auth_full.clone();
+                plan = build_video_plan(
+                    &video, started_at, &title, &channel, &video_id, &auth,
+                    &ytdlp_global_args, pre_media.as_ref(), &ytdlp_bins,
+                );
+            } else {
+                warn!(
+                    video = id,
+                    attempt,
+                    "video download failed — retrying with fresh extraction \
+                     (resumes the partial in the capture cache)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
         }
         let outcome = outcome.expect("at least one download attempt ran");
 
@@ -3488,6 +3528,31 @@ progress_info: None,
             .get(&monitor_id)
             .map(|b| b.po_rejected)
             .unwrap_or(false)
+    }
+
+    /// Pick the yt-dlp client for this take. Public YouTube broadcasts
+    /// capture via the configured primary client (default `tv`, which has no
+    /// GVS PO-token policy at all — attestation rejection waves can't touch
+    /// it); members-only broadcasts stay on `web` + account cookies, the
+    /// known-entitled path. Hand-written extractor-args (the Settings field)
+    /// are respected verbatim for public captures — only the built-in preset
+    /// gets its client swapped.
+    pub(super) fn apply_client_policy(&self, row: &MonitorWithChannel, bins: &mut YtDlpBins) {
+        if row.monitor.platform() != Platform::YouTube || !bins.sabr.usable() {
+            return;
+        }
+        if self.store.monitor_members_only(row.monitor.id) {
+            bins.sabr.extractor_args = with_player_client(&bins.sabr.extractor_args, "web");
+            return;
+        }
+        let custom_xargs = !setting_str(&self.store, "ytdlp_sabr_extractor_args")
+            .trim()
+            .is_empty();
+        let primary = sabr_primary_client(&self.store);
+        if !custom_xargs && !primary.is_empty() {
+            bins.sabr.extractor_args =
+                with_player_client(&bins.sabr.extractor_args, &primary);
+        }
     }
 
     /// Swap the PO-fallback client into the loaded SABR preset when this
@@ -4122,7 +4187,25 @@ progress_info: None,
             .ok()
             .flatten()
             .unwrap_or_default();
-        let auth = resolve_auth(row, &global_method, &global_browser);
+        let mut auth = resolve_auth(row, &global_method, &global_browser);
+        // Public YouTube broadcasts capture anonymously (default on): account
+        // cookies change the PO-token binding (account identity instead of the
+        // anonymous visitor data bgutil mints for) and put the account inside
+        // YouTube's attestation experiments. Members-only broadcasts keep the
+        // cookies — entitlement lives on the account.
+        if row.monitor.platform() == Platform::YouTube
+            && !matches!(auth, AuthSource::None)
+            && yt_anonymous_public(&self.store)
+            && !self.store.monitor_members_only(row.monitor.id)
+        {
+            info!(
+                monitor_id = row.monitor.id,
+                "capturing anonymously (public YouTube broadcast; account cookies \
+                 are reserved for members-only) {}",
+                row.monitor.platform().tag()
+            );
+            auth = AuthSource::None;
+        }
         // Filename media-info ({resolution}/{fps}/…): pre-probe the stream if the
         // template uses it and the mode asks for it. Do this BEFORE taking the
         // concurrency permit (so a slow probe can't block other recordings) and
@@ -4157,6 +4240,7 @@ progress_info: None,
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let mut ytdlp_bins = load_ytdlp_bins(&self.store);
+        self.apply_client_policy(row, &mut ytdlp_bins);
         self.apply_po_fallback(row, &mut ytdlp_bins);
         let started_at = now_unix();
         let plan = build_plan(row, started_at, auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);

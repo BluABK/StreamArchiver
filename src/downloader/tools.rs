@@ -32,6 +32,44 @@ pub const DASH_DEFAULT_FORMAT: &str = "bestvideo+bestaudio/best";
 /// SABR capture (same 140/303 itags, deep rewind to sq0) while every web
 /// token was refused with ATTESTATION_REQUIRED.
 pub const SABR_PO_FALLBACK_DEFAULT_CLIENT: &str = "tv";
+/// Default PRIMARY yt-dlp client for public YouTube live SABR captures. `tv`
+/// (TVHTML5) has no GVS PO-token policy — smart TVs can't run BotGuard, so
+/// YouTube exempts the client — which makes it immune to the
+/// ATTESTATION_REQUIRED rejection waves that have hit `web` captures daily
+/// (see the Warnings history): with `web` primary, every wave burned a doomed
+/// take before the per-take fallback switched to `tv` anyway. Members-only
+/// broadcasts still capture via `web` + cookies (entitlement lives on the
+/// account) — see `Supervisor::apply_client_policy`.
+pub const SABR_PRIMARY_DEFAULT_CLIENT: &str = "tv";
+/// Settings key for the primary SABR client. Absent ⇒ the default (`tv`);
+/// present but empty ⇒ leave the preset's own client (`web`) untouched —
+/// same present-vs-absent semantics as `ytdlp_sabr_po_fallback_client`.
+pub const K_SABR_PRIMARY_CLIENT: &str = "ytdlp_sabr_primary_client";
+
+/// The configured primary SABR client ("" = keep the preset's client).
+pub(crate) fn sabr_primary_client(store: &Store) -> String {
+    match store.get_setting(K_SABR_PRIMARY_CLIENT) {
+        Ok(Some(v)) => v.trim().to_string(),
+        _ => SABR_PRIMARY_DEFAULT_CLIENT.to_string(),
+    }
+}
+
+/// Settings key: capture/download public YouTube content anonymously (no
+/// account cookies). Cookies change what a GVS PO token must be bound to
+/// (account identity instead of anonymous visitor data — the binding bgutil
+/// mints for) and put the account inside YouTube's attestation experiments,
+/// so they are attached only where entitlement actually needs them:
+/// members-only broadcasts, and the cookie-escalation retry of a video
+/// download that failed with a members/sign-in error. Default ON.
+pub const K_YT_ANON_PUBLIC: &str = "youtube_anonymous_public";
+
+/// Whether public YouTube captures/downloads should skip account cookies.
+pub(crate) fn yt_anonymous_public(store: &Store) -> bool {
+    match store.get_setting(K_YT_ANON_PUBLIC) {
+        Ok(Some(v)) => v != "0",
+        _ => true,
+    }
+}
 /// Settings key for the PO-token fallback client. Absent (never written) ⇒
 /// the default (`tv`); present but empty ⇒ fallback disabled (always web,
 /// with the escalating PO cooldown instead) — same present-vs-absent

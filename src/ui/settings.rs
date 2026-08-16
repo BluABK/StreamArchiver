@@ -2321,14 +2321,45 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
+                    ui.label("📺 Capture public streams via tv client");
+                    ui.checkbox(&mut self.settings.sabr_tv_primary, "").on_hover_text(
+                        "Capture PUBLIC YouTube broadcasts via yt-dlp's 'tv' (TVHTML5) \
+                         client, which has no GVS PO-token policy at all — the \
+                         ATTESTATION_REQUIRED rejection waves that kill 'web' takes \
+                         can't touch it (same formats, full-speed from-start, verified \
+                         live). Members-only broadcasts always capture via 'web' + \
+                         account cookies regardless, since entitlement lives on the \
+                         account. When off, the preset's 'web' client is the primary \
+                         and the PO-rejection fallback below carries the waves. \
+                         Hand-written extractor-args override this for public streams.",
+                    );
+                    ui.end_row();
+
+                    ui.label("🕶 Anonymous public YouTube");
+                    ui.checkbox(&mut self.settings.yt_anon_public, "").on_hover_text(
+                        "Capture and download PUBLIC YouTube content without account \
+                         cookies. Cookies change what a PO token must be bound to \
+                         (account identity instead of the anonymous visitor data the \
+                         token server mints for), put the account inside YouTube's \
+                         attestation experiments, and expose it to flagging. Account \
+                         cookies still attach where entitlement needs them: \
+                         members-only broadcasts, and a video download that failed \
+                         with a members-only / sign-in error (it retries with cookies \
+                         automatically). Note: a --cookies-from-browser line in the \
+                         yt-dlp user config (%APPDATA%\\yt-dlp\\config) would override \
+                         this — keep cookies out of that file.",
+                    );
+                    ui.end_row();
+
                     ui.label("🎫 PO-rejection fallback (tv client)");
                     ui.checkbox(&mut self.settings.sabr_po_fallback, "").on_hover_text(
                         "When a take dies because YouTube rejected its GVS PO token \
                          (ATTESTATION_REQUIRED), retry promptly via yt-dlp's 'tv' client, \
                          which doesn't use PO tokens at all — rejection waves can't touch \
-                         it. The web client stays the primary; the fallback applies \
-                         per-retry and the next successful capture returns to normal. \
-                         When off, rejected takes instead wait out the escalating \
+                         it. Mostly relevant when the tv-primary switch above is off (or \
+                         for members-only captures, which run via 'web'): the fallback \
+                         applies per-retry and the next successful capture returns to \
+                         normal. When off, rejected takes instead wait out the escalating \
                          5-15 minute cooldown before retrying (footage at the live edge \
                          is lost for the wait's duration).",
                     );

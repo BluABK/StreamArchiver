@@ -525,6 +525,13 @@ unset/no-longer-valid falls back to the system yt-dlp at download time.
 > capture cache. A download whose merge never completed (only a per-format
 > `.fNNN.*` intermediate exists — e.g. video downloaded, audio died) is marked
 > **failed**, never promoted as a finished video.
+>
+> With **🕶 Anonymous public YouTube** on (Settings → Downloads, the default),
+> YouTube video downloads run **without account cookies** even when the
+> configured auth is a cookies source — cookies invite the PO-token
+> attestation experiments and account flagging. If the video turns out to
+> need entitlement (members-only / sign-in error), the retry escalates to the
+> configured cookies auth automatically.
 
 **Quality.** The Quality dropdown offers **auto-best presets** — the app builds
 the right format selector and the tool resolves the actual best formats per
@@ -899,13 +906,39 @@ the true stream start, while every web-client token was refused). With
 **Settings → Downloads → 🎫 PO-rejection fallback (tv client)** on (the
 default), a take that dies to a rejected PO token retries *promptly* on the
 ordinary short ladder — not the 5-15 minute cooldown — with
-*player-client=tv* swapped into the SABR extractor-args for that retry. Web
-stays the primary client: the swap is per-take, sticky across resumes and
-further failures, and the next successful capture returns the monitor to
-normal. The new take's fresh head backfill re-fetches what the failed take
-missed, so a storm typically costs one short gap at worst. The escalating
-cooldown remains as the last resort when the fallback is disabled or the
-fallback take itself gets rejected.
+*player-client=tv* swapped into the SABR extractor-args for that retry. The
+swap is per-take, sticky across resumes and further failures, and the next
+successful capture returns the monitor to normal. The new take's fresh head
+backfill re-fetches what the failed take missed, so a storm typically costs
+one short gap at worst. The escalating cooldown remains as the last resort
+when the fallback is disabled or the fallback take itself gets rejected.
+
+**Since 2026-08-16, tv is the PRIMARY client for public broadcasts** —
+**Settings → Downloads → 📺 Capture public streams via tv client** (default
+on). The rejection waves had become a daily occurrence (the Warnings history
+shows `po_token_rejected` every day for a week straight, across nearly every
+YouTube channel), which meant web-primary was burning a doomed take per
+broadcast before falling back to tv anyway. With tv primary, public captures
+never mint a PO token in the first place; the 🎫 fallback above stays
+relevant for members-only captures (which always run via `web` + account
+cookies, since entitlement lives on the account) and for anyone who switches
+the primary back to web. Hand-written SABR extractor-args are respected
+verbatim for public streams — the client swap only applies to the built-in
+preset.
+
+**🕶 Anonymous public YouTube** (Settings → Downloads, default on) completes
+the picture: public captures and video downloads run **without account
+cookies**. Cookies change what a PO token must be bound to (account identity
+instead of the anonymous visitor data the token server mints for), put the
+account inside YouTube's attestation experiments, and expose it to flagging —
+yt-dlp's own guidance is to pass cookies only when the content requires them.
+Cookies still attach automatically where entitlement genuinely needs them:
+members-only broadcasts, and a video download that fails with a members-only
+/ sign-in error (it retries with the configured cookies auth by itself).
+Note that a `--cookies-from-browser` line in the yt-dlp **user config**
+(`%APPDATA%\yt-dlp\config`) is applied to every yt-dlp run behind the app's
+back and would defeat this switch — keep cookies out of that file and pass
+them per-command for one-off manual downloads of gated content.
 
 ### Automatic deletion
 
