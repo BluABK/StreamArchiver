@@ -2129,16 +2129,18 @@ pub(super) fn rolling_take_badge(ui: &mut egui::Ui, t: &crate::models::Recording
 /// urgent if it goes tonight, and a collapsed row can't tell you which. Same
 /// countdown, same colour ramp as the take rows beneath it, so drilling down
 /// confirms rather than surprises.
+///
+/// `scope` names what the rollup covers, for the hover text — `"channel"`,
+/// `"instance"`, `"date range"`.
 pub(super) fn rolling_rollup_badge(
     ui: &mut egui::Ui,
     r: &crate::rolling::RollingRollup,
     now: i64,
-    is_channel: bool,
+    scope: &str,
 ) {
     if r.count <= 0 {
         return;
     }
-    let scope = if is_channel { "channel" } else { "instance" };
     match r.remaining(now) {
         Some(left) => {
             ui.colored_label(
@@ -2234,6 +2236,28 @@ pub(super) fn merged_rolling(
     agg
 }
 
+/// The rolling rollup over a set of takes — what a period row (week / month /
+/// year) shows, summed from the broadcasts it groups. The channel and instance
+/// rows get the same shape straight from SQL
+/// ([`crate::store::Store::rolling_rollup_by_monitor`]); this is for the rows
+/// that already have their takes in memory.
+pub(super) fn rolling_of_takes<'a>(
+    takes: impl Iterator<Item = &'a crate::models::Recording>,
+) -> crate::rolling::RollingRollup {
+    use crate::models::RollingState;
+    let mut agg = crate::rolling::RollingRollup::default();
+    for t in takes {
+        if let RollingState::Rolling { deadline } = t.rolling.state(t.ended_at) {
+            agg.merge(&crate::rolling::RollingRollup {
+                count: 1,
+                soonest: deadline,
+                ttl_secs: if deadline.is_some() { t.rolling.ttl_secs } else { 0 },
+            });
+        }
+    }
+    agg
+}
+
 /// One take's rolling state in the broadcast-shaped form, so take rows and
 /// stream rows can share [`rolling_group_cell`] instead of drifting apart.
 pub(super) fn rolling_of_take(t: &crate::models::Recording) -> super::history::GroupRolling {
@@ -2257,12 +2281,11 @@ pub(super) fn rolling_rollup_cell(
     ui: &mut egui::Ui,
     r: &crate::rolling::RollingRollup,
     now: i64,
-    is_channel: bool,
+    scope: &str,
 ) {
     if r.count <= 0 {
         return;
     }
-    let scope = if is_channel { "channel" } else { "instance" };
     match r.remaining(now) {
         Some(left) => {
             ui.colored_label(
@@ -3635,7 +3658,7 @@ pub(super) fn render_instance_row(
                     } else {
                         resp.on_hover_text(&m.last_state);
                     }
-                    rolling_rollup_badge(ui, &rolling, now, false);
+                    rolling_rollup_badge(ui, &rolling, now, "instance");
                     // Subscriber-only: the last take was refused by Twitch, so
                     // what's being archived is the CDN head backfill, behind
                     // the live edge. Shown while the channel is still live —
@@ -3805,7 +3828,7 @@ pub(super) fn render_instance_row(
                 tags_cell(ui, &row.last_tags, &row.last_language);
             }
             "rolling" => {
-                rolling_rollup_cell(ui, &rolling, now, false);
+                rolling_rollup_cell(ui, &rolling, now, "instance");
             }
             "disk_use" if disk_use > 0 => {
                 ui.weak(fmt_bytes(disk_use)).on_hover_text(

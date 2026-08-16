@@ -1377,6 +1377,48 @@ mod tests {
         }
     }
 
+    /// The period rows (week / month / year) and the channel-group header roll
+    /// up from the takes they cover, and must agree with the take rows below
+    /// them: the reported deadline is the soonest anywhere inside, kept and
+    /// expired takes don't count, and a still-recording take counts without
+    /// becoming the headline.
+    #[test]
+    fn rolling_of_takes_rolls_a_period_up_from_its_takes() {
+        use crate::models::Rolling;
+        let take = |ended: Option<i64>, r: Rolling| {
+            let mut t = rec("C:/out/a.mkv");
+            t.ended_at = ended;
+            t.rolling = r;
+            t
+        };
+        let ttl = |secs: i64| Rolling { ttl_secs: secs, ..Default::default() };
+
+        let takes = [
+            // Not rolling at all.
+            take(Some(1_000), Rolling::default()),
+            // Due at 1_000 + 86_400.
+            take(Some(1_000), ttl(86_400)),
+            // Due at 2_000 + 3_600 — ends later, much shorter window, and so
+            // it is the first to actually go.
+            take(Some(2_000), ttl(3_600)),
+            // Kept and expired: neither is counting down any more.
+            take(Some(500), Rolling { ttl_secs: 60, kept_at: 600, ..Default::default() }),
+            take(Some(500), Rolling { ttl_secs: 60, expired_at: 600, ..Default::default() }),
+            // Still recording — counts, but contributes no deadline.
+            take(None, ttl(60)),
+        ];
+        let r = grid::rolling_of_takes(takes.iter());
+        assert_eq!(r.count, 3);
+        assert_eq!(r.soonest, Some(5_600));
+        assert_eq!(r.ttl_secs, 3_600, "the TTL must belong to the soonest take");
+
+        // Nothing rolling at all is an empty rollup, which every renderer
+        // draws as nothing — never as "due now".
+        let none = grid::rolling_of_takes(takes[..1].iter());
+        assert_eq!(none.count, 0);
+        assert_eq!(none.remaining(0), None);
+    }
+
     #[test]
     fn group_rolling_rolls_takes_up_to_one_broadcast_state() {
         use crate::models::Rolling;

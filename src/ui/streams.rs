@@ -2214,9 +2214,21 @@ impl StreamArchiverApp {
                     body.rows(24.0, vis.len(), |mut tr| {
                         match vis[tr.index()] {
                             Vis::ChannelGroup { group_id, count, expanded } => {
+                                // Merged across every channel in the group —
+                                // the outermost row in the tree, so it's the
+                                // one a countdown can hide behind entirely.
+                                let mut rolling = crate::rolling::RollingRollup::default();
+                                for e in chan_entries
+                                    .iter()
+                                    .filter(|e| e.channel.primary_group_id == Some(group_id))
+                                {
+                                    let mons: Vec<&MonitorWithChannel> =
+                                        e.rows.iter().map(|&i| &self.rows[i]).collect();
+                                    rolling.merge(&merged_rolling(&mons, &cache.rolling_rollups));
+                                }
                                 Self::group_row(
                                     &mut tr, group_id, &group_names, count, expanded,
-                                    &col_order, &mut out,
+                                    &col_order, rolling, now, &mut out,
                                 );
                             }
                             Vis::Channel(ci) => {
@@ -3804,7 +3816,7 @@ impl StreamArchiverApp {
                         // NOT present-state-only: a collapsed channel hiding
                         // that something under it is about to be auto-deleted
                         // is exactly the case this exists to prevent.
-                        rolling_rollup_badge(ui, &merged_rolling(&mons, rolling_rollups), now, true);
+                        rolling_rollup_badge(ui, &merged_rolling(&mons, rolling_rollups), now, "channel");
                         // Bubble the instances' live badges up while
                         // they're active — a collapsed channel otherwise
                         // hides that a recording was trigger-started or
@@ -3986,7 +3998,7 @@ impl StreamArchiverApp {
                         tags_cell(ui, &cur_tags, &cur_lang);
                     }
                     "rolling" => {
-                        rolling_rollup_cell(ui, &merged_rolling(&mons, rolling_rollups), now, true);
+                        rolling_rollup_cell(ui, &merged_rolling(&mons, rolling_rollups), now, "channel");
                     }
                     "disk_use" if disk_use_total > 0 => {
                         ui.weak(fmt_bytes(disk_use_total)).on_hover_text(
@@ -4386,8 +4398,10 @@ impl StreamArchiverApp {
     }
 
     /// Render one primary-group header (see [`Vis::ChannelGroup`]) — pure
-    /// navigation/summary + bulk actions, so only the "name" column is
+    /// navigation/summary + bulk actions, so only "name" and the 🕰 rolling
+    /// countdown (which has to survive being collapsed, at every level) are
     /// populated; every other `STREAM_COLUMNS` id falls through blank.
+    #[allow(clippy::too_many_arguments)]
     fn group_row(
         tr: &mut egui_extras::TableRow<'_, '_>,
         group_id: i64,
@@ -4395,17 +4409,26 @@ impl StreamArchiverApp {
         count: usize,
         expanded: bool,
         col_order: &[usize],
+        // Rolling takes across every channel in the group — the 🕰 badge and
+        // column. The one exception to this row's "name only" rule: a
+        // countdown that stops at the group header is a countdown you can
+        // collapse out of existence.
+        rolling: crate::rolling::RollingRollup,
+        now: i64,
         out: &mut StreamsOut,
     ) {
         let label = group_names.get(&group_id).map(String::as_str).unwrap_or("(deleted group)");
         let noun = if count == 1 { "channel" } else { "channels" };
         let mut disc = false;
         for &ci in col_order {
-            tr.col(|ui| {
-                if STREAM_COLUMNS[ci].id == "name" {
+            tr.col(|ui| match STREAM_COLUMNS[ci].id {
+                "name" => {
                     disc = tree_name(ui, 0, true, expanded, None, egui::RichText::new(label).strong());
                     ui.weak(format!("· {count} {noun}"));
                 }
+                "state" => rolling_rollup_badge(ui, &rolling, now, "group"),
+                "rolling" => rolling_rollup_cell(ui, &rolling, now, "group"),
+                _ => {}
             });
         }
         tr.response().context_menu(|ui| {
@@ -4433,8 +4456,9 @@ impl StreamArchiverApp {
     }
 
     /// Render one Year/Month/Week grouping header (see [`Vis::Period`]) —
-    /// pure navigation/summary, so only the "name" column is populated;
-    /// every other `STREAM_COLUMNS` id falls through blank.
+    /// pure navigation/summary, so only "name", "disk_use" and the 🕰 rolling
+    /// countdown (which has to survive being collapsed, at every level) are
+    /// populated; every other `STREAM_COLUMNS` id falls through blank.
     #[allow(clippy::too_many_arguments)]
     fn period_row(
         tr: &mut egui_extras::TableRow<'_, '_>,
@@ -4472,6 +4496,7 @@ impl StreamArchiverApp {
             .map(|t| take_size_bytes(fs_probes, t))
             .sum();
         let captured_secs: i64 = streams.iter().map(|g| g.captured_secs(now)).sum();
+        let rolling = rolling_of_takes(streams.iter().flat_map(|g| g.takes.iter()));
         let key = period_key(mid, kind, anchor);
         let mut disc = false;
         for &ci in col_order {
@@ -4483,26 +4508,14 @@ impl StreamArchiverApp {
                 } else if STREAM_COLUMNS[ci].id == "disk_use" && total > 0 {
                     ui.weak(fmt_bytes(total as i64))
                         .on_hover_text(stream_size_hover(total, captured_secs));
+                } else if STREAM_COLUMNS[ci].id == "state" {
+                    // The countdown has to survive every level of collapse:
+                    // this row sits between the instance rollup and the
+                    // broadcasts, and without it a collapsed week hid that
+                    // something inside it expires in hours.
+                    rolling_rollup_badge(ui, &rolling, now, "date range");
                 } else if STREAM_COLUMNS[ci].id == "rolling" {
-                    // The soonest countdown among this period's broadcasts —
-                    // without it, collapsing a week would hide that something
-                    // inside it expires tomorrow.
-                    let mut soonest: Option<(i64, i64)> = None;
-                    for g in streams {
-                        if let GroupRolling::Rolling { deadline: Some(d), ttl_secs } =
-                            group_rolling(g)
-                            && soonest.is_none_or(|(cur, _)| d < cur)
-                        {
-                            soonest = Some((d, ttl_secs));
-                        }
-                    }
-                    if let Some((d, ttl)) = soonest {
-                        rolling_group_cell(
-                            ui,
-                            GroupRolling::Rolling { deadline: Some(d), ttl_secs: ttl },
-                            now,
-                        );
-                    }
+                    rolling_rollup_cell(ui, &rolling, now, "date range");
                 }
             });
         }
