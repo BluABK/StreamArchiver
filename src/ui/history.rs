@@ -192,6 +192,8 @@ pub(super) struct BacklogPick {
     pub(super) play_vod: Option<i64>,
     /// Resolve + open this take's VOD webpage.
     pub(super) open_vod_webpage: Option<i64>,
+    /// Copy this take's video page URL to the clipboard (recording id).
+    pub(super) copy_video_url: Option<i64>,
     /// Open this take's 📄 Properties window.
     pub(super) properties: Option<i64>,
     /// Open the chat replay for `(monitor id, recording id)`.
@@ -288,6 +290,25 @@ fn backlog_row_menu(
             .clicked()
         {
             pick.open_vod_webpage = Some(t.id);
+            ui.close();
+        }
+    }
+    // Copy URL works on a LIVE broadcast too (unlike the VOD actions above):
+    // on YouTube the watch URL is the same page live and as the VOD.
+    if let Some(t) = g.takes.iter().rev().find(|t| t.stream_id.is_some()) {
+        if vod_take.is_none() {
+            ui.separator();
+        }
+        if ui
+            .button("🔗  Copy video URL")
+            .on_hover_text(
+                "Copy this broadcast's video page URL — on YouTube the watch URL is the \
+                 same page while live and for the VOD afterwards. Twitch: the VOD page \
+                 when its id is known, else the channel page.",
+            )
+            .clicked()
+        {
+            pick.copy_video_url = Some(t.id);
             ui.close();
         }
     }
@@ -1104,6 +1125,21 @@ impl StreamArchiverApp {
         if let Some(rid) = pick.open_vod_webpage {
             self.core.manual(ManualCommand::OpenVodWebpage(rid));
             self.status = "Resolving VOD webpage…".into();
+        }
+        if let Some(rid) = pick.copy_video_url {
+            if let Some(r) = self.history_all.iter().find(|r| r.id == rid)
+                && let Ok(Some(row)) = self.core.store.get_monitor_with_channel(r.monitor_id)
+            {
+                let url = crate::vod_archive::video_page_url(
+                    &row.monitor.url,
+                    r.stream_id.as_deref(),
+                    r.vod_id.as_deref(),
+                );
+                ui.ctx().copy_text(url.clone());
+                self.status = format!("Copied {url}");
+            } else {
+                self.status = "Couldn't resolve a video URL for this broadcast.".into();
+            }
         }
         if let Some(rid) = pick.properties {
             // Notes come from the flat history list this view already loaded —

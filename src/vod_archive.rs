@@ -171,6 +171,29 @@ pub fn youtube_vod_url(video_id: &str) -> String {
     format!("https://www.youtube.com/watch?v={video_id}")
 }
 
+/// Best synchronously-buildable video page URL for a broadcast — no network:
+/// YouTube gets the watch URL from the stream id (the SAME page while live
+/// and for the VOD afterwards); Twitch gets the VOD page when a `vod_id` is
+/// already known (a live broadcast's VOD id isn't), else the channel page;
+/// everything else falls back to the monitor URL.
+pub fn video_page_url(
+    monitor_url: &str,
+    stream_id: Option<&str>,
+    vod_id: Option<&str>,
+) -> String {
+    match crate::models::Platform::detect(monitor_url) {
+        crate::models::Platform::YouTube => match stream_id.filter(|s| !s.is_empty()) {
+            Some(sid) => youtube_vod_url(sid),
+            None => monitor_url.to_string(),
+        },
+        crate::models::Platform::Twitch => match vod_id.filter(|v| !v.is_empty()) {
+            Some(v) => twitch_vod_url(v),
+            None => monitor_url.to_string(),
+        },
+        _ => monitor_url.to_string(),
+    }
+}
+
 /// The Kick VOD watch URL for a video uuid (yt-dlp accepts this form).
 pub fn kick_vod_url(uuid: &str) -> String {
     format!("https://kick.com/video/{uuid}")
@@ -302,6 +325,29 @@ mod tests {
 
     fn scope(download: Option<bool>, replace: Option<bool>) -> VodArchiveScope {
         VodArchiveScope { download, replace }
+    }
+
+    #[test]
+    fn video_page_url_per_platform() {
+        // YouTube: watch URL from the stream id — same page live and as VOD.
+        assert_eq!(
+            video_page_url("https://www.youtube.com/@dokibird", Some("Kuc3o4dESMA"), None),
+            "https://www.youtube.com/watch?v=Kuc3o4dESMA"
+        );
+        // YouTube without a stream id falls back to the channel URL.
+        assert_eq!(
+            video_page_url("https://www.youtube.com/@dokibird", None, None),
+            "https://www.youtube.com/@dokibird"
+        );
+        // Twitch: VOD page when the id is known, else the channel page.
+        assert_eq!(
+            video_page_url("https://twitch.tv/dokibird", Some("123"), Some("456")),
+            "https://www.twitch.tv/videos/456"
+        );
+        assert_eq!(
+            video_page_url("https://twitch.tv/dokibird", Some("123"), Some("")),
+            "https://twitch.tv/dokibird"
+        );
     }
 
     #[test]

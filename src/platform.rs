@@ -1463,8 +1463,23 @@ pub fn open_path(path: &std::path::Path) {
 /// kept as a separate `&str`-typed function rather than overloading
 /// `open_path` since a URL isn't a filesystem path.
 pub fn open_url(url: &str) {
+    // ShellExecuteW, not `explorer.exe <url>`: explorer silently mangles URLs
+    // carrying a query string (e.g. youtube.com/watch?v=…) — instead of the
+    // browser it opens the Documents folder. ShellExecuteW routes through the
+    // proper URL-protocol handler with the query intact.
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    unsafe {
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        use windows::core::{HSTRING, PCWSTR, w};
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(HSTRING::from(url).as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]

@@ -1205,6 +1205,12 @@ gains two playback actions, as inline buttons and context-menu entries:
   [Missed-stream backfill](#missed-stream-backfill)) — those play/open the
   platform's VOD rather than a live edge, and work whether or not the take
   was ever recorded.
+- **🔗 Copy video URL** — copy the broadcast's video page URL to the
+  clipboard, **available while the stream is still live** (unlike the VOD
+  actions): on YouTube the `watch?v=` URL is the same page during the live
+  broadcast and for the VOD afterwards. Twitch copies the VOD page when its
+  id is already known, else the channel page. On take rows, stream rows, and
+  the Backlog's broadcast rows.
 
 [mpv](https://mpv.io) is strongly recommended — the app hands it live-viewing
 flags (`appending://` growing-file URLs, `--keep-open`, a generated live HLS

@@ -262,6 +262,10 @@ struct StreamsOut {
     play_vod_now: Option<i64>,
     /// "🌐 Open VOD webpage" on a past take/stream row — by recording id.
     open_vod_webpage: Option<i64>,
+    /// "🔗 Copy video URL" on a take/stream row — by recording id. Works on
+    /// a LIVE broadcast too (YouTube's watch URL is the same page live and
+    /// as the VOD).
+    copy_video_url: Option<i64>,
     backfill_head_now: Option<i64>,
     abort_backfill: Option<i64>,
     /// "📑 Embed chapters"/"🔁 Re-embed chapters" on a take/stream row.
@@ -2439,6 +2443,7 @@ impl StreamArchiverApp {
             scan_for_missed_streams,
             play_vod_now,
             open_vod_webpage,
+            copy_video_url,
             backfill_head_now,
             abort_backfill,
             retrigger_chapters,
@@ -2523,6 +2528,21 @@ impl StreamArchiverApp {
         if let Some(rec_id) = open_vod_webpage {
             self.core.manual(ManualCommand::OpenVodWebpage(rec_id));
             self.status = "Resolving VOD webpage…".into();
+        }
+        if let Some(rec_id) = copy_video_url {
+            if let Ok(Some(r)) = self.core.store.get_recording(rec_id)
+                && let Ok(Some(row)) = self.core.store.get_monitor_with_channel(r.monitor_id)
+            {
+                let url = crate::vod_archive::video_page_url(
+                    &row.monitor.url,
+                    r.stream_id.as_deref(),
+                    r.vod_id.as_deref(),
+                );
+                ui.ctx().copy_text(url.clone());
+                self.status = format!("Copied {url}");
+            } else {
+                self.status = "Couldn't resolve a video URL for this broadcast.".into();
+            }
         }
         if let Some(rec_id) = backfill_head_now.or_else(|| acts.backfill_head.take()) {
             self.core.manual(ManualCommand::BackfillHeadNow(rec_id));
@@ -5115,6 +5135,21 @@ impl StreamArchiverApp {
                             ui.close();
                         }
                     }
+                    // Works while LIVE too — YouTube's watch URL is the same
+                    // page live and as the VOD.
+                    if ui
+                        .button("🔗  Copy video URL")
+                        .on_hover_text(
+                            "Copy this broadcast's video page URL — on YouTube the \
+                             watch URL is the same page while live and for the VOD \
+                             afterwards. Twitch: the VOD page when its id is known, \
+                             else the channel page.",
+                        )
+                        .clicked()
+                    {
+                        out.copy_video_url = Some(t.id);
+                        ui.close();
+                    }
                     if ui
                         .button("🛟  Recover VOD…")
                         .on_hover_text("Reconstruct this stream's (latest take's) VOD from segments still on the Twitch CDN (deleted or DMCA-muted). Works on a \u{1F441} \"seen live, Auto was off\" row too.")
@@ -5908,6 +5943,22 @@ impl StreamArchiverApp {
                         out.open_vod_webpage = Some(t.id);
                         ui.close();
                     }
+                }
+                // Works while LIVE too — YouTube's watch URL is the same
+                // page live and as the VOD.
+                if t.stream_id.is_some()
+                    && ui
+                        .button("🔗  Copy video URL")
+                        .on_hover_text(
+                            "Copy this broadcast's video page URL — on YouTube the \
+                             watch URL is the same page while live and for the VOD \
+                             afterwards. Twitch: the VOD page when its id is known, \
+                             else the channel page.",
+                        )
+                        .clicked()
+                {
+                    out.copy_video_url = Some(t.id);
+                    ui.close();
                 }
                 // Recover a deleted/muted VOD from the CDN (Twitch takes
                 // that carry a broadcast/stream id).
