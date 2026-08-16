@@ -426,6 +426,16 @@ impl AppCore {
             .await;
         });
 
+        // Periodic clip sweep (K_CLIPS_ENABLED, on by default — indexing only;
+        // downloading is separately gated per channel). One channel per wake,
+        // ~24h per rotation, idling to one settings read per tick while off.
+        let clip_ctx = ctx.clone();
+        let clip_shutdown = self.shutdown.clone();
+        let clip_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            crate::clips::run_clip_sweep(clip_ctx, clip_shutdown, clip_jobs).await;
+        });
+
         // Supervisor: live signals + manual commands -> recordings.
         let max_concurrent = self
             .store

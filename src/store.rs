@@ -154,8 +154,7 @@ pub use alerts::{
 };
 mod channel_groups;
 mod clips;
-// `ClipSweepState` / `VodCdnRow` are re-exported when the sweep and recovery
-// phases first consume them; re-exporting now would only be an unused import.
+pub use clips::VodCdnRow;
 mod collab;
 pub use collab::PartnerSessionRow;
 mod disposal_records;

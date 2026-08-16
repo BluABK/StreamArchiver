@@ -577,6 +577,12 @@ async fn tick(
     // Rolling-recording expiry sweep (self-throttled to once a minute; a no-op
     // single query when nothing is due).
     crate::rolling::maybe_sweep_rolling(&ctx.store, events, checked_at).await;
+    // Post-broadcast clip sweeps (+2h/+24h after a take ends). Self-throttled to
+    // one indexed query per 5 minutes. This runs here rather than on the daily
+    // loop because it is the only window in which Twitch still reports a clip's
+    // `video_id`/`vod_offset` — once the parent VOD expires those are gone for
+    // good, and with them any chance of reconstructing a deleted clip.
+    crate::clips::maybe_sweep_post_broadcast(ctx, checked_at).await;
     // Chat sidecar harvest (self-throttled, a few finished takes per pass):
     // YouTube moderation actions into `stream_event`, and — for both platforms
     // — messages and identities into the chat index. Twitch records its own

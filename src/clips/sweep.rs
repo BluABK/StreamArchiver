@@ -1,0 +1,326 @@
+//! When clip discovery runs.
+//!
+//! Two drivers, and the split between them is the whole point:
+//!
+//! - **Post-broadcast** (`maybe_sweep_post_broadcast`) — at `ended_at + 2h` and
+//!   `+ 24h`. This is the *only* window in which Twitch still reports
+//!   `video_id`/`vod_offset`, so it is the only chance to capture the keys that
+//!   make a clip recoverable after it is deleted. Driven off the persisted
+//!   `recording.clip_sweep_stage` so a restart inside the 24 h window does not
+//!   lose it.
+//! - **Daily** (`run_clip_sweep`) — one channel per wake, ~24 h per rotation.
+//!   Catches clips cut from *old* VODs today, because Helix's date filter is on
+//!   the clip's own creation time, not the broadcast's. These arrive without
+//!   recovery keys and that is simply the truth about them.
+//!
+//! Both idle to one settings read per tick while clips are off.
+
+use super::*;
+use crate::models::MonitorWithChannel;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info, warn};
+
+/// How often each channel is revisited by the daily sweep.
+const CYCLE_SECS: u64 = 24 * 3600;
+/// Never sweep two channels closer together than this, however few there are.
+const MIN_GAP_SECS: u64 = 60;
+/// Re-check cadence while the feature is off or there is nothing to do.
+const IDLE_POLL_SECS: u64 = 300;
+/// Overlap on the incremental window, absorbing clock skew and clips created
+/// while the previous sweep was running.
+const OVERLAP_SECS: i64 = 6 * 3600;
+/// Post-broadcast sweeps are checked at most this often (a single indexed query
+/// when nothing is due).
+const POST_THROTTLE_SECS: i64 = 300;
+/// Settings key holding the last post-broadcast check, so the throttle survives
+/// a restart rather than firing a burst on every launch.
+const K_POST_LAST_CHECK: &str = "clips_post_sweep_last_check";
+/// Takes handled per post-broadcast pass — bounded so a backlog drains steadily
+/// instead of firing hundreds of Helix queries in one tick.
+const POST_BATCH: usize = 4;
+
+/// Is clip indexing on at all?
+pub fn clips_enabled(store: &Store) -> bool {
+    store
+        .get_setting(K_CLIPS_ENABLED)
+        .ok()
+        .flatten()
+        .as_deref()
+        .is_none_or(|v| v != "0")
+}
+
+/// Resolve the sweep target for a monitor, or `None` when it is not a Twitch
+/// channel we can enumerate clips for.
+async fn target_for(ctx: &Arc<DetectContext>, row: &MonitorWithChannel) -> Option<SweepTarget> {
+    let login = crate::detectors::twitch_login(&row.monitor.url)?;
+    let (client_id, token) = ctx.twitch_helix_auth().await.ok()?;
+    let user_id = ctx.twitch_user_id(&client_id, &token, &login).await?;
+    Some(SweepTarget {
+        channel_id: row.channel.id,
+        monitor_id: row.monitor.id,
+        login,
+        user_id,
+    })
+}
+
+/// Sweep one monitor over `window`, then link and snapshot.
+///
+/// Returns the number of clips seen. On failure the sweep cursor is **not**
+/// advanced — per the house contract an `Err` means "we weren't watching", and
+/// moving the high-water mark past a window we failed to read would leave a
+/// permanent hole that no later sweep would ever revisit.
+pub async fn sweep_monitor(
+    ctx: &Arc<DetectContext>,
+    row: &MonitorWithChannel,
+    window: Window,
+    now: i64,
+) -> anyhow::Result<usize> {
+    let Some(t) = target_for(ctx, row).await else {
+        return Ok(0);
+    };
+    let store = &ctx.store;
+    let res = match sweep_window_deep(ctx, store, &t, window, now).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = store.set_clip_sweep_error(t.monitor_id, &format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    if res.seen > 0 {
+        let _ = store.link_clips_to_recordings();
+        snapshot_vod_folders(ctx, t.monitor_id).await;
+    }
+    // Only now, with every window drained, is it safe to move the mark.
+    let _ = store.set_clip_swept(t.monitor_id, window.end);
+    Ok(res.seen)
+}
+
+/// Cache the CDN folder of any VOD we just learned about but have not resolved.
+///
+/// This is the cheap half of the perishable-key story. `gql_vod_info` answers in
+/// one request **while the VOD is alive**; once it expires the answer is gone
+/// forever and recovering a clip from it would need the ~2,400-HEAD host probe
+/// that `find_live_playlist` performs — acceptable once for a VOD, never per
+/// clip. One request now buys a free, exact answer later.
+async fn snapshot_vod_folders(ctx: &Arc<DetectContext>, monitor_id: i64) {
+    let store = &ctx.store;
+    let Ok(vods) = store.unsnapshotted_clip_vods(monitor_id, 8) else {
+        return;
+    };
+    let client = ctx.http_client();
+    for vod_id in vods {
+        match crate::recovery::gql_vod_info(&client, &vod_id).await {
+            Ok(info) => {
+                let _ = store.put_vod_cdn(&crate::store::VodCdnRow {
+                    vod_id: vod_id.clone(),
+                    host: info.host,
+                    folder: info.folder,
+                    login: info.login,
+                    broadcast_id: info.broadcast_id,
+                    start_epoch: info.start_epoch,
+                    learned_at: crate::models::now_unix(),
+                });
+                debug!("clips: cached CDN folder for VOD {vod_id}");
+            }
+            Err(e) => {
+                // Deleted/private/sub-only VOD — expected, and not worth a warn
+                // per clip. The clip stays recoverable only via its own object.
+                debug!("clips: no CDN folder for VOD {vod_id}: {e:#}");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(REQUEST_PACE_MS)).await;
+    }
+}
+
+/// Post-broadcast sweeps, called from the scheduler tick.
+///
+/// Self-throttled to one check per [`POST_THROTTLE_SECS`], and a single indexed
+/// query when nothing is due — the same shape as `rolling::maybe_sweep_rolling`.
+pub async fn maybe_sweep_post_broadcast(ctx: &Arc<DetectContext>, now: i64) {
+    let store = &ctx.store;
+    if !clips_enabled(store) {
+        return;
+    }
+    let last = store
+        .get_setting(K_POST_LAST_CHECK)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    if now - last < POST_THROTTLE_SECS {
+        return;
+    }
+    let _ = store.set_setting(K_POST_LAST_CHECK, &now.to_string());
+
+    let offsets = store
+        .get_setting(K_CLIPS_POST_OFFSETS)
+        .ok()
+        .flatten()
+        .map(|v| parse_post_offsets(&v))
+        .unwrap_or(DEFAULT_POST_OFFSETS);
+    let Ok(due) = store.recordings_due_clip_sweep(now, offsets.0, offsets.1) else {
+        return;
+    };
+    if due.is_empty() {
+        return;
+    }
+    let rows = store.list_monitors_with_channels().unwrap_or_default();
+
+    for (rec_id, monitor_id, stage) in due.into_iter().take(POST_BATCH) {
+        let Some(row) = rows.iter().find(|r| r.monitor.id == monitor_id) else {
+            // The instance is gone; nothing will ever sweep this take.
+            let _ = store.bump_clip_sweep_stage(rec_id, 2);
+            continue;
+        };
+        let Ok(Some(rec)) = store.get_recording(rec_id) else {
+            let _ = store.bump_clip_sweep_stage(rec_id, 2);
+            continue;
+        };
+        // Window the broadcast itself plus a day: clips are made during the
+        // stream and for a while after, and Helix filters on the clip's own
+        // creation time.
+        let from = rec.went_live_at.unwrap_or(rec.started_at) - 3600;
+        let window = Window::new(from, now);
+        match sweep_monitor(ctx, row, window, now).await {
+            Ok(n) => {
+                let _ = store.bump_clip_sweep_stage(rec_id, stage + 1);
+                if n > 0 {
+                    info!(
+                        recording_id = rec_id,
+                        channel = %row.channel.name,
+                        stage,
+                        clips = n,
+                        "clips: post-broadcast sweep (recovery keys are only \
+                         available this close to the broadcast)"
+                    );
+                }
+            }
+            Err(e) => {
+                // Leave the stage alone so the next pass retries — this is the
+                // one sweep whose window closes for good.
+                warn!(
+                    recording_id = rec_id,
+                    channel = %row.channel.name,
+                    "clips: post-broadcast sweep failed, will retry: {e:#}"
+                );
+            }
+        }
+    }
+}
+
+/// The daily per-channel sweep loop. Spawned once at startup.
+pub async fn run_clip_sweep(
+    ctx: Arc<DetectContext>,
+    shutdown: Arc<AtomicBool>,
+    jobs: crate::events::JobRegistry,
+) {
+    crate::app_core::sleep_cancellable(std::time::Duration::from_secs(90), &shutdown).await;
+
+    let mut queue: Vec<MonitorWithChannel> = Vec::new();
+    let mut total: u64 = 1;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if !clips_enabled(&ctx.store) {
+            queue.clear();
+            crate::app_core::sleep_cancellable(
+                std::time::Duration::from_secs(IDLE_POLL_SECS),
+                &shutdown,
+            )
+            .await;
+            continue;
+        }
+        if queue.is_empty() {
+            queue = ctx
+                .store
+                .list_monitors_with_channels()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.automation_on() && r.monitor.url.contains("twitch.tv/"))
+                .collect();
+            total = (queue.len() as u64).max(1);
+        }
+        let Some(row) = queue.pop() else {
+            crate::app_core::sleep_cancellable(
+                std::time::Duration::from_secs(IDLE_POLL_SECS),
+                &shutdown,
+            )
+            .await;
+            continue;
+        };
+
+        let now = crate::models::now_unix();
+        let state = ctx.store.clip_sweep_state(row.monitor.id).unwrap_or_default();
+        let window = incremental_window(state.last_swept_at, now, row.channel.created_at);
+        match sweep_monitor(&ctx, &row, window, now).await {
+            Ok(n) if n > 0 => {
+                info!(
+                    monitor_id = row.monitor.id,
+                    channel = %row.channel.name,
+                    clips = n,
+                    "clips: daily sweep"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(channel = %row.channel.name, "clips: daily sweep failed: {e:#}"),
+        }
+
+        let gap = (CYCLE_SECS / total).max(MIN_GAP_SECS);
+        crate::events::mark_job(&jobs, "Clip sweep", gap as i64);
+        crate::app_core::sleep_cancellable(std::time::Duration::from_secs(gap), &shutdown).await;
+    }
+}
+
+/// The window an incremental sweep should cover.
+///
+/// Overlaps the previous high-water mark by [`OVERLAP_SECS`] so a clip created
+/// while the last sweep was mid-flight is not skipped; a first-ever sweep starts
+/// from when we first knew the channel (falling back to a year) rather than the
+/// epoch, since an unbounded window would just cap immediately.
+pub fn incremental_window(last_swept_at: i64, now: i64, channel_created_at: i64) -> Window {
+    let start = if last_swept_at > 0 {
+        last_swept_at - OVERLAP_SECS
+    } else if channel_created_at > 0 {
+        channel_created_at
+    } else {
+        now - 365 * 24 * 3600
+    };
+    Window::new(start.min(now), now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_window_overlaps_the_previous_high_water_mark() {
+        // The overlap is what stops a clip created mid-sweep from falling into
+        // the gap between two windows and never being seen again.
+        let w = incremental_window(1_000_000, 1_100_000, 0);
+        assert_eq!(w.start, 1_000_000 - OVERLAP_SECS);
+        assert_eq!(w.end, 1_100_000);
+        assert!(w.start < 1_000_000);
+    }
+
+    #[test]
+    fn a_first_sweep_starts_at_the_channel_not_the_epoch() {
+        // Starting at 0 would make the very first window span decades and cap
+        // instantly, hiding everything but the 1000 most-viewed clips.
+        let w = incremental_window(0, 2_000_000, 1_500_000);
+        assert_eq!(w.start, 1_500_000);
+
+        // With no creation date, fall back to a bounded year rather than 1970.
+        let w = incremental_window(0, 2_000_000, 0);
+        assert_eq!(w.start, 2_000_000 - 365 * 24 * 3600);
+    }
+
+    #[test]
+    fn a_window_never_ends_before_it_starts() {
+        // A clock that jumped backwards (or a mark written by a future build)
+        // must not produce a reversed window that Helix would reject.
+        let w = incremental_window(9_000_000, 1_000_000, 0);
+        assert!(w.start <= w.end);
+        assert_eq!(w.end, 1_000_000);
+    }
+}

@@ -323,6 +323,51 @@ impl Store {
         Ok(())
     }
 
+    /// Point every unlinked clip at the local take of its parent broadcast.
+    ///
+    /// One set-based pass rather than a lookup per clip: a sweep can insert
+    /// hundreds of rows and this runs once after it. Only fills `NULL`s, so a
+    /// link already resolved (or set by hand) is never rewritten, and only for
+    /// clips that actually name a parent VOD.
+    ///
+    /// The link is what makes tier-3 recovery possible — cutting a lost clip out
+    /// of our own recording instead of the CDN — so it is worth resolving eagerly
+    /// rather than joining at render time.
+    pub fn link_clips_to_recordings(&self) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE clip SET recording_id = (
+                 SELECT r.id FROM recording r
+                 WHERE r.vod_id = clip.vod_id AND r.output_path <> ''
+                 ORDER BY r.started_at LIMIT 1)
+             WHERE recording_id IS NULL AND vod_id <> ''
+               AND EXISTS (SELECT 1 FROM recording r
+                           WHERE r.vod_id = clip.vod_id AND r.output_path <> '')",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// Parent VODs of this instance's clips whose CDN folder we have not cached
+    /// yet, newest first.
+    ///
+    /// Newest first because the answer is only obtainable while the VOD lives —
+    /// an interrupted pass should have spent its requests on the VODs that still
+    /// have something to give.
+    pub fn unsnapshotted_clip_vods(&self, monitor_id: i64, limit: i64) -> Result<Vec<String>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT c.vod_id FROM clip c
+             WHERE c.monitor_id = ?1 AND c.vod_id <> ''
+               AND NOT EXISTS (SELECT 1 FROM vod_cdn v WHERE v.vod_id = c.vod_id)
+             ORDER BY c.created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, limit], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Total archived bytes for one channel — the per-channel ceiling check.
     pub fn clip_bytes_for_channel(&self, channel_id: i64) -> Result<i64> {
         let conn = self.db();
@@ -817,6 +862,42 @@ mod tests {
             .recordings_due_clip_sweep(9_999_999, 7200, 86_400)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn clips_link_to_the_local_take_of_their_parent_broadcast() {
+        use crate::store::test_util::*;
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let rec = store
+            .insert_recording(mid, 100, "C:/rec/a.mkv", Some(100), false, None, None, "", "")
+            .unwrap();
+        store.set_recording_vod_found(rec, "2840712897", 0).unwrap();
+
+        // One clip of that broadcast, one of a VOD we never recorded.
+        store.upsert_clip(&sample_clip("Mine"), 1).unwrap();
+        let mut foreign = sample_clip("Foreign");
+        foreign.vod_id = "999999".into();
+        store.upsert_clip(&foreign, 1).unwrap();
+        // And one with no parent at all (keys already expired).
+        let mut keyless = sample_clip("Keyless");
+        keyless.vod_id = String::new();
+        keyless.vod_offset_secs = None;
+        store.upsert_clip(&keyless, 1).unwrap();
+
+        let n = store.link_clips_to_recordings().unwrap();
+        assert_eq!(n, 1, "only the clip whose VOD we recorded is linked");
+        let by = |slug: &str| store.clip_by_slug(Platform::Twitch, slug).unwrap().unwrap();
+        assert_eq!(by("Mine").recording_id, Some(rec));
+        assert_eq!(by("Foreign").recording_id, None);
+        assert_eq!(by("Keyless").recording_id, None);
+
+        // Idempotent: a second pass has nothing left to do.
+        assert_eq!(store.link_clips_to_recordings().unwrap(), 0);
     }
 
     #[test]

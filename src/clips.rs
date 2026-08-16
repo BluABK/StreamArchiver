@@ -30,6 +30,11 @@ use crate::store::Store;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+mod sweep;
+// `clips_enabled` joins this list when the download gate and the Clips view
+// need it; re-exporting it now would only be an unused import.
+pub use sweep::{maybe_sweep_post_broadcast, run_clip_sweep};
+
 /// Master switch: index clip metadata for monitored channels. Cheap (tens of MB
 /// for the whole archive) and it is what makes later recovery possible at all.
 pub const K_CLIPS_ENABLED: &str = "clips_enabled";
