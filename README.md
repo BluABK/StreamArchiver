@@ -673,6 +673,17 @@ happened to queue for hours at the disk gate can show a duration longer than
 the broadcast really was — the capture itself is still complete, only the
 timestamp is off; compare against the file's own duration to check.
 
+Beside it, the **🖴 Drives** column answers "where does this actually live?" —
+the drive letters a row's recordings are stored on, comma-separated (`A:, G:`).
+It rolls up the same way: a take shows its own drive, a stream/period/instance/
+channel shows every drive anything beneath it sits on, so a channel that
+straddles two disks reads `A:, G:` while collapsed. Handy before a disk swap,
+and for spotting a channel still writing to the drive you meant to retire —
+sort by it to group everything on one disk together. Like Disk use, it's read
+from the *recorded paths* rather than confirmed against disk (a file moved
+outside the app still counts until its row is disposed of), and network (UNC)
+paths have no drive letter, so they're blank.
+
 Once a channel has been recording long enough, its streams also subgroup into
 collapsible **Week → Month → Year** headers so the list doesn't turn into a
 wall of text. A level only appears once it would actually group more than one

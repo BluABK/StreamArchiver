@@ -2181,6 +2181,12 @@ pub struct StreamArchiverApp {
     /// `streams_cache_rev` — same shape and same reasoning as
     /// [`Self::raid_out_cache`]. Backs the 🕰 rollup badge and column.
     rolling_rollup_cache: Option<(u64, HashMap<i64, crate::rolling::RollingRollup>)>,
+    /// Per-monitor drive letters of stored takes, cached against
+    /// `streams_cache_rev` — same shape and reasoning as
+    /// [`Self::rolling_rollup_cache`]. Backs the 🖴 Drives column on
+    /// channel/instance rows (the rows below them derive it from their own
+    /// takes, which are already in memory).
+    drives_cache: Option<(u64, HashMap<i64, Vec<char>>)>,
     /// Per-monitor sum of finished-take bytes, cached against
     /// `streams_cache_rev` — same shape and same reasoning as
     /// [`Self::rolling_rollup_cache`]. Backs the Streams grid's "Disk use"

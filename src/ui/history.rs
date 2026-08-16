@@ -1377,6 +1377,24 @@ mod tests {
         }
     }
 
+    /// The 🖴 column on the rows that have their takes in memory: distinct
+    /// drives, uppercased, with pathless takes and non-drive paths (UNC,
+    /// relative) contributing nothing — the same answer
+    /// `Store::drive_letters_by_monitor` gives the rows above them.
+    #[test]
+    fn drives_of_takes_dedups_and_skips_non_drive_paths() {
+        let at = |path: &str| rec(path);
+        let takes = [
+            at(r"G:\streams\a.mkv"),
+            at(r"g:\streams\b.mkv"),   // same drive, lowercase
+            at(r"A:\streams\c.mkv"),
+            at(r"\\server\share\d.mkv"), // UNC — no drive letter
+            at(""),                      // never captured / already disposed of
+        ];
+        assert_eq!(grid::drives_of_takes(takes.iter()), vec!['A', 'G']);
+        assert!(grid::drives_of_takes(takes[3..].iter()).is_empty());
+    }
+
     /// The period rows (week / month / year) and the channel-group header roll
     /// up from the takes they cover, and must agree with the take rows below
     /// them: the reported deadline is the soonest anywhere inside, kept and

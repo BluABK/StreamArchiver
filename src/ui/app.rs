@@ -817,6 +817,7 @@ impl StreamArchiverApp {
             deep_filter_texts: None,
             raid_out_cache: None,
             rolling_rollup_cache: None,
+            drives_cache: None,
             disk_usage_cache: None,
             rescan_disk_usage: None,
             saved_layouts_cache: None,

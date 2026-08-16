@@ -799,7 +799,7 @@ pub(super) fn video_status_color(status: &str) -> egui::Color32 {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-pub(super) const STREAM_COLUMNS: [GridCol; 26] = [
+pub(super) const STREAM_COLUMNS: [GridCol; 27] = [
     GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Automation) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
@@ -825,6 +825,7 @@ pub(super) const STREAM_COLUMNS: [GridCol; 26] = [
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "tags",        title: "Tags",       tooltip: "The stream's tags (Twitch; Kick when set) — persists through offline as the channel's usual tags, same as language/category id. Hover for the full list; changes are archived — see 📝 Title/category/tags history.", min_width: 0.0, initial: 120.0, sortable: true, stretch: false },
     GridCol { id: "rolling",     title: "🕰",         tooltip: "Rolling recordings: how long until the next file under this row is deleted automatically. Channel/instance rows show the soonest of everything beneath them; stream and take rows show their own. Sort by it to put whatever expires first at the top. Blank for rows with nothing counting down (📌 = kept, 🗑 = already expired). Hidden by default — enable it from the column header.", min_width: 62.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "drives",      title: "🖴",         tooltip: "Which drive letters this row's recordings are stored on, comma-separated (A:, G:). Channel and instance rows list every drive anything beneath them sits on; period, stream and take rows narrow it down to their own files. Read from the stored paths rather than confirmed against disk, so a file that vanished outside the app still counts until its row is disposed of. Blank for rows with no stored file, and for network (UNC) paths, which have no drive letter.", min_width: 54.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "disk_use",    title: "💾",         tooltip: "Disk space used by stored recordings. Period/stream/take rows confirm each file still exists before counting it; the channel/instance rollup is a stored total instead (refreshed when the grid reloads, not live) and can briefly overcount a take whose file has since gone missing — expand down to it for the exact figure.", min_width: 64.0, initial: 0.0, sortable: true, stretch: false },
 ];
 
@@ -1131,6 +1132,11 @@ pub(super) struct StreamsViewCache {
     /// badge and column on instance and channel rows. A DB read, so it lives
     /// here rather than in the render path; see [`crate::rolling`].
     pub(super) rolling_rollups: HashMap<i64, crate::rolling::RollingRollup>,
+    /// Drive letters each monitor's takes are stored on (absent = nothing
+    /// stored) — the 🖴 column on channel and instance rows, which have no
+    /// per-take data loaded to derive it themselves. A DB read, so it lives
+    /// here rather than in the render path.
+    pub(super) monitor_drives: HashMap<i64, Vec<char>>,
     /// Per-monitor sum of finished-take bytes — the "Disk use" column on
     /// channel/instance rows. See `Store::monitor_disk_usage`'s doc comment
     /// for why this is a coarser figure than what period/stream/take rows
@@ -2236,6 +2242,64 @@ pub(super) fn merged_rolling(
     agg
 }
 
+/// The distinct drives a set of takes is stored on, sorted — the 🖴 column for
+/// the rows that already have their takes in memory (period, stream, take).
+/// Channel and instance rows get the same answer straight from SQL
+/// ([`crate::store::Store::drive_letters_by_monitor`]), since a collapsed row
+/// has no take history loaded.
+pub(super) fn drives_of_takes<'a>(
+    takes: impl Iterator<Item = &'a crate::models::Recording>,
+) -> Vec<char> {
+    let mut out: Vec<char> = Vec::new();
+    for t in takes {
+        if t.output_path.is_empty() {
+            continue;
+        }
+        if let Some(c) = crate::iomon::drive_letter(std::path::Path::new(&t.output_path))
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Merge several drive lists into one sorted, deduplicated list — a channel
+/// row over its instances, or a group row over its channels.
+pub(super) fn merge_drives(lists: impl Iterator<Item = impl AsRef<[char]>>) -> Vec<char> {
+    let mut out: Vec<char> = Vec::new();
+    for l in lists {
+        for &c in l.as_ref() {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// `['A', 'G']` → `"A:, G:"` — the 🖴 cell's text, and the sort key behind it
+/// (alphabetical, so rows sharing a drive sort together).
+pub(super) fn fmt_drives(drives: &[char]) -> String {
+    drives.iter().map(|c| format!("{c}:")).collect::<Vec<_>>().join(", ")
+}
+
+/// The 🖴 column cell. `scope` names what the list covers, for the hover text.
+pub(super) fn drives_cell(ui: &mut egui::Ui, drives: &[char], scope: &str) {
+    if drives.is_empty() {
+        return;
+    }
+    let text = fmt_drives(drives);
+    ui.label(&text).on_hover_text(format!(
+        "This {scope}'s recordings are {} {text}. Read from the recorded paths, not confirmed \
+         against disk — a file moved or deleted outside the app still counts here until its \
+         row is disposed of.",
+        if drives.len() == 1 { "all on" } else { "spread across" },
+    ));
+}
+
 /// The rolling rollup over a set of takes — what a period row (week / month /
 /// year) shows, summed from the broadcasts it groups. The channel and instance
 /// rows get the same shape straight from SQL
@@ -2499,6 +2563,9 @@ pub(super) fn channel_cells(
     // Per-monitor rolling rollup (`Store::rolling_rollup_by_monitor`) — the
     // channel row's 🕰 cell takes the soonest deadline across its instances.
     rolling_rollups: &HashMap<i64, crate::rolling::RollingRollup>,
+    // Per-monitor stored drive letters (`Store::drive_letters_by_monitor`) —
+    // the channel row's 🖴 cell merges every instance's list.
+    monitor_drives: &HashMap<i64, Vec<char>>,
 ) -> Vec<Cell> {
     if monitors.is_empty() {
         // Empty container: just the name + "added"; everything else blank
@@ -2645,6 +2712,10 @@ pub(super) fn channel_cells(
                 None => Cell::num(f64::INFINITY, String::new()),
             }
         },
+        // 🖴 Drives — every drive anything under this channel is stored on.
+        Cell::text(fmt_drives(&merge_drives(
+            monitors.iter().filter_map(|m| monitor_drives.get(&m.monitor.id)),
+        ))),
         // Disk use — summed across every instance (index last).
         {
             let total: i64 =
@@ -2939,6 +3010,9 @@ pub(super) fn render_instance_row(
     // This instance's finished-take byte sum (`Store::monitor_disk_usage`) —
     // the "Disk use" cell.
     disk_use: i64,
+    // The drives this instance's takes are stored on
+    // (`Store::drive_letters_by_monitor`) — the 🖴 cell.
+    drives: &[char],
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -3830,6 +3904,9 @@ pub(super) fn render_instance_row(
             "rolling" => {
                 rolling_rollup_cell(ui, &rolling, now, "instance");
             }
+            "drives" => {
+                drives_cell(ui, drives, "instance");
+            }
             "disk_use" if disk_use > 0 => {
                 ui.weak(fmt_bytes(disk_use)).on_hover_text(
                     "A stored total, refreshed when the grid reloads — not confirmed \
@@ -3968,7 +4045,7 @@ mod tests {
         let no_pref = crate::platform_pref::PlatformPrefCtx::default();
         let model = vec![channel_cells(
             &channel, &[&row], &HashSet::new(), now, &no_pref, &rec_texts, &HashMap::new(),
-            &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
         )];
 
         let idx = |id: &str| STREAM_COLUMNS.iter().position(|c| c.id == id).unwrap();
@@ -4255,7 +4332,7 @@ mod tests {
             let cells =
                 channel_cells(
                     &channel, &[m], active, now, &no_pref, &HashMap::new(), &HashMap::new(),
-                    &HashMap::new(),
+                    &HashMap::new(), &HashMap::new(),
                 );
             assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
             match cells[state_idx].key {
@@ -4303,7 +4380,7 @@ mod tests {
             let row = test_row(1, "offline", None, None, None, false);
             let cells = channel_cells(
                 &channel, &[&row], &HashSet::new(), now, &no_pref, &HashMap::new(),
-                &HashMap::new(), rollups,
+                &HashMap::new(), rollups, &HashMap::new(),
             );
             assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
             match cells[rolling_idx].key {
@@ -4331,6 +4408,24 @@ mod tests {
         assert!(key_for(&soon) < key_for(&later), "the nearer deadline sorts first");
         assert!(key_for(&later) < key_for(&recording), "a dated row outranks a still-recording one");
         assert_eq!(key_for(&HashMap::new()), f64::INFINITY, "nothing rolling sorts last");
+    }
+
+    /// The 🖴 cell's text is also its sort key, so rows sharing a drive have to
+    /// group together: same set → same string, in a stable order regardless of
+    /// which instance contributed what.
+    #[test]
+    fn drives_merge_dedup_sort_and_format_stably() {
+        assert_eq!(fmt_drives(&[]), "");
+        assert_eq!(fmt_drives(&['G']), "G:");
+        assert_eq!(fmt_drives(&['A', 'G']), "A:, G:");
+
+        // Two instances, overlapping drives, listed worst-order first.
+        let merged = merge_drives([vec!['G', 'A'], vec!['G'], vec![], vec!['C']].into_iter());
+        assert_eq!(merged, vec!['A', 'C', 'G']);
+        // Order of the contributing lists can't change the answer.
+        assert_eq!(merged, merge_drives([vec!['C'], vec!['G'], vec!['A', 'G']].into_iter()));
+        assert_eq!(fmt_drives(&merged), "A:, C:, G:");
+        assert!(merge_drives(std::iter::empty::<Vec<char>>()).is_empty());
     }
 
     /// Yellow with the full retention left, red as it runs out — and always a

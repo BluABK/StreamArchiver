@@ -346,6 +346,46 @@ impl Store {
         Ok(rows)
     }
 
+    /// Which drive letters each monitor's takes are stored on — the Streams
+    /// grid's 🖴 column on channel and instance rows, where the per-take paths
+    /// aren't loaded (a collapsed row has no history in memory; see `groups`).
+    ///
+    /// Read from the stored `output_path`s, **not** confirmed against disk:
+    /// a take whose file has since gone missing keeps its drive listed until
+    /// the row is disposed of (which clears `output_path`) — the same caveat
+    /// as `monitor_disk_usage`, and for the same reason. Takes with no path
+    /// (never captured, VOD-backfill placeholders, already disposed of) and
+    /// non-drive paths (UNC, relative) contribute nothing.
+    ///
+    /// The `GROUP BY` collapses this to at most a handful of rows per
+    /// monitor rather than one per take, but it is still a DB read — cache it
+    /// against `streams_cache_rev` like its neighbours, never call it from a
+    /// render path.
+    pub fn drive_letters_by_monitor(&self) -> Result<std::collections::HashMap<i64, Vec<char>>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, UPPER(SUBSTR(output_path, 1, 1))
+             FROM recording
+             WHERE output_path != '' AND SUBSTR(output_path, 2, 1) = ':'
+             GROUP BY monitor_id, UPPER(SUBSTR(output_path, 1, 1))
+             ORDER BY monitor_id, 2",
+        )?;
+        let mut out: std::collections::HashMap<i64, Vec<char>> = std::collections::HashMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (mid, letter) = row?;
+            // SUBSTR can't tell "C:/rec" from "1:2" — only an ASCII letter is
+            // a drive.
+            if let Some(c) = letter.chars().next().filter(char::is_ascii_alphabetic) {
+                let e = out.entry(mid).or_default();
+                if !e.contains(&c) {
+                    e.push(c);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn rolling_rollup_by_monitor(
         &self,
     ) -> Result<std::collections::HashMap<i64, crate::rolling::RollingRollup>> {
@@ -2649,6 +2689,41 @@ impl Store {
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    /// The 🖴 column's per-monitor drive list: one entry per distinct drive,
+    /// uppercased, with non-drive and pathless rows contributing nothing.
+    #[test]
+    fn drive_letters_by_monitor_dedups_and_ignores_non_drive_paths() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let take = |started: i64, path: &str| {
+            store
+                .insert_recording(mid, started, path, Some(started), false, None, None, "", "")
+                .unwrap()
+        };
+        take(1, r"G:\streams\a.mkv");
+        take(2, r"g:\streams\b.mkv"); // same drive, lowercase
+        take(3, r"A:\streams\c.mkv");
+        take(4, r"\\server\share\d.mkv"); // UNC — no drive letter
+        take(5, ""); // never captured / already disposed of
+        take(6, r"1:\weird\e.mkv"); // not a letter, so not a drive
+
+        let map = store.drive_letters_by_monitor().unwrap();
+        assert_eq!(map.get(&mid).unwrap(), &vec!['A', 'G']);
+
+        // A monitor with nothing stored is absent rather than empty-valued.
+        let mid2 = {
+            let mut m2 = sample_monitor(cid);
+            m2.channel_id = cid;
+            m2.url = "https://twitch.tv/other".into();
+            store.insert_monitor(&m2).unwrap()
+        };
+        assert!(!store.drive_letters_by_monitor().unwrap().contains_key(&mid2));
+    }
 
     /// The rolling rollup must report the SOONEST deadline together with that
     /// same take's TTL (the countdown's colour divides one by the other), count

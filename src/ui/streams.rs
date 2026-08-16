@@ -1733,6 +1733,18 @@ impl StreamArchiverApp {
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default();
+            // Same rev-keyed treatment again — backs the 🖴 Drives column on
+            // channel/instance rows, which (like Disk use) have no per-take
+            // paths loaded to derive it from while collapsed.
+            if self.drives_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
+                let fresh = self.core.store.drive_letters_by_monitor().unwrap_or_default();
+                self.drives_cache = Some((self.streams_cache_rev, fresh));
+            }
+            let monitor_drives = self
+                .drives_cache
+                .as_ref()
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
             // Same rev-keyed treatment as `rolling_rollup_cache` — backs the
             // channel/instance "Disk use" column, which has no per-take data
             // loaded to sum itself when collapsed (see `groups`, above).
@@ -1898,7 +1910,7 @@ impl StreamArchiverApp {
                         e.rows.iter().map(|&i| &self.rows[i]).collect();
                     channel_cells(
                         &e.channel, &mons, active_ids, now, &platform_pref, &rec_texts,
-                        &monitor_disk_usage, &rolling_rollups,
+                        &monitor_disk_usage, &rolling_rollups, &monitor_drives,
                     )
                 })
                 .collect();
@@ -1914,6 +1926,7 @@ impl StreamArchiverApp {
                 twitch_login_to_mid,
                 latest_raid_out,
                 rolling_rollups,
+                monitor_drives,
                 monitor_disk_usage,
                 model,
                 platform_pref,
@@ -2218,6 +2231,7 @@ impl StreamArchiverApp {
                                 // the outermost row in the tree, so it's the
                                 // one a countdown can hide behind entirely.
                                 let mut rolling = crate::rolling::RollingRollup::default();
+                                let mut drives: Vec<&Vec<char>> = Vec::new();
                                 for e in chan_entries
                                     .iter()
                                     .filter(|e| e.channel.primary_group_id == Some(group_id))
@@ -2225,10 +2239,15 @@ impl StreamArchiverApp {
                                     let mons: Vec<&MonitorWithChannel> =
                                         e.rows.iter().map(|&i| &self.rows[i]).collect();
                                     rolling.merge(&merged_rolling(&mons, &cache.rolling_rollups));
+                                    drives.extend(
+                                        mons.iter()
+                                            .filter_map(|m| cache.monitor_drives.get(&m.monitor.id)),
+                                    );
                                 }
                                 Self::group_row(
                                     &mut tr, group_id, &group_names, count, expanded,
-                                    &col_order, rolling, now, &mut out,
+                                    &col_order, rolling, &merge_drives(drives.into_iter()), now,
+                                    &mut out,
                                 );
                             }
                             Vis::Channel(ci) => {
@@ -2241,6 +2260,7 @@ impl StreamArchiverApp {
                                     status_bgcolor, &col_order, &self.spark_data,
                                     fhits.as_ref(), &mut out, &cache.platform_pref,
                                     self.collab_title_in_name, &cache.monitor_disk_usage,
+                                    &cache.monitor_drives,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -2259,6 +2279,11 @@ impl StreamArchiverApp {
                                         .copied()
                                         .unwrap_or_default(),
                                     cache.monitor_disk_usage.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
+                                    cache
+                                        .monitor_drives
+                                        .get(&self.rows[ri].monitor.id)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
                                     cache
                                         .simulcast_standby
                                         .get(&self.rows[ri].monitor.id)
@@ -3512,6 +3537,9 @@ impl StreamArchiverApp {
         // Per-monitor finished-take byte sum (`Store::monitor_disk_usage`) —
         // summed across this channel's instances for the "Disk use" cell.
         monitor_disk_usage: &HashMap<i64, i64>,
+        // Per-monitor stored drive letters (`Store::drive_letters_by_monitor`)
+        // — merged across this channel's instances for the 🖴 cell.
+        monitor_drives: &HashMap<i64, Vec<char>>,
     ) {
         let ch = &e.channel;
         let cid = ch.id;
@@ -4000,6 +4028,12 @@ impl StreamArchiverApp {
                     "rolling" => {
                         rolling_rollup_cell(ui, &merged_rolling(&mons, rolling_rollups), now, "channel");
                     }
+                    "drives" => {
+                        let drives = merge_drives(
+                            mons.iter().filter_map(|m| monitor_drives.get(&m.monitor.id)),
+                        );
+                        drives_cell(ui, &drives, "channel");
+                    }
                     "disk_use" if disk_use_total > 0 => {
                         ui.weak(fmt_bytes(disk_use_total)).on_hover_text(
                             "Total across every instance. A stored total, refreshed \
@@ -4244,6 +4278,8 @@ impl StreamArchiverApp {
         // This instance's finished-take byte sum (`Store::monitor_disk_usage`)
         // — the "Disk use" cell.
         disk_use: i64,
+        // The drives this instance's takes are stored on — the 🖴 cell.
+        drives: &[char],
         // Set when this instance is live but standing by for a sibling that is
         // recording the broadcast on the named platform (see `crate::simulcast`).
         standby_for: Option<&str>,
@@ -4391,6 +4427,7 @@ impl StreamArchiverApp {
             collab_title_in_name,
             saved_layouts,
             disk_use,
+            drives,
             &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
@@ -4414,6 +4451,8 @@ impl StreamArchiverApp {
         // countdown that stops at the group header is a countdown you can
         // collapse out of existence.
         rolling: crate::rolling::RollingRollup,
+        // Every drive anything in the group is stored on — the 🖴 cell.
+        drives: &[char],
         now: i64,
         out: &mut StreamsOut,
     ) {
@@ -4428,6 +4467,7 @@ impl StreamArchiverApp {
                 }
                 "state" => rolling_rollup_badge(ui, &rolling, now, "group"),
                 "rolling" => rolling_rollup_cell(ui, &rolling, now, "group"),
+                "drives" => drives_cell(ui, drives, "group"),
                 _ => {}
             });
         }
@@ -4516,6 +4556,8 @@ impl StreamArchiverApp {
                     rolling_rollup_badge(ui, &rolling, now, "date range");
                 } else if STREAM_COLUMNS[ci].id == "rolling" {
                     rolling_rollup_cell(ui, &rolling, now, "date range");
+                } else if STREAM_COLUMNS[ci].id == "drives" {
+                    drives_cell(ui, &drives_of_takes(streams.iter().flat_map(|g| g.takes.iter())), "date range");
                 }
             });
         }
@@ -4997,6 +5039,9 @@ impl StreamArchiverApp {
                     }
                     "rolling" => {
                         rolling_group_cell(ui, group_rolling(g), now);
+                    }
+                    "drives" => {
+                        drives_cell(ui, &drives_of_takes(g.takes.iter()), "broadcast");
                     }
                     // "on"/"platform"/"tool"/"detection"/"polled"/
                     // "next_stream"/"ad_free"/"added" are n/a per stream.
@@ -5821,6 +5866,9 @@ impl StreamArchiverApp {
                     }
                     "rolling" => {
                         rolling_group_cell(ui, rolling_of_take(t), now);
+                    }
+                    "drives" => {
+                        drives_cell(ui, &drives_of_takes(std::iter::once(t)), "take");
                     }
                     // "on"/"platform"/"tool"/"detection"/"polled"/
                     // "next_stream"/"went_live"/"ad_free"/"added" are
