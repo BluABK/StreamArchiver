@@ -879,8 +879,8 @@ Dokibird's copyright interruption — the whole "offline'd" segment was intact
 on the web VOD, including the streamer's reaction while "offline"), so **📥
 Download post-stream VOD** repairs the local capture; if the VOD stays down,
 the local capture may be the only surviving copy. The automatic
-[post-stream VOD archival](#post-stream-vod-download) covers this without any
-clicking when enabled.
+[post-stream VOD archival](#post-stream-vod-download-archive-the-published-vod)
+covers this without any clicking when enabled.
 
 **🍪 Expired cookies.** yt-dlp's own check ("*The provided YouTube account
 cookies are no longer valid*") files as a red **error**, not a plain warning —
@@ -1930,6 +1930,34 @@ recovered the row flips **green** ("Lost segments — Nihmune — recovered",
 button opens the folder with the recovered files. Toggle: Settings → Automation →
 Twitch VOD recovery → *Recover lost segments automatically* (default on);
 per-range failures retry up to 5 times and never affect the capture itself.
+
+**YouTube auto-heal (from the published VOD).** The YouTube counterpart of
+lost-segment recovery — same `gap_range` bookkeeping, same
+`.recovered-{tag}.mkv` patch naming, same optional splice — but the donor is
+the **published VOD** instead of a CDN, and the missing spans are computed
+from the takes themselves: after a broadcast's takes settle, the app measures
+what the local files actually cover (ffprobe duration against the go-live
+clock) and identifies the **head** (joined late / from-start couldn't rewind
+past the DVR window — the 🕘 case), **inter-take gaps** (the capture died
+mid-stream to a PO-token wave, a crash, or a platform suspension, and the
+retry re-joined later), and a **missing tail** (the broadcast outlived the
+last take — detected when the VOD runs meaningfully longer than our
+coverage). Each span is downloaded individually with yt-dlp
+`--download-sections`, quality-matched to the capture, so a 3-minute hole in
+a 6-hour stream costs a 3-minute download — no side-by-side scrubbing, no
+manual ffmpeg. The **local capture stays the primary copy** throughout: the
+VOD is only a donor for spans the capture provably lacks, because VODs get
+trimmed (cut intros), edited, struck after the fact, or never published at
+all. A VOD whose duration falls short of our own coverage is treated as
+**trimmed/edited** — every timestamp in it is shifted, so auto-heal refuses
+(a ✂ Warnings row explains) rather than splice wrong footage into an
+archive. Broadcasts with no fetchable VOD (DVR off, never published, still
+processing) simply leave their ranges pending — retried when the app
+restarts, harmless if the VOD never comes. Toggle: Settings → Automation →
+*YouTube: auto-heal from the published VOD* (default on); an approximate
+go-live time disables anchoring for that broadcast (sections would cut the
+wrong footage), and the *splice* switch governs these patches exactly like
+Twitch ones.
 
 ### Chapters 📑
 

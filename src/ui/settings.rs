@@ -3970,6 +3970,24 @@ impl StreamArchiverApp {
                     ui.label("Re-fetch sequence-gap losses from the VOD CDN into sibling patch files.");
                     ui.end_row();
 
+                    ui.checkbox(&mut self.settings.yt_gap_heal, "YouTube: auto-heal from the published VOD")
+                        .on_hover_text(
+                            "After a YouTube broadcast ends, compute what spans the local \
+                             take files DON'T cover — a late join past the DVR window, gaps \
+                             between takes (capture died mid-stream: PO-token wave, crash, \
+                             platform suspension), or a tail the capture never resumed — and \
+                             download JUST those sections from the published VOD \
+                             (yt-dlp --download-sections), quality-matched to the capture, \
+                             as .recovered-… patch files beside the take. The local capture \
+                             stays the primary copy: a VOD that was trimmed/edited no longer \
+                             lines up with the broadcast clock, so healing is refused with a \
+                             ✂ Warnings row instead of splicing wrong footage. Streams with \
+                             no published VOD simply never heal (the patches wait, then give \
+                             up). The splice switch below applies to these patches too.",
+                        );
+                    ui.label("Download only the missing spans of a broadcast from its VOD as sibling patch files.");
+                    ui.end_row();
+
                     ui.checkbox(&mut self.settings.gap_splice, "Splice recovered gaps into a gapless file")
                         .on_hover_text(
                             "Once a take's recovered patches have all settled, try to mux them \

@@ -333,6 +333,7 @@ impl StreamArchiverApp {
                 == "branded",
             token_overrides: setting_or_empty(&core, crate::downloader::K_TOKEN_OVERRIDES),
             gap_recover: setting_or_empty(&core, crate::downloader::K_GAP_RECOVER) != "0",
+            yt_gap_heal: setting_or_empty(&core, crate::downloader::K_YT_GAP_HEAL) != "0",
             gap_splice: setting_or_empty(&core, crate::downloader::K_GAP_SPLICE) != "0",
             gap_splice_cleanup: crate::disposal::GapSpliceCleanup::parse(&setting_or_empty(
                 &core,
@@ -2082,6 +2083,7 @@ impl StreamArchiverApp {
             (crate::downloader::K_TOKEN_STYLE, if s.token_style_branded { "branded" } else { "plain" }),
             (crate::downloader::K_TOKEN_OVERRIDES, s.token_overrides.trim()),
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),
+            (crate::downloader::K_YT_GAP_HEAL, if s.yt_gap_heal { "1" } else { "0" }),
             (crate::downloader::K_GAP_SPLICE, if s.gap_splice { "1" } else { "0" }),
             (crate::disposal::K_GAP_SPLICE_CLEANUP, s.gap_splice_cleanup.as_str()),
             (crate::downloader::K_CACHE_DROP_REDUNDANT, if s.cache_drop_redundant { "1" } else { "0" }),

@@ -26,7 +26,7 @@ const GAP_MAX_ATTEMPTS: i64 = 5;
 const GAP_RESOLVE_COOLDOWN_SECS: u64 = 300;
 
 /// `6284.0 s + 36 s` → `"1h44m44s+36s"` — the patch filename's range tag.
-fn fmt_gap_tag(start_secs: f64, len_secs: f64) -> String {
+pub(super) fn fmt_gap_tag(start_secs: f64, len_secs: f64) -> String {
     let s = start_secs.max(0.0) as i64;
     format!("{}h{:02}m{:02}s+{}s", s / 3600, (s % 3600) / 60, s % 60, len_secs.round() as i64)
 }
@@ -37,7 +37,10 @@ impl Supervisor {
     /// every pending range regardless of live-edge coverage math (the stream
     /// is over — the VOD covers everything it will ever cover).
     pub(super) fn maybe_spawn_gap_recover(&self, rec_id: i64, final_sweep: bool) {
-        if !gap_recover_enabled(&self.store) {
+        // Either recovery flavor may own the pending rows (Twitch CDN
+        // lost-segment recovery, or the YouTube published-VOD heal) — the
+        // job dispatches per platform and each checks its own switch.
+        if !gap_recover_enabled(&self.store) && !super::yt_heal::yt_heal_enabled(&self.store) {
             return;
         }
         if self.store.gap_ranges_in_state(rec_id, "pending").map(|v| v.is_empty()).unwrap_or(true) {
@@ -67,7 +70,13 @@ impl Supervisor {
         let Some(row) = self.store.get_monitor_with_channel(rec.monitor_id).ok().flatten() else {
             return;
         };
-        if row.monitor.platform() != Platform::Twitch {
+        // YouTube pending ranges heal from the published VOD instead of the
+        // Twitch CDN — same rows, same patch naming, different donor.
+        if row.monitor.platform() == Platform::YouTube {
+            self.youtube_gap_heal_job(rec_id).await;
+            return;
+        }
+        if row.monitor.platform() != Platform::Twitch || !gap_recover_enabled(&self.store) {
             return;
         }
         let Some(login) = crate::detectors::twitch_login(&row.monitor.url) else { return };

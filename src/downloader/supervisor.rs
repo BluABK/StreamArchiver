@@ -4162,6 +4162,15 @@ progress_info: None,
                 let _ = store.upsert_capture_alert(&alert);
             });
         }
+        // YouTube auto-heal: once this broadcast's takes settle, compute what
+        // spans of it the local files DON'T cover (late join past the DVR
+        // window, inter-take gaps from a mid-stream death, a tail the capture
+        // never resumed) and surgically re-fetch just those sections from the
+        // published VOD as `.recovered-{tag}.mkv` patches — the local capture
+        // stays primary. See `yt_heal.rs` for the trimmed-VOD guard.
+        if row.monitor.platform() == Platform::YouTube && !shutting_down {
+            self.maybe_queue_youtube_heal(rec_id);
+        }
         // Twitch has somewhere to put a refused broadcast (the CDN segments);
         // nothing else does. That decides whether asking again is worth
         // anything, and so the retry cadence.

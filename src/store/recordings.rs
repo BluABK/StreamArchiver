@@ -1774,6 +1774,25 @@ impl Store {
 
     /// A single recording by id (full row) — used by manual per-take actions
     /// (e.g. the "Backfill head" context-menu action).
+    /// Every take of one broadcast `(monitor, stream_id)`, oldest first —
+    /// the YouTube auto-heal's raw material for computing uncovered spans.
+    pub fn takes_for_stream(
+        &self,
+        monitor_id: i64,
+        stream_id: &str,
+    ) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut st = conn.prepare(&format!(
+            "SELECT {} FROM recording
+             WHERE monitor_id = ?1 AND stream_id = ?2 ORDER BY started_at, id",
+            Self::RECORDING_FULL_COLUMNS
+        ))?;
+        let rows = st
+            .query_map(params![monitor_id, stream_id], Self::map_recording_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn get_recording(&self, id: i64) -> Result<Option<crate::models::Recording>> {
         let conn = self.db();
         let row = conn

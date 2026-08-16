@@ -181,6 +181,7 @@ pub(crate) mod ffmpeg_job;
 mod finalize;
 mod gap_recover;
 mod gap_splice;
+mod yt_heal;
 mod lock_culprit;
 mod naming;
 mod plan;
@@ -204,6 +205,7 @@ pub use ad_probe::K_AD_PROBE;
 pub use chat_only::K_CHAT_NO_RECORD;
 pub use gap_recover::K_GAP_RECOVER;
 pub use gap_splice::K_GAP_SPLICE;
+pub use yt_heal::K_YT_GAP_HEAL;
 #[allow(unused_imports)]
 use lock_culprit::*;
 pub use cache::K_CACHE_DROP_REDUNDANT;

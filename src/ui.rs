@@ -1312,6 +1312,9 @@ pub(crate) struct SettingsForm {
     /// Re-fetch a live capture's lost segments (sequence gaps) from the VOD
     /// CDN automatically, while the stream is still running. Default on.
     gap_recover: bool,
+    /// YouTube auto-heal: fetch a broadcast's missing spans from the
+    /// published VOD as patch files (`K_YT_GAP_HEAL`, default on).
+    yt_gap_heal: bool,
     /// Splice recovered gap patches into the take's main file once they've
     /// settled, so the result is gapless. Default on — every individual
     /// splice still passes its own safety-check chain regardless (codec
