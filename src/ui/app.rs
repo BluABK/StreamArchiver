@@ -558,6 +558,17 @@ impl StreamArchiverApp {
             grid_columns::save_columns(&core.store, GridTableId::Streams, &streams_grid.entries);
             let _ = core.store.set_setting(K_SCHED_REC_COL_SEEDED, "1");
         }
+        // Same one-time seed for the 🕰 Rolling column: it exists to be SORTED
+        // by ("what expires first"), which is a deliberate act, and the 🕰
+        // badges in the State cell already carry the countdown for everyone
+        // else. Its own marker key, so seeding it can't be skipped by someone
+        // who has already been through the scheduled-rec seed.
+        const K_ROLLING_COL_SEEDED: &str = "streams_rolling_col_seeded";
+        if core.store.get_setting(K_ROLLING_COL_SEEDED).ok().flatten().is_none() {
+            grid_columns::set_visible(&mut streams_grid.entries, "rolling", false);
+            grid_columns::save_columns(&core.store, GridTableId::Streams, &streams_grid.entries);
+            let _ = core.store.set_setting(K_ROLLING_COL_SEEDED, "1");
+        }
         let streams_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Streams);
         let videos_grid = GridState::load(&core.store, GridTableId::Videos, &VIDEO_COLUMNS);
         let videos_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Videos);
@@ -805,7 +816,7 @@ impl StreamArchiverApp {
             schedule_month_icons,
             deep_filter_texts: None,
             raid_out_cache: None,
-            rolling_counts_cache: None,
+            rolling_rollup_cache: None,
             disk_usage_cache: None,
             rescan_disk_usage: None,
             saved_layouts_cache: None,

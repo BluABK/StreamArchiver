@@ -398,8 +398,10 @@ pub(super) enum GroupRolling {
     /// No take of this broadcast is (or ever was) a rolling recording.
     None,
     /// At least one take is still counting down. `deadline` is `None` while a
-    /// take is still recording.
-    Rolling { deadline: Option<i64> },
+    /// take is still recording; `ttl_secs` is the window that deadline came
+    /// out of, which is what the countdown's colour ramp divides by (see
+    /// [`super::grid::rolling_urgency_color`]).
+    Rolling { deadline: Option<i64>, ttl_secs: i64 },
     /// Every rolling take was kept — an ordinary archived broadcast that
     /// happens to have come from a rolling recording.
     Kept,
@@ -408,12 +410,14 @@ pub(super) enum GroupRolling {
 }
 
 pub(super) fn group_rolling(g: &StreamGroup) -> GroupRolling {
-    let mut counting: Vec<Option<i64>> = Vec::new();
+    // (deadline, that take's ttl) — the pair has to travel together, since the
+    // colour ramp is one divided by the other.
+    let mut counting: Vec<(Option<i64>, i64)> = Vec::new();
     let (mut kept, mut expired) = (false, false);
     for t in &g.takes {
         match t.rolling.state(t.ended_at) {
             RollingState::None => {}
-            RollingState::Rolling { deadline } => counting.push(deadline),
+            RollingState::Rolling { deadline } => counting.push((deadline, t.rolling.ttl_secs)),
             RollingState::Kept { .. } => kept = true,
             RollingState::Expired { .. } => expired = true,
         }
@@ -421,12 +425,17 @@ pub(super) fn group_rolling(g: &StreamGroup) -> GroupRolling {
     if !counting.is_empty() {
         // A take with no deadline yet (still recording) wins over any dated
         // sibling: "still going" is the honest answer for the broadcast.
-        let deadline = if counting.iter().any(Option::is_none) {
-            None
-        } else {
-            counting.iter().flatten().copied().min()
+        let still_running = counting.iter().find(|(d, _)| d.is_none());
+        let (deadline, ttl_secs) = match still_running {
+            Some(&(_, ttl)) => (None, ttl),
+            None => counting
+                .iter()
+                .filter(|(d, _)| d.is_some())
+                .min_by_key(|(d, _)| d.unwrap_or(i64::MAX))
+                .map(|&(d, ttl)| (d, ttl))
+                .unwrap_or((None, 0)),
         };
-        return GroupRolling::Rolling { deadline };
+        return GroupRolling::Rolling { deadline, ttl_secs };
     }
     // Nothing is counting down any more. Kept wins over expired: a broadcast
     // with one kept take still has media on disk.
@@ -730,7 +739,7 @@ impl StreamArchiverApp {
         rolling.sort_by_key(|(_, _, r)| match r {
             // Still-recording takes have no deadline yet — they sort last, not
             // first, since nothing is at risk until they finish.
-            GroupRolling::Rolling { deadline } => (0, deadline.unwrap_or(i64::MAX)),
+            GroupRolling::Rolling { deadline, .. } => (0, deadline.unwrap_or(i64::MAX)),
             _ => (1, i64::MAX),
         });
         let counting = rolling.iter().filter(|(_, _, r)| matches!(r, GroupRolling::Rolling { .. })).count();
@@ -740,7 +749,7 @@ impl StreamArchiverApp {
         let soonest = rolling
             .iter()
             .filter_map(|(_, _, r)| match r {
-                GroupRolling::Rolling { deadline } => *deadline,
+                GroupRolling::Rolling { deadline, .. } => *deadline,
                 _ => None,
             })
             .min();
@@ -810,20 +819,23 @@ impl StreamArchiverApp {
                             for (mid, g, state) in &rolling {
                                 body.row(24.0, |mut tr| {
                                     tr.col(|ui| match state {
-                                        GroupRolling::Rolling { deadline: Some(d) } => {
+                                        GroupRolling::Rolling { deadline: Some(d), ttl_secs } => {
                                             let left = d - now;
-                                            let text = crate::rolling::fmt_remaining(left);
-                                            // Under a day is the point at which
-                                            // "I should decide about this" turns
-                                            // into "decide now".
-                                            if left < 86_400 {
-                                                ui.colored_label(grid::HL_ERROR_TEXT, text)
-                                            } else {
-                                                ui.label(text)
-                                            }
-                                            .on_hover_text(format!("Deleted automatically at {}", fmt_datetime_short(*d)));
+                                            // Yellow → red by how much of the
+                                            // TTL is left, exactly as the
+                                            // Streams rows show it.
+                                            ui.colored_label(
+                                                grid::rolling_urgency_color(left, *ttl_secs),
+                                                crate::rolling::fmt_remaining(left),
+                                            )
+                                            .on_hover_text(format!(
+                                                "Deleted automatically at {} — {} left of a {} window",
+                                                fmt_datetime_short(*d),
+                                                crate::rolling::fmt_remaining(left),
+                                                crate::rolling::fmt_remaining(*ttl_secs),
+                                            ));
                                         }
-                                        GroupRolling::Rolling { deadline: None } => {
+                                        GroupRolling::Rolling { deadline: None, .. } => {
                                             ui.weak("recording").on_hover_text(
                                                 "Still capturing — the countdown starts when it ends.",
                                             );
@@ -1385,14 +1397,29 @@ mod tests {
         early.ended_at = Some(100);
         let late = ended(60, 0, 0); // ends at 1000
         let g = group(vec![early, late]);
-        assert!(matches!(group_rolling(&g), GroupRolling::Rolling { deadline: Some(160) }));
+        assert!(matches!(
+            group_rolling(&g),
+            GroupRolling::Rolling { deadline: Some(160), ttl_secs: 60 }
+        ));
+
+        // The reported TTL belongs to the take that owns the deadline, not to
+        // whichever take came first — the countdown's colour divides one by the
+        // other, so a mismatched pair would mis-colour the row.
+        let mut short = ended(60, 0, 0); // ends at 1000 -> due 1060
+        short.ended_at = Some(1_000);
+        let mut long = ended(86_400, 0, 0);
+        long.ended_at = Some(500); // due 86_900, i.e. later despite ending first
+        assert!(matches!(
+            group_rolling(&group(vec![long, short])),
+            GroupRolling::Rolling { deadline: Some(1_060), ttl_secs: 60 }
+        ));
 
         // A still-recording take wins over any dated sibling: "still going" is
         // the honest answer for the broadcast.
         let mut live = ended(60, 0, 0);
         live.ended_at = None;
         let g = group(vec![ended(60, 0, 0), live]);
-        assert!(matches!(group_rolling(&g), GroupRolling::Rolling { deadline: None }));
+        assert!(matches!(group_rolling(&g), GroupRolling::Rolling { deadline: None, .. }));
 
         // All kept → Kept; all expired → Expired; a mix keeps the broadcast
         // "kept", since one kept take still means media on disk.

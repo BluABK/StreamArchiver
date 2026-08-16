@@ -2176,13 +2176,14 @@ pub struct StreamArchiverApp {
     /// streams cache's *per-second* stamp was pure waste. It was also the
     /// single most expensive thing the UI thread did — see migration 87.
     raid_out_cache: Option<(u64, HashMap<i64, crate::models::StreamEventRow>)>,
-    /// Per-monitor count of takes still counting down towards rolling
-    /// auto-deletion, cached against `streams_cache_rev` — same shape and same
-    /// reasoning as [`Self::raid_out_cache`]. Backs the 🕰 rollup badge.
-    rolling_counts_cache: Option<(u64, HashMap<i64, i64>)>,
+    /// Per-monitor rolling rollup (how many takes are counting down towards
+    /// auto-deletion, and when the first goes), cached against
+    /// `streams_cache_rev` — same shape and same reasoning as
+    /// [`Self::raid_out_cache`]. Backs the 🕰 rollup badge and column.
+    rolling_rollup_cache: Option<(u64, HashMap<i64, crate::rolling::RollingRollup>)>,
     /// Per-monitor sum of finished-take bytes, cached against
     /// `streams_cache_rev` — same shape and same reasoning as
-    /// [`Self::rolling_counts_cache`]. Backs the Streams grid's "Disk use"
+    /// [`Self::rolling_rollup_cache`]. Backs the Streams grid's "Disk use"
     /// column on channel/instance rows (a collapsed row has no per-take data
     /// loaded to sum itself — see `Store::monitor_disk_usage`'s doc comment);
     /// period/stream/take rows below them use `take_size_bytes` instead,

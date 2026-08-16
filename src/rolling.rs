@@ -128,6 +128,69 @@ pub fn hours_field_to_secs(s: &str) -> Option<i64> {
     (secs > 0).then_some(secs)
 }
 
+/// What the rolling takes under one row (an instance, or a channel summing its
+/// instances) add up to: how many are counting down, and when the *first* of
+/// them is due.
+///
+/// The soonest deadline is what a collapsed row has to show — "37 rolling
+/// recordings" says nothing about whether the nearest one goes tonight or next
+/// week, which is the only part that's actionable. `ttl_secs` is the TTL of
+/// that same soonest take, so the countdown can be coloured by how much of its
+/// life is left rather than by an absolute threshold — "1 day left" is most of
+/// a 30 h window still to run and the last scrap of a 30 d one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RollingRollup {
+    /// Takes still counting down (neither kept nor expired). Includes takes
+    /// still recording, which have no deadline yet.
+    pub count: i64,
+    /// Unix time the first of them is disposed of, or `None` when every
+    /// counting take is still recording (the clock starts at `ended_at`).
+    pub soonest: Option<i64>,
+    /// TTL of the take that owns `soonest`; `0` when there is none.
+    pub ttl_secs: i64,
+}
+
+impl RollingRollup {
+    /// Fold another row's rollup into this one — the channel row summing its
+    /// instances, or a period row summing its broadcasts.
+    pub fn merge(&mut self, other: &RollingRollup) {
+        self.count += other.count;
+        match (self.soonest, other.soonest) {
+            (_, None) => {}
+            (None, Some(_)) => {
+                self.soonest = other.soonest;
+                self.ttl_secs = other.ttl_secs;
+            }
+            (Some(mine), Some(theirs)) if theirs < mine => {
+                self.soonest = other.soonest;
+                self.ttl_secs = other.ttl_secs;
+            }
+            _ => {}
+        }
+    }
+
+    /// Seconds left before the soonest deadline, or `None` when there isn't
+    /// one yet (nothing counting, or every take still recording).
+    pub fn remaining(&self, now: i64) -> Option<i64> {
+        self.soonest.map(|d| d - now)
+    }
+}
+
+/// How much of a rolling take's life is left, `1.0` = the full TTL still to
+/// run, `0.0` = due now. Drives the countdown's colour ramp, so it's expressed
+/// as a fraction of *that take's own TTL* rather than as an absolute number of
+/// hours — see [`RollingRollup::ttl_secs`].
+///
+/// An unknown/nonsense TTL reads as `1.0` (calm) rather than `0.0`: a missing
+/// denominator is our own bookkeeping gap, not evidence the file is about to
+/// go.
+pub fn remaining_frac(remaining: i64, ttl_secs: i64) -> f32 {
+    if ttl_secs <= 0 {
+        return 1.0;
+    }
+    (remaining as f32 / ttl_secs as f32).clamp(0.0, 1.0)
+}
+
 /// Human countdown for a rolling take's remaining life, e.g. `"6d 4h"`,
 /// `"3h 12m"`, `"45m"`. Negative (already due, sweep hasn't run yet) reads as
 /// `"due"` rather than a negative duration.
@@ -205,6 +268,42 @@ mod tests {
         // Without the restart it would have been due since second 3601.
         let naive = Rolling { ttl_secs: 3600, ..Default::default() };
         assert_eq!(naive.deadline(Some(ended)), Some(3601));
+    }
+
+    #[test]
+    fn rollup_merge_keeps_the_soonest_deadline_and_its_ttl() {
+        let mut a = RollingRollup { count: 2, soonest: Some(500), ttl_secs: 3600 };
+        // A later deadline adds to the count but must not become the headline.
+        a.merge(&RollingRollup { count: 3, soonest: Some(900), ttl_secs: 7200 });
+        assert_eq!(a, RollingRollup { count: 5, soonest: Some(500), ttl_secs: 3600 });
+        // An earlier one takes over, bringing its OWN ttl (the colour ramp
+        // divides by it, so the pair must never come from different takes).
+        a.merge(&RollingRollup { count: 1, soonest: Some(100), ttl_secs: 60 });
+        assert_eq!(a, RollingRollup { count: 6, soonest: Some(100), ttl_secs: 60 });
+        // Still-recording takes count but never clear an existing deadline.
+        a.merge(&RollingRollup { count: 4, soonest: None, ttl_secs: 0 });
+        assert_eq!(a, RollingRollup { count: 10, soonest: Some(100), ttl_secs: 60 });
+        // ...and are adopted wholesale by an empty rollup.
+        let mut empty = RollingRollup::default();
+        empty.merge(&RollingRollup { count: 1, soonest: None, ttl_secs: 0 });
+        assert_eq!(empty.count, 1);
+        assert_eq!(empty.soonest, None);
+        empty.merge(&RollingRollup { count: 1, soonest: Some(7), ttl_secs: 9 });
+        assert_eq!(empty, RollingRollup { count: 2, soonest: Some(7), ttl_secs: 9 });
+    }
+
+    #[test]
+    fn remaining_frac_is_relative_to_the_takes_own_ttl() {
+        assert_eq!(remaining_frac(3600, 3600), 1.0);
+        assert_eq!(remaining_frac(1800, 3600), 0.5);
+        assert_eq!(remaining_frac(0, 3600), 0.0);
+        // Overdue clamps to 0, not a negative fraction.
+        assert_eq!(remaining_frac(-9000, 3600), 0.0);
+        // A longer TTL leaves the same absolute time looking calmer, which is
+        // the whole point of the ratio.
+        assert!(remaining_frac(86_400, 30 * 86_400) < remaining_frac(86_400, 2 * 86_400));
+        // No TTL to divide by reads as calm, never as "due now".
+        assert_eq!(remaining_frac(10, 0), 1.0);
     }
 
     #[test]

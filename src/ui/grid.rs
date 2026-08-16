@@ -799,7 +799,7 @@ pub(super) fn video_status_color(status: &str) -> egui::Color32 {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-pub(super) const STREAM_COLUMNS: [GridCol; 25] = [
+pub(super) const STREAM_COLUMNS: [GridCol; 26] = [
     GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Automation) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
@@ -824,6 +824,7 @@ pub(super) const STREAM_COLUMNS: [GridCol; 25] = [
     GridCol { id: "ad_free",     title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts. A channel row shows one 🛡 per ad-free instance.", min_width: 54.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "tags",        title: "Tags",       tooltip: "The stream's tags (Twitch; Kick when set) — persists through offline as the channel's usual tags, same as language/category id. Hover for the full list; changes are archived — see 📝 Title/category/tags history.", min_width: 0.0, initial: 120.0, sortable: true, stretch: false },
+    GridCol { id: "rolling",     title: "🕰",         tooltip: "Rolling recordings: how long until the next file under this row is deleted automatically. Channel/instance rows show the soonest of everything beneath them; stream and take rows show their own. Sort by it to put whatever expires first at the top. Blank for rows with nothing counting down (📌 = kept, 🗑 = already expired). Hidden by default — enable it from the column header.", min_width: 62.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "disk_use",    title: "💾",         tooltip: "Disk space used by stored recordings. Period/stream/take rows confirm each file still exists before counting it; the channel/instance rollup is a stored total instead (refreshed when the grid reloads, not live) and can briefly overcount a take whose file has since gone missing — expand down to it for the exact figure.", min_width: 64.0, initial: 0.0, sortable: true, stretch: false },
 ];
 
@@ -1126,10 +1127,10 @@ pub(super) struct StreamsViewCache {
     /// "Follow raid" play action's enabled state and target.
     pub(super) latest_raid_out: HashMap<i64, crate::models::StreamEventRow>,
     /// Takes still counting down towards rolling auto-deletion, by monitor id
-    /// (absent = none) — the 🕰 rollup badge on instance and channel rows. A
-    /// DB read, so it lives here rather than in the render path; see
-    /// [`crate::rolling`].
-    pub(super) rolling_counts: HashMap<i64, i64>,
+    /// (absent = none), with the soonest deadline among them — the 🕰 rollup
+    /// badge and column on instance and channel rows. A DB read, so it lives
+    /// here rather than in the render path; see [`crate::rolling`].
+    pub(super) rolling_rollups: HashMap<i64, crate::rolling::RollingRollup>,
     /// Per-monitor sum of finished-take bytes — the "Disk use" column on
     /// channel/instance rows. See `Store::monitor_disk_usage`'s doc comment
     /// for why this is a coarser figure than what period/stream/take rows
@@ -2043,6 +2044,28 @@ pub(super) fn instance_label(url: &str) -> String {
     if s.is_empty() { "(no URL)".to_string() } else { s.to_string() }
 }
 
+/// The countdown colour for a rolling deadline: **yellow** with the full TTL
+/// still to run, ramping through orange to **red** as it runs out.
+///
+/// Deliberately never green — every one of these files is scheduled for
+/// deletion, so the mildest state is still a warning, not an all-clear. The
+/// ramp is against the take's own TTL (see [`crate::rolling::remaining_frac`])
+/// rather than an absolute number of hours: "1 day left" is most of a 30 h
+/// rolling window still to run, and the last scrap of a 30 d one.
+pub(super) fn rolling_urgency_color(remaining: i64, ttl_secs: i64) -> egui::Color32 {
+    // Ends: a readable warning-yellow and the same soft red the rest of the
+    // grid uses for "this needs you now" (`HL_ERROR_TEXT`).
+    const CALM: (f32, f32, f32) = (0xe8 as f32, 0xc5 as f32, 0x4a as f32);
+    const URGENT: (f32, f32, f32) = (0xe0 as f32, 0x6c as f32, 0x6c as f32);
+    let f = crate::rolling::remaining_frac(remaining, ttl_secs);
+    let mix = |urgent: f32, calm: f32| (urgent + (calm - urgent) * f).round() as u8;
+    egui::Color32::from_rgb(
+        mix(URGENT.0, CALM.0),
+        mix(URGENT.1, CALM.1),
+        mix(URGENT.2, CALM.2),
+    )
+}
+
 /// The 🕰 rolling-recording badge for one take: a countdown while its file is
 /// still scheduled for auto-deletion, and a marker once it has been kept or
 /// swept. Nothing at all for an ordinary take. See [`crate::rolling`].
@@ -2055,25 +2078,27 @@ pub(super) fn rolling_take_badge(ui: &mut egui::Ui, t: &crate::models::Recording
                 Some(d) => (
                     format!("🕰 {}", crate::rolling::fmt_remaining(d - now)),
                     format!(
-                        "Rolling recording — this file is deleted automatically at {}, unless \
-                         you Keep it (📥 Backlog → Rolling recordings). The take's history row \
-                         stays either way.",
-                        fmt_datetime_short(d)
+                        "Rolling recording — this file is deleted automatically at {} ({} left \
+                         of a {} window), unless you Keep it (📥 Backlog → Rolling recordings). \
+                         The take's history row stays either way.",
+                        fmt_datetime_short(d),
+                        crate::rolling::fmt_remaining(d - now),
+                        crate::rolling::fmt_remaining(t.rolling.ttl_secs),
                     ),
                 ),
                 None => (
                     "🕰".to_string(),
-                    "Rolling recording — its countdown starts when this capture finishes."
-                        .to_string(),
+                    format!(
+                        "Rolling recording — its {} countdown starts when this capture finishes.",
+                        crate::rolling::fmt_remaining(t.rolling.ttl_secs),
+                    ),
                 ),
             };
-            // Under a day left is the point at which "decide about this
-            // eventually" becomes "decide now".
-            let soon = deadline.is_some_and(|d| d - now < 86_400);
-            if soon {
-                ui.colored_label(HL_ERROR_TEXT, text)
-            } else {
-                ui.weak(text)
+            // Yellow with time in hand, red as the deadline closes in — the
+            // colour IS the "decide now" signal, so it never renders weak.
+            match deadline {
+                Some(d) => ui.colored_label(rolling_urgency_color(d - now, t.rolling.ttl_secs), text),
+                None => ui.weak(text),
             }
             .on_hover_text(hover);
         }
@@ -2096,17 +2121,212 @@ pub(super) fn rolling_take_badge(ui: &mut egui::Ui, t: &crate::models::Recording
 }
 
 /// The 🕰 rollup badge for an instance or channel row: how many takes beneath
-/// it are still counting down towards auto-deletion. Nothing when none are.
-pub(super) fn rolling_rollup_badge(ui: &mut egui::Ui, count: i64, is_channel: bool) {
-    if count <= 0 {
+/// it are still counting down towards auto-deletion, and how long the **first**
+/// of them has left — `🕰 37 (2d 4h)`. Nothing when none are counting.
+///
+/// The count alone was the whole badge until it turned out to be the less
+/// useful half: 37 rolling takes is fine if the nearest one goes next week and
+/// urgent if it goes tonight, and a collapsed row can't tell you which. Same
+/// countdown, same colour ramp as the take rows beneath it, so drilling down
+/// confirms rather than surprises.
+pub(super) fn rolling_rollup_badge(
+    ui: &mut egui::Ui,
+    r: &crate::rolling::RollingRollup,
+    now: i64,
+    is_channel: bool,
+) {
+    if r.count <= 0 {
         return;
     }
-    ui.weak(format!("🕰{count}")).on_hover_text(format!(
-        "{count} rolling recording(s) under this {} are counting down towards automatic \
-         deletion. Open 📥 Backlog → Rolling recordings to see when, and to Keep any you want \
-         to hold on to.",
-        if is_channel { "channel" } else { "instance" }
-    ));
+    let scope = if is_channel { "channel" } else { "instance" };
+    match r.remaining(now) {
+        Some(left) => {
+            ui.colored_label(
+                rolling_urgency_color(left, r.ttl_secs),
+                format!("🕰{} ({})", r.count, crate::rolling::fmt_remaining(left)),
+            )
+            .on_hover_text(format!(
+                "{} rolling recording(s) under this {scope} are counting down towards automatic \
+                 deletion. The first goes at {} — {} from now, out of a {} window. Expand to \
+                 find it, or open 📥 Backlog → Rolling recordings to Keep any you want to hold \
+                 on to.",
+                r.count,
+                fmt_datetime_short(r.soonest.unwrap_or(0)),
+                crate::rolling::fmt_remaining(left),
+                crate::rolling::fmt_remaining(r.ttl_secs),
+            ));
+        }
+        // Counting takes exist but none has a deadline yet — they're all still
+        // recording, and the clock only starts when a capture ends.
+        None => {
+            ui.weak(format!("🕰{}", r.count)).on_hover_text(format!(
+                "{} rolling recording(s) under this {scope}. None is counting down yet — the \
+                 clock starts when each capture finishes.",
+                r.count,
+            ));
+        }
+    }
+}
+
+/// The 🕰 badge for a **broadcast** row: the same countdown its take rows show,
+/// rolled up to the stream that owns them (soonest deadline wins). A broadcast
+/// that reconnected has several takes, all under one TTL — without this the
+/// countdown was only visible after expanding, which is exactly the row you'd
+/// expand *because* you saw it.
+pub(super) fn rolling_group_badge(
+    ui: &mut egui::Ui,
+    rolling: super::history::GroupRolling,
+    now: i64,
+) {
+    use super::history::GroupRolling;
+    match rolling {
+        GroupRolling::None => {}
+        GroupRolling::Rolling { deadline: Some(d), ttl_secs } => {
+            ui.colored_label(
+                rolling_urgency_color(d - now, ttl_secs),
+                format!("🕰 {}", crate::rolling::fmt_remaining(d - now)),
+            )
+            .on_hover_text(format!(
+                "Rolling recording — this broadcast's file(s) are deleted automatically at {} \
+                 ({} left of a {} window), unless you Keep it (📥 Backlog → Rolling \
+                 recordings). The history rows stay either way.",
+                fmt_datetime_short(d),
+                crate::rolling::fmt_remaining(d - now),
+                crate::rolling::fmt_remaining(ttl_secs),
+            ));
+        }
+        GroupRolling::Rolling { deadline: None, ttl_secs } => {
+            ui.weak("🕰").on_hover_text(format!(
+                "Rolling recording — its {} countdown starts when this capture finishes.",
+                crate::rolling::fmt_remaining(ttl_secs),
+            ));
+        }
+        GroupRolling::Kept => {
+            ui.weak("🕰📌").on_hover_text(
+                "Kept from a rolling recording — it was scheduled for automatic deletion and \
+                 you chose to keep it, so it's an ordinary archived broadcast now.",
+            );
+        }
+        GroupRolling::Expired => {
+            ui.weak("🕰🗑").on_hover_text(
+                "Rolling recording expired — the video file(s) were deleted automatically \
+                 because the time ran out and it wasn't kept. Everything else about the \
+                 broadcast (title, stats, chat log, chapters, notes) was preserved.",
+            );
+        }
+    }
+}
+
+/// A channel row's rolling rollup: every instance's merged into one, so the
+/// badge and the 🕰 column both report the soonest deadline anywhere under the
+/// channel. Shared with `channel_cells` so the sort key and the rendered cell
+/// can't disagree.
+pub(super) fn merged_rolling(
+    monitors: &[&MonitorWithChannel],
+    rollups: &HashMap<i64, crate::rolling::RollingRollup>,
+) -> crate::rolling::RollingRollup {
+    let mut agg = crate::rolling::RollingRollup::default();
+    for m in monitors {
+        if let Some(r) = rollups.get(&m.monitor.id) {
+            agg.merge(r);
+        }
+    }
+    agg
+}
+
+/// One take's rolling state in the broadcast-shaped form, so take rows and
+/// stream rows can share [`rolling_group_cell`] instead of drifting apart.
+pub(super) fn rolling_of_take(t: &crate::models::Recording) -> super::history::GroupRolling {
+    use super::history::GroupRolling;
+    use crate::models::RollingState;
+    match t.rolling.state(t.ended_at) {
+        RollingState::None => GroupRolling::None,
+        RollingState::Rolling { deadline } => {
+            GroupRolling::Rolling { deadline, ttl_secs: t.rolling.ttl_secs }
+        }
+        RollingState::Kept { .. } => GroupRolling::Kept,
+        RollingState::Expired { .. } => GroupRolling::Expired,
+    }
+}
+
+/// The 🕰 **column** cell for a rollup row (channel or instance): the time left
+/// on the soonest rolling take beneath it, blank when nothing is counting.
+/// Unlike the State-cell badge this drops the count — the column is here to be
+/// sorted by, and the badge next door already carries the "how many".
+pub(super) fn rolling_rollup_cell(
+    ui: &mut egui::Ui,
+    r: &crate::rolling::RollingRollup,
+    now: i64,
+    is_channel: bool,
+) {
+    if r.count <= 0 {
+        return;
+    }
+    let scope = if is_channel { "channel" } else { "instance" };
+    match r.remaining(now) {
+        Some(left) => {
+            ui.colored_label(
+                rolling_urgency_color(left, r.ttl_secs),
+                crate::rolling::fmt_remaining(left),
+            )
+            .on_hover_text(format!(
+                "The soonest of {} rolling recording(s) under this {scope} is deleted \
+                 automatically at {} — {} left of a {} window.",
+                r.count,
+                fmt_datetime_short(r.soonest.unwrap_or(0)),
+                crate::rolling::fmt_remaining(left),
+                crate::rolling::fmt_remaining(r.ttl_secs),
+            ));
+        }
+        None => {
+            ui.weak("recording").on_hover_text(format!(
+                "{} rolling recording(s) under this {scope}, none counting down yet — the clock \
+                 starts when each capture finishes.",
+                r.count,
+            ));
+        }
+    }
+}
+
+/// The 🕰 **column** cell for a broadcast or take row: its own countdown, or
+/// the 📌 kept / 🗑 expired marker once it has stopped counting.
+pub(super) fn rolling_group_cell(
+    ui: &mut egui::Ui,
+    rolling: super::history::GroupRolling,
+    now: i64,
+) {
+    use super::history::GroupRolling;
+    match rolling {
+        GroupRolling::None => {}
+        GroupRolling::Rolling { deadline: Some(d), ttl_secs } => {
+            ui.colored_label(
+                rolling_urgency_color(d - now, ttl_secs),
+                crate::rolling::fmt_remaining(d - now),
+            )
+            .on_hover_text(format!(
+                "Deleted automatically at {} — {} left of a {} window. 📥 Backlog → Rolling \
+                 recordings to Keep it.",
+                fmt_datetime_short(d),
+                crate::rolling::fmt_remaining(d - now),
+                crate::rolling::fmt_remaining(ttl_secs),
+            ));
+        }
+        GroupRolling::Rolling { deadline: None, ttl_secs } => {
+            ui.weak("recording").on_hover_text(format!(
+                "Rolling recording — its {} countdown starts when this capture finishes.",
+                crate::rolling::fmt_remaining(ttl_secs),
+            ));
+        }
+        GroupRolling::Kept => {
+            ui.weak("📌").on_hover_text("Kept — no longer counting down towards auto-deletion.");
+        }
+        GroupRolling::Expired => {
+            ui.weak("🗑").on_hover_text(
+                "Rolling recording expired — the file was deleted automatically; everything \
+                 else about it was preserved.",
+            );
+        }
+    }
 }
 
 /// Just the channel/user name, for places with no room for a URL — currently
@@ -2238,6 +2458,7 @@ pub(super) fn channel_ad_free_count(monitors: &[&MonitorWithChannel]) -> usize {
 /// the same source the row render uses for its state dot — so sorting by the
 /// State column reorders the moment a recording starts/stops instead of
 /// waiting for the next DB reload to land.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn channel_cells(
     channel: &Channel,
     monitors: &[&MonitorWithChannel],
@@ -2252,6 +2473,9 @@ pub(super) fn channel_cells(
     // Per-monitor finished-take byte sum (`Store::monitor_disk_usage`) — the
     // channel row's "Disk use" cell sums every instance's entry.
     monitor_disk_usage: &HashMap<i64, i64>,
+    // Per-monitor rolling rollup (`Store::rolling_rollup_by_monitor`) — the
+    // channel row's 🕰 cell takes the soonest deadline across its instances.
+    rolling_rollups: &HashMap<i64, crate::rolling::RollingRollup>,
 ) -> Vec<Cell> {
     if monitors.is_empty() {
         // Empty container: just the name + "added"; everything else blank
@@ -2381,6 +2605,23 @@ pub(super) fn channel_cells(
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
         // Tags — the primary live instance's current tag list.
         Cell::text(primary.last_tags.clone()),
+        // 🕰 Rolling — time left on the SOONEST rolling take anywhere under
+        // this channel. Sorted ascending that puts whatever expires first at
+        // the top, so "nothing counting down" has to sort last rather than as
+        // "0 seconds left": hence `INFINITY` for an empty rollup.
+        {
+            let agg = merged_rolling(monitors, rolling_rollups);
+            match agg.remaining(now) {
+                Some(left) => Cell::num(left as f64, crate::rolling::fmt_remaining(left)),
+                None if agg.count > 0 => {
+                    // Counting, but still recording — no deadline yet, and
+                    // nothing is at risk until the capture ends, so it sorts
+                    // after every dated row.
+                    Cell::num(f64::INFINITY, "recording")
+                }
+                None => Cell::num(f64::INFINITY, String::new()),
+            }
+        },
         // Disk use — summed across every instance (index last).
         {
             let total: i64 =
@@ -2625,9 +2866,10 @@ pub(super) fn render_instance_row(
     // put a face on each collab angle's chip in the Custom layout editor
     // (`LayoutAngle`), which needs the *partners'* avatars, not just this row's.
     instance_avatars: &HashMap<i64, egui::TextureHandle>,
-    // How many of this instance's takes are counting down towards rolling
-    // auto-deletion (0 = none) — the 🕰 rollup badge.
-    rolling_count: i64,
+    // This instance's rolling takes: how many are counting down towards
+    // auto-deletion and when the first of them goes — the 🕰 rollup badge and
+    // the 🕰 column.
+    rolling: crate::rolling::RollingRollup,
     // Set when this instance is live but standing by because a sibling is
     // recording the broadcast on the named platform (simulcast dedup) — the ⇄
     // badge in the State cell.
@@ -3393,7 +3635,7 @@ pub(super) fn render_instance_row(
                     } else {
                         resp.on_hover_text(&m.last_state);
                     }
-                    rolling_rollup_badge(ui, rolling_count, false);
+                    rolling_rollup_badge(ui, &rolling, now, false);
                     // Subscriber-only: the last take was refused by Twitch, so
                     // what's being archived is the CDN head backfill, behind
                     // the live edge. Shown while the channel is still live —
@@ -3562,6 +3804,9 @@ pub(super) fn render_instance_row(
             "tags" => {
                 tags_cell(ui, &row.last_tags, &row.last_language);
             }
+            "rolling" => {
+                rolling_rollup_cell(ui, &rolling, now, false);
+            }
             "disk_use" if disk_use > 0 => {
                 ui.weak(fmt_bytes(disk_use)).on_hover_text(
                     "A stored total, refreshed when the grid reloads — not confirmed \
@@ -3700,6 +3945,7 @@ mod tests {
         let no_pref = crate::platform_pref::PlatformPrefCtx::default();
         let model = vec![channel_cells(
             &channel, &[&row], &HashSet::new(), now, &no_pref, &rec_texts, &HashMap::new(),
+            &HashMap::new(),
         )];
 
         let idx = |id: &str| STREAM_COLUMNS.iter().position(|c| c.id == id).unwrap();
@@ -3984,7 +4230,10 @@ mod tests {
         let no_pref = crate::platform_pref::PlatformPrefCtx::default();
         let state_priority = |m: &MonitorWithChannel, active: &HashSet<i64>| {
             let cells =
-                channel_cells(&channel, &[m], active, now, &no_pref, &HashMap::new(), &HashMap::new());
+                channel_cells(
+                    &channel, &[m], active, now, &no_pref, &HashMap::new(), &HashMap::new(),
+                    &HashMap::new(),
+                );
             assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
             match cells[state_idx].key {
                 SortKey::Num(n) => n,
@@ -4003,6 +4252,87 @@ mod tests {
         assert!(recording_p > live_p, "recording must outrank live");
         assert!(live_p > failed_p, "live must outrank failed");
         assert!(failed_p > offline_p, "failed must outrank offline");
+    }
+
+    /// The 🕰 column has to sort "expires soonest" to the top, which means the
+    /// key is *time left* and rows with nothing counting down must sort LAST
+    /// rather than as zero seconds — otherwise ascending order buries the
+    /// urgent rows under every channel that has no rolling takes at all.
+    #[test]
+    fn rolling_cell_sorts_soonest_first_and_idle_rows_last() {
+        let channel = Channel {
+            id: 1,
+            name: "Test".into(),
+            url: "https://twitch.tv/test".into(),
+            platform: Platform::Twitch,
+            created_at: 0,
+            color: String::new(),
+            preferred_asset: None,
+            enabled: true,
+            automation_enabled: true,
+            primary_group_id: None,
+            posts_hidden: false,
+        };
+        let now = 1_000_000;
+        let rolling_idx = STREAM_COLUMNS.iter().position(|c| c.id == "rolling").unwrap();
+        let no_pref = crate::platform_pref::PlatformPrefCtx::default();
+        let key_for = |rollups: &HashMap<i64, crate::rolling::RollingRollup>| {
+            let row = test_row(1, "offline", None, None, None, false);
+            let cells = channel_cells(
+                &channel, &[&row], &HashSet::new(), now, &no_pref, &HashMap::new(),
+                &HashMap::new(), rollups,
+            );
+            assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
+            match cells[rolling_idx].key {
+                SortKey::Num(n) => n,
+                SortKey::Text(_) => panic!("rolling cell must be numeric"),
+            }
+        };
+
+        let soon = HashMap::from([(
+            1,
+            crate::rolling::RollingRollup { count: 1, soonest: Some(now + 3_600), ttl_secs: 86_400 },
+        )]);
+        let later = HashMap::from([(
+            1,
+            crate::rolling::RollingRollup { count: 9, soonest: Some(now + 86_400), ttl_secs: 86_400 },
+        )]);
+        // Counting but still recording — nothing at risk until it ends, so it
+        // belongs with the idle rows at the bottom, not at the top.
+        let recording = HashMap::from([(
+            1,
+            crate::rolling::RollingRollup { count: 1, soonest: None, ttl_secs: 86_400 },
+        )]);
+
+        assert_eq!(key_for(&soon), 3_600.0);
+        assert!(key_for(&soon) < key_for(&later), "the nearer deadline sorts first");
+        assert!(key_for(&later) < key_for(&recording), "a dated row outranks a still-recording one");
+        assert_eq!(key_for(&HashMap::new()), f64::INFINITY, "nothing rolling sorts last");
+    }
+
+    /// Yellow with the full retention left, red as it runs out — and always a
+    /// ratio of the take's OWN retention, never an absolute threshold.
+    #[test]
+    fn rolling_urgency_ramps_yellow_to_red_by_fraction_of_ttl() {
+        let full = rolling_urgency_color(86_400, 86_400);
+        let due = rolling_urgency_color(0, 86_400);
+        let half = rolling_urgency_color(43_200, 86_400);
+        assert_eq!(full, egui::Color32::from_rgb(0xe8, 0xc5, 0x4a), "full window = warning yellow");
+        assert_eq!(due, HL_ERROR_TEXT, "out of time = the grid's error red");
+        // Halfway is strictly between the two ends on every channel — the
+        // yellow's green drains towards the red, its blue creeps up.
+        assert!(half.g() < full.g() && half.g() > due.g());
+        assert!(half.b() > full.b() && half.b() < due.b());
+        // Overdue never wraps back round to calm.
+        assert_eq!(rolling_urgency_color(-99_999, 86_400), due);
+        // The same 24 h left is calm on a 30 h window (most of it still to
+        // run) and nearly out on a 30 d one — the whole reason this divides
+        // by the TTL rather than thresholding on hours.
+        let short_window = rolling_urgency_color(86_400, 30 * 3_600);
+        let long_window = rolling_urgency_color(86_400, 30 * 86_400);
+        assert!(short_window.g() > long_window.g());
+        // An unknown TTL reads calm rather than screaming red.
+        assert_eq!(rolling_urgency_color(600, 0), full);
     }
 
     #[test]

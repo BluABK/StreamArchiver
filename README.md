@@ -3150,19 +3150,37 @@ keeps its own retention (or opts out entirely).
   Stats and the Backlog entry stay correct; only the media is gone.
 - **The 🕰 Rolling recordings section** at the top of 📥 Backlog lists
   everything still counting down, **soonest first** (a countdown list wants
-  urgency, not recency), with its remaining time — red under a day — and a
+  urgency, not recency), with its remaining time — yellow-to-red by how much
+  of the retention is left, exactly as the 📺 Streams rows show it — and a
   **📌 Keep** button. It ignores the Show: watch-state chips on purpose: a
   file about to be deleted has to be visible whether or not you've watched
   it. Tick **Show kept** to also list the ones you've rescued, each with
   **↩ Unkeep**, which restarts the countdown from now rather than resuming it
   (so un-keeping something old never deletes it seconds later).
-- **Markers elsewhere.** A take row in 📺 Streams shows **🕰 6d 4h** while it's
-  counting down, **🕰📌** once kept ("kept from a rolling recording") and
-  **🕰🗑** once expired ("the video was auto-deleted, everything else was
-  kept"). Instance and channel rows carry a **🕰N** rollup of how many takes
-  underneath them are counting down — shown even when the channel is
-  collapsed, since a collapsed row hiding an imminent deletion is precisely
-  what that badge exists to prevent.
+- **Markers elsewhere.** Every level of the 📺 Streams tree shows the
+  countdown, so it can't hide behind a collapsed row:
+  - **Take rows** — **🕰 6d 4h** while counting down, **🕰📌** once kept
+    ("kept from a rolling recording"), **🕰🗑** once expired ("the video was
+    auto-deleted, everything else was kept").
+  - **Stream (broadcast) rows** — the same badge, rolled up from that
+    broadcast's takes (soonest deadline wins). A reconnect splits a broadcast
+    into several takes under one retention, and this is the row the Keep
+    action targets, so it's the one that has to show the clock.
+  - **Instance and channel rows** — **🕰37 (2d 4h)**: how many takes
+    underneath are counting down, and how long the *first* of them has left.
+    The count alone was never the useful half — 37 rolling takes is fine if
+    the next goes in a week and urgent if it goes tonight.
+- **The countdown is coloured by how much of its retention is left**, ramping
+  from yellow at the full window through orange to red as it runs out. Never
+  green: every one of these files is scheduled for deletion, so the calmest
+  state is still a warning. The ramp is a *fraction of that take's own
+  retention* rather than a fixed number of hours — "1 day left" is most of a
+  30-hour window still to run, and the last scrap of a 30-day one.
+- **A sortable 🕰 column**, hidden by default (enable it from the column
+  header's ⇕ list). It shows the same countdown as the badges, on every row
+  kind — channel, instance, period, broadcast and take — and sorting by it
+  ascending puts whatever expires first at the top of the grid. Rows with
+  nothing counting down sort last rather than as "zero seconds left".
 - **🗃 Stream History** — the same list with a checkbox filter bank instead:
   Missing/deleted VOD, Muted VOD, VOD check pending, Recorded, Remux
   pending, Remuxed, Chapters embedded/pending, Failed (unacked),

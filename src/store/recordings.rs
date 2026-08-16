@@ -309,9 +309,10 @@ impl Store {
         Ok(())
     }
 
-    /// How many takes per monitor are currently counting down towards
-    /// auto-deletion — the 🕰 rollup badge on the Streams grid's instance and
-    /// channel rows.
+    /// What each monitor's rolling takes add up to — how many are counting
+    /// down towards auto-deletion, and when the first of them is due. Backs
+    /// the 🕰 rollup badge and the sortable "Rolling" column on the Streams
+    /// grid's instance and channel rows.
     ///
     /// Monitors with none are absent from the map. Served by
     /// `idx_recording_rolling` (a partial index over `rolling_ttl_secs > 0`),
@@ -331,7 +332,7 @@ impl Store {
     /// the file still exists — a take whose file vanished after finalize
     /// keeps counting here until its row is disposed of or its `bytes` is
     /// otherwise cleared. Cache against `streams_cache_rev`, same as
-    /// `rolling_counts_by_monitor`, never call from a render path.
+    /// `rolling_rollup_by_monitor`, never call from a render path.
     pub fn monitor_disk_usage(&self) -> Result<std::collections::HashMap<i64, i64>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
@@ -345,16 +346,48 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn rolling_counts_by_monitor(&self) -> Result<std::collections::HashMap<i64, i64>> {
+    pub fn rolling_rollup_by_monitor(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, crate::rolling::RollingRollup>> {
         let conn = self.db();
+        // The deadline expression mirrors `Rolling::deadline` exactly (see
+        // `expired_rolling_recordings`, which sweeps on the same arithmetic):
+        // count from `rolling_from` when an Unkeep restarted the clock, else
+        // from `ended_at`. A still-recording take has no `ended_at`, so its
+        // deadline is NULL — MIN() skips it while COUNT(*) still counts it,
+        // which is what "3 rolling, next in 2d" has to mean while one of them
+        // is being captured right now.
+        //
+        // `rolling_ttl_secs` is a bare column beside a single MIN(), so SQLite
+        // takes it from the row that MIN() selected — the TTL of the soonest
+        // take, which is exactly the denominator its countdown colour needs.
         let mut stmt = conn.prepare(
-            "SELECT monitor_id, COUNT(*) FROM recording
+            "SELECT monitor_id,
+                    COUNT(*),
+                    MIN((CASE WHEN rolling_from > 0 THEN rolling_from ELSE ended_at END)
+                        + rolling_ttl_secs),
+                    rolling_ttl_secs
+             FROM recording
              WHERE rolling_ttl_secs > 0 AND rolling_kept_at = 0 AND rolling_expired_at = 0
              GROUP BY monitor_id",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<std::collections::HashMap<i64, i64>>>()?;
+            .query_map([], |r| {
+                let soonest: Option<i64> = r.get(2)?;
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::rolling::RollingRollup {
+                        count: r.get(1)?,
+                        soonest,
+                        // Meaningless without a deadline to pair it with, and
+                        // arbitrary in SQL when every row's deadline is NULL.
+                        ttl_secs: if soonest.is_some() { r.get(3)? } else { 0 },
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<
+                std::collections::HashMap<i64, crate::rolling::RollingRollup>,
+            >>()?;
         Ok(rows)
     }
 
@@ -2616,6 +2649,68 @@ impl Store {
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    /// The rolling rollup must report the SOONEST deadline together with that
+    /// same take's TTL (the countdown's colour divides one by the other), count
+    /// still-recording takes without letting their absent deadline win, and
+    /// ignore kept/expired takes entirely.
+    #[test]
+    fn rolling_rollup_reports_soonest_deadline_with_its_own_ttl() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let take = |started: i64, ended: Option<i64>, ttl: i64| {
+            let r = store
+                .insert_recording(mid, started, "C:/rec/x.mkv", Some(started), false, None, None, "", "")
+                .unwrap();
+            store.set_recording_rolling_ttl(r, ttl).unwrap();
+            if let Some(e) = ended {
+                store.finish_recording(r, e, 1, Some(0), "completed", "C:/rec/x.mkv", "").unwrap();
+            }
+            r
+        };
+
+        // Ends at 1_000 with a 10 h TTL -> due 37_000; the other ends later but
+        // with a much shorter TTL, so IT is the soonest (11_600) — a rollup
+        // that just took the oldest take, or paired one take's deadline with
+        // another's TTL, would get this wrong.
+        take(500, Some(1_000), 36_000);
+        take(1_000, Some(2_000), 9_600);
+        // Still recording: counts, but has no deadline to contribute yet.
+        take(3_000, None, 3);
+        // Neither of these is counting down any more.
+        let kept = take(100, Some(200), 60);
+        store.keep_rolling_recording(kept, 300).unwrap();
+        let expired = take(100, Some(200), 60);
+        store.mark_rolling_expired(expired, 300).unwrap();
+
+        let map = store.rolling_rollup_by_monitor().unwrap();
+        let r = map.get(&mid).copied().unwrap();
+        assert_eq!(r.count, 3, "kept and expired takes are not counting down");
+        assert_eq!(r.soonest, Some(11_600));
+        assert_eq!(r.ttl_secs, 9_600, "the TTL must belong to the soonest take");
+        assert_eq!(r.remaining(10_000), Some(1_600));
+
+        // An Unkeep restarts the clock from `rolling_from`, and the query has
+        // to count from there rather than from `ended_at` — same arithmetic the
+        // sweep uses.
+        store.unkeep_rolling_recording(kept, 100_000).unwrap();
+        let r = store.rolling_rollup_by_monitor().unwrap().get(&mid).copied().unwrap();
+        assert_eq!(r.count, 4);
+        assert_eq!(r.soonest, Some(11_600), "the un-kept take is due much later");
+
+        // A monitor with nothing rolling is absent rather than zero-valued.
+        let mid2 = {
+            let mut m2 = sample_monitor(cid);
+            m2.channel_id = cid;
+            m2.url = "https://twitch.tv/other".into();
+            store.insert_monitor(&m2).unwrap()
+        };
+        assert!(!store.rolling_rollup_by_monitor().unwrap().contains_key(&mid2));
+    }
 
     /// Every failed take must reach the 🚨 Warnings window: finish_recording
     /// files a `capture_failed` error alert — unless an error alert (🎫 PO

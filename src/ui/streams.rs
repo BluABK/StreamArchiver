@@ -1723,17 +1723,17 @@ impl StreamArchiverApp {
                 .unwrap_or_default();
             // Same rev-keyed treatment (and same reason) as `raid_out_cache`:
             // one small indexed query per grid rebuild, never per frame.
-            if self.rolling_counts_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
+            if self.rolling_rollup_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
             {
-                let fresh = self.core.store.rolling_counts_by_monitor().unwrap_or_default();
-                self.rolling_counts_cache = Some((self.streams_cache_rev, fresh));
+                let fresh = self.core.store.rolling_rollup_by_monitor().unwrap_or_default();
+                self.rolling_rollup_cache = Some((self.streams_cache_rev, fresh));
             }
-            let rolling_counts = self
-                .rolling_counts_cache
+            let rolling_rollups = self
+                .rolling_rollup_cache
                 .as_ref()
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default();
-            // Same rev-keyed treatment as `rolling_counts_cache` — backs the
+            // Same rev-keyed treatment as `rolling_rollup_cache` — backs the
             // channel/instance "Disk use" column, which has no per-take data
             // loaded to sum itself when collapsed (see `groups`, above).
             if self.disk_usage_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
@@ -1898,7 +1898,7 @@ impl StreamArchiverApp {
                         e.rows.iter().map(|&i| &self.rows[i]).collect();
                     channel_cells(
                         &e.channel, &mons, active_ids, now, &platform_pref, &rec_texts,
-                        &monitor_disk_usage,
+                        &monitor_disk_usage, &rolling_rollups,
                     )
                 })
                 .collect();
@@ -1913,7 +1913,7 @@ impl StreamArchiverApp {
                 active_recordings,
                 twitch_login_to_mid,
                 latest_raid_out,
-                rolling_counts,
+                rolling_rollups,
                 monitor_disk_usage,
                 model,
                 platform_pref,
@@ -2223,7 +2223,7 @@ impl StreamArchiverApp {
                                 Self::channel_row(
                                     &mut tr, &chan_entries[ci], &self.rows, groups,
                                     channel_avatars, channel_name_colors, twitch_login_to_mid,
-                                    &cache.rolling_counts, &ptex,
+                                    &cache.rolling_rollups, &ptex,
                                     active_ids, &finalizing_ids, &active_chat_ids,
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
@@ -2241,7 +2241,11 @@ impl StreamArchiverApp {
                                     &finalizing_ids, &cdn_capture_ids, &active_chat_ids,
                                     selected_monitor,
                                     &exp_instances, instance_avatars,
-                                    cache.rolling_counts.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
+                                    cache
+                                        .rolling_rollups
+                                        .get(&self.rows[ri].monitor.id)
+                                        .copied()
+                                        .unwrap_or_default(),
                                     cache.monitor_disk_usage.get(&self.rows[ri].monitor.id).copied().unwrap_or(0),
                                     cache
                                         .simulcast_standby
@@ -3467,9 +3471,9 @@ impl StreamArchiverApp {
         channel_avatars: &HashMap<i64, egui::TextureHandle>,
         channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
         login_to_mid: &HashMap<String, i64>,
-        // Per-monitor rolling-recording counts (see `StreamsViewCache`) —
-        // summed across this channel's instances for the 🕰 rollup badge.
-        rolling_counts: &HashMap<i64, i64>,
+        // Per-monitor rolling rollups (see `StreamsViewCache`) — merged across
+        // this channel's instances for the 🕰 rollup badge and column.
+        rolling_rollups: &HashMap<i64, crate::rolling::RollingRollup>,
         ptex: &PlatformTextures,
         active_ids: &HashSet<i64>,
         finalizing_ids: &HashSet<i64>,
@@ -3800,9 +3804,7 @@ impl StreamArchiverApp {
                         // NOT present-state-only: a collapsed channel hiding
                         // that something under it is about to be auto-deleted
                         // is exactly the case this exists to prevent.
-                        let rolling: i64 =
-                            mons.iter().map(|m| rolling_counts.get(&m.monitor.id).copied().unwrap_or(0)).sum();
-                        rolling_rollup_badge(ui, rolling, true);
+                        rolling_rollup_badge(ui, &merged_rolling(&mons, rolling_rollups), now, true);
                         // Bubble the instances' live badges up while
                         // they're active — a collapsed channel otherwise
                         // hides that a recording was trigger-started or
@@ -3982,6 +3984,9 @@ impl StreamArchiverApp {
                         let cur_lang =
                             primary.map(|m| m.last_language.clone()).unwrap_or_default();
                         tags_cell(ui, &cur_tags, &cur_lang);
+                    }
+                    "rolling" => {
+                        rolling_rollup_cell(ui, &merged_rolling(&mons, rolling_rollups), now, true);
                     }
                     "disk_use" if disk_use_total > 0 => {
                         ui.weak(fmt_bytes(disk_use_total)).on_hover_text(
@@ -4221,8 +4226,9 @@ impl StreamArchiverApp {
         exp_instances: &HashSet<i64>,
         instance_avatars: &HashMap<i64, egui::TextureHandle>,
         // Takes of THIS instance still counting down towards rolling
-        // auto-deletion — the 🕰 rollup badge (see `crate::rolling`).
-        rolling_count: i64,
+        // auto-deletion, with the soonest deadline among them — the 🕰 rollup
+        // badge and column (see `crate::rolling`).
+        rolling: crate::rolling::RollingRollup,
         // This instance's finished-take byte sum (`Store::monitor_disk_usage`)
         // — the "Disk use" cell.
         disk_use: i64,
@@ -4359,7 +4365,7 @@ impl StreamArchiverApp {
             inst_stream_target.as_ref(), &media_player,
             instance_avatars.get(&mid),
             instance_avatars,
-            rolling_count,
+            rolling,
             standby_for,
             inst_latest_rec_id,
             scheduled_recordings,
@@ -4477,6 +4483,26 @@ impl StreamArchiverApp {
                 } else if STREAM_COLUMNS[ci].id == "disk_use" && total > 0 {
                     ui.weak(fmt_bytes(total as i64))
                         .on_hover_text(stream_size_hover(total, captured_secs));
+                } else if STREAM_COLUMNS[ci].id == "rolling" {
+                    // The soonest countdown among this period's broadcasts —
+                    // without it, collapsing a week would hide that something
+                    // inside it expires tomorrow.
+                    let mut soonest: Option<(i64, i64)> = None;
+                    for g in streams {
+                        if let GroupRolling::Rolling { deadline: Some(d), ttl_secs } =
+                            group_rolling(g)
+                            && soonest.is_none_or(|(cur, _)| d < cur)
+                        {
+                            soonest = Some((d, ttl_secs));
+                        }
+                    }
+                    if let Some((d, ttl)) = soonest {
+                        rolling_group_cell(
+                            ui,
+                            GroupRolling::Rolling { deadline: Some(d), ttl_secs: ttl },
+                            now,
+                        );
+                    }
                 }
             });
         }
@@ -4800,6 +4826,12 @@ impl StreamArchiverApp {
                         } else {
                             resp.on_hover_text(g.status());
                         }
+                        // Rolling countdown for the broadcast, rolled up from
+                        // its takes. It used to live only on the take rows,
+                        // which meant a collapsed stream gave no hint that its
+                        // files were on a clock — and this row is the one the
+                        // Keep action targets.
+                        rolling_group_badge(ui, group_rolling(g), now);
                         let nr = g.takes.iter().filter(|t| t.needs_remux()).count();
                         if nr > 0 {
                             let lbl = if nr == 1 {
@@ -4949,6 +4981,9 @@ impl StreamArchiverApp {
                             );
                         }
                         ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(hover);
+                    }
+                    "rolling" => {
+                        rolling_group_cell(ui, group_rolling(g), now);
                     }
                     // "on"/"platform"/"tool"/"detection"/"polled"/
                     // "next_stream"/"ad_free"/"added" are n/a per stream.
@@ -5770,6 +5805,9 @@ impl StreamArchiverApp {
                         if let Some(h) = hover {
                             d.on_hover_text(h);
                         }
+                    }
+                    "rolling" => {
+                        rolling_group_cell(ui, rolling_of_take(t), now);
                     }
                     // "on"/"platform"/"tool"/"detection"/"polled"/
                     // "next_stream"/"went_live"/"ad_free"/"added" are
