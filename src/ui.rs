@@ -256,6 +256,11 @@ const COOKIE_BROWSERS: [&str; 8] = [
     "firefox", "chrome", "chromium", "edge", "brave", "opera", "vivaldi", "safari",
 ];
 
+/// Clip counts `(total, archived)` per parent VOD id. Named so the cache field
+/// and the render path share one spelling (and to keep clippy's type-complexity
+/// lint quiet), the same reason `TrashActionOutcome` exists.
+type ClipsByVod = HashMap<String, (i64, i64)>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Streams,
@@ -2195,7 +2200,7 @@ pub struct StreamArchiverApp {
     /// cached against `streams_cache_rev` — same shape and reasoning as
     /// [`Self::drives_cache`]. Backs the Streams tree's 🎞 summary row and
     /// decides whether a single-take broadcast gains an expander at all.
-    clips_by_vod_cache: Option<(u64, HashMap<String, (i64, i64)>)>,
+    clips_by_vod_cache: Option<(u64, ClipsByVod)>,
     /// Per-monitor sum of finished-take bytes, cached against
     /// `streams_cache_rev` — same shape and same reasoning as
     /// [`Self::rolling_rollup_cache`]. Backs the Streams grid's "Disk use"

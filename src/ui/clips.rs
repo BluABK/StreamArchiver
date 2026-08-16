@@ -36,6 +36,7 @@ enum ClipMenuChoice {
     Download(i64),
     Recover(i64),
     Forget(i64),
+    DeleteFile(i64),
 }
 
 impl StreamArchiverApp {
@@ -318,9 +319,25 @@ impl StreamArchiverApp {
                             }
                             ui.separator();
                             if ui
-                                .button("🗑  Forget clip")
+                                .add_enabled(has_file, egui::Button::new("🗑  Delete file"))
                                 .on_hover_text(
-                                    "Remove the catalogue row. Does not delete any file.",
+                                    "Dispose of the downloaded media using your configured \
+                                     method (Trash / Recycle Bin / permanent). The catalogue \
+                                     row and its recovery keys are kept, so the clip can be \
+                                     fetched again while it still exists upstream.",
+                                )
+                                .on_disabled_hover_text("Nothing downloaded for this clip.")
+                                .clicked()
+                            {
+                                *pick = Some(ClipMenuChoice::DeleteFile(c.id));
+                                ui.close();
+                            }
+                            if ui
+                                .button("✖  Forget clip")
+                                .on_hover_text(
+                                    "Remove the catalogue row. Does not delete any file — and \
+                                     discards the recovery keys with it, so a clip that later \
+                                     vanishes could no longer be rebuilt.",
                                 )
                                 .clicked()
                             {
@@ -412,6 +429,15 @@ impl StreamArchiverApp {
             }
             Some(ClipMenuChoice::Forget(id)) => {
                 let _ = self.core.store.forget_clip(id);
+                self.clips_loaded = false;
+            }
+            Some(ClipMenuChoice::DeleteFile(id)) => {
+                let store = self.core.store.clone();
+                let ctx = ui.ctx().clone();
+                self.core.rt.spawn(async move {
+                    crate::clips::dispose_clip_media(&store, id).await;
+                    ctx.request_repaint();
+                });
                 self.clips_loaded = false;
             }
             None => {}

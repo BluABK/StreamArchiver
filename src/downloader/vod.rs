@@ -742,6 +742,42 @@ impl Supervisor {
         }
     }
 
+    /// Fold a finished clip download onto its catalogue row, then **delete the
+    /// `video` job ticket**.
+    ///
+    /// The ticket exists only to borrow the download pipeline (restart
+    /// survival, the semaphore, rate limiting, progress, Stop/Retry). Keeping
+    /// it afterwards would put tens of thousands of rows in the Videos tab,
+    /// which loads unpaginated. `delete_video` drops the row and never the
+    /// file, which is exactly the semantics wanted here.
+    ///
+    /// A no-op when this download wasn't a clip.
+    pub(super) fn finalize_clip_download(
+        &self,
+        video_id: i64,
+        final_path: &Path,
+        bytes: i64,
+        status: &str,
+    ) {
+        let Ok(Some(clip_id)) = self.store.clip_for_video(video_id) else {
+            return;
+        };
+        if status != "completed" {
+            let _ = self.store.fail_clip(clip_id, status);
+            // Leave the ticket for the Videos tab's Retry action; the next
+            // drain pass will not pick this clip up again until it clears.
+            return;
+        }
+        let _ = self.store.finish_clip(
+            clip_id,
+            &final_path.to_string_lossy(),
+            bytes,
+            "live",
+            "",
+        );
+        let _ = self.store.delete_video(video_id);
+    }
+
     pub(super) async fn finalize_vod_archive(&self, video_id: i64, final_path: &Path, status: &str) {
         let Ok(Some(rec_id)) = self.store.recording_for_vod_video(video_id) else {
             return;

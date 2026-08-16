@@ -30,10 +30,13 @@ use crate::store::Store;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+mod fetch;
+// `download_allowed` / `enqueue_clip_download` join this list when the Clips
+// view gates its Download action on them; re-exporting now would only be unused
+// imports (the queue drainer calls them from inside this module).
+pub use fetch::{dispose_clip_media, download_master_on, drain_clip_queue};
 mod sweep;
-// `clips_enabled` joins this list when the download gate and the Clips view
-// need it; re-exporting it now would only be an unused import.
-pub use sweep::{maybe_sweep_post_broadcast, run_clip_sweep};
+pub use sweep::{clips_enabled, maybe_sweep_post_broadcast, run_clip_sweep};
 
 /// Master switch: index clip metadata for monitored channels. Cheap (tens of MB
 /// for the whole archive) and it is what makes later recovery possible at all.

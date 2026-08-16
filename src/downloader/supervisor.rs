@@ -3394,6 +3394,9 @@ progress_info: None,
         // If this download was a post-stream VOD archive, file it on the recording
         // (alongside) and optionally replace the live capture. No-op otherwise.
         self.finalize_vod_archive(id, &final_path, status).await;
+        // Likewise for a clip: fold the result onto the catalogue row and drop
+        // the `video` job ticket. No-op when this wasn't a clip.
+        self.finalize_clip_download(id, &final_path, bytes, status);
         info!(video = id, bytes, status, "video download finished");
     }
 

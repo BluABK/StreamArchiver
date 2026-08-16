@@ -211,6 +211,7 @@ pub async fn maybe_sweep_post_broadcast(ctx: &Arc<DetectContext>, now: i64) {
 /// The daily per-channel sweep loop. Spawned once at startup.
 pub async fn run_clip_sweep(
     ctx: Arc<DetectContext>,
+    manual_tx: tokio::sync::mpsc::UnboundedSender<crate::events::ManualCommand>,
     shutdown: Arc<AtomicBool>,
     jobs: crate::events::JobRegistry,
 ) {
@@ -264,6 +265,14 @@ pub async fn run_clip_sweep(
             }
             Ok(_) => {}
             Err(e) => warn!(channel = %row.channel.name, "clips: daily sweep failed: {e:#}"),
+        }
+
+        // Top the download queue up rather than enqueueing everything at once:
+        // a channel can hold ten thousand pending clips, and the gate is
+        // per-channel so most candidates are skipped anyway.
+        let started = super::drain_clip_queue(&ctx.store, &manual_tx);
+        if started > 0 {
+            debug!("clips: queued {started} download(s)");
         }
 
         let gap = (CYCLE_SECS / total).max(MIN_GAP_SECS);

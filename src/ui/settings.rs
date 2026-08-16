@@ -768,6 +768,7 @@ impl StreamArchiverApp {
             self.settings_ytdlp_args_section(ui);
             self.settings_custom_tools_section(ui);
             self.settings_sabr_section(ui);
+            self.settings_clips_section(ui);
             self.settings_pot_server_section(ui);
             // Schedule.
             self.settings_schedule_sources_section(ui);
@@ -2206,6 +2207,89 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
+
+    fn settings_clips_section(&mut self, ui: &mut egui::Ui) {
+            if self.section_shown(SettingsTab::Downloads, "Clips 🎞", &["clip", "clips", "twitch clips", "download clips"]) {
+            ui.add_space(12.0);
+            ui.heading("Clips 🎞");
+            ui.label(
+                "Indexing every clip of your monitored channels costs tens of megabytes for \
+                 the whole archive, and is what preserves the keys that let a deleted clip be \
+                 rebuilt later. Downloading the media is a different order of magnitude — a \
+                 busy channel accumulates 7,500–12,000 clips, roughly 200 GB — so it is off \
+                 until you turn it on, per channel.",
+            );
+            // These write straight to the store rather than through
+            // `SettingsForm`: both are switches whose effect is immediate and
+            // which the sweep loop re-reads every pass, so round-tripping them
+            // through the form's save button would only add a way to forget.
+            let store = &self.core.store;
+            let mut index_on = crate::clips::clips_enabled(store);
+            if ui
+                .checkbox(&mut index_on, "Index clips (metadata only)")
+                .on_hover_text(
+                    "Catalogue every clip of your monitored channels. Cheap, and the only way \
+                     to capture a clip's recovery keys — Twitch reports which VOD a clip came \
+                     from only while that VOD still exists (100% of clips under two weeks old, \
+                     5% at a year), so a clip indexed late can never be rebuilt.",
+                )
+                .changed()
+            {
+                let _ = store.set_setting(crate::clips::K_CLIPS_ENABLED, if index_on { "1" } else { "0" });
+            }
+            let mut dl_on = crate::clips::download_master_on(store);
+            if ui
+                .checkbox(&mut dl_on, "Download clip media (master switch)")
+                .on_hover_text(
+                    "Master switch for downloading. Each channel ALSO has to be enabled \
+                     below — the two are independent switches rather than an inherit chain, \
+                     because there is no sensible global default under a ~200 GB-per-channel \
+                     decision.",
+                )
+                .changed()
+            {
+                let _ = store.set_setting(crate::clips::K_CLIPS_DOWNLOAD, if dl_on { "1" } else { "0" });
+            }
+            ui.add_enabled_ui(dl_on, |ui| {
+                ui.indent("clips_channels", |ui| {
+                    ui.label(
+                        egui::RichText::new("Download clips for these channels:")
+                            .small()
+                            .weak(),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .id_salt("clips_channel_gates")
+                        .show(ui, |ui| {
+                            for c in &self.channels {
+                                let mut on = crate::raid_follow::load_bool_scope(
+                                    store,
+                                    crate::clips::K_CHANNEL_CLIPS_DOWNLOAD,
+                                    c.id,
+                                )
+                                .unwrap_or(false);
+                                if ui
+                                    .checkbox(&mut on, &c.name)
+                                    .on_hover_text(
+                                        "Download every clip of this channel as it is \
+                                         discovered. The catalogue is kept either way.",
+                                    )
+                                    .changed()
+                                {
+                                    let _ = crate::raid_follow::save_bool_scope(
+                                        store,
+                                        crate::clips::K_CHANNEL_CLIPS_DOWNLOAD,
+                                        c.id,
+                                        Some(on).filter(|v| *v),
+                                    );
+                                }
+                            }
+                        });
+                });
+            });
+            }
+
     }
 
     fn settings_sabr_section(&mut self, ui: &mut egui::Ui) {
