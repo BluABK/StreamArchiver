@@ -38,6 +38,13 @@ const K_POST_LAST_CHECK: &str = "clips_post_sweep_last_check";
 /// Takes handled per post-broadcast pass — bounded so a backlog drains steadily
 /// instead of firing hundreds of Helix queries in one tick.
 const POST_BATCH: usize = 4;
+/// Known clips re-checked per sweep. 100 is Helix's per-call maximum, so this is
+/// exactly one extra request.
+const LIVENESS_BATCH: i64 = 100;
+/// Rebuilds attempted automatically per sweep. A channel purge can take out
+/// hundreds at once; recovering them all in one pass would hammer the CDN and
+/// the disk together.
+const AUTO_RECOVER_BATCH: usize = 3;
 
 /// Is clip indexing on at all?
 pub fn clips_enabled(store: &Store) -> bool {
@@ -92,7 +99,76 @@ pub async fn sweep_monitor(
     }
     // Only now, with every window drained, is it safe to move the mark.
     let _ = store.set_clip_swept(t.monitor_id, window.end);
+    check_liveness(ctx, t.channel_id, now).await;
     Ok(res.seen)
+}
+
+/// Re-check clips we already know about, and act on the ones that have gone.
+///
+/// **A failed hydrate marks nothing.** Absence is the deletion signal here, so
+/// treating a 500 as "they're all gone" would both lie and fire a recovery
+/// attempt at a clip that is perfectly fine — the `Err` = "we weren't watching"
+/// contract matters more here than anywhere else in the module.
+async fn check_liveness(ctx: &Arc<DetectContext>, channel_id: i64, now: i64) {
+    let store = &ctx.store;
+    let Ok(known) = store.clips_to_recheck(channel_id, LIVENESS_BATCH) else {
+        return;
+    };
+    if known.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = known.iter().map(|c| c.slug.clone()).collect();
+    let alive = match hydrate_clip_ids(ctx, &ids).await {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("clips: liveness check skipped (not authoritative): {e:#}");
+            return;
+        }
+    };
+    let alive: std::collections::HashSet<String> = alive
+        .iter()
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect();
+    let gone: Vec<String> = ids.into_iter().filter(|s| !alive.contains(s)).collect();
+    if gone.is_empty() {
+        return;
+    }
+    let n = store
+        .mark_clips_gone(crate::models::Platform::Twitch, &gone, now)
+        .unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    warn!(channel_id, gone = n, "clips: vanished upstream since the last sweep");
+
+    // Auto-attempt once, then leave it to the manual action. Only for clips we
+    // never archived — one that is already on disk has nothing to recover.
+    if !auto_recover_on(store) {
+        return;
+    }
+    let client = ctx.http_client();
+    for slug in gone.iter().take(AUTO_RECOVER_BATCH) {
+        let Ok(Some(c)) = store.clip_by_slug(crate::models::Platform::Twitch, slug) else {
+            continue;
+        };
+        if c.is_archived() || c.dl_attempts > 0 {
+            continue;
+        }
+        let ok = super::recover::recover_clip(store, &client, c.id, 4).await;
+        debug!(slug = %slug, ok, "clips: auto-recovery attempt");
+    }
+}
+
+/// Attempt one automatic rebuild when a clip is first found missing. On by
+/// default — the window in which a rebuild can still succeed closes with the
+/// parent VOD, so waiting for a human is often waiting too long.
+fn auto_recover_on(store: &Store) -> bool {
+    store
+        .get_setting("clips_auto_recover")
+        .ok()
+        .flatten()
+        .as_deref()
+        .is_none_or(|v| v != "0")
 }
 
 /// Cache the CDN folder of any VOD we just learned about but have not resolved.

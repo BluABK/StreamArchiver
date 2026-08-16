@@ -31,6 +31,8 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 mod fetch;
+mod recover;
+pub use recover::recover_clip;
 // `download_allowed` / `enqueue_clip_download` join this list when the Clips
 // view gates its Download action on them; re-exporting now would only be unused
 // imports (the queue drainer calls them from inside this module).

@@ -422,9 +422,17 @@ impl StreamArchiverApp {
                 self.clips_loaded = false;
             }
             Some(ClipMenuChoice::Recover(id)) => {
-                // The ladder lands in a later phase; queueing is the honest
-                // no-op until then rather than a button that lies.
-                let _ = self.core.store.set_clip_download(id, "queued", None);
+                // Share the DetectContext's client rather than building one:
+                // it carries the connection pool and the token cache.
+                if let Some(dctx) = self.core.detect_ctx() {
+                    let store = self.core.store.clone();
+                    let ctx = ui.ctx().clone();
+                    self.core.rt.spawn(async move {
+                        let client = dctx.http_client();
+                        crate::clips::recover_clip(&store, &client, id, 4).await;
+                        ctx.request_repaint();
+                    });
+                }
                 self.clips_loaded = false;
             }
             Some(ClipMenuChoice::Forget(id)) => {

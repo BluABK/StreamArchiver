@@ -170,6 +170,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Clips of one channel due a liveness re-check: least-recently-checked
+    /// first, and never ones already known to be gone (their fate is settled).
+    pub fn clips_to_recheck(&self, channel_id: i64, limit: i64) -> Result<Vec<Clip>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CLIP_COLS} FROM clip
+             WHERE channel_id=?1 AND gone_at = 0
+             ORDER BY last_seen_at, id LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(params![channel_id, limit], Self::map_clip)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Newest clips across every channel — the Clips view's default scope.
     pub fn recent_clips(&self, limit: i64) -> Result<Vec<Clip>> {
         let conn = self.db();
