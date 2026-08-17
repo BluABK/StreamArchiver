@@ -5370,6 +5370,17 @@ lock, written only by the `chat_scan` sweep. Both databases share one
 instrumented lock helper (`store::db_lock`), which is what lets the I/O tab
 report them as separate lanes.
 
+Neither database is ever `ANALYZE`d, so **the planner works from its built-in
+guesses** — and its strongest guess is that an equality constraint is highly
+selective. Twice now that has made it prefer a 300k-row scan over a purpose-built
+partial index: once in `store::clips` (v96), once in the chat index's
+unresolved-login lookup (index v3). Both were found the same way and fixed the
+same way — check `EXPLAIN QUERY PLAN` against a *real* database, not a fixture,
+then shape the index so the plan the planner wants is also the fast one. Adding
+`ANALYZE` does not substitute for this: it was measured on the live 1.7 GB index
+and changed neither plan. Queries whose plan matters carry a test that asserts
+the plan, because every one of these bugs returns perfectly correct rows.
+
 Unit tests live in a `#[cfg(test)] mod tests` inside the submodule whose code
 they cover (they exercise private items and compile out of release builds).
 

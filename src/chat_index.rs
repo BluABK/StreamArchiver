@@ -52,7 +52,7 @@ use crate::store::db_lock;
 
 /// Latest index-schema version understood by this build. Independent of the
 /// store's `SCHEMA_VERSION` — the two files migrate separately.
-const INDEX_SCHEMA_VERSION: i64 = 2;
+const INDEX_SCHEMA_VERSION: i64 = 3;
 
 /// How long [`ChatIndex::health`] reuses its last answer.
 ///
@@ -395,6 +395,37 @@ impl ChatIndex {
             )?;
             info!(version = 2, "chat index: indexed the unresolved-login lookup");
         }
+        if version < 3 {
+            // v2 built the index but the planner never used it. `unresolved_logins`
+            // also filters `platform = 'twitch'`, and an equality constraint is the
+            // one shape SQLite reaches for hardest: it took the UNIQUE(platform,
+            // user_key) autoindex and sorted 316k twitch rows in a temp B-tree
+            // instead of walking 6.3k already-ordered index rows. Measured on a real
+            // 1.7 GB index: 1276 ms, every ten minutes, forever.
+            //
+            // ANALYZE does NOT fix this — verified on a copy of that index. Even
+            // told honestly that `platform = ?` matches 181,514 rows and the partial
+            // index holds 6,303, the planner still picked the autoindex. (And
+            // `analysis_limit = 400` makes it worse: the sampled estimate comes back
+            // as the 401-row sentinel, so `platform = ?` looks *more* selective than
+            // it is.)
+            //
+            // So give the planner the equality it wants ON THE RIGHT INDEX: lead
+            // with `platform`, keep `msgs_total DESC` for the ORDER BY, and carry
+            // `login` so the whole query is answered from the index without a single
+            // table seek. 1276 ms -> 0.32 ms, with no stats present at all. The
+            // health count (`resolved = 0 AND merged_into = 0`, no platform term)
+            // still rides it as a covering scan.
+            conn.execute_batch(
+                r#"
+                DROP INDEX IF EXISTS idx_chat_user_unresolved;
+                CREATE INDEX idx_chat_user_unresolved
+                    ON chat_user(platform, msgs_total DESC, login)
+                    WHERE resolved = 0 AND merged_into = 0;
+                "#,
+            )?;
+            info!(version = 3, "chat index: made the unresolved-login index one the planner picks");
+        }
         conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
         Ok(())
     }
@@ -608,6 +639,13 @@ impl ChatIndex {
     /// Login-keyed Twitch identities that have never been looked up, oldest
     /// first. These are the pre-2026-08-05 logs, where the sidecar carried no
     /// `user-id` at all.
+    ///
+    /// Every term here is load-bearing for the plan, not just for the result:
+    /// the column order of `idx_chat_user_unresolved` (see the v3 migration) is
+    /// chosen so this exact shape is answered from the index alone. Changing
+    /// the predicates or the ORDER BY without changing the index puts it back
+    /// on a 316k-row scan — `plan_for_unresolved_logins_uses_the_index` is the
+    /// guard.
     pub fn unresolved_logins(&self, limit: i64) -> Result<Vec<(i64, String)>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
@@ -1214,6 +1252,64 @@ mod tests {
         assert_eq!(idx.name_matched_streams(after[0].id).unwrap(), 2);
         // Both messages now hang off the surviving identity.
         assert_eq!(idx.user_messages(after[0].id, "", 10).unwrap().len(), 2);
+    }
+
+    /// The resolver query must be answered from `idx_chat_user_unresolved`
+    /// alone. This asserts the *plan*, not the rows, because the rows were
+    /// always right — v2 shipped an index the planner quietly declined to use,
+    /// and a correctness test passes just as happily at 1276 ms as at 0.3 ms.
+    /// A temp B-tree appearing here means the ORDER BY is no longer riding the
+    /// index; a table scan means the predicates and the column order have
+    /// drifted apart.
+    #[test]
+    fn plan_for_unresolved_logins_uses_the_index() {
+        let idx = ChatIndex::open_in_memory().unwrap();
+        let conn = idx.db();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, login FROM chat_user
+                 WHERE resolved = 0 AND merged_into = 0 AND platform = 'twitch' AND login != ''
+                 ORDER BY msgs_total DESC
+                 LIMIT ?1",
+            )
+            .unwrap();
+        let plan = stmt
+            .query_map(params![25_i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.contains("COVERING INDEX idx_chat_user_unresolved"),
+            "resolver query fell off its index: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "resolver query is sorting by hand: {plan}");
+    }
+
+    /// The health readout shares that index — it has no `platform` term, so it
+    /// can only use it as a covering scan, and only while `platform` stays a
+    /// leading column rather than part of the WHERE predicate.
+    #[test]
+    fn plan_for_the_health_count_uses_the_same_index() {
+        let idx = ChatIndex::open_in_memory().unwrap();
+        let conn = idx.db();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM chat_user WHERE resolved = 0 AND merged_into = 0",
+            )
+            .unwrap();
+        let plan = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.contains("COVERING INDEX idx_chat_user_unresolved"),
+            "health count fell off its index: {plan}"
+        );
     }
 
     #[test]
