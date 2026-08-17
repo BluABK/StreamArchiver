@@ -94,7 +94,10 @@ pub async fn sweep_monitor(
         }
     };
     if res.seen > 0 {
-        let _ = store.link_clips_to_recordings();
+        // Bounded to the slugs this sweep actually touched — see
+        // `link_clips_to_recordings`, whose unbounded first version froze the UI
+        // for 13.5 s per sweep and never converged.
+        let _ = store.link_clips_to_recordings(crate::models::Platform::Twitch, &res.slugs);
         snapshot_vod_folders(ctx, t.monitor_id).await;
     }
     // Only now, with every window drained, is it safe to move the mark.
@@ -426,7 +429,7 @@ async fn backfill_step(ctx: &Arc<DetectContext>, row: &MonitorWithChannel, now: 
     };
     match sweep_window_deep(ctx, store, &t, window, now).await {
         Ok(res) => {
-            let _ = store.link_clips_to_recordings();
+            let _ = store.link_clips_to_recordings(crate::models::Platform::Twitch, &res.slugs);
             let _ = store.set_clip_backfill(row.monitor.id, window.start, false);
             if res.seen > 0 {
                 info!(

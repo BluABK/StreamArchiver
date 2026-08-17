@@ -368,26 +368,57 @@ impl Store {
 
     /// Point every unlinked clip at the local take of its parent broadcast.
     ///
-    /// One set-based pass rather than a lookup per clip: a sweep can insert
-    /// hundreds of rows and this runs once after it. Only fills `NULL`s, so a
-    /// link already resolved (or set by hand) is never rewritten, and only for
-    /// clips that actually name a parent VOD.
+    /// The link is what makes a local-cut rebuild possible — cutting a lost clip
+    /// out of our own recording instead of the CDN — so it is resolved eagerly
+    /// rather than joined at render time.
     ///
-    /// The link is what makes tier-3 recovery possible — cutting a lost clip out
-    /// of our own recording instead of the CDN — so it is worth resolving eagerly
-    /// rather than joining at render time.
-    pub fn link_clips_to_recordings(&self) -> Result<usize> {
-        let conn = self.db();
-        let n = conn.execute(
-            "UPDATE clip SET recording_id = (
-                 SELECT r.id FROM recording r
-                 WHERE r.vod_id = clip.vod_id AND r.output_path <> ''
-                 ORDER BY r.started_at LIMIT 1)
-             WHERE recording_id IS NULL AND vod_id <> ''
-               AND EXISTS (SELECT 1 FROM recording r
-                           WHERE r.vod_id = clip.vod_id AND r.output_path <> '')",
-            [],
-        )?;
+    /// **Only ever run this against a bounded set.** The first version updated
+    /// every unlinked clip in one statement, correlating on `recording.vod_id`
+    /// with no index behind it: 2,455 clips x 3,544 recordings x two subqueries
+    /// = ~17M row reads holding the WRITE lock for 13.5 s, which froze the UI
+    /// (v96 adds the index; this still bounds the work). It also never
+    /// converged, because a clip of a broadcast we never recorded stays NULL
+    /// and got rescanned identically after every sweep, forever. `slugs` is the
+    /// set a sweep just touched, so the cost tracks new arrivals rather than the
+    /// whole catalogue.
+    pub fn link_clips_to_recordings(&self, platform: Platform, slugs: &[String]) -> Result<usize> {
+        if slugs.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        {
+            // `r.vod_id <> ''` is redundant on its own terms — it equals
+            // `clip.vod_id`, which the outer WHERE already constrains — but it
+            // is LOAD-BEARING for the plan. `idx_recording_vod` is a PARTIAL
+            // index (`WHERE vod_id <> ''`), and SQLite will only use a partial
+            // index when the query provably satisfies its predicate; it cannot
+            // infer that through the correlation. Without this clause both
+            // subqueries fall back to a full scan of `recording` and the
+            // statement takes 11 s on the real database instead of 25 ms
+            // (measured 2026-08-18, 4,125 clips / 3,544 takes).
+            //
+            // The EXISTS guard is kept because without it SQLite counts a
+            // NULL-over-NULL write as an updated row, and the return value
+            // stops meaning "clips actually linked".
+            let mut stmt = tx.prepare(
+                "UPDATE clip SET recording_id = (
+                     SELECT r.id FROM recording r
+                     WHERE r.vod_id = clip.vod_id AND r.vod_id <> ''
+                       AND r.output_path <> ''
+                     ORDER BY r.started_at LIMIT 1)
+                 WHERE platform = ?1 AND slug = ?2
+                   AND recording_id IS NULL AND vod_id <> ''
+                   AND EXISTS (SELECT 1 FROM recording r
+                               WHERE r.vod_id = clip.vod_id AND r.vod_id <> ''
+                                 AND r.output_path <> '')",
+            )?;
+            for s in slugs {
+                n += stmt.execute(params![platform.as_str(), s])?;
+            }
+        }
+        tx.commit()?;
         Ok(n)
     }
 
@@ -932,7 +963,13 @@ mod tests {
         keyless.vod_offset_secs = None;
         store.upsert_clip(&keyless, 1).unwrap();
 
-        let n = store.link_clips_to_recordings().unwrap();
+        let touched: Vec<String> = ["Mine", "Foreign", "Keyless"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let n = store
+            .link_clips_to_recordings(Platform::Twitch, &touched)
+            .unwrap();
         assert_eq!(n, 1, "only the clip whose VOD we recorded is linked");
         let by = |slug: &str| store.clip_by_slug(Platform::Twitch, slug).unwrap().unwrap();
         assert_eq!(by("Mine").recording_id, Some(rec));
@@ -940,7 +977,84 @@ mod tests {
         assert_eq!(by("Keyless").recording_id, None);
 
         // Idempotent: a second pass has nothing left to do.
-        assert_eq!(store.link_clips_to_recordings().unwrap(), 0);
+        assert_eq!(
+            store.link_clips_to_recordings(Platform::Twitch, &touched).unwrap(),
+            0
+        );
+        // And an empty touch-set does no work at all — the guard that stops a
+        // sweep with no new clips from walking the whole catalogue.
+        assert_eq!(store.link_clips_to_recordings(Platform::Twitch, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_link_query_uses_the_vod_index_rather_than_scanning() {
+        // The 13.5s UI freeze was a plan regression, not a logic bug, so guard
+        // the PLAN. `idx_recording_vod` is partial (`WHERE vod_id <> ''`) and
+        // SQLite silently falls back to a full scan unless the query provably
+        // satisfies that predicate — which is why the redundant-looking
+        // `r.vod_id <> ''` in the subqueries must stay.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.db();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 UPDATE clip SET recording_id = (
+                     SELECT r.id FROM recording r
+                     WHERE r.vod_id = clip.vod_id AND r.vod_id <> ''
+                       AND r.output_path <> ''
+                     ORDER BY r.started_at LIMIT 1)
+                 WHERE platform = 'twitch' AND slug = 'x'
+                   AND recording_id IS NULL AND vod_id <> ''
+                   AND EXISTS (SELECT 1 FROM recording r
+                               WHERE r.vod_id = clip.vod_id AND r.vod_id <> ''
+                                 AND r.output_path <> '')",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.matches("idx_recording_vod").count() >= 2,
+            "both correlated subqueries must use the vod index, got: {joined}"
+        );
+        assert!(
+            !joined.contains("SCAN r"),
+            "a full scan of `recording` here froze the UI for 13.5s: {joined}"
+        );
+    }
+
+    #[test]
+    fn linking_only_touches_the_slugs_it_was_given() {
+        // The regression behind the 13.5s write-lock hold: the first version
+        // updated EVERY unlinked clip on every sweep, including thousands whose
+        // broadcasts we never recorded and which therefore never converged.
+        use crate::store::test_util::*;
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let rec = store
+            .insert_recording(mid, 100, "C:/rec/a.mkv", Some(100), false, None, None, "", "")
+            .unwrap();
+        store.set_recording_vod_found(rec, "2840712897", 0).unwrap();
+
+        store.upsert_clip(&sample_clip("Asked"), 1).unwrap();
+        store.upsert_clip(&sample_clip("NotAsked"), 1).unwrap();
+
+        let n = store
+            .link_clips_to_recordings(Platform::Twitch, &["Asked".to_string()])
+            .unwrap();
+        assert_eq!(n, 1);
+        let by = |s: &str| store.clip_by_slug(Platform::Twitch, s).unwrap().unwrap();
+        assert_eq!(by("Asked").recording_id, Some(rec));
+        assert_eq!(
+            by("NotAsked").recording_id,
+            None,
+            "a clip outside the touched set must not be walked"
+        );
     }
 
     #[test]

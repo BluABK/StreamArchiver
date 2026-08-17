@@ -1957,7 +1957,28 @@ impl Store {
             stamp_history_clip_swept(&conn)?;
             conn.pragma_update(None, "user_version", 95)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 95);
+        if version < 96 {
+            // `link_clips_to_recordings` correlates `clip.vod_id` against
+            // `recording.vod_id`, which had NO index — so every unlinked clip
+            // drove a full scan of `recording`, twice (the scalar subquery and
+            // a redundant EXISTS). Measured on the live DB the morning after
+            // v95 shipped: 2,455 unlinked clips x 3,544 recordings x 2 ~= 17M
+            // row reads, holding the WRITE lock for 13.5 s while the UI's own
+            // row reload blocked behind it — the watchdog's "UI frozen" dialog.
+            //
+            // Worse, it never converged: those clips are of broadcasts we never
+            // recorded, so the correlation finds nothing, `recording_id` stays
+            // NULL, and the identical scan repeated after every sweep.
+            //
+            // Partial, because the overwhelming majority of takes have no VOD
+            // id and indexing them would only bloat the tree.
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_recording_vod
+                     ON recording(vod_id) WHERE vod_id <> '';",
+            )?;
+            conn.pragma_update(None, "user_version", 96)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 96);
         Ok(())
     }
 }
