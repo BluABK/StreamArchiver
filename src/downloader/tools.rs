@@ -84,7 +84,20 @@ pub(crate) fn apply_yt_client_policy(store: &Store, monitor_id: i64, sabr: &mut 
         sabr.extractor_args = with_player_client(&sabr.extractor_args, "web");
         return;
     }
-    let custom_xargs = !setting_str(store, "ytdlp_sabr_extractor_args").trim().is_empty();
+    // "Custom" has to mean DIFFERENT FROM THE DEFAULT, not merely present.
+    // The Settings form writes every field on save, so the built-in default
+    // gets persisted verbatim the first time anyone saves anything at all — and
+    // a non-empty test then reads the app's own default back as a hand-written
+    // override and stops applying the primary-client policy, permanently and
+    // silently.
+    //
+    // Panko, 2026-08-17: `ytdlp_sabr_extractor_args` held exactly
+    // `SABR_DEFAULT_EXTRACTOR_ARGS`, so `primary_client = tv` was configured and
+    // ignored, every public capture stayed pinned to `web` (which requires a GVS
+    // PO token), and the take died at frag 309/555 when the token was rejected.
+    let stored = setting_str(store, "ytdlp_sabr_extractor_args");
+    let stored = stored.trim();
+    let custom_xargs = !stored.is_empty() && stored != SABR_DEFAULT_EXTRACTOR_ARGS;
     let primary = sabr_primary_client(store);
     if !custom_xargs && !primary.is_empty() {
         sabr.extractor_args = with_player_client(&sabr.extractor_args, &primary);
@@ -465,6 +478,56 @@ mod tests {
         assert_eq!(bins.resolve_program(TOOL_BINARY_SABR), "yt-dlp");
         assert_eq!(bins.resolve_program("no-such-alias"), "yt-dlp");
         assert_eq!(bins.resolve_program(""), "yt-dlp");
+    }
+
+    #[test]
+    fn persisting_the_default_extractor_args_does_not_disable_tv_primary() {
+        // The regression: saving Settings writes every field, so the built-in
+        // default lands in the store verbatim. Read back as "custom", it pinned
+        // every public capture to `web` — which needs a GVS PO token — while
+        // `primary_client = tv` sat there being ignored.
+        let store = Store::open_in_memory().unwrap();
+        let mut sabr = SabrConfig {
+            extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.to_string(),
+            ..Default::default()
+        };
+        store
+            .set_setting("ytdlp_sabr_extractor_args", SABR_DEFAULT_EXTRACTOR_ARGS)
+            .unwrap();
+        apply_yt_client_policy(&store, 1, &mut sabr);
+        assert!(
+            sabr.extractor_args.contains("player-client=tv"),
+            "the stored default must not read as a hand-written override: {}",
+            sabr.extractor_args
+        );
+        // Everything else in the preset survives the swap.
+        assert!(sabr.extractor_args.contains("webpage-client=web"));
+        assert!(sabr.extractor_args.contains("missing_pot"));
+    }
+
+    #[test]
+    fn genuinely_hand_written_extractor_args_are_still_respected_verbatim() {
+        // The behaviour the non-empty test was reaching for, kept intact.
+        let store = Store::open_in_memory().unwrap();
+        let hand = "youtube:formats=duplicate;player-client=web_safari";
+        let mut sabr = SabrConfig {
+            extractor_args: hand.to_string(),
+            ..Default::default()
+        };
+        store.set_setting("ytdlp_sabr_extractor_args", hand).unwrap();
+        apply_yt_client_policy(&store, 1, &mut sabr);
+        assert_eq!(sabr.extractor_args, hand, "a real override must not be rewritten");
+    }
+
+    #[test]
+    fn an_unset_extractor_args_setting_still_gets_the_primary_client() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sabr = SabrConfig {
+            extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.to_string(),
+            ..Default::default()
+        };
+        apply_yt_client_policy(&store, 1, &mut sabr);
+        assert!(sabr.extractor_args.contains("player-client=tv"));
     }
 
     #[test]
