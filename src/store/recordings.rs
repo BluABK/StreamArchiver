@@ -1968,6 +1968,40 @@ impl Store {
     /// `limit`. Backs the Backlog/Stream History views — checkbox filtering
     /// happens client-side over this list (same convention as
     /// `list_notifications`); callers increase `limit` for "Load more".
+    /// Every take belonging to a monitor that has at least one take still
+    /// counting down (or kept) — the 🕰 Rolling recordings section's own set.
+    ///
+    /// The section used to be built by filtering Backlog's loaded page, which
+    /// made it silently incomplete: the page is `recordings_all(limit)` ordered
+    /// newest-first, and on a busy archive 500 rows barely covers a day, so a
+    /// week-old take counting down was simply not considered. The header then
+    /// reported "next in 1d 3h" while something was four minutes from deletion.
+    /// A list whose whole job is to prevent surprise deletions cannot be a view
+    /// of whatever happened to be paged in.
+    ///
+    /// It returns *every* take of those monitors, not just the rolling ones,
+    /// because `group_recordings` walks takes in order and decides broadcast
+    /// boundaries from gaps between neighbours: hand it a filtered subset and
+    /// id-less takes group differently, and every rolled-up cell (duration,
+    /// size, take count) is drawn from the wrong set. Rolling mode is a
+    /// per-channel opt-in, so this is bounded by the monitors actually using
+    /// it — 281 rows of 3,709 on a real archive, 1.8 ms, both sides indexed
+    /// (`idx_recording_monitor` and the partial `idx_recording_rolling`).
+    pub fn recordings_for_rolling(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM recording
+             WHERE monitor_id IN (SELECT monitor_id FROM recording
+                                  WHERE rolling_ttl_secs > 0 AND rolling_expired_at = 0)
+             ORDER BY started_at DESC",
+            Self::RECORDING_FULL_COLUMNS
+        ))?;
+        let rows = stmt
+            .query_map([], Self::map_recording_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn recordings_all(&self, limit: i64) -> Result<Vec<crate::models::Recording>> {
         let conn = self.db();
         let mut stmt = conn.prepare(&format!(
@@ -3965,6 +3999,82 @@ mod tests {
         assert_eq!(row.output_path, "C:/tmp/1.mkv");
         // The sweep tells the two apart on this alone, so it has to survive.
         assert_eq!(store.expired_rolling_recordings(now).unwrap()[1].output_path, "");
+    }
+
+    /// The 🕰 Rolling recordings section must see a counting-down take that
+    /// the Backlog page does not.
+    ///
+    /// This is the pagination half of the same evening's bug. `recordings_all`
+    /// is newest-first and capped, so on a busy archive an older rolling take
+    /// falls off the page — and the section, which was filtering that page,
+    /// reported "next in 1d 3h" while a take was four minutes from deletion.
+    /// The test makes the page cap deliberately too small and asserts the two
+    /// sets disagree in exactly that way.
+    #[test]
+    fn the_rolling_section_sees_takes_the_backlog_page_does_not() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        const TTL: i64 = 3600;
+
+        // One old rolling take, then newer ordinary ones that crowd it off a
+        // small page — the shape of a week-old countdown under a day of volume.
+        let old_rolling = store
+            .insert_recording(mid, 100, "C:/tmp/old.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(old_rolling, 200, 1, Some(0), "completed", "C:/tmp/old.mkv", "")
+            .unwrap();
+        store.set_recording_rolling_ttl(old_rolling, TTL).unwrap();
+        for n in 0..5 {
+            let rid = store
+                .insert_recording(mid, 1_000 + n * 10, "C:/tmp/n.mkv", None, false, None, None, "", "")
+                .unwrap();
+            store
+                .finish_recording(rid, 1_005 + n * 10, 1, Some(0), "completed", "C:/tmp/n.mkv", "")
+                .unwrap();
+        }
+
+        let page: Vec<i64> = store.recordings_all(3).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(!page.contains(&old_rolling), "the page must have crowded it out");
+
+        let section: Vec<i64> =
+            store.recordings_for_rolling().unwrap().into_iter().map(|r| r.id).collect();
+        assert!(section.contains(&old_rolling), "the section must still see it");
+        // Every take of the monitor, not just the rolling one: `group_recordings`
+        // decides broadcast boundaries from the gaps between neighbouring takes,
+        // so a filtered subset would group them differently.
+        assert_eq!(section.len(), 6, "all takes of a rolling monitor, not only the rolling ones");
+    }
+
+    /// A monitor with nothing rolling contributes nothing — the section's query
+    /// must not quietly become "the whole recording table".
+    #[test]
+    fn the_rolling_section_query_ignores_monitors_with_nothing_counting() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let rolling_mon = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let plain_mon = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        for mid in [rolling_mon, plain_mon] {
+            let rid = store
+                .insert_recording(mid, 100, "C:/tmp/a.mkv", None, false, None, None, "", "")
+                .unwrap();
+            store
+                .finish_recording(rid, 200, 1, Some(0), "completed", "C:/tmp/a.mkv", "")
+                .unwrap();
+            if mid == rolling_mon {
+                store.set_recording_rolling_ttl(rid, 3600).unwrap();
+            }
+        }
+        let mons: Vec<i64> =
+            store.recordings_for_rolling().unwrap().into_iter().map(|r| r.monitor_id).collect();
+        assert_eq!(mons, vec![rolling_mon]);
+
+        // An already-swept take is not "counting down", so its monitor drops
+        // out too once nothing else there is rolling.
+        let swept = store.recordings_for_rolling().unwrap()[0].id;
+        store.mark_rolling_expired(swept, 999).unwrap();
+        assert!(store.recordings_for_rolling().unwrap().is_empty());
     }
 
     /// The bug this pins, stated as an invariant: **anything the countdown

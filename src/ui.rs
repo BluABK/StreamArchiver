@@ -1986,6 +1986,11 @@ pub struct StreamArchiverApp {
     /// views. Loaded lazily on first visit to either; see
     /// `history::ensure_history_loaded`.
     history_all: Vec<Recording>,
+    /// Takes for the 🕰 Rolling recordings section, from its own unpaged query
+    /// (`Store::recordings_for_rolling`) rather than from `history_all` — that
+    /// section must not be limited by `history_load_limit`, since anything it
+    /// fails to list is a file that disappears without warning.
+    history_rolling: Vec<Recording>,
     history_loaded: bool,
     /// "Load more" cap for `recordings_all`; grows by 500 per click.
     history_load_limit: i64,

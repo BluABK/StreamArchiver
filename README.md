@@ -3258,13 +3258,18 @@ keeps its own retention (or opts out entirely).
   to clear.
 - **The 🕰 Rolling recordings section** at the top of 📥 Backlog lists
   everything still counting down, **soonest first** (a countdown list wants
-  urgency, not recency), with its remaining time — yellow-to-red by how much
+  urgency, not recency), **however old**, with its remaining time — yellow-to-red by how much
   of the retention is left, exactly as the 📺 Streams rows show it — and a
   **📌 Keep** button. It ignores the Show: watch-state chips on purpose: a
   file about to be deleted has to be visible whether or not you've watched
   it. Tick **Show kept** to also list the ones you've rescued, each with
   **↩ Unkeep**, which restarts the countdown from now rather than resuming it
-  (so un-keeping something old never deletes it seconds later).
+  (so un-keeping something old never deletes it seconds later). It also ignores
+  the **Load more** cap on the grid below: the section runs its own query, so a
+  week-old take counting down is listed even when the page only reaches back a
+  few hours. It used to be filtered out of the loaded page instead, which meant
+  the busier your archive the less this list could be trusted — the one place
+  that must never quietly omit something.
 - **Markers elsewhere.** *Every* level of the 📺 Streams tree shows the
   countdown, so no amount of collapsing can hide an imminent deletion:
   - **Take rows** — **🕰 6d 4h** while counting down, **🕰📌** once kept

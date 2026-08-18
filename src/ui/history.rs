@@ -589,6 +589,10 @@ impl StreamArchiverApp {
 
     pub(super) fn reload_history(&mut self) {
         self.history_all = self.core.store.recordings_all(self.history_load_limit).unwrap_or_default();
+        // Deliberately NOT a slice of `history_all`: the rolling section is the
+        // one list that must never be cut off by the page cap. See
+        // `Store::recordings_for_rolling`.
+        self.history_rolling = self.core.store.recordings_for_rolling().unwrap_or_default();
         self.history_watch = self.core.store.stream_watch_states().unwrap_or_default();
         self.history_loaded = true;
     }
@@ -767,6 +771,11 @@ impl StreamArchiverApp {
                         "These files are deleted automatically when their time runs out. \
                          Keep one to make it a normal archived stream — its history row \
                          survives either way, only the video goes.",
+                    )
+                    .on_hover_text(
+                        "Everything still counting down, however old — this list is not \
+                         limited by the Load more cap below it, and ignores the Show: \
+                         filters. If a file is going to be deleted, it is in here.",
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.checkbox(&mut self.backlog_show_kept, "Show kept")
@@ -906,6 +915,10 @@ impl StreamArchiverApp {
         self.ensure_history_loaded();
         let now = now_unix();
         let groups = flat_stream_groups(&self.history_all);
+        // The rolling section has its own unpaged set — building it from
+        // `groups` meant "Load more" silently decided what counted as
+        // expiring, and a week-old take counting down never appeared at all.
+        let rolling_groups = flat_stream_groups(&self.history_rolling);
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Show:");
@@ -957,9 +970,14 @@ impl StreamArchiverApp {
         // model below is built so it can still borrow `self` mutably.
         // Resolved before either table renders — both draw the same faces, and
         // this is the last thing here that needs `&mut self`.
-        let avatars = self.backlog_avatars(ui.ctx(), &groups);
+        let avatars = {
+            let mut both = groups.clone();
+            both.extend(rolling_groups.iter().cloned());
+            self.backlog_avatars(ui.ctx(), &both)
+        };
 
-        let rolling_acts = self.backlog_rolling_section(ui, &groups, &col_order, &avatars, now);
+        let rolling_acts =
+            self.backlog_rolling_section(ui, &rolling_groups, &col_order, &avatars, now);
         if !rolling_acts.is_empty() {
             for (rec_id, keep) in rolling_acts {
                 let _ = if keep {

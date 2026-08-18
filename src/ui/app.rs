@@ -749,6 +749,7 @@ impl StreamArchiverApp {
             chapters_popup_registry: PopupRegistry::default(),
             chapters_popup_cache: HashMap::new(),
             history_all: Vec::new(),
+            history_rolling: Vec::new(),
             history_loaded: false,
             history_load_limit: 500,
             history_watch: HashMap::new(),
