@@ -3052,12 +3052,19 @@ impl Rolling {
 
     /// When this take's file is due for disposal, or `None` while the capture
     /// is still running (nothing to count from yet).
+    ///
+    /// Still-recording wins over `from`: an Unkeep during a capture sets
+    /// `rolling_from`, and honouring it here would show a countdown the sweep
+    /// can never act on (it is gated on `ended_at IS NOT NULL`). A UI that
+    /// counts down to a deletion that will not happen is worse than no
+    /// countdown.
     pub fn deadline(&self, ended_at: Option<i64>) -> Option<i64> {
         if self.ttl_secs <= 0 {
             return None;
         }
-        let base = if self.from > 0 { Some(self.from) } else { ended_at };
-        base.map(|b| b + self.ttl_secs)
+        let ended_at = ended_at?;
+        let base = if self.from > 0 { self.from } else { ended_at };
+        Some(base + self.ttl_secs)
     }
 }
 

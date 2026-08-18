@@ -2154,9 +2154,9 @@ pub(super) fn rolling_take_badge(ui: &mut egui::Ui, t: &crate::models::Recording
         }
         RollingState::Expired { at } => {
             ui.weak("🕰🗑").on_hover_text(format!(
-                "Rolling recording expired on {} — the video file was deleted automatically \
-                 because its time ran out and it wasn't kept. Everything else about the take \
-                 (title, stats, chat log, chapters, notes) was preserved.",
+                "Rolling recording expired on {} — its time ran out and it wasn't kept, so \
+                 the video file is gone (deleted then, or already gone by then). Everything \
+                 else about the take (title, stats, chat log, chapters, notes) was preserved.",
                 fmt_datetime_short(at)
             ));
         }
@@ -2254,9 +2254,9 @@ pub(super) fn rolling_group_badge(
         }
         GroupRolling::Expired => {
             ui.weak("🕰🗑").on_hover_text(
-                "Rolling recording expired — the video file(s) were deleted automatically \
-                 because the time ran out and it wasn't kept. Everything else about the \
-                 broadcast (title, stats, chat log, chapters, notes) was preserved.",
+                "Rolling recording expired — the time ran out and it wasn't kept, so the \
+                 video file(s) are gone. Everything else about the broadcast (title, stats, \
+                 chat log, chapters, notes) was preserved.",
             );
         }
     }
@@ -2446,8 +2446,8 @@ pub(super) fn rolling_group_cell(
         }
         GroupRolling::Expired => {
             ui.weak("🗑").on_hover_text(
-                "Rolling recording expired — the file was deleted automatically; everything \
-                 else about it was preserved.",
+                "Rolling recording expired — the file is gone; everything else about it was \
+                 preserved.",
             );
         }
     }

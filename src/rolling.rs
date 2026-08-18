@@ -43,8 +43,10 @@ const SWEEP_INTERVAL_SECS: i64 = 60;
 ///
 /// A disposal failure is logged and **not** stamped as expired, so the next
 /// sweep retries — matching this codebase's "disposal failures never escalate"
-/// rule. A take whose file has already vanished is stamped without a disposal
-/// attempt.
+/// rule. A take whose file has already vanished — an empty `output_path`, or a
+/// path pointing at nothing — is stamped without a disposal attempt: its media
+/// is already in the state the countdown exists to produce, and leaving it
+/// unstamped is what made a channel read `🕰 38 (due)` for ever.
 pub async fn maybe_sweep_rolling(store: &Store, events: &EventTx, now: i64) {
     let last = store
         .get_setting(K_LAST_SWEEP)
@@ -68,9 +70,15 @@ pub async fn maybe_sweep_rolling(store: &Store, events: &EventTx, now: i64) {
     info!(count = due.len(), "rolling: disposing of expired recordings");
     for r in due {
         let path = std::path::PathBuf::from(&r.output_path);
-        // Already gone (moved/deleted outside the app): nothing to dispose of,
-        // but the take is still expired — stamp it so it stops being queried.
-        if crate::iomon::fs::metadata(crate::iomon::Cat::CacheSweep, &path).await.is_err() {
+        // Already gone — either the row has no path at all (its media went via
+        // manual delete or a relocation that cleared it) or the path points at
+        // nothing. Either way there is nothing to dispose of, but the take IS
+        // expired: stamp it so it stops counting down. `metadata("")` would
+        // error into the same branch, but only by accident, and the empty case
+        // is common enough to say out loud.
+        if r.output_path.trim().is_empty()
+            || crate::iomon::fs::metadata(crate::iomon::Cat::CacheSweep, &path).await.is_err()
+        {
             let _ = store.mark_rolling_expired(r.rec_id, now);
             let _ = store.update_recording_output_path(r.rec_id, "");
             let _ = events.send(AppEvent::RecordingUpdated { recording_id: r.rec_id });

@@ -144,10 +144,21 @@ impl Store {
     /// what [`crate::rolling`]'s sweep disposes of.
     ///
     /// Excludes, in order: non-rolling takes, already-kept ones, already-swept
-    /// ones, takes still recording (`ended_at IS NULL` — the clock only starts
-    /// when the capture finishes) and takes with no file left to delete. The
-    /// deadline mirrors `Rolling::deadline`: `rolling_from` when the user
-    /// un-kept it, otherwise `ended_at`.
+    /// ones, and takes still recording (`ended_at IS NULL` — the clock only
+    /// starts when the capture finishes). The deadline mirrors
+    /// `Rolling::deadline`: `rolling_from` when the user un-kept it, otherwise
+    /// `ended_at`.
+    ///
+    /// It deliberately does **not** exclude takes with an empty `output_path`.
+    /// It used to — "no file left to delete" reads like an obvious skip — and
+    /// that made every such take a permanent ghost: the countdown query
+    /// ([`Self::rolling_rollup_by_monitor`]) still counted it, so its channel
+    /// read `🕰 38 (due)` forever, while the sweep that would have stamped it
+    /// could not see it. A take whose media went elsewhere (manual delete, a
+    /// relocation that cleared the path) has *already* reached the end state
+    /// this countdown exists to produce; the sweep stamps it and moves on.
+    /// Anything the two queries disagree about is a bug by construction —
+    /// `every_counting_take_is_reachable_by_the_sweep` pins that.
     pub fn expired_rolling_recordings(&self, now: i64) -> Result<Vec<ExpiredRolling>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
@@ -157,7 +168,6 @@ impl Store {
                AND r.rolling_kept_at = 0
                AND r.rolling_expired_at = 0
                AND r.ended_at IS NOT NULL
-               AND COALESCE(r.output_path, '') != ''
                AND (CASE WHEN r.rolling_from > 0 THEN r.rolling_from ELSE r.ended_at END)
                    + r.rolling_ttl_secs <= ?1
              ORDER BY r.id",
@@ -393,10 +403,13 @@ impl Store {
         // The deadline expression mirrors `Rolling::deadline` exactly (see
         // `expired_rolling_recordings`, which sweeps on the same arithmetic):
         // count from `rolling_from` when an Unkeep restarted the clock, else
-        // from `ended_at`. A still-recording take has no `ended_at`, so its
-        // deadline is NULL — MIN() skips it while COUNT(*) still counts it,
-        // which is what "3 rolling, next in 2d" has to mean while one of them
-        // is being captured right now.
+        // from `ended_at`. A still-recording take has no deadline at all —
+        // MIN() skips it while COUNT(*) still counts it, which is what
+        // "3 rolling, next in 2d" has to mean while one of them is being
+        // captured right now. `ended_at IS NULL` is tested FIRST rather than
+        // relying on the ELSE branch to be NULL: an Unkeep on a live take sets
+        // `rolling_from`, which would otherwise hand it a deadline the sweep
+        // (gated on `ended_at IS NOT NULL`) could never act on.
         //
         // `rolling_ttl_secs` is a bare column beside a single MIN(), so SQLite
         // takes it from the row that MIN() selected — the TTL of the soonest
@@ -404,8 +417,9 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT monitor_id,
                     COUNT(*),
-                    MIN((CASE WHEN rolling_from > 0 THEN rolling_from ELSE ended_at END)
-                        + rolling_ttl_secs),
+                    MIN(CASE WHEN ended_at IS NULL THEN NULL
+                             WHEN rolling_from > 0 THEN rolling_from + rolling_ttl_secs
+                             ELSE ended_at + rolling_ttl_secs END),
                     rolling_ttl_secs
              FROM recording
              WHERE rolling_ttl_secs > 0 AND rolling_kept_at = 0 AND rolling_expired_at = 0
@@ -3926,6 +3940,9 @@ mod tests {
         store.keep_rolling_recording(kept, now).unwrap();
         let already_swept = take(4, TTL);
         store.mark_rolling_expired(already_swept, now).unwrap();
+        // No file left — still due. It has already reached the end state the
+        // countdown produces, and the sweep is the only thing that can stamp
+        // it; excluding it here is what made these rows read "due" for ever.
         let no_file = take(5, TTL);
         store.update_recording_output_path(no_file, "").unwrap();
         // Still recording: no `ended_at`, so the clock hasn't started.
@@ -3936,8 +3953,8 @@ mod tests {
 
         let got: Vec<i64> =
             store.expired_rolling_recordings(now).unwrap().into_iter().map(|r| r.rec_id).collect();
-        assert_eq!(got, vec![due], "only the genuinely-due take");
-        let _ = (not_rolling, kept, already_swept, no_file, recording);
+        assert_eq!(got, vec![due, no_file], "the due take and the one with nothing left to delete");
+        let _ = (not_rolling, kept, already_swept, recording);
 
         // One second before the deadline it isn't due yet.
         assert!(store.expired_rolling_recordings(ENDED + TTL - 1).unwrap().is_empty());
@@ -3946,6 +3963,69 @@ mod tests {
         let row = &store.expired_rolling_recordings(now).unwrap()[0];
         assert_eq!((row.monitor_id, row.channel_id), (mid, cid));
         assert_eq!(row.output_path, "C:/tmp/1.mkv");
+        // The sweep tells the two apart on this alone, so it has to survive.
+        assert_eq!(store.expired_rolling_recordings(now).unwrap()[1].output_path, "");
+    }
+
+    /// The bug this pins, stated as an invariant: **anything the countdown
+    /// badge shows as due must be something the sweep can reach.**
+    ///
+    /// `rolling_rollup_by_monitor` drives the `🕰 N (due)` badge and
+    /// `expired_rolling_recordings` drives the deletion. They are separate SQL
+    /// and they drifted: the sweep excluded takes with an empty `output_path`,
+    /// the rollup did not, so one such take dragged its whole channel's MIN()
+    /// into the past and pinned it at "due" with nothing able to clear it.
+    /// Zentreya sat at `🕰 38 (due)` for a week on the strength of one row.
+    #[test]
+    fn every_counting_take_is_reachable_by_the_sweep() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        const TTL: i64 = 3600;
+        const ENDED: i64 = 10_000;
+        let now = ENDED + TTL + 1;
+
+        // Every shape a rolling take can be in, including the ones that drifted.
+        let mut rolling = Vec::new();
+        for (n, path, end, unkeep) in [
+            (1_i64, "C:/tmp/1.mkv", true, false), // ordinary, due
+            (2, "", true, false),                 // media already gone
+            (3, "C:/tmp/3.mkv", false, false),    // still recording
+            (4, "C:/tmp/4.mkv", false, true),     // still recording, un-kept
+        ] {
+            let rid = store
+                .insert_recording(mid, n, "C:/tmp/x.mkv", None, false, None, None, "", "")
+                .unwrap();
+            if end {
+                store
+                    .finish_recording(rid, ENDED, 1, Some(0), "completed", path, "")
+                    .unwrap();
+            }
+            store.set_recording_rolling_ttl(rid, TTL).unwrap();
+            if unkeep {
+                // Unkeep stamps `rolling_from`, the one way a take can have a
+                // clock start that isn't `ended_at`.
+                store.unkeep_rolling_recording(rid, ENDED - TTL).unwrap();
+            }
+            store.update_recording_output_path(rid, path).unwrap();
+            rolling.push(rid);
+        }
+
+        let rollup = store.rolling_rollup_by_monitor().unwrap();
+        let got = rollup.get(&mid).expect("the monitor has rolling takes");
+        assert_eq!(got.count, rolling.len() as i64, "every rolling take is counted");
+
+        let due: Vec<i64> =
+            store.expired_rolling_recordings(now).unwrap().into_iter().map(|r| r.rec_id).collect();
+        // The badge says "due" exactly when the soonest deadline has passed —
+        // so when it does, the sweep must have something to work with.
+        let soonest = got.soonest.expect("two of them have ended, so there is a deadline");
+        assert!(soonest <= now, "the badge would read (due)");
+        assert!(!due.is_empty(), "...so the sweep must be able to clear it");
+        assert!(due.contains(&rolling[1]), "including the one with no file left");
+        // A take that never ended has no deadline to count down to, whichever
+        // way its clock was started — the sweep can't touch it either.
+        assert!(!due.contains(&rolling[2]) && !due.contains(&rolling[3]));
     }
 
     #[test]

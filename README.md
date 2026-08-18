@@ -3247,6 +3247,15 @@ keeps its own retention (or opts out entirely).
   folder / Recycle Bin / permanent), and the take's history row survives
   intact: title, stats, chat log, chapters and notes are all kept. Channel
   Stats and the Backlog entry stay correct; only the media is gone.
+- **A take whose file is already gone still expires on schedule.** If you
+  deleted the video by hand, or moved it somewhere the app lost track of, the
+  countdown has nothing left to delete — but it still finishes, and the take
+  is marked **🕰🗑 expired** when its time comes. It used to be skipped
+  instead, which sounds harmless and isn't: the take kept counting down for
+  ever, and because a channel's badge reports the *soonest* deadline anywhere
+  beneath it, one such take pinned its whole channel at **🕰 N (due)**
+  permanently. Nothing was wrong with the files; the badge simply had no way
+  to clear.
 - **The 🕰 Rolling recordings section** at the top of 📥 Backlog lists
   everything still counting down, **soonest first** (a countdown list wants
   urgency, not recency), with its remaining time — yellow-to-red by how much
@@ -3259,8 +3268,8 @@ keeps its own retention (or opts out entirely).
 - **Markers elsewhere.** *Every* level of the 📺 Streams tree shows the
   countdown, so no amount of collapsing can hide an imminent deletion:
   - **Take rows** — **🕰 6d 4h** while counting down, **🕰📌** once kept
-    ("kept from a rolling recording"), **🕰🗑** once expired ("the video was
-    auto-deleted, everything else was kept").
+    ("kept from a rolling recording"), **🕰🗑** once expired ("the video is
+    gone, everything else was kept").
   - **Stream (broadcast) rows** — the same badge, rolled up from that
     broadcast's takes (soonest deadline wins). A reconnect splits a broadcast
     into several takes under one retention, and this is the row the Keep
