@@ -956,12 +956,18 @@ the primary back to web. Hand-written SABR extractor-args are respected
 verbatim for public streams — the client swap only applies to the built-in
 preset.
 
-**🕶 Anonymous public YouTube** (Settings → Downloads, default on) completes
-the picture: public captures and video downloads run **without account
-cookies**. Cookies change what a PO token must be bound to (account identity
-instead of the anonymous visitor data the token server mints for), put the
-account inside YouTube's attestation experiments, and expose it to flagging —
-yt-dlp's own guidance is to pass cookies only when the content requires them.
+**🕶 Anonymous as a last resort** (Settings → Downloads, default on) is the
+bottom rung. Public captures and video downloads run **with** account cookies;
+anonymity is tried only after three captures in a row have failed with them and
+nothing was captured. It used to be the reverse — public content always captured
+anonymously, because cookies change what a PO token must be bound to (account
+identity instead of the anonymous visitor data the token server mints for), put
+the account inside YouTube's attestation experiments, and expose it to flagging.
+That reasoning was sound and held until **2026-08-18**, when YouTube began
+refusing every anonymous request from this network, on both clients — at which
+point anonymous-first meant capturing nothing at all. The rung is skipped
+entirely when the failures *are* the anonymous bot check, since that is a
+refusal of anonymity and the attempt cannot help.
 Cookies still attach automatically where entitlement genuinely needs them:
 members-only broadcasts, a video download that fails with a members-only /
 sign-in error (it retries with the configured cookies auth by itself), and —

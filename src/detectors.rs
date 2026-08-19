@@ -4993,10 +4993,17 @@ fn youtube_live_url(url: &str) -> String {
 
 /// How long to wait before paying for another `/streams`-tab check on a
 /// monitor whose `/live` page said offline. The page is ~1 MB and most
-/// offline polls have nothing to find, so this trades a few minutes of
-/// detection latency on gated broadcasts for not multiplying every YouTube
-/// monitor's bandwidth by its poll rate.
-const YT_STREAMS_FALLBACK_SECS: u64 = 300;
+/// offline polls have nothing to find, so this trades detection latency on
+/// gated broadcasts for not multiplying every YouTube monitor's bandwidth by
+/// its poll rate.
+///
+/// Raised from 300s on 2026-08-19. Measured: a `/live` page is 1,167 KB, and
+/// the scrape path was pulling ~45,000 pages a day (~50 GB) from one
+/// residential IP — very likely why YouTube began refusing anonymous requests
+/// from it. This is the *second* page fetched per offline monitor and only
+/// ever finds anything for gated broadcasts, so it is the cheapest thing to
+/// slow down. WebSub push (the VPS relay) is what actually notices a go-live.
+const YT_STREAMS_FALLBACK_SECS: u64 = 1800;
 
 /// Build the YouTube `/streams` (live tab) URL for a channel URL, normalizing a
 /// trailing `/live` or `/streams` first.

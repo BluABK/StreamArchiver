@@ -1978,7 +1978,22 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 96)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 96);
+        if version < 97 {
+            // `youtube_anonymous_public` became `youtube_anonymous_fallback`
+            // when the ladder inverted (2026-08-19): anonymity went from "how
+            // public YouTube is always captured" to "the last rung, after the
+            // cookie path has failed repeatedly". The two settings mean
+            // opposite things at the same value, so the old row is dropped
+            // rather than carried over — leaving it would only mislead the
+            // next person to read the table, and the new key's default (on,
+            // meaning "a last-resort attempt is allowed") is what we want
+            // either way.
+            conn.execute_batch(
+                "DELETE FROM app_settings WHERE key = 'youtube_anonymous_public';",
+            )?;
+            conn.pragma_update(None, "user_version", 97)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 97);
         Ok(())
     }
 }

@@ -2459,19 +2459,22 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
-                    ui.label("🕶 Anonymous public YouTube");
+                    ui.label("🕶 Anonymous as a last resort");
                     ui.checkbox(&mut self.settings.yt_anon_public, "").on_hover_text(
-                        "Capture and download PUBLIC YouTube content without account \
-                         cookies. Cookies change what a PO token must be bound to \
-                         (account identity instead of the anonymous visitor data the \
-                         token server mints for), put the account inside YouTube's \
-                         attestation experiments, and expose it to flagging. Account \
-                         cookies still attach where entitlement needs them: \
-                         members-only broadcasts, and a video download that failed \
-                         with a members-only / sign-in error (it retries with cookies \
-                         automatically). Note: a --cookies-from-browser line in the \
-                         yt-dlp user config (%APPDATA%\\yt-dlp\\config) would override \
-                         this — keep cookies out of that file.",
+                        "After three YouTube captures in a row fail WITH account cookies \
+                         and nothing is captured, allow ONE attempt without them — on the \
+                         chance that whatever is refusing the account will not refuse a \
+                         stranger. Cookies are the normal path.\n\n\
+                         It used to be the other way round: public YouTube always captured \
+                         anonymously, to keep the account out of YouTube attestation \
+                         experiments. That held until 2026-08-18, when YouTube began \
+                         refusing every anonymous request from this network — both clients, \
+                         measured — so anonymous-first meant capturing nothing at all.\n\n\
+                         Skipped when the failures ARE the anonymous bot check (Sign in to \
+                         confirm you are not a bot): that is a refusal of anonymity, so the \
+                         attempt cannot help. Note that a --cookies-from-browser line in \
+                         the yt-dlp user config applies to every run behind the app back — \
+                         keep cookies out of that file and let the app attach them.",
                     );
                     ui.end_row();
 

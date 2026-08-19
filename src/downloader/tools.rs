@@ -54,17 +54,31 @@ pub(crate) fn sabr_primary_client(store: &Store) -> String {
     }
 }
 
-/// Settings key: capture/download public YouTube content anonymously (no
-/// account cookies). Cookies change what a GVS PO token must be bound to
-/// (account identity instead of anonymous visitor data — the binding bgutil
-/// mints for) and put the account inside YouTube's attestation experiments,
-/// so they are attached only where entitlement actually needs them:
-/// members-only broadcasts, and the cookie-escalation retry of a video
-/// download that failed with a members/sign-in error. Default ON.
-pub const K_YT_ANON_PUBLIC: &str = "youtube_anonymous_public";
+/// Settings key: try public YouTube content **anonymously as a last resort**,
+/// after the cookie path has failed repeatedly.
+///
+/// This used to mean "always capture public YouTube anonymously", and was on
+/// by default: cookies change what a GVS PO token must be bound to (account
+/// identity instead of the anonymous visitor data bgutil mints for) and put
+/// the account inside YouTube's attestation experiments. Sound reasoning, and
+/// it held until 2026-08-18, when YouTube began refusing *every* anonymous
+/// request from this network — both clients, measured — and anonymous-first
+/// meant capturing nothing at all.
+///
+/// So the ladder inverted. Cookies are the normal path; anonymity is the rung
+/// tried only once cookies have failed [`ANON_FALLBACK_AFTER`] times in a row
+/// with nothing captured, on the theory that whatever is refusing the account
+/// might not refuse a stranger. Off means never try it.
+pub const K_YT_ANON_PUBLIC: &str = "youtube_anonymous_fallback";
 
-/// Whether public YouTube captures/downloads should skip account cookies.
-pub(crate) fn yt_anonymous_public(store: &Store) -> bool {
+/// Consecutive failed captures on the cookie path before a monitor is allowed
+/// one anonymous attempt. Low enough to be reached within a broadcast, high
+/// enough that an ordinary blip (a stall, a restart) never spends it.
+pub const ANON_FALLBACK_AFTER: u32 = 3;
+
+/// Whether an anonymous last-resort attempt is permitted at all. Default ON —
+/// as a *fallback* it costs nothing until the cookie path is already failing.
+pub(crate) fn yt_anonymous_fallback(store: &Store) -> bool {
     match store.get_setting(K_YT_ANON_PUBLIC) {
         Ok(Some(v)) => v != "0",
         _ => true,
@@ -110,7 +124,7 @@ pub(crate) fn apply_yt_client_policy(store: &Store, monitor_id: i64, sabr: &mut 
 /// caller can log it in its own context.
 pub(crate) fn yt_public_auth(store: &Store, monitor_id: i64, auth: &mut AuthSource) -> bool {
     if !matches!(auth, AuthSource::None)
-        && yt_anonymous_public(store)
+        && yt_anonymous_fallback(store)
         && !store.monitor_members_only(monitor_id)
     {
         *auth = AuthSource::None;

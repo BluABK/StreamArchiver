@@ -3138,24 +3138,17 @@ progress_info: None,
             &global_method,
             &global_browser,
         );
-        // Public YouTube videos download anonymously (default on): cookies
-        // change the PO-token binding and put the account inside YouTube's
-        // attestation experiments. If the video actually needs entitlement,
-        // the retry loop below escalates to the configured cookies auth on a
-        // members-only / sign-in error.
-        let yt_anon = Platform::detect(&video.url) == Platform::YouTube
-            && !matches!(auth_full, AuthSource::None)
-            && yt_anonymous_public(&self.store);
-        let mut auth = if yt_anon {
-            info!(
-                video = id,
-                "downloading anonymously (public YouTube; cookies attach only if \
-                 the video turns out to need entitlement)"
-            );
-            AuthSource::None
-        } else {
-            auth_full.clone()
-        };
+        // Video downloads start WITH cookies now (see `K_YT_ANON_PUBLIC`): as
+        // of 2026-08-18 YouTube refuses anonymous requests from this network
+        // outright, so anonymous-first meant downloading nothing. Anonymity is
+        // still reachable, but from the other end — the retry loop escalates a
+        // members-only / sign-in failure, and a download that keeps failing
+        // WITH cookies is the case an anonymous attempt might yet help.
+        //
+        // A download is one-shot with its own retry loop, unlike a capture's
+        // per-monitor failure chain, so it has no rung counter to consult: it
+        // simply starts authenticated.
+        let mut auth = auth_full.clone();
         // Optionally resolve the real title + channel + id (for
         // {title}/{channel}/{video_id}/{name} and the list display).
         let (title, channel, mut video_id) = if video.auto_title {
@@ -3555,6 +3548,13 @@ progress_info: None,
             .get(&monitor_id)
             .map(|b| b.po_rejected)
             .unwrap_or(false)
+    }
+
+    /// How many captures this monitor has failed in a row (0 once one
+    /// succeeds — success removes the whole backoff entry). Drives the
+    /// anonymous last-resort rung; the backoff ladder reads the same count.
+    fn consecutive_fails(&self, monitor_id: i64) -> u32 {
+        self.backoff.lock().unwrap().get(&monitor_id).map(|b| b.fails).unwrap_or(0)
     }
 
     /// Whether this monitor's next capture should keep its account cookies
@@ -4320,22 +4320,31 @@ progress_info: None,
         // YouTube's attestation experiments. Members-only broadcasts keep the
         // cookies — entitlement lives on the account.
         if row.monitor.platform() == Platform::YouTube {
-            // A bot-walled monitor keeps its cookies. Anonymity is a privacy
-            // preference; this refusal makes it a dead end, and repeating the
-            // same anonymous attempt is what turned one wall into 144 identical
-            // failures over two days.
-            if self.bot_wall_pending(row.monitor.id) {
+            // Cookies are the normal path. Anonymity is the LAST rung: tried
+            // only once the cookie path has failed `ANON_FALLBACK_AFTER` times
+            // in a row with nothing captured, and never when the failure was
+            // YouTube's anonymous bot check — that refusal is precisely a
+            // refusal of anonymity, so spending the rung on it is guaranteed
+            // waste (and repeating it is what turned one wall into 144
+            // identical failures over two days).
+            let walled = self.bot_wall_pending(row.monitor.id);
+            let rung_reached = self.consecutive_fails(row.monitor.id) >= ANON_FALLBACK_AFTER;
+            if !walled
+                && rung_reached
+                && yt_public_auth(&self.store, row.monitor.id, &mut auth)
+            {
                 info!(
                     monitor_id = row.monitor.id,
-                    "🤖 previous take hit YouTube's anonymous bot check {} — keeping \
-                     account cookies for this take instead of capturing anonymously",
+                    fails = self.consecutive_fails(row.monitor.id),
+                    "🕶 cookie captures keep failing {} — trying this take anonymously \
+                     as a last resort",
                     row.monitor.platform().tag()
                 );
-            } else if yt_public_auth(&self.store, row.monitor.id, &mut auth) {
+            } else if walled {
                 info!(
                     monitor_id = row.monitor.id,
-                    "capturing anonymously (public YouTube broadcast; account cookies \
-                     are reserved for members-only) {}",
+                    "🤖 previous take hit YouTube's anonymous bot check {} — capturing \
+                     with account cookies on the web client",
                     row.monitor.platform().tag()
                 );
             }
