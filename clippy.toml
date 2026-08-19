@@ -3,6 +3,8 @@
 # monitor sees it — see src/iomon.rs. Test fixtures, build.rs, and the facade
 # itself opt out with #[allow(clippy::disallowed_methods)].
 disallowed-methods = [
+    # --- in-process HTTP: bodies must be counted (see NetKind::Detection) ---
+    { path = "reqwest::Response::text", reason = "use crate::detectors::read_body so the traffic is counted" },
     # --- std::fs free functions ---
     { path = "std::fs::read", reason = "use crate::iomon::fs::read_sync so the I/O monitor sees it" },
     { path = "std::fs::read_to_string", reason = "use crate::iomon::fs::read_to_string_sync so the I/O monitor sees it" },

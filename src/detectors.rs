@@ -763,6 +763,26 @@ fn file_ocr_cli_failed_alert(
     }
 }
 
+/// Read a response body and account its size as [`NetKind::Detection`].
+///
+/// Every in-process HTTP read goes through here, the same way every
+/// filesystem operation goes through `iomon::fs` — and for the same reason:
+/// traffic nobody counts is traffic nobody notices. The sampler measures per
+/// tool process, so the app's own requests were attributed nowhere, and the
+/// scrape path quietly grew to ~45,000 YouTube pages a day (~1.1 MB each)
+/// before anyone had a number for it.
+///
+/// Counts the decoded body only — headers and TLS overhead are ignored rather
+/// than estimated, because a bandwidth readout that guesses is worse than one
+/// that is honestly a lower bound. `clippy.toml` disallows
+/// `reqwest::Response::text` so a new call site cannot skip this by accident.
+#[allow(clippy::disallowed_methods)]
+pub(crate) async fn read_body(resp: reqwest::Response) -> reqwest::Result<String> {
+    let body = resp.text().await?;
+    crate::iomon::note_net_bytes(crate::iomon::NetKind::Detection, body.len() as u64);
+    Ok(body)
+}
+
 impl DetectContext {
     pub fn new(store: Arc<Store>, events: EventTx) -> DetectContext {
         let browser = store
@@ -938,7 +958,7 @@ impl DetectContext {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_body(resp).await.unwrap_or_default();
             bail!("Twitch token request failed: {status} {body}");
         }
 
@@ -2302,7 +2322,7 @@ impl DetectContext {
         if !resp.status().is_success() {
             return None;
         }
-        let body = resp.text().await.ok()?;
+        let body = read_body(resp).await.ok()?;
         let mut segs = parse_youtube_schedule(&body);
         // Shape-independent fallback: if the structured `ytInitialData` walk found
         // nothing (Polymer markup drift), scan the raw page for scheduled-start
@@ -2669,7 +2689,7 @@ impl DetectContext {
         if !resp.status().is_success() {
             return None;
         }
-        let body = resp.text().await.ok()?;
+        let body = read_body(resp).await.ok()?;
         let data = extract_json_after(&body, "ytInitialData")?;
 
         let mut imgs: Vec<String> = Vec::new();
@@ -2900,7 +2920,7 @@ impl DetectContext {
         if !resp.status().is_success() {
             return;
         }
-        let Ok(body) = resp.text().await else { return };
+        let Ok(body) = read_body(resp).await else { return };
         let Some(data) = extract_json_after(&body, "ytInitialData") else {
             return;
         };
@@ -3237,7 +3257,7 @@ impl DetectContext {
         if !resp.status().is_success() {
             return None;
         }
-        let body = resp.text().await.ok()?;
+        let body = read_body(resp).await.ok()?;
         let img = first_twimg_media(&body)?;
         let dest = self.schedule_src_path(row, "twitter", url_image_ext(&img));
         crate::assets::download_image(&self.http, &img, &dest).await.ok()?;
@@ -3756,7 +3776,7 @@ impl DetectContext {
         let resp = self.fingerprint.apply_yt_nav_headers(rb).send().await;
         match resp {
             Ok(r) => {
-                let body = r.text().await.unwrap_or_default();
+                let body = read_body(r).await.unwrap_or_default();
                 // Prefer the structured player response: `videoDetails.isLive` is
                 // authoritative and stays `false` for ended/upcoming streams even
                 // when other live-related strings (e.g. `hqdefault_live`, or
@@ -3868,7 +3888,7 @@ impl DetectContext {
         // the throttle makes above, and just as important: a single dropped
         // request would otherwise report a live gated stream as offline.
         let body = match self.fingerprint.apply_yt_nav_headers(rb).send().await {
-            Ok(r) => match r.text().await {
+            Ok(r) => match read_body(r).await {
                 Ok(b) => b,
                 Err(e) => {
                     debug!(monitor_id = item.monitor_id, "youtube /streams read failed: {e}");
@@ -3932,7 +3952,7 @@ impl DetectContext {
             debug!("youtube_stream_meta: {live_url} got HTTP {status}");
             return MetaFetch::Failed;
         }
-        let body = match resp.text().await {
+        let body = match read_body(resp).await {
             Ok(b) => b,
             Err(e) => {
                 debug!("youtube_stream_meta: reading the body for {live_url} failed: {e}");
@@ -6014,16 +6034,14 @@ pub(crate) async fn youtube_playability(
     video_id: &str,
 ) -> Option<(String, String)> {
     let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let body = client
+    let resp = client
         .get(&url)
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
         .send()
         .await
-        .ok()?
-        .text()
-        .await
         .ok()?;
+    let body = read_body(resp).await.ok()?;
     let pr = extract_json_after(&body, "ytInitialPlayerResponse")?;
     let status = pr["playabilityStatus"]["status"].as_str().unwrap_or_default().to_string();
     let reason = pr["playabilityStatus"]["reason"].as_str().unwrap_or_default().to_string();

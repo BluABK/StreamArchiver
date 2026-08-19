@@ -629,7 +629,7 @@ async fn scrape_uc(http: &Client, url: &str) -> Option<String> {
         .send()
         .await
         .ok()?;
-    let body = resp.text().await.ok()?;
+    let body = crate::detectors::read_body(resp).await.ok()?;
     find_uc(&body)
 }
 

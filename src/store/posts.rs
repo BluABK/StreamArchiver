@@ -585,6 +585,204 @@ impl Store {
     /// and total archived bytes — the raw series the Stats view buckets
     /// in-memory into the Day/Week/Month/Year recordings breakdown (one
     /// query covers every period; no per-period SQL needed).
+    /// Why captures failed, over 7 days / 30 days / all time.
+    ///
+    /// Classified from `log_excerpt`, since none of these causes has a column
+    /// — every one of them was identified after the fact, from logs that
+    /// happened to still be there. Two consequences worth knowing:
+    ///
+    /// * **Most specific cause wins.** A log can carry more than one marker (a
+    ///   disk-full take often mentions a token too). Each row excludes the
+    ///   ones above it, so the rows sum to the failure total instead of
+    ///   over-counting. The order is deliberate: refusals (the bot wall,
+    ///   entitlement) outrank a token complaint, which outranks a local fault.
+    /// * **It only sees what the excerpt kept.** A truncated log can hide its
+    ///   own cause and lands in "unclassified" — so that row is a floor on the
+    ///   unknowns, never a claim that nothing else is wrong.
+    ///
+    /// Costs a full scan of `log_excerpt` (~22 MB over 3.8k rows on a real
+    /// archive: 108 ms). Snapshot it on tab load like its neighbours; never
+    /// call it from a render path.
+    pub fn capture_failure_stats(&self) -> Result<Vec<CaptureFailureStat>> {
+        // (key, label, LIKE pattern). Order = precedence, most specific first.
+        const CAUSES: &[(&str, &str, &str)] = &[
+            ("bot_wall", "Anonymous bot check", "%Sign in to confirm%"),
+            ("members_only", "Members-only / not entitled", "%members-only%"),
+            ("sub_only", "Subscriber-only (Twitch)", "%UNAUTHORIZED_ENTITLEMENTS%"),
+            ("po_token", "GVS PO token rejected", "%GVS PO Token%"),
+            ("attestation", "Attestation required", "%ATTESTATION_REQUIRED%"),
+            ("disk_full", "No space left on device", "%No space left on device%"),
+            ("not_live", "Channel was not live", "%not currently live%"),
+        ];
+        let conn = self.db();
+        let now = crate::models::now_unix();
+        let (d7, d30) = (now - 7 * 86_400, now - 30 * 86_400);
+
+        // Accumulates the patterns already claimed, so each row counts only
+        // the logs no earlier cause matched.
+        let mut prior: Vec<&str> = Vec::new();
+        let mut out: Vec<CaptureFailureStat> = Vec::new();
+        let exclusions = |prior: &[&str]| -> String {
+            prior.iter().map(|p| format!(" AND log_excerpt NOT LIKE '{p}'")).collect()
+        };
+        for (key, label, pat) in CAUSES {
+            let sql = format!(
+                "SELECT COALESCE(SUM(started_at >= ?2), 0),
+                        COALESCE(SUM(started_at >= ?3), 0),
+                        COUNT(*), COALESCE(MAX(started_at), 0)
+                 FROM recording
+                 WHERE status = 'failed' AND log_excerpt LIKE ?1{}",
+                exclusions(&prior)
+            );
+            let (last_7d, last_30d, total, last_at) =
+                conn.query_row(&sql, params![pat, d7, d30], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
+            out.push(CaptureFailureStat {
+                cause: (*key).into(),
+                label: (*label).into(),
+                last_7d,
+                last_30d,
+                total,
+                last_at,
+            });
+            prior.push(pat);
+        }
+
+        // Whatever is left: the same exclusions, no pattern of its own.
+        let sql = format!(
+            "SELECT COALESCE(SUM(started_at >= ?1), 0),
+                    COALESCE(SUM(started_at >= ?2), 0),
+                    COUNT(*), COALESCE(MAX(started_at), 0)
+             FROM recording
+             WHERE status = 'failed'{}",
+            exclusions(&prior)
+        );
+        let (last_7d, last_30d, total, last_at) = conn.query_row(&sql, params![d7, d30], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        out.push(CaptureFailureStat {
+            cause: "other".into(),
+            label: "Unclassified".into(),
+            last_7d,
+            last_30d,
+            total,
+            last_at,
+        });
+        Ok(out)
+    }
+
+    /// Capture outcomes per platform over the last `days` — the denominator
+    /// the failure breakdown is meaningless without.
+    ///
+    /// Platform comes from the instance URL, the way it does everywhere else
+    /// (there is no `monitor.platform` column).
+    pub fn platform_outcome_stats(&self, days: i64) -> Result<Vec<PlatformOutcomeStat>> {
+        let conn = self.db();
+        let since = crate::models::now_unix() - days.max(1) * 86_400;
+        let mut stmt = conn.prepare(
+            "SELECT CASE
+                        WHEN m.url LIKE '%youtube%' THEN 'YouTube'
+                        WHEN m.url LIKE '%twitch%'  THEN 'Twitch'
+                        WHEN m.url LIKE '%kick%'    THEN 'Kick'
+                        ELSE 'Other' END AS platform,
+                    COALESCE(SUM(r.status = 'completed'), 0),
+                    COALESCE(SUM(r.status = 'failed'), 0),
+                    COALESCE(SUM(r.status = 'not_recorded'), 0),
+                    COALESCE(SUM(CASE WHEN r.status = 'completed' THEN r.bytes ELSE 0 END), 0)
+             FROM recording r JOIN monitor m ON m.id = r.monitor_id
+             WHERE r.started_at >= ?1
+             GROUP BY platform
+             ORDER BY 2 + 3 DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                Ok(PlatformOutcomeStat {
+                    platform: r.get(0)?,
+                    completed: r.get(1)?,
+                    failed: r.get(2)?,
+                    not_recorded: r.get(3)?,
+                    bytes: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// What each channel is storing, **per drive** — the Stats view's
+    /// storage-by-channel table, and the answer to "what is filling G:".
+    ///
+    /// Split by drive rather than summed per channel: a channel whose old
+    /// takes were moved to another disk would otherwise inflate the row for
+    /// the disk you are trying to clear, which is the exact confusion this
+    /// table exists to remove.
+    ///
+    /// Read from the current `output_path`, so a take whose media has been
+    /// disposed of (path cleared) contributes nothing, and a take relocated to
+    /// another drive counts against its new one. Recordings and downloads stay
+    /// in separate columns: different owners, different remedies ("stop
+    /// recording this channel" vs "delete these downloads").
+    ///
+    /// Two honest limits:
+    ///
+    /// * **Downloads join by NAME.** The `video` table has no `channel_id`,
+    ///   only the text `channel` yt-dlp reported, so a download merges with a
+    ///   monitored channel's row only when those strings match exactly.
+    ///   Anything else appears as its own row with `channel_id` 0 — visible
+    ///   and attributable, just not linked.
+    /// * **`bytes` is the recorded size, not a fresh stat.** A take whose file
+    ///   vanished outside the app still counts until its row is disposed of —
+    ///   the same caveat as `drive_letters_by_monitor`.
+    pub fn channel_drive_usage(&self) -> Result<Vec<ChannelDriveUsage>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "WITH takes AS (
+                 SELECT UPPER(SUBSTR(r.output_path, 1, 1)) AS drv, c.name AS nm,
+                        MAX(c.id) AS cid, COUNT(*) AS n,
+                        COALESCE(SUM(r.bytes), 0) AS b,
+                        COALESCE(MAX(r.started_at), 0) AS newest
+                 FROM recording r
+                 JOIN monitor m ON m.id = r.monitor_id
+                 JOIN channel c ON c.id = m.channel_id
+                 WHERE r.output_path != '' AND SUBSTR(r.output_path, 2, 1) = ':'
+                 GROUP BY drv, nm
+             ),
+             dls AS (
+                 SELECT UPPER(SUBSTR(v.output_path, 1, 1)) AS drv,
+                        COALESCE(NULLIF(TRIM(v.channel), ''), '(no channel)') AS nm,
+                        COUNT(*) AS n, COALESCE(SUM(v.bytes), 0) AS b
+                 FROM video v
+                 WHERE v.output_path != '' AND SUBSTR(v.output_path, 2, 1) = ':'
+                 GROUP BY drv, nm
+             ),
+             keys AS (SELECT drv, nm FROM takes UNION SELECT drv, nm FROM dls)
+             SELECT k.drv, COALESCE(t.cid, 0), k.nm,
+                    COALESCE(t.n, 0), COALESCE(t.b, 0),
+                    COALESCE(d.n, 0), COALESCE(d.b, 0),
+                    COALESCE(t.newest, 0)
+             FROM keys k
+             LEFT JOIN takes t ON t.drv = k.drv AND t.nm = k.nm
+             LEFT JOIN dls   d ON d.drv = k.drv AND d.nm = k.nm
+             ORDER BY k.drv, COALESCE(t.b, 0) + COALESCE(d.b, 0) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let drive: String = r.get(0)?;
+                Ok(ChannelDriveUsage {
+                    drive: drive.chars().next().unwrap_or('?'),
+                    channel_id: r.get(1)?,
+                    channel: r.get(2)?,
+                    takes: r.get(3)?,
+                    take_bytes: r.get(4)?,
+                    downloads: r.get(5)?,
+                    download_bytes: r.get(6)?,
+                    newest_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn recordings_daily_stats(&self) -> Result<Vec<DailyRecordingStat>> {
         let conn = self.db();
         let mut st = conn.prepare(
@@ -680,6 +878,83 @@ const POLL_HISTORY_RETENTION_SECS: i64 = 60 * 86_400;
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    /// Causes are counted most-specific-first and each excludes the ones
+    /// above it, so a log mentioning two things is attributed once and the
+    /// rows sum to the failure total. Without that, a single disk-full take
+    /// whose log also names a token would be counted twice and the breakdown
+    /// would total more than the failures it describes.
+    #[test]
+    fn failure_causes_are_attributed_once_and_sum_to_the_total() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let now = crate::models::now_unix();
+        let fail = |n: i64, log: &str| {
+            let rid = store
+                .insert_recording(mid, now - n, "C:/tmp/a.mkv", None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, now, 0, Some(1), "failed", "", log).unwrap();
+        };
+        fail(10, "ERROR: Sign in to confirm you are not a bot");
+        fail(20, "ERROR: No space left on device");
+        // Both markers: the refusal is more specific, so it must not also be
+        // counted as a token failure.
+        fail(30, "sps:ATTESTATION_REQUIRED ... Sign in to confirm you are not a bot");
+        fail(40, "ERROR: something nobody has classified yet");
+        // A COMPLETED take mentioning a marker is not a failure at all.
+        let ok = store
+            .insert_recording(mid, now - 50, "C:/tmp/b.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(ok, now, 5, Some(0), "completed", "C:/tmp/b.mkv", "No space left on device")
+            .unwrap();
+
+        let stats = store.capture_failure_stats().unwrap();
+        let by = |k: &str| stats.iter().find(|s| s.cause == k).unwrap().clone();
+        assert_eq!(by("bot_wall").total, 2, "both bot-wall logs, including the double-marked one");
+        assert_eq!(by("attestation").total, 0, "already claimed by the more specific cause");
+        assert_eq!(by("disk_full").total, 1);
+        assert_eq!(by("other").total, 1);
+        assert_eq!(stats.iter().map(|s| s.total).sum::<i64>(), 4, "rows sum to the failures");
+        assert!(by("bot_wall").last_7d >= 2 && by("bot_wall").last_at > 0);
+    }
+
+    /// The table exists to answer "what is filling THIS disk", so a channel
+    /// with takes on two drives must appear as two rows — summing it into one
+    /// is exactly the pollution the split is for. And a disposed take (path
+    /// cleared) has to vanish from the drive it used to sit on.
+    #[test]
+    fn storage_is_split_per_drive_and_forgets_disposed_takes() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let take = |n: i64, path: &str, bytes: i64| -> i64 {
+            let rid = store
+                .insert_recording(mid, n, path, None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, n + 10, bytes, Some(0), "completed", path, "").unwrap();
+            rid
+        };
+        take(100, r"G:\streams\a.mkv", 3_000);
+        take(200, r"G:\streams\b.mkv", 1_000);
+        take(300, r"P:\streams\c.mkv", 9_000);
+        let gone = take(400, r"G:\streams\d.mkv", 5_000);
+
+        let rows = store.channel_drive_usage().unwrap();
+        let on = |d: char| rows.iter().find(|r| r.drive == d).unwrap().clone();
+        assert_eq!(rows.len(), 2, "one row per drive, never summed together");
+        assert_eq!((on('G').takes, on('G').take_bytes), (3, 9_000));
+        assert_eq!((on('P').takes, on('P').take_bytes), (1, 9_000));
+        assert_eq!(on('G').newest_at, 400);
+
+        // Disposing of the media takes it off G: entirely.
+        store.clear_recording_media(gone, 999).unwrap();
+        let rows = store.channel_drive_usage().unwrap();
+        let on = |d: char| rows.iter().find(|r| r.drive == d).unwrap().clone();
+        assert_eq!((on('G').takes, on('G').take_bytes), (2, 4_000));
+        assert_eq!(on('P').take_bytes, 9_000, "the other drive is untouched");
+    }
 
     #[test]
     fn poll_history_upserts_aggregates_and_prunes() {

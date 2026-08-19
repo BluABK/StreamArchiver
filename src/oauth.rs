@@ -72,7 +72,7 @@ pub async fn start_device(http: &Client, client_id: &str) -> Result<DeviceCode> 
         let s = resp.status();
         bail!(
             "device code request failed: {s} {}",
-            resp.text().await.unwrap_or_default()
+            crate::detectors::read_body(resp).await.unwrap_or_default()
         );
     }
     let v: Value = resp.json().await?;
@@ -163,7 +163,7 @@ pub async fn refresh(
     let resp = http.post(TOKEN_URL).form(&form).send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::detectors::read_body(resp).await.unwrap_or_default();
         bail!("token refresh failed: {status} — {body}");
     }
     let v: Value = resp.json().await?;

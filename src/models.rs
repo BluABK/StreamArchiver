@@ -2999,6 +2999,74 @@ pub struct DailyRecordingStat {
     pub bytes: i64,
 }
 
+/// Why captures are failing, over a window — the Stats view's failure
+/// breakdown.
+///
+/// Classified from the take's stored `log_excerpt` rather than a column,
+/// because the causes worth counting were only identified after the failures
+/// happened and nothing was recording them at the time. Classification is
+/// therefore best-effort and by design **non-exclusive at the source**: one
+/// log can mention two things. `Store::capture_failure_stats` resolves that by
+/// counting the most specific cause first (see its docs), so the rows sum to
+/// the failure total.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureFailureStat {
+    /// Stable key (`bot_wall`, `po_token`, `disk_full`, …) — also the sort
+    /// order the UI shows, most actionable first.
+    pub cause: String,
+    /// Human label for the row.
+    pub label: String,
+    pub last_7d: i64,
+    pub last_30d: i64,
+    pub total: i64,
+    /// Most recent occurrence (unix secs), 0 if never.
+    pub last_at: i64,
+}
+
+/// Capture outcomes for one platform over a window — the headline beside the
+/// failure breakdown, so a cause count can be read against how much was
+/// attempted rather than in isolation.
+#[derive(Clone, Debug, Default)]
+pub struct PlatformOutcomeStat {
+    pub platform: String,
+    pub completed: i64,
+    pub failed: i64,
+    pub not_recorded: i64,
+    pub bytes: i64,
+}
+
+/// How much one channel is storing **on one drive** — the Stats view's
+/// storage-by-channel table.
+///
+/// Split by drive on purpose: the whole point is to find what is filling a
+/// specific disk, and a channel whose old takes were moved to another drive
+/// would otherwise inflate the row for the drive you are trying to clear.
+/// Rows come from the takes' current `output_path`, so a take whose media has
+/// been disposed of (path cleared) contributes to nothing.
+#[derive(Clone, Debug, Default)]
+pub struct ChannelDriveUsage {
+    /// Uppercased drive letter (`G`), or `?` for a non-drive path.
+    pub drive: char,
+    pub channel_id: i64,
+    pub channel: String,
+    /// Live recordings archived by this channel on this drive.
+    pub takes: i64,
+    pub take_bytes: i64,
+    /// Manual/VOD downloads (the `video` table) landing on this drive.
+    pub downloads: i64,
+    pub download_bytes: i64,
+    /// Newest take start on this drive (unix secs) — tells you whether this is
+    /// a live problem or a dead archive you can move.
+    pub newest_at: i64,
+}
+
+impl ChannelDriveUsage {
+    /// Everything this channel stores on this drive.
+    pub fn total_bytes(&self) -> i64 {
+        self.take_bytes + self.download_bytes
+    }
+}
+
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};

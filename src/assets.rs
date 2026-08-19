@@ -2204,7 +2204,7 @@ async fn fetch_youtube_page_banner(
     if !resp.status().is_success() {
         bail!("YouTube channel page: {}", resp.status());
     }
-    let body = resp.text().await?;
+    let body = crate::detectors::read_body(resp).await?;
     let data = crate::detectors::extract_json_after(&body, "ytInitialData")
         .ok_or_else(|| anyhow::anyhow!("ytInitialData not found"))?;
     let banner_url = youtube_banner_from_page_data(&data)
@@ -2733,7 +2733,7 @@ async fn fetch_youtube_about(
         let rb = if let Some(fp) = fingerprint { fp.apply_yt_nav_headers(rb) } else { rb };
         match rb.send().await {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.text().await
+                if let Ok(body) = crate::detectors::read_body(resp).await
                     && let Some(data) = crate::detectors::extract_json_after(&body, "ytInitialData")
                     && let Some(hit) = youtube_about_from_page_data(&data)
                 {

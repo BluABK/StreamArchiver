@@ -487,7 +487,9 @@ pub async fn build_playlist(
     max_secs: Option<f64>,
     skip_secs: Option<f64>,
 ) -> anyhow::Result<RecoveredPlaylist> {
-    let mut src = client.get(playlist_url).send().await?.error_for_status()?.text().await?;
+    let mut src =
+        crate::detectors::read_body(client.get(playlist_url).send().await?.error_for_status()?)
+            .await?;
     if let Some(cap) = max_secs {
         src = match skip_secs {
             Some(skip) => truncate_playlist_window(&src, skip, cap),
@@ -1355,7 +1357,7 @@ pub mod scrape {
         url: &str,
         site: Site,
     ) -> anyhow::Result<i64> {
-        let html = client.get(url).send().await?.error_for_status()?.text().await?;
+        let html = crate::detectors::read_body(client.get(url).send().await?.error_for_status()?).await?;
         match site {
             Site::TwitchTracker => parse_twitchtracker(&html),
             Site::StreamsCharts => parse_streamscharts(&html),

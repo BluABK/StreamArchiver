@@ -2580,6 +2580,18 @@ pub struct StreamArchiverApp {
     /// Per-day recording count/bytes series backing the Recordings
     /// Day/Week/Month/Year breakdown — loaded/refreshed with `stats_snapshot`.
     stats_recordings_daily: Option<Vec<DailyRecordingStat>>,
+    /// Why captures are failing + per-platform outcomes, loaded with
+    /// `stats_snapshot`. The failure query scans every `log_excerpt`
+    /// (~100 ms on a real archive), so it is snapshot-once, never per frame.
+    stats_failures: Option<(
+        Vec<crate::models::CaptureFailureStat>,
+        Vec<crate::models::PlatformOutcomeStat>,
+    )>,
+    /// Storage per (drive, channel) for the Stats view's 🖴 table.
+    stats_storage: Option<Vec<crate::models::ChannelDriveUsage>>,
+    /// Which drive the 🖴 table is showing (`None` = every drive). Session
+    /// only: it is a lens on one disk's problem, not a preference.
+    stats_storage_drive: Option<char>,
     /// Selected period for the Recordings breakdown (session-only).
     recordings_period: RecordingsPeriod,
     /// Cached 🤝 collab-partner overview (login, name, sessions, last seen)

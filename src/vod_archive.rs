@@ -259,7 +259,7 @@ pub async fn resolve_kick_vod(
     went_live_at: Option<i64>,
 ) -> Option<String> {
     let url = format!("https://kick.com/api/v2/channels/{slug}/videos");
-    let body = client.get(&url).send().await.ok()?.text().await.ok()?;
+    let body = crate::detectors::read_body(client.get(&url).send().await.ok()?).await.ok()?;
     let uuid = parse_kick_vod_uuid(&body, went_live_at)?;
     Some(kick_vod_url(&uuid))
 }
@@ -313,7 +313,7 @@ pub async fn list_kick_vods(client: &reqwest::Client, slug: &str) -> Vec<KickVod
     let Ok(resp) = client.get(&url).send().await else {
         return Vec::new();
     };
-    let Ok(body) = resp.text().await else {
+    let Ok(body) = crate::detectors::read_body(resp).await else {
         return Vec::new();
     };
     parse_kick_vod_listing(&body)

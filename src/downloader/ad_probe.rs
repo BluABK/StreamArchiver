@@ -180,7 +180,7 @@ fn file_ad_probe_degraded_alert(store: &Store, monitor_id: i64, rec_id: i64, log
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
     let resp = client.get(url).send().await?.error_for_status()?;
-    Ok(resp.text().await?)
+    Ok(crate::detectors::read_body(resp).await?)
 }
 
 /// Fetch a live playback token then resolve the cheapest media-playlist URL
@@ -199,7 +199,7 @@ async fn resolve_media_playlist_url(client: &reqwest::Client, login: &str) -> an
         .send()
         .await?
         .error_for_status()?;
-    let master = resp.text().await?;
+    let master = crate::detectors::read_body(resp).await?;
     pick_cheapest_variant(&master).ok_or_else(|| anyhow::anyhow!("no variant in master playlist"))
 }
 

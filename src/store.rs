@@ -28,9 +28,11 @@ fn quota_date_today() -> String {
 }
 
 use crate::models::{
-    AdBreak, AuthKind, Channel, Clip, Container, DailyRecordingStat, DetachedKind, DetachedRow,
+    AdBreak, AuthKind, CaptureFailureStat, Channel, ChannelDriveUsage, Clip, Container,
+    DailyRecordingStat, DetachedKind, DetachedRow,
     DetectionMethod, FfmpegJobKind, FfmpegJobRow, GlobalStats, Monitor, MonitorStreamChange,
-    MonitorWithChannel, Platform, PollBucket, RecurrenceKind, SabrCodecPref, ScheduleSegment,
+    MonitorWithChannel, Platform, PlatformOutcomeStat, PollBucket, RecurrenceKind, SabrCodecPref,
+    ScheduleSegment,
     ScheduledRecording, ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video,
     now_unix,
 };

@@ -1144,6 +1144,37 @@ already-running ffmpeg mux is killed rather than left to finish, any partial
 capture is left completely untouched. A later stream restart or manual retry
 can always start a fresh backfill.
 
+### Capture failures 🩺 and Storage by channel 🖴
+
+Two tables at the bottom of **📊 Stats**, both added after a week where the
+answer to "why did this break" took a database query to find out.
+
+**Capture failures** classifies every failed take from its own tool log — the
+anonymous bot check, members-only, subscriber-only, PO-token rejection,
+attestation, disk full, "wasn't live", and everything else. Causes are
+attributed **most specific first** and each excludes the ones above it, so the
+rows sum to the failure total instead of double-counting a log that mentions
+two things. Above them sit per-platform outcomes for the last 30 days
+(completed / failed / not recorded / success rate), because a cause count with
+no denominator is unreadable: 144 bot-walls means one thing against 3,000
+captures and quite another against 150. Hovering a cause explains what to
+actually do about it. **Unclassified** is a floor on the unknowns, not a clean
+bill — a truncated log can hide its own cause.
+
+**Storage by channel** answers "what is filling this disk". One row per channel
+**per drive**, never summed across them: a channel whose old streams were moved
+to another disk would otherwise inflate its row for the disk you are trying to
+clear, which is exactly the confusion the table exists to remove. Chips at the
+top filter to one drive and show that drive's total; each row gives the
+channel's share of it, recordings and downloads separately (different remedies),
+and the newest take — a large row nobody has added to in months is the one to
+move rather than delete. Channel names link through to Streams.
+
+Sizes are what was recorded at capture time, not a fresh look at disk, and a
+take whose media the app has deleted drops out entirely. Downloads join by
+channel **name** (the Videos table stores no channel id), so a download that
+matches no monitored channel appears as its own row.
+
 ### Database backups 🗄
 
 **Settings → System → Database backups** takes periodic, self-contained

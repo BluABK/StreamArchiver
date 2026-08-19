@@ -216,10 +216,19 @@ pub enum NetKind {
     Chat,
     /// CDN-fed repair traffic: head backfill, gap recovery, VOD recovery.
     Recovery,
+    /// The app's OWN HTTP client: liveness scrapes, API calls, asset fetches.
+    ///
+    /// Every other kind is measured per-process by the sampler, which cannot
+    /// see in-process traffic — so until this existed, the single largest
+    /// consumer was invisible. A YouTube `/live` scrape is ~1.1 MB, and at the
+    /// 60s default across 29 channels that came to roughly 45,000 requests and
+    /// 50 GB a day, which is the most likely reason YouTube began bot-walling
+    /// this address. Counted at the point each response body is read.
+    Detection,
 }
 
 /// How many [`NetKind`] variants exist (array sizing for the accumulator).
-pub const NET_KIND_COUNT: usize = 5;
+pub const NET_KIND_COUNT: usize = 6;
 
 impl NetKind {
     pub const ALL: [NetKind; NET_KIND_COUNT] = [
@@ -228,12 +237,18 @@ impl NetKind {
         NetKind::Download,
         NetKind::Chat,
         NetKind::Recovery,
+        NetKind::Detection,
     ];
 
     /// The network-carrying kinds, in the order the Stats view lists them.
     /// [`NetKind::Local`] is deliberately absent: it is disk traffic.
-    pub const NETWORK: [NetKind; 4] =
-        [NetKind::Recording, NetKind::Download, NetKind::Chat, NetKind::Recovery];
+    pub const NETWORK: [NetKind; 5] = [
+        NetKind::Recording,
+        NetKind::Download,
+        NetKind::Chat,
+        NetKind::Recovery,
+        NetKind::Detection,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -242,6 +257,7 @@ impl NetKind {
             NetKind::Download => "Downloads",
             NetKind::Chat => "Chat",
             NetKind::Recovery => "Recovery",
+            NetKind::Detection => "Detection",
         }
     }
 
@@ -254,6 +270,7 @@ impl NetKind {
             NetKind::Download => "download",
             NetKind::Chat => "chat",
             NetKind::Recovery => "recovery",
+            NetKind::Detection => "detection",
         }
     }
 
@@ -950,6 +967,37 @@ static NET_SESSION: Mutex<[u64; NET_KIND_COUNT]> = Mutex::new([0; NET_KIND_COUNT
 /// long paused session would grow this map forever. 3 days of minutes is far
 /// past any real drain gap while still being ~4k tiny entries.
 const NET_BUCKETS_MAX: usize = 3 * 24 * 60;
+
+/// Record bytes this process downloaded itself (an HTTP response body read in
+/// the app rather than by a child tool).
+///
+/// The sampler attributes traffic per PID, so in-process requests belong to no
+/// tool and were counted nowhere. This feeds the same minute buckets and the
+/// same session totals, so [`NetKind::Detection`] plots and totals beside the
+/// rest instead of living in its own readout.
+///
+/// Call it with the body length once the body is in hand — close enough for a
+/// bandwidth readout, and it deliberately ignores headers and TLS overhead
+/// rather than pretending to a precision it cannot have.
+pub fn note_net_bytes(kind: NetKind, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let now_s = chrono::Utc::now().timestamp();
+    let bucket_t = now_s - now_s.rem_euclid(NET_BUCKET_SECS);
+    let idx = NetKind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
+    {
+        let mut acc = NET_BUCKETS.lock();
+        if acc.len() >= NET_BUCKETS_MAX
+            && !acc.contains_key(&bucket_t)
+            && let Some(&oldest) = acc.keys().next()
+        {
+            acc.remove(&oldest);
+        }
+        acc.entry(bucket_t).or_insert([0; NET_KIND_COUNT])[idx] += bytes;
+    }
+    NET_SESSION.lock()[idx] += bytes;
+}
 
 /// Drain the accumulated per-minute download totals, oldest first. Each entry
 /// is `(bucket start unix secs, kind, bytes)`; only non-zero kinds appear.

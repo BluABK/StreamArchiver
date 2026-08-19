@@ -160,7 +160,7 @@ pub async fn youtube_subscriptions(http: &Client, store: &Store) -> Result<Vec<I
             .await?;
         if !resp.status().is_success() {
             let s = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::detectors::read_body(resp).await.unwrap_or_default();
             bail!("YouTube subscriptions failed: {s} — {body}");
         }
         let v: serde_json::Value = resp.json().await?;

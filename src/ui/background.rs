@@ -846,6 +846,11 @@ impl StreamArchiverApp {
             self.stats_recordings_daily =
                 Some(self.core.store.recordings_daily_stats().unwrap_or_default());
             self.stats_net_daily = Some(self.core.store.net_history_daily().unwrap_or_default());
+            self.stats_failures = Some((
+                self.core.store.capture_failure_stats().unwrap_or_default(),
+                self.core.store.platform_outcome_stats(30).unwrap_or_default(),
+            ));
+            self.stats_storage = Some(self.core.store.channel_drive_usage().unwrap_or_default());
         }
         let (ocr, global, poll) = match self.stats_snapshot.clone() {
             Some(s) => s,
@@ -863,6 +868,8 @@ impl StreamArchiverApp {
                         self.stats_snapshot = None;
                         self.stats_history = None;
                         self.stats_net_history = None;
+                        self.stats_failures = None;
+                        self.stats_storage = None;
                     }
                     if ui.button("🗑  Reset").on_hover_text("Clear all accumulated OCR stats").clicked() {
                         let _ = self.core.store.set_setting(K_OCR_STATS, "{}");
@@ -1436,6 +1443,14 @@ impl StreamArchiverApp {
 
             ui.add_space(16.0);
 
+            self.stats_failures_section(ui);
+
+            ui.add_space(16.0);
+
+            self.stats_storage_section(ui);
+
+            ui.add_space(16.0);
+
             // ── Capture health (🚨 Warnings rollup + trend) ──────────────────
             ui.heading("Capture health 🚨").on_hover_text(
                 "Rollup of the capture-alert scanner: data loss reported by the \
@@ -1550,6 +1565,288 @@ impl StreamArchiverApp {
         });
     }
 
+    /// Stats view → **Capture failures 🩺**: why captures are failing, and how
+    /// that compares with what succeeded.
+    ///
+    /// A count with no denominator is unreadable — "144 bot-walls" means one
+    /// thing against 3,000 captures and another against 150 — so the platform
+    /// outcomes sit above the breakdown rather than in a separate section.
+    fn stats_failures_section(&mut self, ui: &mut egui::Ui) {
+        use super::io_view::fmt_bytes;
+
+        let Some((causes, outcomes)) = self.stats_failures.clone() else { return };
+
+        ui.heading("Capture failures 🩺").on_hover_text(
+            "What is going wrong, classified from each failed take's own tool log. \
+             Causes are attributed most-specific-first and each excludes the ones \
+             above it, so the rows sum to the failure total rather than \
+             double-counting a log that mentions two things.\n\n\
+             'Unclassified' is a floor on the unknowns, not a clean bill: a \
+             truncated log can hide its own cause.",
+        );
+        ui.separator();
+
+        egui::Grid::new("stats_platform_outcomes")
+            .num_columns(6)
+            .spacing([24.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Platform (30d)");
+                ui.strong("Completed");
+                ui.strong("Failed");
+                ui.strong("Not recorded");
+                ui.strong("Success");
+                ui.strong("Archived");
+                ui.end_row();
+                for o in &outcomes {
+                    let attempted = o.completed + o.failed;
+                    ui.label(&o.platform);
+                    ui.label(o.completed.to_string());
+                    // Red only when failures actually dominate: a handful
+                    // against a healthy total is noise, not a problem.
+                    if o.failed > o.completed {
+                        ui.colored_label(super::HL_ERROR_TEXT, o.failed.to_string())
+                    } else {
+                        ui.label(o.failed.to_string())
+                    };
+                    ui.label(o.not_recorded.to_string());
+                    ui.label(if attempted > 0 {
+                        format!("{:.0}%", 100.0 * o.completed as f64 / attempted as f64)
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(fmt_bytes(o.bytes));
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(8.0);
+
+        egui::Grid::new("stats_failure_causes")
+            .num_columns(5)
+            .spacing([24.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Cause");
+                ui.strong("7 days");
+                ui.strong("30 days");
+                ui.strong("All time");
+                ui.strong("Last seen");
+                ui.end_row();
+                for c in &causes {
+                    if c.total == 0 {
+                        continue; // a cause that has never happened is noise
+                    }
+                    // Keyed on the stable `cause`, never the label: the label
+                    // is free to be reworded, this mapping is not.
+                    ui.label(&c.label).on_hover_text(Self::cause_advice(&c.cause));
+                    if c.last_7d > 0 {
+                        ui.colored_label(super::HL_ERROR_TEXT, c.last_7d.to_string())
+                    } else {
+                        ui.weak("0")
+                    };
+                    ui.label(c.last_30d.to_string());
+                    ui.label(c.total.to_string());
+                    ui.weak(if c.last_at > 0 {
+                        super::format::fmt_datetime_short(c.last_at)
+                    } else {
+                        "—".into()
+                    });
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Stats view → **Storage by channel 🖴**: which channels are filling
+    /// which disk.
+    ///
+    /// Per drive, never summed across them. A channel whose old takes were
+    /// moved elsewhere would otherwise inflate the row for the disk being
+    /// cleared, which is precisely the question this table exists to answer.
+    fn stats_storage_section(&mut self, ui: &mut egui::Ui) {
+        use super::io_view::fmt_bytes;
+
+        let Some(rows) = self.stats_storage.clone() else { return };
+
+        ui.heading("Storage by channel 🖴").on_hover_text(
+            "Which channels are using which disk, biggest first. Split per drive \
+             on purpose: a channel whose old streams were moved to another disk \
+             would otherwise inflate its row for the disk you are trying to \
+             clear.\n\n\
+             Sizes are what was recorded at capture time, not a fresh look at \
+             the disk, and a take whose media has been deleted through the app \
+             drops out entirely. Downloads join by channel NAME (the Videos \
+             table stores no channel id), so an unmatched download appears as \
+             its own row.",
+        );
+        ui.separator();
+
+        // Per-drive totals drive both the filter chips and the "share of this
+        // disk" column — computed here so the table below stays a pure render.
+        let mut drives: Vec<char> = rows.iter().map(|r| r.drive).collect();
+        drives.sort_unstable();
+        drives.dedup();
+        let drive_total = |d: char| -> i64 {
+            rows.iter().filter(|r| r.drive == d).map(|r| r.total_bytes()).sum()
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Drive:");
+            if ui
+                .selectable_label(self.stats_storage_drive.is_none(), "All")
+                .on_hover_text("Every drive, still grouped one row per channel per drive")
+                .clicked()
+            {
+                self.stats_storage_drive = None;
+            }
+            for d in &drives {
+                let on = self.stats_storage_drive == Some(*d);
+                if ui
+                    .selectable_label(on, format!("{d}:  {}", fmt_bytes(drive_total(*d))))
+                    .clicked()
+                {
+                    self.stats_storage_drive = if on { None } else { Some(*d) };
+                }
+            }
+        });
+        ui.add_space(4.0);
+
+        let shown: Vec<&crate::models::ChannelDriveUsage> = rows
+            .iter()
+            .filter(|r| self.stats_storage_drive.is_none_or(|d| r.drive == d))
+            .collect();
+        if shown.is_empty() {
+            ui.weak("Nothing stored on this drive.");
+            return;
+        }
+
+        let mut jump_to: Option<i64> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("stats_storage_scroll")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                egui::Grid::new("stats_storage_grid")
+                    .num_columns(7)
+                    .spacing([20.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Drive");
+                        ui.strong("Channel");
+                        ui.strong("Total");
+                        ui.strong("Share");
+                        ui.strong("Recordings");
+                        ui.strong("Downloads");
+                        ui.strong("Newest");
+                        ui.end_row();
+                        for r in shown {
+                            let total = drive_total(r.drive);
+                            ui.label(format!("{}:", r.drive));
+                            // A row you can act on beats a row you can only
+                            // read: the point of finding a perpetrator is
+                            // going and doing something about it. Rows with no
+                            // channel id are downloads whose name matched no
+                            // monitored channel, so there is nowhere to go.
+                            if r.channel_id != 0 {
+                                if ui
+                                    .link(&r.channel)
+                                    .on_hover_text("Open this channel in Streams")
+                                    .clicked()
+                                {
+                                    jump_to = Some(r.channel_id);
+                                }
+                            } else {
+                                ui.label(&r.channel)
+                                    .on_hover_text(
+                                        "Downloads only — this name matched no monitored \
+                                         channel (the Videos table stores no channel id).",
+                                    );
+                            }
+                            ui.strong(fmt_bytes(r.total_bytes()));
+                            ui.label(if total > 0 {
+                                format!("{:.1}%", 100.0 * r.total_bytes() as f64 / total as f64)
+                            } else {
+                                "—".into()
+                            });
+                            ui.label(format!("{} ({})", fmt_bytes(r.take_bytes), r.takes));
+                            if r.downloads > 0 {
+                                ui.label(format!(
+                                    "{} ({})",
+                                    fmt_bytes(r.download_bytes),
+                                    r.downloads
+                                ))
+                            } else {
+                                ui.weak("—")
+                            };
+                            // Age is the actionable part: a big row nobody has
+                            // added to in months is the one to move.
+                            ui.weak(if r.newest_at > 0 {
+                                super::format::fmt_datetime_short(r.newest_at)
+                            } else {
+                                "—".into()
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        // Applied after the borrow ends, like every other view's row actions.
+        // The Streams tree selects an INSTANCE, so a channel resolves to its
+        // first one — which is also what the tree expands to.
+        if let Some(cid) = jump_to
+            && let Some(row) = self.rows.iter().find(|r| r.channel.id == cid)
+        {
+            let mid = row.monitor.id;
+            self.switch_view(super::View::Streams);
+            self.selected_monitor = Some(mid);
+        }
+    }
+
+    /// What to actually do about each failure cause, keyed on the stable
+    /// `CaptureFailureStat::cause`. A count nobody can act on is trivia.
+    fn cause_advice(cause: &str) -> &'static str {
+        match cause {
+            "bot_wall" => {
+                "YouTube refused an ANONYMOUS request. It is a judgement about this \
+                 address, not about the broadcast, and it refuses every client — so \
+                 retrying anonymously cannot clear it. Captures escalate to account \
+                 cookies by themselves after one of these. If it persists, the usual \
+                 cause is request volume: check the Detection class in Network above."
+            }
+            "members_only" => {
+                "The broadcast needs a membership the configured account does not \
+                 hold. Nothing to retry — YouTube gates the manifest itself, so \
+                 there is no CDN fallback. Connect an account that has the \
+                 membership, or leave the channel to record its public streams only."
+            }
+            "sub_only" => {
+                "Twitch subscriber-only. The live edge refuses us, but the CDN still \
+                 serves the broadcast's own segments, so head backfill can still \
+                 archive it — lagging the live edge rather than losing the stream."
+            }
+            "po_token" | "attestation" => {
+                "YouTube rejected the GVS PO token. These come in waves. The tv \
+                 client has no PO-token policy at all, which is what the PO-rejection \
+                 fallback switches to; check the token server is healthy in the \
+                 Background view before changing anything else."
+            }
+            "disk_full" => {
+                "The capture cache drive ran out of room mid-write. Nothing about \
+                 the stream was wrong. Storage by channel below shows what is \
+                 filling that disk."
+            }
+            "not_live" => {
+                "The channel was not live when the capture started — usually a \
+                 detection race, a premiere, or a broadcast that ended between the \
+                 liveness check and the spawn. Harmless in ones and twos."
+            }
+            _ => {
+                "No known marker in this take's log. Either a cause nothing \
+                 classifies yet, or the excerpt was truncated before the error — \
+                 open the take's log to see which."
+            }
+        }
+    }
+
     /// Stats view → **Network / downloads**: what the capture and download
     /// tools are pulling off the network right now, and how much they have
     /// pulled historically, split by traffic class.
@@ -1575,9 +1872,14 @@ impl StreamArchiverApp {
                  network traffic rather than 'bytes the tools moved': local \
                  post-processing (remux, concat, embedding), which reads from \
                  disk, and a download tool's own child ffmpeg, which is the \
-                 merge pass reading the finished parts back. The app's own API \
-                 polls and image fetches aren't counted here either — they \
-                 land in the I/O tab's 'unattributed' figure.",
+                 merge pass reading the finished parts back.\n\n\
+                 The app's own requests — liveness scrapes, API calls, asset \
+                 fetches — are the 'Detection' class. They are counted \
+                 differently (the body size of each response, in-process) \
+                 because per-process sampling cannot see them; they used to be \
+                 invisible entirely, which is how a 60-second scrape across a \
+                 few dozen YouTube channels grew to tens of GB a day without \
+                 anyone noticing.",
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1966,6 +2268,7 @@ fn net_kind_color(k: crate::iomon::NetKind) -> egui::Color32 {
         NetKind::Download => egui::Color32::from_rgb(92, 156, 232),
         NetKind::Chat => egui::Color32::from_rgb(154, 124, 224),
         NetKind::Recovery => egui::Color32::from_rgb(228, 172, 74),
+        NetKind::Detection => egui::Color32::from_rgb(112, 198, 154),
         NetKind::Local => egui::Color32::GRAY,
     }
 }
@@ -1990,6 +2293,15 @@ fn net_kind_hover(k: crate::iomon::NetKind) -> &'static str {
         NetKind::Recovery => {
             "CDN-fed repair traffic: head backfill, lost-segment gap recovery, \
              and VOD recovery — all of which re-fetch from the platform's CDN."
+        }
+        NetKind::Detection => {
+            "The app's own HTTP requests: liveness scrapes, platform API calls, \
+             asset fetches. Everything else here is measured per tool process, \
+             which cannot see traffic the app makes itself — so this was \
+             invisible until it mattered. A YouTube /live scrape is ~1.1 MB, \
+             and at a 60-second poll across a few dozen channels that is tens \
+             of GB a day from one address. Detection methods that push \
+             (EventSub, WebSub) cost nothing here."
         }
         NetKind::Local => "Local disk work (remux, concat, embed) — not network traffic.",
     }

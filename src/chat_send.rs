@@ -229,7 +229,7 @@ pub async fn send_message(
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();
-            let body = r.text().await.unwrap_or_default();
+            let body = crate::detectors::read_body(r).await.unwrap_or_default();
             interpret_response(status, &body)
         }
         Err(e) => SendOutcome::Failed(e.to_string()),
