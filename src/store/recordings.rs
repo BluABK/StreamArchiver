@@ -131,6 +131,14 @@ impl Store {
     }
 
     /// Stamp a take as expired once the sweep has disposed of its file.
+    ///
+    /// Test-only: production always goes through
+    /// [`Self::clear_recording_media`], because a take's countdown ending and
+    /// its file going away are the same event and writing one without the
+    /// other is exactly the bug that produced permanent `🕰 N (due)` badges.
+    /// Kept here so a test can set up an already-swept row without also
+    /// clearing its path.
+    #[cfg(test)]
     pub fn mark_rolling_expired(&self, rec_id: i64, now: i64) -> Result<()> {
         let conn = self.db();
         conn.execute(
@@ -789,6 +797,33 @@ impl Store {
 
     /// Update the output path of a finished recording — used after a manual
     /// re-remux succeeds to replace the `.ts` capture path with the final `.mkv`.
+    /// A take's media is gone: clear the path and end any countdown attached
+    /// to it, in one step.
+    ///
+    /// Every caller that disposes of a take's file wants both halves, and the
+    /// two used to be written separately at each site — so manual delete wrote
+    /// one and forgot the other. That left a rolling take with no file still
+    /// counting down, unreachable by the sweep (which needs something to
+    /// delete) and still counted by the badge, which pinned a whole channel at
+    /// `🕰 N (due)` for ever. See `crate::rolling`.
+    ///
+    /// A **kept** take is deliberately left alone: it has no countdown to end,
+    /// so it was never part of that failure, and stamping it would relabel a
+    /// deliberate Keep as an expiry — reporting something the user did not do.
+    pub fn clear_recording_media(&self, id: i64, now: i64) -> Result<()> {
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE recording SET output_path = '' WHERE id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE recording SET rolling_expired_at = ?2
+             WHERE id = ?1 AND rolling_ttl_secs > 0
+               AND rolling_kept_at = 0 AND rolling_expired_at = 0",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn update_recording_output_path(&self, id: i64, path: &str) -> Result<()> {
         let conn = self.db();
         conn.execute(
@@ -3999,6 +4034,51 @@ mod tests {
         assert_eq!(row.output_path, "C:/tmp/1.mkv");
         // The sweep tells the two apart on this alone, so it has to survive.
         assert_eq!(store.expired_rolling_recordings(now).unwrap()[1].output_path, "");
+    }
+
+    /// Deleting a rolling take's file by hand ends its countdown there and
+    /// then, instead of leaving a row the sweep can't reach and the badge
+    /// still counts. This is how the real ghosts were made: three Zentreya
+    /// takes manually deleted on 08-16 kept counting down afterwards.
+    #[test]
+    fn clearing_a_takes_media_ends_its_countdown() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let mk = |n: i64| {
+            let rid = store
+                .insert_recording(mid, n, "C:/tmp/a.mkv", None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, n + 100, 1, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+            store.set_recording_rolling_ttl(rid, 3600).unwrap();
+            rid
+        };
+
+        let counting = mk(1);
+        store.clear_recording_media(counting, 555).unwrap();
+        let r = store.get_recording(counting).unwrap().unwrap();
+        assert_eq!(r.output_path, "");
+        assert_eq!(r.rolling.expired_at, 555, "the countdown ended with the file");
+        // And it is gone from both the sweep's set and the badge's.
+        assert!(store.expired_rolling_recordings(999_999).unwrap().is_empty());
+        assert!(store.recordings_for_rolling().unwrap().is_empty());
+
+        // A kept take has no countdown to end; stamping it would relabel a
+        // deliberate Keep as an expiry.
+        let kept = mk(1_000);
+        store.keep_rolling_recording(kept, 10).unwrap();
+        store.clear_recording_media(kept, 555).unwrap();
+        let r = store.get_recording(kept).unwrap().unwrap();
+        assert_eq!(r.output_path, "");
+        assert_eq!((r.rolling.kept_at, r.rolling.expired_at), (10, 0));
+
+        // A take that was never rolling is only ever a path clear.
+        let plain = store
+            .insert_recording(mid, 2_000, "C:/tmp/b.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store.clear_recording_media(plain, 555).unwrap();
+        let r = store.get_recording(plain).unwrap().unwrap();
+        assert_eq!((r.output_path.as_str(), r.rolling.expired_at), ("", 0));
     }
 
     /// The 🕰 Rolling recordings section must see a counting-down take that

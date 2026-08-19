@@ -601,7 +601,9 @@ impl StreamArchiverApp {
             .await
             {
                 Ok(d) => {
-                    let _ = store.update_recording_output_path(rec_id, "");
+                    // Ends any rolling countdown too — the file it was counting
+                    // down to delete is already gone.
+                    let _ = store.clear_recording_media(rec_id, crate::models::now_unix());
                     let _ = events.send(crate::events::AppEvent::RecordingUpdated { recording_id: rec_id });
                     Ok(d.describe().to_string())
                 }
@@ -761,7 +763,7 @@ impl StreamArchiverApp {
                 .await
                 {
                     Ok(d) => {
-                        let _ = store.update_recording_output_path(rec_id, "");
+                        let _ = store.clear_recording_media(rec_id, crate::models::now_unix());
                         let _ = events
                             .send(crate::events::AppEvent::RecordingUpdated { recording_id: rec_id });
                         Ok(d.describe().to_string())

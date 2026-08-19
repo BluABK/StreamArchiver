@@ -3247,10 +3247,11 @@ keeps its own retention (or opts out entirely).
   folder / Recycle Bin / permanent), and the take's history row survives
   intact: title, stats, chat log, chapters and notes are all kept. Channel
   Stats and the Backlog entry stay correct; only the media is gone.
-- **A take whose file is already gone still expires on schedule.** If you
-  deleted the video by hand, or moved it somewhere the app lost track of, the
-  countdown has nothing left to delete — but it still finishes, and the take
-  is marked **🕰🗑 expired** when its time comes. It used to be skipped
+- **A take whose file is already gone still expires on schedule.** Deleting
+  the video by hand ends the countdown immediately — there is nothing left for
+  it to delete. If the file went missing some other way (moved outside the app,
+  a drive re-pointed), the countdown simply runs out as normal and the take is
+  marked **🕰🗑 expired** when its time comes. It used to be skipped
   instead, which sounds harmless and isn't: the take kept counting down for
   ever, and because a channel's badge reports the *soonest* deadline anywhere
   beneath it, one such take pinned its whole channel at **🕰 N (due)**

@@ -79,8 +79,7 @@ pub async fn maybe_sweep_rolling(store: &Store, events: &EventTx, now: i64) {
         if r.output_path.trim().is_empty()
             || crate::iomon::fs::metadata(crate::iomon::Cat::CacheSweep, &path).await.is_err()
         {
-            let _ = store.mark_rolling_expired(r.rec_id, now);
-            let _ = store.update_recording_output_path(r.rec_id, "");
+            let _ = store.clear_recording_media(r.rec_id, now);
             let _ = events.send(AppEvent::RecordingUpdated { recording_id: r.rec_id });
             continue;
         }
@@ -95,8 +94,7 @@ pub async fn maybe_sweep_rolling(store: &Store, events: &EventTx, now: i64) {
         .await
         {
             Ok(d) => {
-                let _ = store.update_recording_output_path(r.rec_id, "");
-                let _ = store.mark_rolling_expired(r.rec_id, now);
+                let _ = store.clear_recording_media(r.rec_id, now);
                 let _ = events.send(AppEvent::RecordingUpdated { recording_id: r.rec_id });
                 info!(rec_id = r.rec_id, path = %r.output_path, "rolling: {}", d.describe());
             }
