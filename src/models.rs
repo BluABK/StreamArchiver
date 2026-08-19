@@ -2583,6 +2583,25 @@ pub(crate) fn members_only_rejected(log: &str) -> bool {
         || log.contains("available to this channel's members")
 }
 
+/// YouTube refused an **anonymous** request with its bot check ("Sign in to
+/// confirm you're not a bot").
+///
+/// Unlike [`members_only_rejected`] this says nothing about the broadcast — it
+/// is a property of the *requester*. YouTube applies it per IP/session when
+/// anonymous traffic looks automated, and it hits every client
+/// (`player-client=tv` and `web` alike, verified live 2026-08-19), so swapping
+/// clients cannot clear it. The one thing that does is presenting an account,
+/// which is why the capture path escalates to the configured cookies on the
+/// next take rather than retrying identically — see
+/// `Supervisor::apply_auth_escalation`.
+///
+/// Matched on the stable half of the message: yt-dlp renders the apostrophe in
+/// "you're" as a non-ASCII U+2019 and the surrounding advice text changes
+/// between releases, so neither is safe to depend on.
+pub(crate) fn bot_wall_rejected(log: &str) -> bool {
+    log.contains("Sign in to confirm") && log.contains("not a bot")
+}
+
 /// One aggregated time bucket of download traffic for a single class, as
 /// returned by `Store::net_history` — the raw material for the Stats view's
 /// Network/downloads graphs. Backed by the `net_history` table (schema v80):

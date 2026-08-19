@@ -607,6 +607,12 @@ struct BackoffEntry {
     /// whole entry): a mid-chain non-PO failure doesn't forget that the wave
     /// is on. In-memory only, like the rest of the backoff state.
     po_rejected: bool,
+    /// The failure chain includes YouTube's anonymous bot check — the next
+    /// attempt keeps the configured account cookies instead of being
+    /// anonymised (see `Supervisor::apply_auth_escalation`). Sticky in the
+    /// same way as `po_rejected`, and for the same reason: the wall is a
+    /// property of how the requester looks, not of one take.
+    bot_walled: bool,
 }
 /// Settings key: restart a young Twitch `best` capture when a better rendition
 /// appears after join (`"0"` disables; default on — see

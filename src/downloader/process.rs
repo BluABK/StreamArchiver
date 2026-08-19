@@ -1703,6 +1703,8 @@ impl Supervisor {
         let used_po_fallback = self.po_fallback_takes.lock().unwrap().remove(&monitor_id);
         let po_rejected =
             !manually_stopped && !ok && crate::models::po_token_rejected(&outcome.log);
+        let bot_walled =
+            !manually_stopped && !ok && crate::models::bot_wall_rejected(&outcome.log);
         if po_rejected {
             self.file_po_token_alert(&row, monitor_id, rec_id, used_po_fallback);
         }
@@ -1711,11 +1713,14 @@ impl Supervisor {
                 monitor_id,
                 ended - resume_started,
                 ok,
-                po_rejected,
-                used_po_fallback,
-                // Resume path: an entitlement refusal can only come from the
-                // original capture, which already set the cadence.
-                crate::downloader::supervisor::Gated::No,
+                crate::downloader::supervisor::FailureShape {
+                    po_token_rejected: po_rejected,
+                    used_po_fallback,
+                    bot_walled,
+                    // Resume path: an entitlement refusal can only come from
+                    // the original capture, which already set the cadence.
+                    gated: crate::downloader::supervisor::Gated::No,
+                },
             );
         }
         let _ = self.store.finish_recording(

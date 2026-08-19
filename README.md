@@ -963,8 +963,21 @@ instead of the anonymous visitor data the token server mints for), put the
 account inside YouTube's attestation experiments, and expose it to flagging —
 yt-dlp's own guidance is to pass cookies only when the content requires them.
 Cookies still attach automatically where entitlement genuinely needs them:
-members-only broadcasts, and a video download that fails with a members-only
-/ sign-in error (it retries with the configured cookies auth by itself).
+members-only broadcasts, a video download that fails with a members-only /
+sign-in error (it retries with the configured cookies auth by itself), and —
+since 2026-08-19 — **any monitor whose last capture hit YouTube's anonymous
+bot check** ("Sign in to confirm you're not a bot").
+
+That last one is not about entitlement at all: the bot check is a judgement
+about the *requester*, not the broadcast, so it refuses every client equally
+(`tv` and `web` alike, measured) and no amount of retrying anonymously clears
+it. The monitor keeps its cookies until a capture succeeds, and the client
+moves to `web` in the same step, because cookies only get through there:
+measured live against a running stream, `tv` + cookies fails with "The page
+needs to be reloaded" while `web` + cookies works, and both anonymous
+combinations are refused. Escalating one half without the other just swaps one
+failure for another. Until this existed, a walled monitor simply re-failed on
+every poll — 144 identical failures over two days on one archive.
 Note that a `--cookies-from-browser` line in the yt-dlp **user config**
 (`%APPDATA%\yt-dlp\config`) is applied to every yt-dlp run behind the app's
 back and would defeat this switch — keep cookies out of that file and pass

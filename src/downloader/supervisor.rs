@@ -80,6 +80,26 @@ pub(super) enum Gated {
     NoFallback,
 }
 
+/// How a finished take failed, as far as the *next* attempt is concerned.
+///
+/// Bundled rather than passed as five loose booleans: each field changes what
+/// the following capture does (its backoff, its client, its auth), so they are
+/// read together and adding one to the list should not mean editing every call
+/// site's argument order.
+#[derive(Clone, Copy)]
+pub(super) struct FailureShape {
+    /// YouTube rejected the GVS PO token — see [`crate::models::po_token_rejected`].
+    pub po_token_rejected: bool,
+    /// This take had already been swapped onto the PO-fallback client, so that
+    /// card is spent.
+    pub used_po_fallback: bool,
+    /// YouTube's anonymous bot check refused it — see
+    /// [`crate::models::bot_wall_rejected`].
+    pub bot_walled: bool,
+    /// Entitlement gating, which has its own retry cadence.
+    pub gated: Gated,
+}
+
 pub(super) fn failure_backoff_secs(
     fails: u32,
     duration_secs: i64,
@@ -2614,6 +2634,7 @@ progress_info: None,
                     fails: 0,
                     until: Instant::now() + Duration::from_secs(120),
                     po_rejected: false,
+                    bot_walled: false,
                 },
             );
             info!(monitor_id, "manual stop");
@@ -2788,6 +2809,7 @@ progress_info: None,
                     fails: 0,
                     until: Instant::now() + Duration::from_secs(10),
                     po_rejected: false,
+                    bot_walled: false,
                 },
             );
             return;
@@ -3476,10 +3498,9 @@ progress_info: None,
         monitor_id: i64,
         duration_secs: i64,
         ok: bool,
-        po_token_rejected: bool,
-        used_po_fallback: bool,
-        gated: Gated,
+        fail: FailureShape,
     ) {
+        let FailureShape { po_token_rejected, used_po_fallback, bot_walled, gated } = fail;
         let mut map = self.backoff.lock().unwrap();
         // Back off on any capture that produced no footage (bytes == 0), even one
         // that ran a while before dying: a long run that wrote nothing is still a
@@ -3494,9 +3515,11 @@ progress_info: None,
                 fails: 0,
                 until: Instant::now(),
                 po_rejected: false,
+                bot_walled: false,
             });
             entry.fails = entry.fails.saturating_add(1);
             entry.po_rejected = entry.po_rejected || po_token_rejected;
+            entry.bot_walled = entry.bot_walled || bot_walled;
             // The escalating 5-15m PO cooldown is a last resort for when
             // there's nothing better to do than wait the wave out. When a
             // fallback client is configured and this take didn't use it yet,
@@ -3514,6 +3537,7 @@ progress_info: None,
                 duration_secs,
                 po_token_rejected,
                 used_po_fallback,
+                bot_walled,
                 "recording captured nothing; backing off"
             );
         }
@@ -3533,6 +3557,18 @@ progress_info: None,
             .unwrap_or(false)
     }
 
+    /// Whether this monitor's next capture should keep its account cookies
+    /// rather than being anonymised: its failure chain includes YouTube's
+    /// anonymous bot check and nothing has succeeded since.
+    fn bot_wall_pending(&self, monitor_id: i64) -> bool {
+        self.backoff
+            .lock()
+            .unwrap()
+            .get(&monitor_id)
+            .map(|b| b.bot_walled)
+            .unwrap_or(false)
+    }
+
     /// Pick the yt-dlp client for this take. Public YouTube broadcasts
     /// capture via the configured primary client (default `tv`, which has no
     /// GVS PO-token policy at all — attestation rejection waves can't touch
@@ -3545,6 +3581,16 @@ progress_info: None,
             return;
         }
         apply_yt_client_policy(&self.store, row.monitor.id, &mut bins.sabr);
+        // A bot-walled monitor is about to capture WITH cookies
+        // (`resolve_auth_and_preprobe`), and cookies only get through on `web`:
+        // measured live 2026-08-19 against a live stream, `tv` + cookies fails
+        // with "The page needs to be reloaded" while `web` + cookies succeeds
+        // (both anonymous combinations are refused outright). So the escalation
+        // has to move BOTH halves — attaching cookies while leaving the client
+        // on `tv` just swaps one failure for another.
+        if self.bot_wall_pending(row.monitor.id) {
+            bins.sabr.extractor_args = with_player_client(&bins.sabr.extractor_args, "web");
+        }
     }
 
     /// Swap the PO-fallback client into the loaded SABR preset when this
@@ -3561,6 +3607,11 @@ progress_info: None,
             || !bins.sabr.usable()
             || bins.sabr.po_fallback_client.is_empty()
             || !self.po_fallback_pending(row.monitor.id)
+            // The bot-wall escalation wins: it runs with cookies, and the
+            // fallback client (`tv`) cannot load a page with cookies attached.
+            // Swapping it in here would undo `apply_client_policy` and leave
+            // the one combination that fails both ways.
+            || self.bot_wall_pending(row.monitor.id)
         {
             return;
         }
@@ -4082,6 +4133,10 @@ progress_info: None,
         // take).
         let used_po_fallback = self.po_fallback_takes.lock().unwrap().remove(&monitor_id);
         let po_rejected = !manually_stopped && !ok && po_token_rejected(&outcome.log);
+        // Anonymous-only refusal: the next take keeps its cookies instead of
+        // repeating an attempt that cannot succeed as it stands.
+        let bot_walled =
+            !manually_stopped && !ok && crate::models::bot_wall_rejected(&outcome.log);
         if po_rejected {
             self.file_po_token_alert(&row, monitor_id, rec_id, used_po_fallback);
         }
@@ -4225,7 +4280,17 @@ progress_info: None,
         // otherwise reset the wait to 30s, and a captured one would clear it entirely,
         // either way re-triggering the moment the next LIVE signal arrives.
         if !manually_stopped {
-            self.note_result(monitor_id, duration, ok, po_rejected, used_po_fallback, gated);
+            self.note_result(
+                monitor_id,
+                duration,
+                ok,
+                FailureShape {
+                    po_token_rejected: po_rejected,
+                    used_po_fallback,
+                    bot_walled,
+                    gated,
+                },
+            );
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
     }
@@ -4254,15 +4319,26 @@ progress_info: None,
         // anonymous visitor data bgutil mints for) and put the account inside
         // YouTube's attestation experiments. Members-only broadcasts keep the
         // cookies — entitlement lives on the account.
-        if row.monitor.platform() == Platform::YouTube
-            && yt_public_auth(&self.store, row.monitor.id, &mut auth)
-        {
-            info!(
-                monitor_id = row.monitor.id,
-                "capturing anonymously (public YouTube broadcast; account cookies \
-                 are reserved for members-only) {}",
-                row.monitor.platform().tag()
-            );
+        if row.monitor.platform() == Platform::YouTube {
+            // A bot-walled monitor keeps its cookies. Anonymity is a privacy
+            // preference; this refusal makes it a dead end, and repeating the
+            // same anonymous attempt is what turned one wall into 144 identical
+            // failures over two days.
+            if self.bot_wall_pending(row.monitor.id) {
+                info!(
+                    monitor_id = row.monitor.id,
+                    "🤖 previous take hit YouTube's anonymous bot check {} — keeping \
+                     account cookies for this take instead of capturing anonymously",
+                    row.monitor.platform().tag()
+                );
+            } else if yt_public_auth(&self.store, row.monitor.id, &mut auth) {
+                info!(
+                    monitor_id = row.monitor.id,
+                    "capturing anonymously (public YouTube broadcast; account cookies \
+                     are reserved for members-only) {}",
+                    row.monitor.platform().tag()
+                );
+            }
         }
         // Filename media-info ({resolution}/{fps}/…): pre-probe the stream if the
         // template uses it and the mode asks for it. Do this BEFORE taking the
@@ -5431,6 +5507,30 @@ mod tests {
         // Unrelated failures keep the ordinary backoff ladder.
         assert!(!po_token_rejected("ERROR: No video formats found!"));
         assert!(!po_token_rejected(""));
+    }
+
+    /// Taken from the real 2026-08-18/19 wall: 144 captures over two days,
+    /// every one of them this message.
+    #[test]
+    fn the_anonymous_bot_wall_is_recognised_across_its_spellings() {
+        use crate::models::bot_wall_rejected;
+        // yt-dlp renders the apostrophe as U+2019, which is exactly why the
+        // predicate must not try to match "you're".
+        assert!(bot_wall_rejected(
+            "ERROR: [youtube] o0n_5jb3DbM: Sign in to confirm you\u{2019}re not a bot. \
+             Use --cookies-from-browser or --cookies for the authentication."
+        ));
+        // ASCII apostrophe, and a future release wording the advice differently.
+        assert!(bot_wall_rejected("ERROR: Sign in to confirm you're not a bot."));
+
+        // Age gating and members-only are different refusals with different
+        // answers — neither may trigger the cookie escalation on its own.
+        assert!(!bot_wall_rejected("ERROR: Sign in to confirm your age"));
+        assert!(!bot_wall_rejected(
+            "ERROR: Join this channel to get access to members-only content"
+        ));
+        assert!(!bot_wall_rejected("ERROR: No video formats found!"));
+        assert!(!bot_wall_rejected(""));
     }
 
     /// The fix for the DyaRikku incident (2026-07-24): a stall-killed
