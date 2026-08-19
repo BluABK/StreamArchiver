@@ -1624,8 +1624,16 @@ impl Supervisor {
                     continue;
                 }
             }
-            if crate::iomon::fs::metadata(Cat::Startup, &p).await.is_ok() {
-                continue; // the issue is real
+            // An EMPTY file is as much of a non-issue as a missing one: a
+            // capture that created its `.ts` and then died wrote a husk, and
+            // ffmpeg rightly refuses it (`AVERROR_INVALIDDATA`). Found the
+            // hard way — a bulk re-remux of the backlog failed 41 times out of
+            // 42 on exactly these, because "the file exists" was the only test
+            // being applied.
+            match crate::iomon::fs::metadata(Cat::Startup, &p).await {
+                Ok(md) if md.len() > 0 => continue, // the issue is real
+                Ok(_) => {}                          // 0-byte husk: clear it
+                Err(_) => {}                         // missing: clear it
             }
             // The file is missing — but is its whole folder missing too? That
             // is a mount problem, not a deletion, and must not be "repaired".

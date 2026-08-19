@@ -1152,7 +1152,9 @@ believes against what is actually on disk.
 **Orphan outputs** promotes a take whose file turned out to be intact after an
 unclean shutdown, or re-points it at the capture file still in the cache.
 
-**Stale issues** retires ⚠ Issues entries whose file no longer exists. Every
+**Stale issues** retires ⚠ Issues entries whose file no longer exists, or is a
+0-byte husk — a capture that created its file and then died wrote nothing, and
+there is no more to remux there than in a file that was deleted. Every
 Issues section is built from database state alone — none of them asks whether
 the file is still there — so an entry outlives its subject: a "needs remux" row
 keeps asking for a `.ts` that was swept months ago. On one real archive **177 of
