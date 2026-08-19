@@ -1556,6 +1556,74 @@ impl Supervisor {
     /// - neither on disk → leave the row alone (genuinely gone; Issues says so).
     ///
     /// Never touches rows that are 'recording' (adopted or being finalized).
+    /// Forget companion pointers (`full_path`, `backfill_path`,
+    /// `recovered_path`, `vod_dl_path`) whose file is no longer on disk.
+    ///
+    /// The main `output_path` is cleared wherever the app disposes of media,
+    /// but a companion is a *separate* file that can go independently — a
+    /// manual delete, a trash sweep, a drive reorganisation outside the app —
+    /// and nothing was noticing. On a real archive that left 35 pointers to
+    /// files that had not existed for weeks, across 12 channels; the only
+    /// reason it surfaced was a path relocation rewriting four of them to a
+    /// new drive where they equally did not exist.
+    ///
+    /// **An unreachable drive is not an absent file.** The whole point of the
+    /// guard below is that this archive lives on removable bays that drop out:
+    /// treating an offline `G:` as "35 files deleted" would erase every
+    /// pointer on it, permanently, from a cable fault. A drive whose root does
+    /// not answer is skipped entirely and retried next startup.
+    async fn reconcile_companion_paths(&self) {
+        use std::collections::HashMap;
+
+        let rows = match self.store.companion_media_paths() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("companion repair: failed to load pointers: {e:#}");
+                return;
+            }
+        };
+        // One probe per drive, not per file: the answer is the same for every
+        // path on it, and a dead drive can take seconds per stat.
+        let mut drive_ok: HashMap<char, bool> = HashMap::new();
+        let mut cleared = 0usize;
+        let mut skipped_offline = 0usize;
+        for (rec_id, which, path) in rows {
+            let p = PathBuf::from(&path);
+            if let Some(d) = crate::downloader::drive_of(&p) {
+                let ok = match drive_ok.get(&d) {
+                    Some(v) => *v,
+                    None => {
+                        let root = PathBuf::from(format!("{d}:\\"));
+                        let ok =
+                            crate::iomon::fs::metadata(Cat::Startup, &root).await.is_ok();
+                        if !ok {
+                            info!(drive = %d, "companion repair: drive offline, skipping its pointers");
+                        }
+                        drive_ok.insert(d, ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    skipped_offline += 1;
+                    continue;
+                }
+            }
+            if crate::iomon::fs::metadata(Cat::Startup, &p).await.is_ok() {
+                continue;
+            }
+            match self.store.clear_recording_companion(rec_id, which) {
+                Ok(()) => {
+                    cleared += 1;
+                    info!(rec_id, ?which, path = %path, "companion repair: file is gone, pointer cleared");
+                }
+                Err(e) => warn!(rec_id, ?which, "companion repair: clear failed: {e:#}"),
+            }
+        }
+        if cleared > 0 || skipped_offline > 0 {
+            info!(cleared, skipped_offline, "companion repair: finished");
+        }
+    }
+
     pub async fn reconcile_orphan_outputs(&self) {
         let candidates = match self.store.orphan_repair_candidates() {
             Ok(c) => c,
@@ -1638,6 +1706,7 @@ impl Supervisor {
         if promoted + retargeted > 0 {
             info!(promoted, retargeted, "orphan repair: pass complete");
         }
+        self.reconcile_companion_paths().await;
     }
 }
 

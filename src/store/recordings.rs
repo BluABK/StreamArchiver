@@ -3,6 +3,24 @@
 
 use super::*;
 
+/// One of a take's *companion* media pointers — the files that live
+/// alongside the main capture.
+///
+/// An enum rather than a column name in a string so the reconciler cannot
+/// be handed one that does not exist, and so every consumer is forced
+/// through the same fixed set of SQL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanionPath {
+    /// The joined head+live file (`full_path`).
+    Full,
+    /// The CDN head backfill (`backfill_path`).
+    Backfill,
+    /// A gap/VOD recovery result (`recovered_path`).
+    Recovered,
+    /// The downloaded published VOD (`vod_dl_path`).
+    VodDl,
+}
+
 /// `(id, started_at, ended_at, status)` — see `Store::earlier_takes_for_stream`.
 pub type EarlierTakeRow = (i64, i64, Option<i64>, String);
 
@@ -1288,6 +1306,46 @@ impl Store {
     /// Clear a recording's head-backfill reference — the file itself is
     /// deleted by the caller first. Used when a later take's fresh head
     /// supersedes an older take's now-redundant head file.
+    /// Every companion pointer currently set, as `(recording id, which, path)`.
+    ///
+    /// Small by construction — 136 rows on a real 3.8k-take archive — because
+    /// only takes that actually produced a head/full/recovery/VOD file have
+    /// one. Cheap enough for the startup reconciler to stat every one.
+    pub fn companion_media_paths(&self) -> Result<Vec<(i64, CompanionPath, String)>> {
+        let conn = self.db();
+        let mut out = Vec::new();
+        for (which, col) in [
+            (CompanionPath::Full, "full_path"),
+            (CompanionPath::Backfill, "backfill_path"),
+            (CompanionPath::Recovered, "recovered_path"),
+            (CompanionPath::VodDl, "vod_dl_path"),
+        ] {
+            let sql =
+                format!("SELECT id, {col} FROM recording WHERE COALESCE({col}, '') != ''");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, which, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    /// Forget a companion pointer whose file is gone. The history row and
+    /// every other pointer are untouched — this only stops the take claiming
+    /// a file that is not there.
+    pub fn clear_recording_companion(&self, id: i64, which: CompanionPath) -> Result<()> {
+        let conn = self.db();
+        let sql = match which {
+            CompanionPath::Full => "UPDATE recording SET full_path = '' WHERE id = ?1",
+            CompanionPath::Backfill => "UPDATE recording SET backfill_path = '' WHERE id = ?1",
+            CompanionPath::Recovered => "UPDATE recording SET recovered_path = '' WHERE id = ?1",
+            CompanionPath::VodDl => "UPDATE recording SET vod_dl_path = '' WHERE id = ?1",
+        };
+        conn.execute(sql, params![id])?;
+        Ok(())
+    }
+
     pub fn clear_recording_backfill_path(&self, id: i64) -> Result<()> {
         let conn = self.db();
         conn.execute(
@@ -4034,6 +4092,41 @@ mod tests {
         assert_eq!(row.output_path, "C:/tmp/1.mkv");
         // The sweep tells the two apart on this alone, so it has to survive.
         assert_eq!(store.expired_rolling_recordings(now).unwrap()[1].output_path, "");
+    }
+
+    /// Companion pointers are enumerated and cleared independently of each
+    /// other and of `output_path`, because they are separate files that can
+    /// disappear separately. Clearing one must not disturb the rest — a
+    /// blanket "this take's media is gone" would drop pointers to files that
+    /// are still there, which is the opposite mistake and the harder one to
+    /// notice.
+    #[test]
+    fn companion_pointers_are_listed_and_cleared_one_at_a_time() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store.finish_recording(rid, 200, 1, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+        store.set_recording_full_path(rid, "C:/tmp/a.full.mkv").unwrap();
+        store.set_recording_recovered(rid, "C:/tmp/a.rec.mkv", "done").unwrap();
+
+        let mut got = store.companion_media_paths().unwrap();
+        got.sort_by_key(|(_, w, _)| format!("{w:?}"));
+        assert_eq!(got.len(), 2, "only the two that are set");
+        assert!(got.iter().any(|(_, w, p)| *w == CompanionPath::Full && p == "C:/tmp/a.full.mkv"));
+        assert!(
+            got.iter().any(|(_, w, p)| *w == CompanionPath::Recovered && p == "C:/tmp/a.rec.mkv")
+        );
+
+        store.clear_recording_companion(rid, CompanionPath::Full).unwrap();
+        let left = store.companion_media_paths().unwrap();
+        assert_eq!(left.len(), 1, "the other pointer survives");
+        assert_eq!(left[0].1, CompanionPath::Recovered);
+        // And the take's own media pointer is untouched by all of this.
+        let r = store.get_recording(rid).unwrap().unwrap();
+        assert_eq!(r.output_path, "C:/tmp/a.mkv");
     }
 
     /// Deleting a rolling take's file by hand ends its countdown there and
