@@ -1408,6 +1408,8 @@ in-app for a one-line description of each.
 | **Twitch EventSub** | Twitch | Client ID + Secret | ~seconds | Real-time push over a WebSocket (conduit + app token) for both go-live **and** go-offline; ignores the poll interval, idles cheaply, reconciles on (re)connect. No public endpoint needed, no poll fallback. |
 | **Twitch EventSub + Helix** | Twitch | Client ID + Secret | ~seconds, with a poll backstop | Does both: EventSub push **and** Helix polling. Whichever sees live first starts the recording, so a missed event (network drop, app started after go-live) is still caught. A longer poll interval is fine — it's just a safety net. |
 | **YouTube WebSub (VPS push)** | YouTube | [yt-websub](../yt-websub) relay (URL + token) | ~seconds, with a poll backstop | Push via an external relay on a public VPS: it subscribes to YouTube's WebSub/PubSubHubbub hub and streamarchiver polls it for events. Each notification triggers an **on-demand liveness check** (records only if actually live), with scrape polling as a safety net. A longer poll interval is fine. |
+| **YouTube WebSub + slow net** | YouTube | [yt-websub](../yt-websub) relay (URL + token) | ~seconds, with a slow backstop | The same push, with the scrape safety net **floored at 15 minutes** however short the instance's poll interval is. Use it where a missed push would cost you a broadcast. Plain WebSub polls on the instance interval, which at the 60s default across a few dozen channels is ~45,000 page loads a day (~1.1 MB each) — the traffic that got this archive's IP bot-walled by YouTube. Same net, a thirtieth of the cost. |
+| **YouTube WebSub (push only)** | YouTube | [yt-websub](../yt-websub) relay (URL + token) | ~seconds, no backstop | Push and nothing else — zero scheduled HTTP requests to YouTube. Lowest traffic, and the only option with **no safety net at all**: a notification the relay misses is a broadcast nobody notices. Good for Auto-off info-only channels, or when the relay is trusted. |
 | **YouTube Data API** | YouTube | API key | one poll interval | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use a long interval. |
 | **Kick official API** | Kick | Client ID + Secret | one poll interval | client-credentials app token; more reliable than scraping (no Cloudflare). |
 | **Scrape poll** | YouTube `/live`, Kick, generic | No | one poll interval | **Default for YouTube/Kick**; no credentials, but fragile to site changes. Go-live time is approximate (`~`). |
@@ -1442,7 +1444,16 @@ that API. Because a WebSub notification fires for uploads and metadata edits too
 not just go-lives — each event is treated as a *"check this channel now"* trigger:
 streamarchiver runs its normal liveness check and records **only if the channel is
 actually live** (so it's safe and idempotent), while the scrape poll stays on as a
-backstop. To use it: deploy `yt-websub` (see its README), then in **Settings →
+backstop.
+
+**Pick the backstop deliberately** — this is where YouTube traffic is won or lost.
+Plain **WebSub** polls on the instance's own interval, and at the 60s default that
+is one ~1.1 MB page per channel per minute; across 29 channels it measured ~45,000
+requests and ~50 GB a day from one residential IP, which is very likely why YouTube
+started refusing anonymous requests from it. **WebSub + slow net** keeps a backstop
+but floors it at 15 minutes (~1,400 requests/day for the same channels).
+**WebSub (push only)** has no backstop at all: nothing polls YouTube, and nothing
+catches a missed notification either. To use it: deploy `yt-websub` (see its README), then in **Settings →
 YouTube WebSub** set the **VPS base URL** + **bearer token**, and set the relevant
 YouTube monitors' **Detection** to **YouTube WebSub (VPS push)**. streamarchiver
 auto-resolves each channel to its `UC…` id, pushes the set to the VPS, and the VPS

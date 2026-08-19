@@ -448,7 +448,9 @@ fn load_websub_monitors(store: &Store) -> Vec<(String, i64)> {
             if row.monitor.platform() == Platform::YouTube
                 && matches!(
                     row.monitor.detection_method,
-                    DetectionMethod::WebSub | DetectionMethod::WebSubOnly
+                    DetectionMethod::WebSub
+                        | DetectionMethod::WebSubSlow
+                        | DetectionMethod::WebSubOnly
                 )
             {
                 out.push((row.monitor.url.clone(), row.monitor.id));

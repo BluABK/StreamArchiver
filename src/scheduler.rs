@@ -94,6 +94,21 @@ fn fold_net_history(store: &crate::store::Store) {
     }
 }
 
+/// How often this instance is actually polled, given its method.
+///
+/// Everything obeys its own `poll_interval_secs` (with a 5s sanity floor)
+/// except [`DetectionMethod::WebSubSlow`], whose entire purpose is a safety
+/// net that cannot be dialled back up into a traffic problem: its floor beats
+/// the instance's setting, so the 60s default cannot recreate the ~45,000
+/// page loads a day that got this IP bot-walled. A channel already set slower
+/// keeps its own value — the promise is "no faster than", not "exactly this".
+fn effective_interval(method: DetectionMethod, configured: i64) -> i64 {
+    match method {
+        DetectionMethod::WebSubSlow => configured.max(crate::models::WEBSUB_SLOW_FLOOR_SECS),
+        _ => configured.max(5),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tick(
     ctx: &Arc<DetectContext>,
@@ -220,6 +235,8 @@ async fn tick(
         // whichever sees live first wins (the supervisor dedupes). WebSub is the
         // same idea for YouTube: scrape-polled here as a fallback, and pushed by
         // the websub task (which triggers an on-demand liveness check).
+        // WebSubSlow is WebSub with the poll floored to a deliberately slow
+        // cadence (see `WEBSUB_SLOW_FLOOR_SECS`).
         // WebSubOnly is push-only — no poll fallback, so it is not in this list.
         // Disabled is intentionally never in this list either: it means "never
         // auto-check this instance at all" (see `DetectionMethod::Disabled`).
@@ -232,12 +249,13 @@ async fn tick(
                 | DetectionMethod::YouTubeApi
                 | DetectionMethod::KickApi
                 | DetectionMethod::WebSub
+                | DetectionMethod::WebSubSlow
         );
         if !handled {
             continue;
         }
 
-        let interval = m.poll_interval_secs.max(5);
+        let interval = effective_interval(m.detection_method, m.poll_interval_secs);
         let due_at = m.last_checked_at.unwrap_or(0) + interval;
         if now >= due_at {
             meta.insert(
@@ -253,7 +271,9 @@ async fn tick(
                 DetectionMethod::TwitchApi | DetectionMethod::EventSubHelix => {
                     twitch_items.push(item)
                 }
-                DetectionMethod::Scrape | DetectionMethod::WebSub => scrape_items.push(item),
+                DetectionMethod::Scrape
+                | DetectionMethod::WebSub
+                | DetectionMethod::WebSubSlow => scrape_items.push(item),
                 DetectionMethod::GenericProbe => generic_items.push(item),
                 DetectionMethod::YouTubeApi => youtube_api_items.push(item),
                 DetectionMethod::KickApi => kick_api_items.push(item),
@@ -722,10 +742,27 @@ async fn run_per_item(
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::models::Platform;
     use crate::store::Store;
+
+    /// `WebSubSlow` exists to be a net that cannot be dialled back into a
+    /// traffic problem, so its floor has to beat the instance's own setting —
+    /// including the 60s default that produced ~45,000 YouTube page loads a
+    /// day across a few dozen channels.
+    #[test]
+    fn websub_slow_is_floored_however_short_the_instance_interval_is() {
+        use crate::models::WEBSUB_SLOW_FLOOR_SECS as FLOOR;
+        assert_eq!(effective_interval(DetectionMethod::WebSubSlow, 60), FLOOR);
+        assert_eq!(effective_interval(DetectionMethod::WebSubSlow, 1), FLOOR);
+        // Already slower than the floor: keep the channel's own setting.
+        assert_eq!(effective_interval(DetectionMethod::WebSubSlow, 3600), 3600);
+        // Every other method is untouched, sanity floor included.
+        assert_eq!(effective_interval(DetectionMethod::WebSub, 60), 60);
+        assert_eq!(effective_interval(DetectionMethod::Scrape, 1), 5);
+    }
 
     /// `load_poll_stats`/`save_poll_stats` round-trip through the settings
     /// store, and folding several outcomes for the same platform accumulates

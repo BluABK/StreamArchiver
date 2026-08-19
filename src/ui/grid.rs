@@ -1783,7 +1783,7 @@ pub(super) fn detection_icon(m: crate::models::DetectionMethod) -> &'static str 
         GenericProbe => "◉",                      // HTTP probe
         EventSub => "⚡",                          // pure push event
         EventSubHelix => "⚡↺",                   // push + poll fallback
-        WebSub | WebSubOnly => "⚡",             // WebSub push
+        WebSub | WebSubSlow | WebSubOnly => "⚡", // WebSub push
         Disabled => "⛔",                          // no auto-detection at all
     }
 }

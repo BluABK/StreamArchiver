@@ -2826,6 +2826,7 @@ impl StreamArchiverApp {
                                 DetectionMethod::EventSubHelix,
                                 DetectionMethod::YouTubeApi,
                                 DetectionMethod::WebSub,
+                                DetectionMethod::WebSubSlow,
                                 DetectionMethod::WebSubOnly,
                                 DetectionMethod::Scrape,
                                 DetectionMethod::KickApi,

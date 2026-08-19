@@ -156,6 +156,7 @@ impl Platform {
             Platform::YouTube => &[
                 DetectionMethod::Scrape,
                 DetectionMethod::WebSub,
+                DetectionMethod::WebSubSlow,
                 DetectionMethod::WebSubOnly,
                 DetectionMethod::YouTubeApi,
                 DetectionMethod::GenericProbe,
@@ -247,6 +248,14 @@ impl Tool {
     }
 }
 
+/// Floor on the scrape interval for [`DetectionMethod::WebSubSlow`]: however
+/// short the instance's own poll interval is, its safety net never fires more
+/// often than this. A floor rather than a fixed value so a channel already set
+/// slower keeps its own setting — the option promises "no faster than", which
+/// is the only promise that stops the net growing back into the problem it was
+/// added to solve.
+pub const WEBSUB_SLOW_FLOOR_SECS: i64 = 900;
+
 /// Per-channel live-detection strategy (the UI "method" dropdown).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectionMethod {
@@ -272,6 +281,16 @@ pub enum DetectionMethod {
     /// notification triggers an immediate liveness check. Polls (scrape) as a
     /// fallback. Needs the `yt-websub` server URL + token in Settings.
     WebSub,
+    /// `WebSub` push with a **deliberately slow** scrape safety net, floored at
+    /// [`WEBSUB_SLOW_FLOOR_SECS`] however short the instance's own interval is.
+    ///
+    /// Exists because plain `WebSub` polls on that interval — at the 60 s
+    /// default across 29 channels that was ~45,000 YouTube page loads a day
+    /// (~1.14 MB each) from one residential IP, which is the most likely
+    /// reason YouTube began bot-walling it. `WebSubOnly` removes the net
+    /// entirely, but then a missed notification means a missed broadcast with
+    /// nothing to catch it. This keeps a net at ~1/30th the traffic.
+    WebSubSlow,
     /// Like `WebSub` but with **no polling fallback**: only push notifications
     /// trigger recording. Zero scheduled polls — ideal for monitoring channels
     /// with auto=off, or for any YouTube channel where push reliability is
@@ -298,6 +317,7 @@ impl DetectionMethod {
             DetectionMethod::EventSubHelix => "eventsub_helix",
             DetectionMethod::KickApi => "kick_api",
             DetectionMethod::WebSub => "websub",
+            DetectionMethod::WebSubSlow => "websub_slow",
             DetectionMethod::WebSubOnly => "websub_only",
             DetectionMethod::Disabled => "disabled",
         }
@@ -314,6 +334,7 @@ impl DetectionMethod {
             DetectionMethod::EventSubHelix => "Twitch EventSub + Helix",
             DetectionMethod::KickApi => "Kick official API",
             DetectionMethod::WebSub => "YouTube WebSub (VPS push)",
+            DetectionMethod::WebSubSlow => "YouTube WebSub + slow net",
             DetectionMethod::WebSubOnly => "YouTube WebSub (push only)",
             DetectionMethod::Disabled => "Disabled (manual only)",
         }
@@ -331,6 +352,7 @@ impl DetectionMethod {
             DetectionMethod::EventSubHelix => "ES+Helix",
             DetectionMethod::KickApi => "Kick API",
             DetectionMethod::WebSub => "WebSub",
+            DetectionMethod::WebSubSlow => "WebSub+",
             DetectionMethod::WebSubOnly => "WebSub!",
             DetectionMethod::Disabled => "Disabled",
         }
@@ -346,6 +368,7 @@ impl DetectionMethod {
             "eventsub_helix" => DetectionMethod::EventSubHelix,
             "kick_api" => DetectionMethod::KickApi,
             "websub" => DetectionMethod::WebSub,
+            "websub_slow" => DetectionMethod::WebSubSlow,
             "websub_only" => DetectionMethod::WebSubOnly,
             "disabled" => DetectionMethod::Disabled,
             _ => DetectionMethod::GenericProbe,
@@ -388,6 +411,9 @@ impl DetectionMethod {
                  triggers an immediate liveness check (records only if actually live), with \
                  scrape polling as a safety-net fallback. Set the VPS URL + token in Settings; \
                  a longer poll interval is fine."
+            }
+            DetectionMethod::WebSubSlow => {
+                "WebSub push plus a SLOW scrape safety net — one page fetch per channel every                  15 minutes at most, however short this instance's poll interval is. Use it                  where a missed push would cost you a broadcast. Plain WebSub polls on the                  instance interval instead, which at 60s across a few dozen channels is tens                  of thousands of page loads a day and is what got this IP bot-walled by                  YouTube; this is the same net at a thirtieth of the traffic."
             }
             DetectionMethod::WebSubOnly => {
                 "Like WebSub but with zero polling: only push notifications from the yt-websub \
