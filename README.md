@@ -1152,6 +1152,13 @@ believes against what is actually on disk.
 **Orphan outputs** promotes a take whose file turned out to be intact after an
 unclean shutdown, or re-points it at the capture file still in the cache.
 
+**Stale issues** retires ⚠ Issues entries whose file no longer exists. Every
+Issues section is built from database state alone — none of them asks whether
+the file is still there — so an entry outlives its subject: a "needs remux" row
+keeps asking for a `.ts` that was swept months ago. On one real archive **177 of
+465** path-bearing entries were like that, enough to hide the 210 that were
+genuine work (648 GB of unremuxed captures) in plain sight.
+
 **Companion pointers** forgets a `full` / head-backfill / recovery / VOD-download
 path whose file is gone. The main recording path is cleared wherever the app
 disposes of media, but a companion is a separate file that can vanish
@@ -1162,7 +1169,8 @@ four of them onto a new drive where they equally did not exist.
 
 **An unreachable drive is never read as an absent file.** Each drive is probed
 once per pass and, if its root does not answer, every pointer on it is left
-alone and retried next start. On an archive spread over removable bays this is
+alone and retried next start. A file whose whole parent directory is missing is
+skipped too — that is a mount problem, not a deletion. On an archive spread over removable bays this is
 the difference between a repair and a cable fault silently erasing a drive's
 worth of pointers.
 

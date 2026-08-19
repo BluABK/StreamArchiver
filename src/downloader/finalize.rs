@@ -1572,6 +1572,104 @@ impl Supervisor {
     /// treating an offline `G:` as "35 files deleted" would erase every
     /// pointer on it, permanently, from a cable fault. A drive whose root does
     /// not answer is skipped entirely and retried next startup.
+    /// Retire Issues entries whose file is gone.
+    ///
+    /// Every Issues section is built from database state alone, so an entry
+    /// outlives its subject: a "needs remux" row keeps asking for a `.ts` that
+    /// was swept months ago, and a gap-splice failure keeps describing a
+    /// splice on a file nobody has. On a real archive 177 of 465 path-bearing
+    /// entries were like this — enough to hide the 210 that were real work
+    /// (648 GB of unremuxed captures) in plain sight.
+    ///
+    /// A missing `.ts` clears the take's media pointer, which is both true and
+    /// what takes it out of the panel. A gap-splice failure on a file that is
+    /// gone clears the state instead: the take may still have other media, and
+    /// only the splice verdict is meaningless.
+    ///
+    /// Two guards, because being wrong here is destructive and silent:
+    /// **the drive must answer**, and **the parent directory must exist**. A
+    /// removable bay that dropped out, or a volume mounted without its tree,
+    /// would otherwise read as "every issue resolved itself" and take the
+    /// pointers with it.
+    async fn reconcile_stale_issues(&self) {
+        use std::collections::HashMap;
+
+        let rows = match self.store.issue_paths_to_verify() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("issue repair: failed to load entries: {e:#}");
+                return;
+            }
+        };
+        let mut drive_ok: HashMap<char, bool> = HashMap::new();
+        let (mut cleared_media, mut cleared_splice, mut skipped) = (0usize, 0usize, 0usize);
+
+        for (rec_id, path) in rows {
+            let p = PathBuf::from(&path);
+            if let Some(d) = crate::downloader::drive_of(&p) {
+                let ok = match drive_ok.get(&d) {
+                    Some(v) => *v,
+                    None => {
+                        let root = PathBuf::from(format!("{d}:\\"));
+                        let ok = crate::iomon::fs::metadata(Cat::Startup, &root).await.is_ok();
+                        drive_ok.insert(d, ok);
+                        if !ok {
+                            info!(drive = %d, "issue repair: drive offline, leaving its entries alone");
+                        }
+                        ok
+                    }
+                };
+                if !ok {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            if crate::iomon::fs::metadata(Cat::Startup, &p).await.is_ok() {
+                continue; // the issue is real
+            }
+            // The file is missing — but is its whole folder missing too? That
+            // is a mount problem, not a deletion, and must not be "repaired".
+            if let Some(parent) = p.parent()
+                && crate::iomon::fs::metadata(Cat::Startup, parent).await.is_err()
+            {
+                skipped += 1;
+                continue;
+            }
+            match self.store.clear_stale_gap_splice(rec_id) {
+                Ok(n) if n > 0 => {
+                    cleared_splice += 1;
+                    info!(rec_id, path = %path, "issue repair: gap-splice failure on a file that is gone");
+                }
+                Ok(_) => {}
+                Err(e) => warn!(rec_id, "issue repair: clearing splice state failed: {e:#}"),
+            }
+            if let Err(e) = self.store.clear_recording_media(rec_id, crate::models::now_unix()) {
+                warn!(rec_id, "issue repair: clearing media pointer failed: {e:#}");
+            } else {
+                cleared_media += 1;
+                info!(rec_id, path = %path, "issue repair: media is gone, pointer cleared");
+            }
+        }
+
+        // Gap-splice failures that never had a path to begin with.
+        match self.store.pathless_gap_splice_failures() {
+            Ok(ids) => {
+                for id in ids {
+                    if let Ok(n) = self.store.clear_stale_gap_splice(id)
+                        && n > 0
+                    {
+                        cleared_splice += 1;
+                    }
+                }
+            }
+            Err(e) => warn!("issue repair: pathless splice query failed: {e:#}"),
+        }
+
+        if cleared_media + cleared_splice + skipped > 0 {
+            info!(cleared_media, cleared_splice, skipped, "issue repair: finished");
+        }
+    }
+
     async fn reconcile_companion_paths(&self) {
         use std::collections::HashMap;
 
@@ -1707,6 +1805,7 @@ impl Supervisor {
             info!(promoted, retargeted, "orphan repair: pass complete");
         }
         self.reconcile_companion_paths().await;
+        self.reconcile_stale_issues().await;
     }
 }
 

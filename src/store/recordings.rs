@@ -1306,6 +1306,67 @@ impl Store {
     /// Clear a recording's head-backfill reference — the file itself is
     /// deleted by the caller first. Used when a later take's fresh head
     /// supersedes an older take's now-redundant head file.
+    /// Takes the Issues panel is currently reporting **because of a file**:
+    /// the "needs remux" list (a `.ts` still in the capture cache) and the
+    /// gap-splice failures. Returned as `(id, path)` so the caller can check
+    /// each against disk.
+    ///
+    /// Issues is built entirely from database state — no section asks whether
+    /// the file is still there — so an entry can never resolve itself once its
+    /// media is swept, disposed of, or deleted by hand. On a real archive that
+    /// left **177 of 465** path-bearing entries pointing at files that had not
+    /// existed for weeks, burying the 210 that were genuine work.
+    ///
+    /// Deliberately scoped to the Issues predicates rather than "every take
+    /// whose file is missing": clearing paths archive-wide on startup would
+    /// rewrite thousands of rows unattended, and the question asked here is
+    /// only whether what the panel *reports* is true.
+    pub fn issue_paths_to_verify(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, output_path FROM recording
+             WHERE output_path != ''
+               AND ( (output_path LIKE '%.ts'
+                      AND (output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%')
+                      AND status != 'ended')
+                  OR gap_splice_state IN ('mismatch', 'anchor_failed', 'verify_failed') )",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget a gap-splice failure whose media is gone.
+    ///
+    /// `mismatch` / `anchor_failed` / `verify_failed` describe a splice that
+    /// went wrong on a specific file. Once that file no longer exists the
+    /// state is a fact about nothing — there is no retry, no repair, and no
+    /// way for the row to leave the Issues panel on its own.
+    pub fn clear_stale_gap_splice(&self, id: i64) -> Result<usize> {
+        let conn = self.db();
+        Ok(conn.execute(
+            "UPDATE recording SET gap_splice_state = '' WHERE id = ?1
+               AND gap_splice_state IN ('mismatch', 'anchor_failed', 'verify_failed')",
+            params![id],
+        )?)
+    }
+
+    /// Gap-splice failures with no `output_path` at all — the media was
+    /// disposed of, so the state can only ever be historical.
+    pub fn pathless_gap_splice_failures(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM recording
+             WHERE COALESCE(output_path, '') = ''
+               AND gap_splice_state IN ('mismatch', 'anchor_failed', 'verify_failed')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Every companion pointer currently set, as `(recording id, which, path)`.
     ///
     /// Small by construction — 136 rows on a real 3.8k-take archive — because
@@ -4092,6 +4153,64 @@ mod tests {
         assert_eq!(row.output_path, "C:/tmp/1.mkv");
         // The sweep tells the two apart on this alone, so it has to survive.
         assert_eq!(store.expired_rolling_recordings(now).unwrap()[1].output_path, "");
+    }
+
+    /// The Issues panel reports from database state alone, so its entries
+    /// have to be verifiable against disk from outside. This pins WHICH rows
+    /// the verifier is handed: the ones the panel is showing because of a
+    /// file, and no others — a verifier scoped to "every take with a missing
+    /// file" would rewrite thousands of unrelated rows on startup.
+    #[test]
+    fn only_file_backed_issue_entries_are_offered_for_verification() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let mk = |n: i64, path: &str, status: &str| -> i64 {
+            let rid = store
+                .insert_recording(mid, n, path, None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, n + 10, 1, Some(0), status, path, "").unwrap();
+            rid
+        };
+
+        let needs_remux = mk(100, r"G:\streams\.sa-cache\c\a.ts", "completed");
+        // 'ended' takes captured nothing: their .ts is a husk, not remux work.
+        let ended_husk = mk(200, r"G:\streams\.sa-cache\c\b.ts", "ended");
+        // An ordinary archived take is not an issue and must not be offered.
+        let archived = mk(300, r"G:\streams\c\c.mkv", "completed");
+        let splice = mk(400, r"G:\streams\c\d.mkv", "completed");
+        store.set_gap_splice_state(splice, "anchor_failed").unwrap();
+
+        let offered: Vec<i64> =
+            store.issue_paths_to_verify().unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(offered.contains(&needs_remux), "a cached .ts is remux work");
+        assert!(offered.contains(&splice), "a splice failure names a file");
+        assert!(!offered.contains(&ended_husk), "'ended' is not remux work");
+        assert!(!offered.contains(&archived), "an ordinary take is not an issue");
+
+        // Clearing a splice verdict is scoped to failure states, so a healthy
+        // or in-progress splice can never be wiped by the repair.
+        assert_eq!(store.clear_stale_gap_splice(splice).unwrap(), 1);
+        assert_eq!(store.clear_stale_gap_splice(splice).unwrap(), 0, "idempotent");
+        store.set_gap_splice_state(archived, "done").unwrap();
+        assert_eq!(store.clear_stale_gap_splice(archived).unwrap(), 0, "'done' is untouched");
+    }
+
+    /// A splice failure whose take has no media at all can only be historical,
+    /// and nothing else will ever clear it.
+    #[test]
+    fn pathless_splice_failures_are_found_regardless_of_status() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store.finish_recording(rid, 200, 1, Some(0), "completed", "", "").unwrap();
+        store.set_gap_splice_state(rid, "verify_failed").unwrap();
+        assert_eq!(store.pathless_gap_splice_failures().unwrap(), vec![rid]);
+        // ...and it is NOT offered to the disk verifier, which needs a path.
+        assert!(store.issue_paths_to_verify().unwrap().is_empty());
     }
 
     /// Companion pointers are enumerated and cleared independently of each
