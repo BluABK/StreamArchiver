@@ -1357,7 +1357,9 @@ impl StreamArchiverApp {
                 .show(ui, |ui| {
                     ui.label("Total recordings");
                     ui.strong(global.total_recordings.to_string());
-                    ui.label("Total archived");
+                    ui.label("Total on disk").on_hover_text(
+                        "Every take's media, archived or not. A capture that died                          mid-stream still occupies whatever it wrote to the capture                          cache, and that now counts here — it used to record as zero,                          which is how hundreds of GB of unfinished captures stayed                          invisible to every total in the app.",
+                    );
                     ui.strong(fmt_bytes(global.total_bytes));
                     ui.end_row();
 

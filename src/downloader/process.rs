@@ -1201,6 +1201,9 @@ impl Supervisor {
         }
 
         let bytes = file_len(&final_path).await as i64;
+        // Success is the promoted file; `disk_bytes` is what the take
+        // actually occupies, including cache leftovers it never merged.
+        let disk_bytes = disk_bytes_for(&final_path).await;
         let log = read_log_tail(&PathBuf::from(&row.log_path), RING_MAX_LINES).await;
         let key = match row.kind {
             DetachedKind::Video => row.ref_id,
@@ -1232,7 +1235,7 @@ impl Supervisor {
                 let _ = self.store.finish_recording(
                     row.ref_id,
                     ended,
-                    bytes,
+                    disk_bytes,
                     None,
                     status,
                     &final_path.to_string_lossy(),
@@ -1428,11 +1431,14 @@ impl Supervisor {
             src.clone()
         };
         let bytes = file_len(&final_path).await as i64;
+        // Success is the promoted file; `disk_bytes` is what the take
+        // actually occupies, including cache leftovers it never merged.
+        let disk_bytes = disk_bytes_for(&final_path).await;
         let status = if bytes > 0 { "completed" } else { "failed" };
         let _ = self.store.finish_recording(
             rec_id,
             ended,
-            bytes,
+            disk_bytes,
             None,
             status,
             &final_path.to_string_lossy(),
@@ -1655,6 +1661,9 @@ impl Supervisor {
         }
 
         let bytes = file_len(&final_path).await as i64;
+        // Success is the promoted file; `disk_bytes` is what the take
+        // actually occupies, including cache leftovers it never merged.
+        let disk_bytes = disk_bytes_for(&final_path).await;
         // Lost-time: a from-start capture that reached the live edge missed nothing.
         if let (Some(wl), Some(captured)) =
             (rec.went_live_at, media_duration_secs(&final_path).await)
@@ -1726,7 +1735,7 @@ impl Supervisor {
         let _ = self.store.finish_recording(
             rec_id,
             ended,
-            bytes,
+            disk_bytes,
             outcome.exit_code,
             status,
             &final_path.to_string_lossy(),

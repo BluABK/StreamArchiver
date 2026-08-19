@@ -702,6 +702,28 @@ pub(super) fn expand_title_tag(opts: &crate::models::RemuxOpts, dst: &Path) -> S
         .to_string()
 }
 
+/// What a finished take costs on disk: the promoted file if there is one,
+/// otherwise whatever the capture left behind in the cache.
+///
+/// **Never use this to decide whether a take succeeded.** Success is
+/// `file_len(final_path) > 0` and nothing else — a take that died leaving 5 GB
+/// of unmergeable SABR partials has media on disk but did not succeed, and
+/// promoting it on the strength of that would break the backoff ladder, the
+/// alerts, and the retry logic all at once.
+///
+/// It exists because the two questions had been conflated in the other
+/// direction: `bytes` was the promoted file's size, so a failed take recorded
+/// 0 and its disk usage was invisible to every readout in the app. That is how
+/// 826 GB of capture cache accumulated on one archive without appearing in a
+/// single total.
+pub(super) async fn disk_bytes_for(final_path: &Path) -> i64 {
+    let promoted = file_len(final_path).await;
+    if promoted > 0 {
+        return promoted as i64;
+    }
+    crate::downloader::cache::cache_leftover_bytes(final_path).await as i64
+}
+
 pub(super) async fn file_len(path: &Path) -> u64 {
     crate::iomon::fs::metadata(Cat::FsProbe, path)
         .await

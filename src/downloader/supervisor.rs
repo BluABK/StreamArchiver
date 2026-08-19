@@ -3363,6 +3363,11 @@ progress_info: None,
             }
         }
 
+        // NOTE: video downloads still record only the promoted file's size.
+        // A failed download leaves `.part` files in the cache the same way a
+        // capture does, so the same under-reporting applies here — not fixed
+        // in this pass because the video table's `bytes` feeds different
+        // readouts and deserves its own look.
         let bytes = file_len(&final_path).await as i64;
         // A clean exit with a media-named file is trusted; a nonzero/unknown
         // exit must additionally prove itself to ffprobe (partial-but-playable
@@ -4114,6 +4119,9 @@ progress_info: None,
             .await;
 
         let bytes = file_len(&final_path).await as i64;
+        // Success is the promoted file; `disk_bytes` is what the take
+        // actually occupies, including cache leftovers it never merged.
+        let disk_bytes = disk_bytes_for(&final_path).await;
 
         self.maybe_clear_lost_time(resolve_lost, went_live_at, &final_path, ended, rec_id)
             .await;
@@ -4266,6 +4274,7 @@ progress_info: None,
             &outcome,
             &final_path,
             bytes,
+            disk_bytes,
             ok,
             manually_stopped,
             shutting_down,
@@ -5173,7 +5182,11 @@ progress_info: None,
         rec_id: i64,
         outcome: &ProcessOutcome,
         final_path: &Path,
+        // `bytes` is the promoted file and decides `ok`/status; `disk_bytes`
+        // is what the take occupies including cache leftovers and is only
+        // recorded — see `disk_bytes_for` for why conflating them is a bug.
         bytes: i64,
+        disk_bytes: i64,
         ok: bool,
         manually_stopped: bool,
         shutting_down: bool,
@@ -5213,7 +5226,7 @@ progress_info: None,
         let _ = self.store.finish_recording(
             rec_id,
             ended,
-            bytes,
+            disk_bytes,
             outcome.exit_code,
             status,
             &final_path.to_string_lossy(),
@@ -5358,6 +5371,9 @@ progress_info: None,
         }
 
         let bytes = file_len(&final_path).await as i64;
+        // Success is the promoted file; `disk_bytes` is what the take
+        // actually occupies, including cache leftovers it never merged.
+        let disk_bytes = disk_bytes_for(&final_path).await;
         let ok = bytes > 0;
         let manually_stopped = self.stopping_monitors.lock().unwrap().contains(&monitor_id);
         let stall_killed = self
@@ -5380,7 +5396,7 @@ progress_info: None,
         let _ = self.store.finish_recording(
             rec_id,
             ended,
-            bytes,
+            disk_bytes,
             outcome.exit_code,
             status,
             &final_path.to_string_lossy(),

@@ -219,6 +219,48 @@ pub(super) fn is_sweepable_cache_litter(name: &str) -> bool {
 /// derives `capture_path`, without needing to re-derive SABR/container state
 /// — the caller just probes each candidate and uses whichever exists). Used
 /// by `Supervisor::manual_head_backfill` for a take that's still active.
+/// Every byte this take currently has sitting in the capture cache.
+///
+/// [`live_capture_candidates`] only names `{stem}.ts` and `{stem}.mkv`,
+/// because those are what a take is *promoted* from. That is the wrong shape
+/// for accounting: a yt-dlp SABR capture that dies mid-stream leaves
+/// `{stem}.f303.mkv.sq0.part` (video) and `{stem}.f140.mkv` (audio), which
+/// match neither name — so a take that wrote 5 GB was recorded as 0 bytes and
+/// its disk usage was invisible everywhere in the app. One real archive had
+/// **826 GB** of capture cache accounted for nowhere.
+///
+/// So this globs the cache directory for anything sharing the take's stem —
+/// media, partials, thumbnails, `.state`, playlists. Everything the take left
+/// behind counts, because all of it is occupying the disk, which is the
+/// question the number exists to answer.
+pub(super) async fn cache_leftover_bytes(final_path: &Path) -> u64 {
+    let (Some(dir), Some(stem)) =
+        (final_path.parent(), final_path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+    else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for cache in cache_dir_candidates(dir) {
+        let Ok(mut entries) = crate::iomon::fs::read_dir(Cat::FsProbe, &cache).await else {
+            continue;
+        };
+        while let Ok(Some(e)) = entries.next_entry().await {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // `starts_with` on the stem, so `<stem>.f303.mkv.sq0.part` counts
+            // while a DIFFERENT take that merely shares a title prefix does
+            // not — stems carry the take's own timestamp.
+            if !name.starts_with(&stem) {
+                continue;
+            }
+            if let Ok(md) = crate::iomon::fs::metadata(Cat::FsProbe, &e.path()).await {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
 pub(super) fn live_capture_candidates(final_path: &Path) -> Vec<PathBuf> {
     let (Some(dir), Some(stem)) =
         (final_path.parent(), final_path.file_stem().map(|s| s.to_string_lossy().into_owned()))
@@ -538,6 +580,37 @@ mod tests {
     #[allow(unused_imports)]
     use crate::downloader::test_util::*;
 
+    /// A take that dies mid-capture leaves yt-dlp's SABR halves behind, and
+    /// they match neither `{stem}.ts` nor `{stem}.mkv` — which is exactly why
+    /// their gigabytes were recorded as zero. The stem prefix has to catch
+    /// them, without catching a different take that merely shares a title.
+    #[tokio::test]
+    async fn cache_leftovers_count_sabr_partials_but_not_a_neighbouring_take() {
+        #![allow(clippy::disallowed_methods)]
+        let dir = std::env::temp_dir().join(format!("sa_leftover_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join(CACHE_DIR_NAME);
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let stem = "chan - 2026-08-04 18-52-08 - Title [YouTube AAA]";
+        // What a dead SABR capture actually leaves.
+        std::fs::write(cache.join(format!("{stem}.f303.mkv.sq0.part")), vec![0u8; 5000]).unwrap();
+        std::fs::write(cache.join(format!("{stem}.f140.mkv")), vec![0u8; 700]).unwrap();
+        std::fs::write(cache.join(format!("{stem}.thumbnail.jpg")), vec![0u8; 30]).unwrap();
+        // A DIFFERENT take of the same stream: same title, different timestamp.
+        // Stems carry the take's own time, so this must not be counted.
+        std::fs::write(
+            cache.join("chan - 2026-08-04 19-30-00 - Title [YouTube AAA].f303.mkv.sq0.part"),
+            vec![0u8; 900_000],
+        )
+        .unwrap();
+
+        let final_path = dir.join(format!("{stem}.mkv"));
+        let got = cache_leftover_bytes(&final_path).await;
+        assert_eq!(got, 5000 + 700 + 30, "the take's own leftovers, and only those");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn sweepable_cache_litter_never_matches_a_real_capture() {
         // Recognized tool byproducts: safe to age-sweep.
