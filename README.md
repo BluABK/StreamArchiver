@@ -4069,7 +4069,13 @@ left/right with each sender's badge count — only a message with more than 3
 badges at once (rare) overflows its own row.
 
 **7TV gradient usernames ("paints")** render for chatters who have one, from
-7TV's v4 GraphQL API. It is an approximation, and the shape of the
+7TV's v4 GraphQL API. That API scores query complexity and the ceiling moves
+without notice — on 2026-08-19 batches of 50 that had worked since the feature
+shipped started coming back `Query is too complex`, and every paint quietly
+stopped resolving. Measured that day, 18 aliases pass and 19 do not, so the app
+asks for 12 at a time and, on a complexity refusal, halves the batch and
+retries rather than giving up. A future tightening costs extra requests against
+a 24-hour cache instead of taking the feature out. It is an approximation, and the shape of the
 approximation is worth knowing: egui colours text one *run* at a time, so a
 gradient is quantized into at most 12 flat-coloured runs across the name —
 enough to read as a smooth sweep at chat sizes, and bounded so a screen full

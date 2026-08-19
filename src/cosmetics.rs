@@ -25,9 +25,29 @@ pub const K_RENDER_PAINTS: &str = "chat_render_7tv_paints";
 /// a stale gradient is a cosmetic non-event.
 pub const PAINTS_TTL_SECS: i64 = 24 * 60 * 60;
 
-/// Twitch ids per GraphQL request. The endpoint scores query complexity, so
-/// this stays modest rather than asking for hundreds of aliases at once.
-const CHUNK: usize = 50;
+/// Twitch ids per GraphQL request.
+///
+/// 7TV scores query complexity and the ceiling moves without notice. Measured
+/// against the live endpoint on 2026-08-19 with the exact selection below:
+/// **18 aliases pass, 19 are refused**. It had been 50, which worked when the
+/// query was written and silently stopped working when they tightened it.
+///
+/// So this sits well under the measured ceiling rather than on it — the cost
+/// of a smaller batch is another HTTP request against a 24-hour cache, and the
+/// cost of sitting on the limit is every paint in the app going missing the
+/// next time somebody at 7TV changes a number. [`fetch_paints`] also halves
+/// and retries on a complexity refusal, so a future tightening degrades into
+/// extra requests instead of an outage.
+const CHUNK: usize = 12;
+
+/// The alias count 7TV refused at, measured live on 2026-08-19.
+const MEASURED_COMPLEXITY_CEILING: usize = 19;
+
+// `CHUNK` must stay clear of the ceiling rather than sit on it: one more
+// request against a 24-hour cache is cheap, and being a single field addition
+// away from every paint vanishing is not. A compile error rather than a test,
+// because raising `CHUNK` past this is a mistake worth catching before it runs.
+const _: () = assert!(CHUNK * 3 < MEASURED_COMPLEXITY_CEILING * 2);
 
 /// One colour stop: position along the gradient (0..1) and an `#RRGGBBAA`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -209,43 +229,78 @@ pub async fn fetch_paints(
     http: &reqwest::Client,
     twitch_ids: &[String],
 ) -> anyhow::Result<HashMap<String, Paint>> {
+    let mut out = HashMap::new();
+    // A work stack rather than a plain chunk loop: a batch refused for
+    // complexity is split and re-queued, so the fetch adapts to whatever
+    // ceiling 7TV is enforcing today instead of failing wholesale.
+    let mut queue: Vec<&[String]> = twitch_ids.chunks(CHUNK).collect();
+    while let Some(batch) = queue.pop() {
+        match fetch_paint_batch(http, batch).await {
+            Ok(found) => out.extend(found),
+            Err(e) if is_too_complex(&e) && batch.len() > 1 => {
+                let mid = batch.len() / 2;
+                tracing::debug!(
+                    n = batch.len(),
+                    "7tv paints: batch refused as too complex, splitting and retrying"
+                );
+                queue.push(&batch[..mid]);
+                queue.push(&batch[mid..]);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a fetch error is 7TV refusing the query for size rather than for
+/// anything about the request being wrong.
+///
+/// This is the one GraphQL error worth retrying differently: a smaller batch
+/// is genuinely likely to succeed, where a bad field name never will.
+fn is_too_complex(e: &anyhow::Error) -> bool {
+    e.to_string().to_lowercase().contains("too complex")
+}
+
+/// One request's worth of ids. Returns only the users who have a paint.
+async fn fetch_paint_batch(
+    http: &reqwest::Client,
+    chunk: &[String],
+) -> anyhow::Result<HashMap<String, Paint>> {
     const FIELDS: &str = "style { activePaint { id name data { layers { opacity ty { \
         __typename \
         ... on PaintLayerTypeSingleColor { color { hex } } \
         ... on PaintLayerTypeLinearGradient { angle repeating stops { at color { hex } } } \
         ... on PaintLayerTypeRadialGradient { repeating stops { at color { hex } } } \
         } } } } }";
+    // Twitch ids are numeric, so they're safe to embed; aliases can't
+    // start with a digit, hence the `u` prefix.
+    let subs: String = chunk
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!("u{i}: userByConnection(platform: TWITCH, platformId: \"{id}\") {{ {FIELDS} }} ")
+        })
+        .collect();
+    let body = serde_json::json!({ "query": format!("{{ users {{ {subs}}} }}") });
+    let resp = http.post("https://7tv.io/v4/gql").json(&body).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("7tv gql {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    // A GraphQL error is still an HTTP 200 with `data: null` — anything
+    // in `chunk` would then read back as "asked, no paint" and get
+    // negative-cached for `PAINTS_TTL_SECS` (24h) by the caller, even
+    // though nobody in this batch was actually checked. Bailing here
+    // instead means the caller's `asked` set is untouched and the next
+    // sweep retries the same chunk.
+    if let Some(e) = gql_error(&v) {
+        anyhow::bail!("7tv gql: {e}");
+    }
     let mut out = HashMap::new();
-    for chunk in twitch_ids.chunks(CHUNK) {
-        // Twitch ids are numeric, so they're safe to embed; aliases can't
-        // start with a digit, hence the `u` prefix.
-        let subs: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                format!("u{i}: userByConnection(platform: TWITCH, platformId: \"{id}\") {{ {FIELDS} }} ")
-            })
-            .collect();
-        let body = serde_json::json!({ "query": format!("{{ users {{ {subs}}} }}") });
-        let resp = http.post("https://7tv.io/v4/gql").json(&body).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("7tv gql {}", resp.status());
-        }
-        let v: serde_json::Value = resp.json().await?;
-        // A GraphQL error is still an HTTP 200 with `data: null` — anything
-        // in `chunk` would then read back as "asked, no paint" and get
-        // negative-cached for `PAINTS_TTL_SECS` (24h) by the caller, even
-        // though nobody in this batch was actually checked. Bailing here
-        // instead means the caller's `asked` set is untouched and the next
-        // sweep retries the same chunk.
-        if let Some(e) = gql_error(&v) {
-            anyhow::bail!("7tv gql: {e}");
-        }
-        for (i, id) in chunk.iter().enumerate() {
-            let node = &v["data"]["users"][format!("u{i}")]["style"]["activePaint"];
-            if let Some(p) = parse_paint(node) {
-                out.insert(id.clone(), p);
-            }
+    for (i, id) in chunk.iter().enumerate() {
+        let node = &v["data"]["users"][format!("u{i}")]["style"]["activePaint"];
+        if let Some(p) = parse_paint(node) {
+            out.insert(id.clone(), p);
         }
     }
     Ok(out)
@@ -324,6 +379,29 @@ mod tests {
     /// for this, every id in that batch reads back as "no paint" and gets
     /// negative-cached for `PAINTS_TTL_SECS`, silently hiding a real paint
     /// for up to a day.
+    /// 7TV refused batches of 50 on 2026-08-19 that had worked since the query
+    /// was written — their complexity ceiling moved and every paint in the app
+    /// quietly stopped resolving. Measured live that day: 18 aliases pass, 19
+    /// do not.
+    ///
+    /// A complexity refusal is the one GraphQL error where retrying smaller
+    /// genuinely helps, so it has to be told apart from the errors where it
+    /// never will (a bad field name shrinks to a bad field name).
+    #[test]
+    fn only_a_complexity_refusal_is_worth_retrying_smaller() {
+        assert!(is_too_complex(&anyhow::anyhow!("7tv gql: Query is too complex.")));
+        // Wording is theirs to change; match loosely and case-insensitively.
+        assert!(is_too_complex(&anyhow::anyhow!("QUERY IS TOO COMPLEX")));
+        assert!(is_too_complex(&anyhow::anyhow!("too complex, reduce the query")));
+
+        // These do not get smaller by being split.
+        assert!(!is_too_complex(&anyhow::anyhow!(
+            "7tv gql: Unknown field \"idz\" on type \"Paint\"."
+        )));
+        assert!(!is_too_complex(&anyhow::anyhow!("7tv gql 503 Service Unavailable")));
+        assert!(!is_too_complex(&anyhow::anyhow!("error decoding response body")));
+    }
+
     #[test]
     fn gql_error_finds_a_top_level_graphql_error() {
         let v: serde_json::Value = serde_json::from_str(
