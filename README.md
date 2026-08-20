@@ -3293,7 +3293,8 @@ newest 500 broadcasts by default — **⬇ Load more** raises the cap):
 
 - **📥 Backlog** — a to-do list for catching up, as a **full grid**: watch
   state, platform, channel, title, game, went live, started, duration, size,
-  💬 chat (click to open the replay), ✏ changes, 📢 ads and status. Columns
+  💾 on disk, 💬 chat (click to open the replay), ✏ changes, 📢 ads, status and
+  the media's **File** path. Columns
   hide/show, resize, reorder and sort like every other table, and it defaults
   to **newest first, flat across every channel** — which is exactly why it
   isn't just a mode of 📺 Streams, where rows are grouped under channel
@@ -3313,8 +3314,25 @@ newest 500 broadcasts by default — **⬇ Load more** raises the cap):
   to the *broadcast*, not any one file — a reconnect that produces multiple
   takes for the same stream shares one state.
 
-  **Right-click any row** for the parts of the Streams take-row menu that make
-  sense for a finished broadcast: **▶ Open file**, **⏵ Play local recording**,
+  **💾 On disk** answers a question **Size** cannot: whether the media is still
+  there. Size comes from the database, which is written once when a capture
+  finishes and can be years out of date; this column probes the filesystem
+  instead — **✔** every take present, **◐** some gone, **✖** nothing left,
+  blank if the broadcast was never captured at all (which is not the same thing
+  as losing it). While a check is still in flight it shows **…** rather than
+  guessing — a column that says a file is missing before it has looked is worse
+  than no column. Sort it ascending to bring the gaps to the top.
+
+  **File** shows where the media actually lives — the newest take's path, so the
+  drive is readable at a glance, which matters once takes have been relocated
+  between disks or a channel's output folder has changed. It takes the leftover
+  width, and its filter box accepts a plain substring, so typing `P:` narrows
+  the grid to one disk.
+
+  **Double-click a row to play it** — the configured media player if you've set
+  one, the system handler otherwise, which is exactly what the menu's two
+  entries do rather than a third behaviour. **Right-click any row** for the
+  parts of the Streams take-row menu that make sense for a finished broadcast: **▶ Open file**, **⏵ Play local recording**,
   **▷ Play VOD** and **🌐 Open VOD webpage** (both re-resolve the URL live, so
   they work even on a broadcast that was never captured locally), **💬 Chat
   replay**, **📂 Open folder**, **📋 Copy file path**, **📄 Properties…**, and
@@ -3376,7 +3394,11 @@ keeps its own retention (or opts out entirely).
   week-old take counting down is listed even when the page only reaches back a
   few hours. It used to be filtered out of the loaded page instead, which meant
   the busier your archive the less this list could be trusted — the one place
-  that must never quietly omit something.
+  that must never quietly omit something. **Its rows behave like the grid's**:
+  double-click to play, right-click for the same full menu, and the Watch and
+  💬 cells work rather than swallowing the click. These are the files most worth
+  watching *now* — they are the ones about to be deleted — so making them harder
+  to open than an ordinary archived stream had it backwards.
 - **Markers elsewhere.** *Every* level of the 📺 Streams tree shows the
   countdown, so no amount of collapsing can hide an imminent deletion:
   - **Take rows** — **🕰 6d 4h** while counting down, **🕰📌** once kept

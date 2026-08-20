@@ -916,7 +916,7 @@ pub(super) const CLIP_COLS: usize = 13;
 /// hence Watch + the recording-shaped columns, and nothing about live state.
 /// Each `id` is a stable persistence key: never reuse or change one once
 /// shipped.
-pub(super) const BACKLOG_COLUMNS: [GridCol; 13] = [
+pub(super) const BACKLOG_COLUMNS: [GridCol; 15] = [
     GridCol { id: "watch",     title: "Watch",   tooltip: "Watch state for this broadcast: ◻ Unwatched, ▶ Started, ⏭ Skipped, ✔ Watched. Playing a take (or tuning into the channel live) advances Unwatched/Skipped to Started automatically; it never downgrades one you already marked. State belongs to the BROADCAST, so a reconnect that produced several takes shares one.", min_width: 130.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "platform",  title: "Plat",    tooltip: "Source platform of the channel this broadcast came from.", min_width: 46.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "channel",   title: "Channel", tooltip: "Which channel broadcast this, with the capturing instance's profile picture (the channel's own when that account has none yet) — hold Alt while hovering a picture for a full-size preview. Click a row to select that channel in 📺 Streams.", min_width: 120.0, initial: 0.0, sortable: true, stretch: false },
@@ -926,10 +926,12 @@ pub(super) const BACKLOG_COLUMNS: [GridCol; 13] = [
     GridCol { id: "started",   title: "Started", tooltip: "When recording started.", min_width: 92.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "duration",  title: "Duration", tooltip: "How much was captured, summed across every take of this broadcast.", min_width: 56.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "size",      title: "Size",    tooltip: "Total size on disk of this broadcast's takes. Blank once the files are gone (e.g. an expired rolling recording, or a manual delete) — the history row survives either way.", min_width: 62.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "on_disk",   title: "💾",      tooltip: "Whether this broadcast's media is still on disk, checked against the filesystem rather than the database: ✔ every take present, ◐ some takes gone, ✖ nothing left, blank if it was never captured at all. \"…\" means the check hasn't come back yet — it is never reported as missing before it has actually been looked for. Sort ascending to bring the gaps to the top.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "chat",      title: "💬",      tooltip: "A chat log was captured for this broadcast. Click to open the chat replay.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "changes",   title: "✏",       tooltip: "Title / game-category changes logged during the broadcast.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "ads",       title: "📢",      tooltip: "Ad breaks detected during the broadcast; each is a hard cut. Hover for count + total time.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
-    GridCol { id: "status",    title: "●",       tooltip: "Rolled-up capture status for the broadcast: ⏺ recording, ✔ completed, ⚠ failed, ⚡ aborted.", min_width: 26.0, initial: 0.0, sortable: true, stretch: true },
+    GridCol { id: "status",    title: "●",       tooltip: "Rolled-up capture status for the broadcast: ⏺ recording, ✔ completed, ⚠ failed, ⚡ aborted.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "path",      title: "File",    tooltip: "Where this broadcast's media actually is — the newest take's file path, so the drive it lives on is readable at a glance (takes get relocated, and the folder a channel records to can change). Hover for the full path, right-click the row to copy or open it. Multi-take broadcasts show the newest and say how many others there are. Takes the leftover width, so drag it narrower if you want the columns before it wider.", min_width: 120.0, initial: 260.0, sortable: true, stretch: true },
 ];
 
 /// Background "Active tasks" columns (no sort/filter — hide/reorder only).

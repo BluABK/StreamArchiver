@@ -218,6 +218,48 @@ pub(super) struct BacklogPick {
 /// a platform stream id — for the overwhelmingly common single-take broadcast
 /// these are the same take, and for a split one "the last piece" is the useful
 /// default. Per-take precision lives on the Streams take rows.
+/// The file a Play/Open action on this broadcast would use: the newest take
+/// that both names a file and still has one on disk.
+///
+/// One resolver for the row menu, the double-click and the rolling section, so
+/// "▶ Open file" and double-clicking a row can never pick different takes.
+fn backlog_playable(g: &StreamGroup, fs_probes: &mut FsProbes) -> Option<std::path::PathBuf> {
+    g.takes
+        .iter()
+        .rev()
+        .find(|t| !t.output_path.is_empty() && fs_probes.is_file(std::path::Path::new(&t.output_path)))
+        .map(|t| std::path::PathBuf::from(&t.output_path))
+}
+
+/// Play (or open) a broadcast on double-click, shared by both Backlog tables.
+/// Prefers the configured media player and falls back to the OS handler, which
+/// is exactly what the menu's two entries do — a double-click should not be a
+/// third behaviour.
+fn backlog_row_activate(g: &StreamGroup, mid: i64, media_player: &str, fs_probes: &mut FsProbes, pick: &mut BacklogPick) {
+    let Some(f) = backlog_playable(g, fs_probes) else { return };
+    if media_player.is_empty() {
+        pick.open_path = Some(f);
+    } else {
+        pick.play_local = Some(f);
+    }
+    pick.mark_started = Some((g.key.clone(), mid));
+}
+
+/// Find a take by id across both lists the Backlog view holds.
+///
+/// The 🕰 Rolling section is fed by `history_rolling`, which is deliberately
+/// NOT a slice of `history_all` — it ignores the "Load more" cap so an old take
+/// still counting down can never be off the page. A menu action started there
+/// must therefore look in both, or "Copy video URL" and "Properties…" quietly
+/// fail for exactly the rows that section exists to surface.
+fn find_backlog_take<'a>(
+    all: &'a [Recording],
+    rolling: &'a [Recording],
+    rid: i64,
+) -> Option<&'a Recording> {
+    all.iter().chain(rolling.iter()).find(|r| r.id == rid)
+}
+
 fn backlog_row_menu(
     ui: &mut egui::Ui,
     mid: i64,
@@ -233,7 +275,7 @@ fn backlog_row_menu(
         .iter()
         .rev()
         .find(|t| !t.output_path.is_empty() && fs_probes.is_file(std::path::Path::new(&t.output_path)));
-    let file = with_file.map(|t| std::path::PathBuf::from(&t.output_path));
+    let file = backlog_playable(g, fs_probes);
     let file_ok = file.is_some();
 
     if ui
@@ -448,6 +490,66 @@ pub(super) fn group_rolling(g: &StreamGroup) -> GroupRolling {
     }
 }
 
+/// What the 💾 column shows for one broadcast, and the number it sorts by.
+///
+/// Rolled up across the takes that claim a file, because a multi-take broadcast
+/// can be half-there: one take archived, its sibling swept from the cache. The
+/// sort key ascends worst-first (`0` = nothing left) so sorting the column
+/// brings the gaps to the top, which is the only reason to sort it at all.
+///
+/// Deliberately probes the filesystem rather than reading `bytes`: the whole
+/// point of the column is to disagree with the database when the database is
+/// wrong. Takes with no path at all are not counted as missing — a broadcast
+/// that was never captured has nothing to lose.
+fn backlog_disk_state(g: &StreamGroup, fs_probes: &mut FsProbes) -> (f64, &'static str, String) {
+    let paths: Vec<&str> =
+        g.takes.iter().map(|t| t.output_path.as_str()).filter(|p| !p.is_empty()).collect();
+    if paths.is_empty() {
+        return (4.0, "", "This broadcast has no file — it was never captured.".into());
+    }
+    let mut present = 0usize;
+    let mut missing = 0usize;
+    let mut unknown = 0usize;
+    for p in &paths {
+        match fs_probes.file_state(std::path::Path::new(p)) {
+            FileState::Present => present += 1,
+            FileState::Missing => missing += 1,
+            FileState::Unknown => unknown += 1,
+        }
+    }
+    let n = paths.len();
+    if unknown > 0 {
+        // Never answer "missing" on a partial result: one unprobed take would
+        // otherwise flip the whole row to ✖ for a frame.
+        return (3.0, "…", format!("Checking {unknown} of {n} file(s) on disk…"));
+    }
+    if missing == 0 {
+        let word = if n == 1 { "file is" } else { "files are" };
+        return (2.0, "✔", format!("All {n} {word} on disk."));
+    }
+    if present == 0 {
+        return (
+            0.0,
+            "✖",
+            format!(
+                "None of this broadcast's {n} file(s) are on disk any more — deleted manually,                  swept as an expired rolling recording, or moved outside the app. The history                  row survives either way."
+            ),
+        );
+    }
+    (
+        1.0,
+        "◐",
+        format!("{present} of {n} files still on disk — {missing} gone."),
+    )
+}
+
+/// The newest take that names a file, for the File column and its hover.
+fn backlog_newest_path(g: &StreamGroup) -> Option<(&str, usize)> {
+    let with_path: Vec<&str> =
+        g.takes.iter().map(|t| t.output_path.as_str()).filter(|p| !p.is_empty()).collect();
+    with_path.last().map(|p| (*p, with_path.len()))
+}
+
 /// Draw one Backlog cell. Column order is driven by the user's persisted
 /// arrangement, so this dispatches on the column **id**, never on an index —
 /// exactly like the Streams/Videos row renderers.
@@ -466,6 +568,7 @@ fn backlog_cell(
     avatars: &HashMap<i64, egui::TextureHandle>,
     set_state: &mut Option<(String, i64, &'static str)>,
     open_chat: &mut Option<(i64, i64)>,
+    fs_probes: &mut FsProbes,
 ) {
     match id {
         "watch" => {
@@ -539,6 +642,36 @@ fn backlog_cell(
                      been deleted (manually, or by a rolling recording expiring). The history row \
                      stays either way.",
                 );
+            }
+        }
+        "on_disk" => {
+            let (_, glyph, hover) = backlog_disk_state(g, fs_probes);
+            if !glyph.is_empty() {
+                // Only the bad news is coloured: a grid where every healthy row
+                // is green is a grid nobody scans.
+                let text = match glyph {
+                    "✖" => egui::RichText::new(glyph).color(egui::Color32::from_rgb(230, 100, 100)),
+                    "◐" => egui::RichText::new(glyph).color(egui::Color32::from_rgb(230, 180, 90)),
+                    _ => egui::RichText::new(glyph).weak(),
+                };
+                ui.label(text).on_hover_text(hover);
+            }
+        }
+        "path" => {
+            match backlog_newest_path(g) {
+                Some((p, n)) => {
+                    let hover = if n > 1 {
+                        format!("{p}
+
+Newest of {n} takes — right-click ▸ Properties for the rest.")
+                    } else {
+                        p.to_string()
+                    };
+                    ui.weak(p).on_hover_text(hover);
+                }
+                None => {
+                    ui.weak("—").on_hover_text("Never captured — this broadcast has no file.");
+                }
             }
         }
         "chat" => {
@@ -682,6 +815,7 @@ impl StreamArchiverApp {
         g: &StreamGroup,
         watch_state: &str,
         now: i64,
+        fs_probes: &mut FsProbes,
     ) -> Vec<Cell> {
         let (name, platform) = channel_label(&self.rows, mid);
         let bytes: i64 = g.takes.iter().map(|t| t.bytes).sum();
@@ -691,6 +825,7 @@ impl StreamArchiverApp {
             .find(|(s, _)| *s == watch_state)
             .map(|(_, l)| *l)
             .unwrap_or("");
+        let (disk_rank, disk_glyph, _) = backlog_disk_state(g, fs_probes);
         vec![
             Cell::text(watch_label),
             Cell::text(platform.map(|p| p.label().to_string()).unwrap_or_default()),
@@ -701,10 +836,14 @@ impl StreamArchiverApp {
             Cell::num(g.started_at() as f64, fmt_datetime_short(g.started_at())),
             Cell::num(g.captured_secs(now) as f64, fmt_duration(g.captured_secs(now))),
             Cell::num(bytes as f64, if bytes > 0 { fmt_bytes(bytes) } else { String::new() }),
+            Cell::num(disk_rank, disk_glyph.to_string()),
             Cell::num(has_chat as i64 as f64, if has_chat { "💬".into() } else { String::new() }),
             Cell::num(g.meta_change_count() as f64, non_zero(g.meta_change_count())),
             Cell::num(g.ad_count() as f64, non_zero(g.ad_count())),
             Cell::text(g.status()),
+            // Filterable as text, so typing a drive letter narrows the grid to
+            // one disk — the quickest way to see what a bay is holding.
+            Cell::text(backlog_newest_path(g).map(|(p, _)| p.to_string()).unwrap_or_default()),
         ]
     }
 
@@ -716,9 +855,15 @@ impl StreamArchiverApp {
     ///
     /// Uses the same columns (and the same user arrangement) as the main grid
     /// below it, with TTL + the button prepended — this is the same list seen
-    /// through a different lens, not a different list.
+    /// through a different lens, not a different list. That extends to the row
+    /// interactions: double-click plays, right-click opens the identical menu.
+    /// These are the files most likely to be worth watching *now*, since they
+    /// are the ones about to be deleted, so making them harder to open than an
+    /// ordinary archived stream had it exactly backwards.
     ///
-    /// Returns the actions the caller applies after the borrow ends.
+    /// Returns the actions the caller applies after the borrow ends; anything
+    /// the row menu picked lands in `pick`.
+    #[allow(clippy::too_many_arguments)]
     fn backlog_rolling_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -726,9 +871,18 @@ impl StreamArchiverApp {
         col_order: &[usize],
         avatars: &HashMap<i64, egui::TextureHandle>,
         now: i64,
+        media_player: &str,
+        pick: &mut BacklogPick,
     ) -> Vec<(i64, bool)> {
         use egui_extras::{Column, TableBuilder};
         let mut acts: Vec<(i64, bool)> = Vec::new(); // (recording id, keep?)
+        // Taken out of `self` up front: the table closures below already borrow
+        // `self.rows`/`self.history_watch` immutably.
+        let fs_probes = self.fs_probes.clone();
+        // The 💬 and Watch cells are live here too, not just in the main grid —
+        // they were wired to `&mut None` and silently swallowed every click.
+        let mut set_state: Option<(String, i64, &'static str)> = None;
+        let mut open_chat: Option<(i64, i64)> = None;
 
         // Soonest-expiring first: this is a countdown list, so recency (the
         // main grid's order) is the wrong axis entirely.
@@ -800,6 +954,7 @@ impl StreamArchiverApp {
                             .id_salt("backlog_rolling_table")
                             .striped(true)
                             .resizable(true)
+                            .sense(egui::Sense::click())
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(Column::auto().at_least(72.0))
                             .column(Column::auto().at_least(64.0));
@@ -888,17 +1043,46 @@ impl StreamArchiverApp {
                                                 now,
                                                 &self.rows,
                                                 avatars,
-                                                &mut None,
-                                                &mut None,
+                                                &mut set_state,
+                                                &mut open_chat,
+                                                &mut fs_probes.lock().unwrap(),
                                             );
                                         });
                                     }
+                                    let resp = tr.response();
+                                    if resp.double_clicked() {
+                                        backlog_row_activate(
+                                            g,
+                                            *mid,
+                                            media_player,
+                                            &mut fs_probes.lock().unwrap(),
+                                            pick,
+                                        );
+                                    }
+                                    resp.context_menu(|ui| {
+                                        backlog_row_menu(
+                                            ui,
+                                            *mid,
+                                            g,
+                                            media_player,
+                                            &mut fs_probes.lock().unwrap(),
+                                            *state,
+                                            pick,
+                                        );
+                                    });
                                 });
                             }
                         });
                     });
             });
         ui.separator();
+        if let Some((key, mid, st)) = set_state {
+            let _ = self.core.store.set_stream_watch_state(&key, mid, st);
+            self.reload_history();
+        }
+        if let Some((mid, rid)) = open_chat {
+            pick.chat = Some((mid, rid));
+        }
         acts
     }
 
@@ -976,8 +1160,20 @@ impl StreamArchiverApp {
             self.backlog_avatars(ui.ctx(), &both)
         };
 
-        let rolling_acts =
-            self.backlog_rolling_section(ui, &rolling_groups, &col_order, &avatars, now);
+        // Declared before the rolling section, which now shares them: it draws
+        // the same row menu as the grid below, so it feeds the same pick.
+        let mut pick = BacklogPick::default();
+        let media_player = self.settings.media_player_path.trim().to_string();
+
+        let rolling_acts = self.backlog_rolling_section(
+            ui,
+            &rolling_groups,
+            &col_order,
+            &avatars,
+            now,
+            &media_player,
+            &mut pick,
+        );
         if !rolling_acts.is_empty() {
             for (rec_id, keep) in rolling_acts {
                 let _ = if keep {
@@ -989,6 +1185,10 @@ impl StreamArchiverApp {
             self.reload_history();
             self.backlog_sort = sort;
             self.backlog_filters = filters;
+            // Keep/Unkeep short-circuits the rest of the view, but a menu pick
+            // made in the same frame still has to happen — dropping it here
+            // would make an action silently do nothing.
+            self.apply_backlog_pick(ui, pick, now);
             return;
         }
 
@@ -1002,17 +1202,20 @@ impl StreamArchiverApp {
             })
             .filter(|(_, _, state)| self.backlog_show_states.contains(*state))
             .collect();
-        let model: Vec<Vec<Cell>> =
-            visible.iter().map(|(mid, g, state)| self.backlog_cells(*mid, g, state, now)).collect();
+        // Taken out of `self` for the table closure, which borrows `self.rows`
+        // immutably at the same time.
+        let fs_probes = self.fs_probes.clone();
+        let model: Vec<Vec<Cell>> = {
+            let mut fp = fs_probes.lock().unwrap();
+            visible
+                .iter()
+                .map(|(mid, g, state)| self.backlog_cells(*mid, g, state, now, &mut fp))
+                .collect()
+        };
 
         let mut set_state: Option<(String, i64, &'static str)> = None;
         let mut want_reorder = false;
         let mut open_chat: Option<(i64, i64)> = None;
-        let mut pick = BacklogPick::default();
-        let media_player = self.settings.media_player_path.trim().to_string();
-        // Taken out of `self` for the table closure, which borrows `self.rows`
-        // immutably at the same time.
-        let fs_probes = self.fs_probes.clone();
 
         egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
             ui.style_mut().interaction.selectable_labels = false;
@@ -1070,10 +1273,21 @@ impl StreamArchiverApp {
                                 &avatars,
                                 &mut set_state,
                                 &mut open_chat,
+                                &mut fs_probes.lock().unwrap(),
                             );
                         });
                     }
-                    tr.response().context_menu(|ui| {
+                    let resp = tr.response();
+                    if resp.double_clicked() {
+                        backlog_row_activate(
+                            g,
+                            mid,
+                            &media_player,
+                            &mut fs_probes.lock().unwrap(),
+                            &mut pick,
+                        );
+                    }
+                    resp.context_menu(|ui| {
                         backlog_row_menu(
                             ui,
                             mid,
@@ -1126,6 +1340,7 @@ impl StreamArchiverApp {
     /// watch-state advance) — the menu is a different entry point to the same
     /// actions, not a reimplementation of them.
     fn apply_backlog_pick(&mut self, ui: &egui::Ui, pick: BacklogPick, now: i64) {
+
         if let Some((key, mid)) = pick.mark_started {
             self.mark_broadcast_started(&key, mid);
             self.reload_history();
@@ -1157,7 +1372,7 @@ impl StreamArchiverApp {
             self.status = "Resolving VOD webpage…".into();
         }
         if let Some(rid) = pick.copy_video_url {
-            if let Some(r) = self.history_all.iter().find(|r| r.id == rid)
+            if let Some(r) = find_backlog_take(&self.history_all, &self.history_rolling, rid)
                 && let Ok(Some(row)) = self.core.store.get_monitor_with_channel(r.monitor_id)
             {
                 let url = crate::vod_archive::video_page_url(
@@ -1174,10 +1389,7 @@ impl StreamArchiverApp {
         if let Some(rid) = pick.properties {
             // Notes come from the flat history list this view already loaded —
             // Streams reads the same field out of its own per-monitor cache.
-            let notes = self
-                .history_all
-                .iter()
-                .find(|r| r.id == rid)
+            let notes = find_backlog_take(&self.history_all, &self.history_rolling, rid)
                 .map(|r| r.notes.clone())
                 .unwrap_or_default();
             self.open_recording_properties(rid, notes);
@@ -1333,6 +1545,11 @@ impl StreamArchiverApp {
 
 #[cfg(test)]
 mod tests {
+    // Real files on a real filesystem: the 💾 column's whole job is to answer
+    // from disk rather than from the database, so mocking the probe would test
+    // nothing. Same exemption `ui::format`'s take-size tests take.
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     fn rec(output_path: &str) -> Recording {
@@ -1382,6 +1599,85 @@ mod tests {
             not_recorded_reason: String::new(),
             gated: false,
         }
+    }
+
+    /// Poll until the 💾 glyph settles on `want`.
+    ///
+    /// Cannot just wait for "not …": results are cached for `FS_PROBE_TTL`, so
+    /// straight after a file is deleted the cache still says ✔ and a
+    /// wait-for-any-answer loop would return that stale value immediately. The
+    /// re-probe is only queued once the entry ages out, which is what makes
+    /// this a real wait rather than a formality.
+    fn settle(fp: &mut FsProbes, g: &StreamGroup, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            fp.drain_results();
+            if backlog_disk_state(g, fp).1 == want {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "never settled on {want:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The 💾 column's whole purpose is to disagree with the database when the
+    /// database is wrong, so it has to read the filesystem — and it must never
+    /// say "missing" before it has actually looked.
+    #[test]
+    fn the_on_disk_column_reports_present_partial_and_gone() {
+        let dir = std::env::temp_dir()
+            .join(format!("sa_backlog_disk_{}_{}", std::process::id(), crate::models::now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.mkv");
+        let b = dir.join("b.mkv");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"y").unwrap();
+        let g = group(vec![rec(&a.to_string_lossy()), rec(&b.to_string_lossy())]);
+        let mut fp = FsProbes::new(egui::Context::default());
+
+        // Before any probe lands the answer is "…", NOT "gone" — a column that
+        // claims a file is missing when it has not been checked is a lie.
+        assert_eq!(backlog_disk_state(&g, &mut fp).1, "…");
+
+        settle(&mut fp, &g, "✔");
+
+        // One take swept from the cache, its sibling archived: half-there is
+        // its own state, not "fine" and not "gone".
+        std::fs::remove_file(&b).unwrap();
+        settle(&mut fp, &g, "◐");
+        let rank_partial = backlog_disk_state(&g, &mut fp).0;
+
+        std::fs::remove_file(&a).unwrap();
+        settle(&mut fp, &g, "✖");
+        let rank_gone = backlog_disk_state(&g, &mut fp).0;
+
+        // Worst first, so sorting the column ascending surfaces the gaps.
+        assert!(rank_gone < rank_partial, "gone must sort above partial");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A broadcast that was never captured has nothing to be missing — it must
+    /// not be lumped in with one whose files were deleted, and it must not
+    /// queue filesystem work either.
+    #[test]
+    fn a_never_captured_broadcast_is_blank_not_missing() {
+        let g = group(vec![rec("")]);
+        let mut fp = FsProbes::new(egui::Context::default());
+        let (rank, glyph, _) = backlog_disk_state(&g, &mut fp);
+        assert_eq!(glyph, "", "nothing to report");
+        assert!(rank > 2.0, "sorts away from the real problems");
+        assert!(fp.files.is_empty(), "a pathless take queued a needless probe");
+    }
+
+    /// The File column names the newest take, and says so when there are more.
+    #[test]
+    fn the_file_column_names_the_newest_take_that_has_one() {
+        let g = group(vec![rec(""), rec(r"G:\streams\one.mkv"), rec(r"P:\streams\two.mkv")]);
+        let (path, n) = backlog_newest_path(&g).expect("a take has a file");
+        assert_eq!(path, r"P:\streams\two.mkv", "newest wins");
+        assert_eq!(n, 2, "the pathless take is not counted");
+        assert!(backlog_newest_path(&group(vec![rec("")])).is_none());
     }
 
     /// A finished broadcast made of `takes`, for the rollup tests below.

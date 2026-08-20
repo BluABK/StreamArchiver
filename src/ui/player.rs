@@ -184,6 +184,15 @@ where
     placeholder
 }
 
+/// What a probe knows about one path — see [`FsProbes::file_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileState {
+    /// Not probed yet. Say nothing rather than guess.
+    Unknown,
+    Present,
+    Missing,
+}
+
 impl FsProbes {
     pub(super) fn new(ctx: egui::Context) -> FsProbes {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<ProbeJob>();
@@ -252,6 +261,25 @@ impl FsProbes {
     /// Last-known `is_file` (false until the first probe lands).
     pub(super) fn is_file(&mut self, p: &std::path::Path) -> bool {
         probe_lookup(&self.tx, &mut self.files, p, false, ProbeJob::File)
+    }
+
+    /// Tri-state `is_file`: whether the worker has actually looked yet.
+    ///
+    /// [`FsProbes::is_file`] answers `false` until the first probe lands, which
+    /// is right for "hide a stale size" (the pessimistic answer is the safe
+    /// one) but wrong for anything that *reports* presence to the user: every
+    /// row would read "missing" on the first paint and then flip. A column that
+    /// says a file is gone when it has not been checked is a lie, however
+    /// briefly it is on screen.
+    pub(super) fn file_state(&mut self, p: &std::path::Path) -> FileState {
+        let present = self.is_file(p);
+        match self.files.get(p) {
+            // `at` is only stamped once a result comes back.
+            Some(slot) if slot.at.is_some() => {
+                if present { FileState::Present } else { FileState::Missing }
+            }
+            _ => FileState::Unknown,
+        }
     }
 
     /// Last-known `is_dir` (false until the first probe lands).
