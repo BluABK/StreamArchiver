@@ -1358,7 +1358,9 @@ impl StreamArchiverApp {
                     ui.label("Total recordings");
                     ui.strong(global.total_recordings.to_string());
                     ui.label("Total on disk").on_hover_text(
-                        "Every take's media, archived or not. A capture that died                          mid-stream still occupies whatever it wrote to the capture                          cache, and that now counts here — it used to record as zero,                          which is how hundreds of GB of unfinished captures stayed                          invisible to every total in the app.",
+                        "Every take's media that is still on disk, archived or not. A                          capture that died mid-stream still occupies whatever it wrote to                          the capture cache, and that counts here — it used to record as                          zero, which is how hundreds of GB of unfinished captures stayed                          invisible to every total in the app.
+
+Media that has since been                          deleted stops counting from the next startup sweep: the take's                          history row and its recorded size both survive, but a file that                          is gone is not disk usage. That was 413 GB of takes and 335 GB of                          downloads on this archive.",
                     );
                     ui.strong(fmt_bytes(global.total_bytes));
                     ui.end_row();
@@ -1675,11 +1677,9 @@ impl StreamArchiverApp {
              on purpose: a channel whose old streams were moved to another disk \
              would otherwise inflate its row for the disk you are trying to \
              clear.\n\n\
-             Sizes are what was recorded at capture time, not a fresh look at \
-             the disk, and a take whose media has been deleted through the app \
-             drops out entirely. Downloads join by channel NAME (the Videos \
-             table stores no channel id), so an unmatched download appears as \
-             its own row.",
+             Sizes come from what each file measured, refreshed by the startup \n             sweep rather than read live per frame. Anything whose file is gone \n             stops counting from that sweep — however it went (deleted here, \n             trashed, a rolling recording expiring, or moved outside the app \n             entirely), not only the deletions the app performed itself. Its \n             history row and recorded size both survive; it just stops being \n             charged as space in use.
+
+\n             Downloads join by channel NAME (the Videos table stores no channel \n             id), so an unmatched download appears as its own row.",
         );
         ui.separator();
 

@@ -1993,7 +1993,28 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 97)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 97);
+        if version < 98 {
+            // `bytes` records how big a take WAS; it says nothing about whether
+            // the media is still there. Nothing clears it when a file is
+            // deleted, trashed, swept as an expired rolling recording, or moved
+            // outside the app, so every "space in use" total counted media that
+            // no longer existed: measured on one archive, 178 takes claiming
+            // 413 GB and 37 video downloads claiming 335 GB — 748 GB of
+            // phantom disk usage in the very stats meant to find what is
+            // filling a drive.
+            //
+            // Keeping `bytes` and stamping the absence separately preserves
+            // both answers: how big it was, and whether it is still here. The
+            // startup reconcile is already statting these files to correct
+            // sizes, so the stamp costs no extra I/O — and it clears itself if
+            // the file comes back (a drive remounted, an archive restored).
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN media_missing_at INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE video ADD COLUMN media_missing_at INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 98)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 98);
         Ok(())
     }
 }

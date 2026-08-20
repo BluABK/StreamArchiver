@@ -1164,7 +1164,9 @@ can always start a fresh backfill.
 ### Repairs at startup
 
 Four passes run once when the app starts, all comparing what the database
-believes against what is actually on disk.
+believes against what is actually on disk. **An unreachable drive is never read
+as an absent file** — see the note at the end of the section, which is what
+stops unplugging a bay from erasing its archive from every total.
 
 **Orphan outputs** promotes a take whose file turned out to be intact after an
 unclean shutdown, or re-points it at the capture file still in the cache.
@@ -1187,8 +1189,9 @@ the app — and nothing noticed. One real archive had 35 such pointers across 12
 channels, some weeks old; they only surfaced because a path relocation rewrote
 four of them onto a new drive where they equally did not exist.
 
-**Recorded sizes** corrects any take whose file on disk is larger than the size
-in its row. A take's size is written when its capture finishes, but a later
+**Recorded media** reconciles every archived take and video download against
+the file it names — correcting a size that reads too small, and recording
+whether the media is there at all. A take's size is written when its capture finishes, but a later
 head-backfill join, gap splice, re-remux or published-VOD replacement swaps in a
 *different* file — and five of those paths re-pointed the row without re-measuring
 it. The shortfall is exactly the material that was added, so the error is worst
@@ -1197,7 +1200,21 @@ across 66 takes**, including a row reading 0.04 GB for a 16.41 GB file. Those ar
 precisely the rows the storage stats exist to surface, so the totals were blindest
 where they mattered most. The repair only ever corrects *upward* — a file smaller
 than its row is a truncation or a deliberate capture-cache accounting, and
-silently shrinking the row would hide it.
+silently shrinking the row would hide it. (Measured afterwards, that downward
+drift totals 2.3 GB across 161 takes — container overhead lost in a `.ts` →
+`.mkv` remux. Noise, correctly left alone.)
+
+The same pass records **whether the media still exists**, which `bytes` never
+could: `bytes` says how big a take *was*, and nothing clears it when a file is
+deleted, trashed, swept as an expired rolling recording, or moved outside the
+app. So every space-in-use total counted media that had been gone for months —
+**178 takes claiming 413 GB and 37 downloads claiming 335 GB** on one archive,
+748 GB of phantom usage in exactly the figures you would consult to find what
+is filling a drive. The absence is stamped separately from `bytes` so both
+answers survive: **Storage by channel**, the per-channel 🖴 badge, the Files
+view's per-directory totals and **Total on disk** all stop charging for it,
+while the history row and its recorded size stay intact. It reverses on its own
+— remount a drive and its media counts again on the next sweep.
 
 **An unreachable drive is never read as an absent file.** Each drive is probed
 once per pass and, if its root does not answer, every pointer on it is left

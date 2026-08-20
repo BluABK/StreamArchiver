@@ -1594,36 +1594,54 @@ impl Supervisor {
     /// removable bay that dropped out, or a volume mounted without its tree,
     /// would otherwise read as "every issue resolved itself" and take the
     /// pointers with it.
-    /// Correct takes whose recorded `bytes` is smaller than the file actually
-    /// sitting at their `output_path`.
+    /// Reconcile every archived take and video download against the file it
+    /// names: correct a size that reads smaller than the file, and stamp (or
+    /// clear) whether the media is there at all.
     ///
-    /// Every join, splice, remux and VOD replacement re-points a row at a
-    /// *different* file; before [`RepointBytes`] made that explicit, five of
-    /// those sites left `bytes` at the old file's size. Measured on a live
-    /// archive: **412 GB under-reported across 66 takes**, worst on the biggest
+    /// **Sizes.** Every join, splice, remux and VOD replacement re-points a row
+    /// at a *different* file; before [`RepointBytes`] made that explicit, five
+    /// of those sites left `bytes` at the old file's size. Measured on a live
+    /// archive: 412 GB under-reported across 66 takes, worst on the biggest
     /// ones (0.04 GB recorded for a 16.41 GB file) because the shortfall is
-    /// exactly the size of the head that had to be fetched. The call sites are
-    /// fixed, but nothing would have healed the rows already written.
+    /// exactly the size of the head that was fetched. Corrected **upward only**
+    /// — a file smaller than its row is a truncation, or the deliberate
+    /// accounting that lets a failed take report its capture-cache leftovers,
+    /// and quietly shrinking the row would hide it. (Measured after the fact,
+    /// the downward drift is 2.3 GB across 161 takes: container overhead lost
+    /// in a `.ts` → `.mkv` remux. Noise, correctly left alone.)
     ///
-    /// **Upward only.** A file *smaller* than its row is a different question —
-    /// a truncation, or the deliberate accounting that lets a failed take
-    /// report its capture-cache leftovers — and quietly shrinking the row would
-    /// hide it. It also makes an offline drive harmless: every stat fails, every
-    /// candidate reads as smaller, and nothing is touched.
+    /// **Presence.** `bytes` says how big a take *was*; nothing clears it when
+    /// the media is deleted, trashed, swept as an expired rolling recording, or
+    /// moved outside the app. So every space-in-use total counted media that no
+    /// longer existed — 178 takes claiming 413 GB and 37 downloads claiming
+    /// 335 GB on one archive, 748 GB of phantom usage in exactly the stats you
+    /// would consult to find what is filling a drive. The stamp is separate
+    /// from `bytes` so both answers survive, and it clears itself the moment a
+    /// file comes back.
+    ///
+    /// **An unreachable drive is never read as an absent file.** Each drive is
+    /// probed once and, if its root does not answer, every row on it is skipped
+    /// — otherwise unplugging a bay would mark its whole archive missing and
+    /// silently delete it from the totals.
     async fn reconcile_recorded_sizes(&self) {
         use std::collections::HashMap;
 
-        let rows = match self.store.takes_with_media_on_disk() {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("size repair: failed to load takes: {e:#}");
-                return;
-            }
-        };
+        let takes = self.store.takes_with_media_on_disk().unwrap_or_else(|e| {
+            warn!("size repair: failed to load takes: {e:#}");
+            Vec::new()
+        });
+        let videos = self.store.videos_with_media_on_disk().unwrap_or_else(|e| {
+            warn!("size repair: failed to load downloads: {e:#}");
+            Vec::new()
+        });
+
+        let now = crate::models::now_unix();
         let mut drive_ok: HashMap<char, bool> = HashMap::new();
-        let (mut fixed, mut gained) = (0usize, 0i64);
-        for (rec_id, path, recorded) in rows {
-            let p = PathBuf::from(&path);
+        let (mut resized, mut gained) = (0usize, 0i64);
+        let (mut went_missing, mut came_back, mut phantom) = (0usize, 0usize, 0i64);
+
+        for (row, is_take) in takes.iter().map(|r| (r, true)).chain(videos.iter().map(|r| (r, false))) {
+            let p = PathBuf::from(&row.path);
             if let Some(d) = crate::downloader::drive_of(&p) {
                 let ok = match drive_ok.get(&d) {
                     Some(v) => *v,
@@ -1631,6 +1649,9 @@ impl Supervisor {
                         let root = PathBuf::from(format!("{d}:\\"));
                         let ok = crate::iomon::fs::metadata(Cat::Startup, &root).await.is_ok();
                         drive_ok.insert(d, ok);
+                        if !ok {
+                            info!(drive = %d, "media sweep: drive offline, leaving its rows alone");
+                        }
                         ok
                     }
                 };
@@ -1639,23 +1660,54 @@ impl Supervisor {
                 }
             }
             let actual = crate::downloader::remux::file_len(&p).await as i64;
-            if actual <= recorded {
+            let missing = actual == 0 && crate::iomon::fs::metadata(Cat::Startup, &p).await.is_err();
+            let stamp = if missing { now } else { 0 };
+            let changed = if is_take {
+                self.store.set_recording_media_missing(row.id, stamp)
+            } else {
+                self.store.set_video_media_missing(row.id, stamp)
+            };
+            match changed {
+                Ok(true) if missing => {
+                    went_missing += 1;
+                    phantom += row.bytes.max(0);
+                }
+                Ok(true) => came_back += 1,
+                Ok(false) => {}
+                Err(e) => warn!(id = row.id, "media sweep: presence update failed: {e:#}"),
+            }
+            if missing || actual <= row.bytes {
                 continue;
             }
-            match self.store.set_recording_bytes(rec_id, actual) {
+            let set = if is_take {
+                self.store.set_recording_bytes(row.id, actual)
+            } else {
+                self.store.set_video_bytes(row.id, actual)
+            };
+            match set {
                 Ok(()) => {
-                    fixed += 1;
-                    gained += actual - recorded;
+                    resized += 1;
+                    gained += actual - row.bytes;
                 }
-                Err(e) => warn!(rec_id, "size repair: update failed: {e:#}"),
+                Err(e) => warn!(id = row.id, "size repair: update failed: {e:#}"),
             }
         }
-        if fixed > 0 {
+        if resized > 0 {
             info!(
-                takes = fixed,
+                takes = resized,
                 gained_gb = gained / (1024 * 1024 * 1024),
-                "size repair: corrected takes whose row was smaller than the file on disk"
+                "size repair: corrected rows whose size was smaller than the file on disk"
             );
+        }
+        if went_missing > 0 {
+            info!(
+                rows = went_missing,
+                phantom_gb = phantom / (1024 * 1024 * 1024),
+                "media sweep: rows whose file is gone no longer count towards disk usage"
+            );
+        }
+        if came_back > 0 {
+            info!(rows = came_back, "media sweep: media reappeared and counts again");
         }
     }
 

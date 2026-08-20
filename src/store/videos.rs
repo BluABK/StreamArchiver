@@ -3,6 +3,48 @@
 use super::*;
 
 impl Store {
+    /// Every finished video download with a file to check, for the startup
+    /// media sweep. Same shape (and the same reason) as
+    /// [`Store::takes_with_media_on_disk`] — proportionally the downloads were
+    /// worse: 37 of 64 rows on one archive claimed 335 GB for files that had
+    /// been deleted.
+    pub fn videos_with_media_on_disk(&self) -> Result<Vec<crate::store::MediaRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, output_path, bytes, media_missing_at FROM video WHERE output_path <> ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::store::MediaRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    bytes: r.get(2)?,
+                    missing_at: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record that a download's file is (or is no longer) missing from disk.
+    /// See [`Store::set_recording_media_missing`].
+    pub fn set_video_media_missing(&self, id: i64, now: i64) -> Result<bool> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE video SET media_missing_at = ?2
+             WHERE id = ?1 AND (media_missing_at = 0) != (?2 = 0)",
+            params![id, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Correct a download's recorded size to what is actually on disk.
+    pub fn set_video_bytes(&self, id: i64, bytes: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE video SET bytes = ?2 WHERE id = ?1", params![id, bytes])?;
+        Ok(())
+    }
+
     // ----- videos (on-demand downloads) -----
 
     /// Insert a new video download request (status starts as `queued`).

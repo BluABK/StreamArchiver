@@ -38,7 +38,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 97;
+const SCHEMA_VERSION: i64 = 98;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -166,7 +166,7 @@ mod migrations;
 mod monitors;
 mod posts;
 mod recordings;
-pub use recordings::{ChatIndexTarget, EarlierTakeRow, RepointBytes, TakeLabel};
+pub use recordings::{ChatIndexTarget, EarlierTakeRow, MediaRow, RepointBytes, TakeLabel};
 mod recording_groups;
 mod scheduled;
 mod stats_history;

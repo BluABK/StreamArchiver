@@ -561,7 +561,7 @@ impl Store {
         let r = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM recording)                                            AS total_recordings,
-               (SELECT COALESCE(SUM(bytes), 0) FROM recording)                            AS total_bytes,
+               (SELECT COALESCE(SUM(bytes), 0) FROM recording WHERE media_missing_at = 0) AS total_bytes,
                (SELECT COUNT(*) FROM monitor)                                              AS total_monitors,
                (SELECT COUNT(*) FROM monitor WHERE enabled = 1)                            AS active_monitors,
                (SELECT COUNT(*) FROM channel)                                              AS total_channels,
@@ -745,6 +745,7 @@ impl Store {
                  JOIN monitor m ON m.id = r.monitor_id
                  JOIN channel c ON c.id = m.channel_id
                  WHERE r.output_path != '' AND SUBSTR(r.output_path, 2, 1) = ':'
+                   AND r.media_missing_at = 0
                  GROUP BY drv, nm
              ),
              dls AS (
@@ -753,6 +754,7 @@ impl Store {
                         COUNT(*) AS n, COALESCE(SUM(v.bytes), 0) AS b
                  FROM video v
                  WHERE v.output_path != '' AND SUBSTR(v.output_path, 2, 1) = ':'
+                   AND v.media_missing_at = 0
                  GROUP BY drv, nm
              ),
              keys AS (SELECT drv, nm FROM takes UNION SELECT drv, nm FROM dls)

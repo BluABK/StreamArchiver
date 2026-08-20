@@ -47,6 +47,18 @@ pub enum RepointBytes {
     Measured(i64),
 }
 
+/// One row the startup media sweep checks against the filesystem — a take or a
+/// video download. See [`Store::takes_with_media_on_disk`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaRow {
+    pub id: i64,
+    pub path: String,
+    /// What the row claims the file's size is.
+    pub bytes: i64,
+    /// When the media was last found to be gone; `0` while it is present.
+    pub missing_at: i64,
+}
+
 /// `(id, started_at, ended_at, status)` — see `Store::earlier_takes_for_stream`.
 pub type EarlierTakeRow = (i64, i64, Option<i64>, String);
 
@@ -398,8 +410,10 @@ impl Store {
     pub fn monitor_disk_usage(&self) -> Result<std::collections::HashMap<i64, i64>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
+            // `media_missing_at`: a deleted file is not disk usage. Without
+            // this the badge kept charging a channel for media that is gone.
             "SELECT monitor_id, SUM(bytes) FROM recording
-             WHERE bytes > 0 AND output_path != ''
+             WHERE bytes > 0 AND output_path != '' AND media_missing_at = 0
              GROUP BY monitor_id",
         )?;
         let rows = stmt
@@ -895,14 +909,16 @@ impl Store {
     /// Deliberately *not* limited to `.full.mkv`/`.gapless.mkv`: the same drift
     /// reaches any take a substitution touched, and the caller's own stat is
     /// the authority on whether a given row needs correcting.
-    pub fn takes_with_media_on_disk(&self) -> Result<Vec<(i64, String, i64)>> {
+    pub fn takes_with_media_on_disk(&self) -> Result<Vec<MediaRow>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT id, output_path, bytes FROM recording
+            "SELECT id, output_path, bytes, media_missing_at FROM recording
              WHERE output_path <> '' AND status IN ('completed', 'ended', 'stopped')",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map([], |r| {
+                Ok(MediaRow { id: r.get(0)?, path: r.get(1)?, bytes: r.get(2)?, missing_at: r.get(3)? })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -912,6 +928,24 @@ impl Store {
         let conn = self.db();
         conn.execute("UPDATE recording SET bytes = ?2 WHERE id = ?1", params![id, bytes])?;
         Ok(())
+    }
+
+    /// Record that a take's media is (or is no longer) missing from disk.
+    /// `now` stamps the absence; `0` clears it because the file came back.
+    ///
+    /// Separate from `bytes` on purpose: `bytes` answers "how big was this
+    /// take", which stays true forever, while this answers "is it still
+    /// here", which every space-in-use total needs and none of them could ask.
+    /// Writes only on a change, so a startup sweep over a healthy archive
+    /// touches nothing.
+    pub fn set_recording_media_missing(&self, id: i64, now: i64) -> Result<bool> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE recording SET media_missing_at = ?2
+             WHERE id = ?1 AND (media_missing_at = 0) != (?2 = 0)",
+            params![id, now],
+        )?;
+        Ok(n > 0)
     }
 
     /// Remove a recording (take) row from the history. The captured file on disk
@@ -1662,11 +1696,16 @@ impl Store {
     }
 
     /// Per-monitor recording stats: `(monitor_id, count, total bytes)`.
+    ///
+    /// Counts only takes whose media is still on disk — the Files view renders
+    /// this as "N GB in M recording(s)" beside an output directory, which is a
+    /// claim about what is in that directory right now, not about how much was
+    /// ever recorded into it.
     pub fn recording_stats_by_monitor(&self) -> Result<Vec<(i64, i64, i64)>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT monitor_id, COUNT(*), COALESCE(SUM(bytes), 0)
-             FROM recording GROUP BY monitor_id",
+             FROM recording WHERE media_missing_at = 0 GROUP BY monitor_id",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -4278,16 +4317,51 @@ mod tests {
 
         let rows = store.takes_with_media_on_disk().unwrap();
         assert!(
-            rows.iter().any(|(id, p, b)| *id == joined && p.ends_with("a.full.mkv") && *b == 1_000),
+            rows.iter().any(|r| r.id == joined && r.path.ends_with("a.full.mkv") && r.bytes == 1_000),
             "an archived take is offered with the size to compare against"
         );
         assert!(
-            !rows.iter().any(|(id, _, _)| *id == pathless),
+            !rows.iter().any(|r| r.id == pathless),
             "a take with no path has nothing to stat"
         );
 
         store.set_recording_bytes(joined, 18_000_000_000).unwrap();
         assert_eq!(store.get_recording(joined).unwrap().unwrap().bytes, 18_000_000_000);
+    }
+
+    /// `bytes` says how big a take was; it has never said whether the media is
+    /// still there, so every space-in-use total counted files that had been
+    /// deleted — 748 GB of them on one archive. The stamp is what lets SQL ask
+    /// a question it cannot answer by statting.
+    #[test]
+    fn media_that_is_gone_stops_counting_as_disk_usage() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let mk = |n: i64, path: &str, bytes: i64| -> i64 {
+            let rid = store
+                .insert_recording(mid, n, path, None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, n + 10, bytes, Some(0), "completed", path, "").unwrap();
+            rid
+        };
+        let here = mk(100, r"G:\streams\c\here.mkv", 3_000);
+        let gone = mk(200, r"G:\streams\c\gone.mkv", 7_000);
+        let usage = |store: &Store| store.monitor_disk_usage().unwrap().get(&mid).copied().unwrap_or(0);
+        assert_eq!(usage(&store), 10_000, "both count while both are present");
+
+        assert!(store.set_recording_media_missing(gone, 1_800_000_000).unwrap());
+        assert_eq!(usage(&store), 3_000, "a deleted file is not disk usage");
+        // `bytes` survives: how big it WAS is still a true and useful answer.
+        assert_eq!(store.get_recording(gone).unwrap().unwrap().bytes, 7_000);
+
+        // Idempotent, so a sweep over a settled archive writes nothing.
+        assert!(!store.set_recording_media_missing(gone, 1_800_000_001).unwrap());
+
+        // And it reverses: a remounted drive puts the media back in the totals.
+        assert!(store.set_recording_media_missing(gone, 0).unwrap());
+        assert_eq!(usage(&store), 10_000);
+        assert_ne!(here, gone);
     }
 
     #[test]
