@@ -956,6 +956,25 @@ the primary back to web. Hand-written SABR extractor-args are respected
 verbatim for public streams — the client swap only applies to the built-in
 preset.
 
+> **The primary client only applies to an ANONYMOUS attempt.** The client is
+> not an independent choice: only two of the four (client, auth) combinations
+> work at all. Measured live against a public stream on 2026-08-20 —
+>
+> | client | auth | result |
+> |---|---|---|
+> | `tv` | anonymous | `Sign in to confirm you're not a bot` |
+> | `tv` | cookies | `The page needs to be reloaded` |
+> | `web` | anonymous | `Sign in to confirm you're not a bot` |
+> | `web` | cookies | **works** |
+>
+> — so **cookies force `web`**, overriding both the configured primary and any
+> hand-written `player-client`, because honouring those would mean shipping a
+> combination that cannot fetch anything. This used to be two decisions taken
+> apart, reconciled only inside the bot-wall escalation below. When the auth
+> ladder inverted and cookies became the *normal* rung, that left ordinary
+> public captures — and every live-edge play — running cookies + `tv`, the one
+> pairing that fails both ways.
+
 **🕶 Anonymous as a last resort** (Settings → Downloads, default on) is the
 bottom rung. Public captures and video downloads run **with** account cookies;
 anonymity is tried only after three captures in a row have failed with them and
@@ -978,12 +997,10 @@ That last one is not about entitlement at all: the bot check is a judgement
 about the *requester*, not the broadcast, so it refuses every client equally
 (`tv` and `web` alike, measured) and no amount of retrying anonymously clears
 it. The monitor keeps its cookies until a capture succeeds, and the client
-moves to `web` in the same step, because cookies only get through there:
-measured live against a running stream, `tv` + cookies fails with "The page
-needs to be reloaded" while `web` + cookies works, and both anonymous
-combinations are refused. Escalating one half without the other just swaps one
-failure for another. Until this existed, a walled monitor simply re-failed on
-every poll — 144 identical failures over two days on one archive.
+moves to `web` in the same step — which is no longer a special case of the
+escalation but simply the cookies-imply-`web` rule above applying to it. Until
+this existed, a walled monitor simply re-failed on every poll — 144 identical
+failures over two days on one archive.
 Note that a `--cookies-from-browser` line in the yt-dlp **user config**
 (`%APPDATA%\yt-dlp\config`) is applied to every yt-dlp run behind the app's
 back and would defeat this switch — keep cookies out of that file and pass
@@ -1344,12 +1361,15 @@ are **mpv-only** and their buttons say so when disabled. Any player opens
 finished files. With no player configured the buttons are disabled and **Open
 file** falls back to the Windows file association.
 
-Live-edge plays and the SABR preview downloader follow the same YouTube
-client/cookies policy as captures (📺 tv client + 🕶 anonymous for public
-broadcasts, `web` + account cookies for members-only) — before 2026-08-16 the
-preview always ran `web` + cookies, so a PO-token rejection wave would kill
-its downloader a few seconds in and the player stalled at "Cache: 0s" while
-the capture itself, already on the tv fallback, kept recording fine.
+Live-edge plays and the SABR preview downloader pick their client from the
+resolved auth exactly as captures do (`web` whenever cookies are attached, the
+configured primary only for an anonymous attempt). They do **not** take the
+🕶 anonymous rung: that rung is spent by a monitor whose unattended captures
+have failed three times running, and watching is a single deliberate request
+with no failure chain behind it. They used to anonymise every public YouTube
+play unconditionally, which after the ladder inverted meant every live-edge
+play took the one path this network refuses outright — the player just sat at
+"Cache: 0s" while the downloader died to the bot check.
 
 | Row state | ⏵ Play local recording (start) | ▷ Play stream (live edge) |
 |---|---|---|

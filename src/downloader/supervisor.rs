@@ -3590,21 +3590,22 @@ progress_info: None,
     /// known-entitled path. Hand-written extractor-args (the Settings field)
     /// are respected verbatim for public captures — only the built-in preset
     /// gets its client swapped.
-    pub(super) fn apply_client_policy(&self, row: &MonitorWithChannel, bins: &mut YtDlpBins) {
+    pub(super) fn apply_client_policy(
+        &self,
+        row: &MonitorWithChannel,
+        bins: &mut YtDlpBins,
+        auth: &AuthSource,
+    ) {
         if row.monitor.platform() != Platform::YouTube || !bins.sabr.usable() {
             return;
         }
-        apply_yt_client_policy(&self.store, row.monitor.id, &mut bins.sabr);
-        // A bot-walled monitor is about to capture WITH cookies
-        // (`resolve_auth_and_preprobe`), and cookies only get through on `web`:
-        // measured live 2026-08-19 against a live stream, `tv` + cookies fails
-        // with "The page needs to be reloaded" while `web` + cookies succeeds
-        // (both anonymous combinations are refused outright). So the escalation
-        // has to move BOTH halves — attaching cookies while leaving the client
-        // on `tv` just swaps one failure for another.
-        if self.bot_wall_pending(row.monitor.id) {
-            bins.sabr.extractor_args = with_player_client(&bins.sabr.extractor_args, "web");
-        }
+        // The bot-wall escalation used to live here as a special case: force
+        // `web` when this monitor is walled, because it is about to capture
+        // with cookies and cookies only get through on `web`. That rule is not
+        // special — it is just "cookies imply web", and it belongs wherever the
+        // client is chosen. `apply_yt_client_policy` now takes the auth and
+        // applies it to every take, walled or not.
+        apply_yt_client_policy(&self.store, row.monitor.id, &mut bins.sabr, auth);
     }
 
     /// Swap the PO-fallback client into the loaded SABR preset when this
@@ -4401,7 +4402,7 @@ progress_info: None,
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let mut ytdlp_bins = load_ytdlp_bins(&self.store);
-        self.apply_client_policy(row, &mut ytdlp_bins);
+        self.apply_client_policy(row, &mut ytdlp_bins, auth);
         self.apply_po_fallback(row, &mut ytdlp_bins);
         let started_at = now_unix();
         let plan = build_plan(row, started_at, auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);

@@ -85,16 +85,44 @@ pub(crate) fn yt_anonymous_fallback(store: &Store) -> bool {
     }
 }
 
-/// Apply the public/members-only client policy to a loaded SABR config for
-/// one YouTube monitor (callers gate on platform + `sabr.usable()`): a
-/// members-only monitor always gets `web` (entitlement lives on the
-/// account); a public one gets the configured primary client (default `tv`)
-/// unless the user hand-wrote custom extractor-args, which are respected
-/// verbatim. Shared by the capture path and the live-edge preview — the
-/// preview initially missed this policy and kept dying to PO-token waves
-/// that captures had already sidestepped.
-pub(crate) fn apply_yt_client_policy(store: &Store, monitor_id: i64, sabr: &mut SabrConfig) {
-    if store.monitor_members_only(monitor_id) {
+/// Pick the yt-dlp client for one YouTube monitor's SABR config (callers gate
+/// on platform + `sabr.usable()`).
+///
+/// **The client is a function of the auth, not an independent choice.** Only
+/// two of the four combinations are coherent, measured live against a public
+/// stream on 2026-08-20:
+///
+/// | client | auth | result |
+/// |---|---|---|
+/// | `tv` | anonymous | `Sign in to confirm you're not a bot` |
+/// | `tv` | cookies | `The page needs to be reloaded` |
+/// | `web` | anonymous | `Sign in to confirm you're not a bot` |
+/// | `web` | cookies | **works** |
+///
+/// So cookies force `web`, full stop: `tv` cannot load a page with cookies
+/// attached. The configured primary (default `tv`) applies only to an
+/// anonymous attempt, which is the case it exists for — `tv` has no GVS
+/// PO-token policy, so an attestation rejection wave can't touch it.
+///
+/// This used to be two decisions taken apart: auth here, client there,
+/// reconciled only inside the supervisor's bot-wall special case. When the
+/// auth ladder inverted (cookies became the normal rung, anonymity the last
+/// resort) that left the *ordinary* public capture running cookies + `tv` —
+/// the one combination that fails both ways — and the live-edge preview with
+/// it. Pairing them here is the whole fix; the special case is now just the
+/// general rule.
+pub(crate) fn apply_yt_client_policy(
+    store: &Store,
+    monitor_id: i64,
+    sabr: &mut SabrConfig,
+    auth: &AuthSource,
+) {
+    // Cookies present (the normal path), or a members-only monitor whose
+    // entitlement lives on the account: `web` is the only client that works.
+    // This overrides hand-written extractor-args deliberately — respecting a
+    // custom `player-client=tv` here would mean shipping a combination that
+    // cannot fetch anything.
+    if !matches!(auth, AuthSource::None) || store.monitor_members_only(monitor_id) {
         sabr.extractor_args = with_player_client(&sabr.extractor_args, "web");
         return;
     }
@@ -508,7 +536,7 @@ mod tests {
         store
             .set_setting("ytdlp_sabr_extractor_args", SABR_DEFAULT_EXTRACTOR_ARGS)
             .unwrap();
-        apply_yt_client_policy(&store, 1, &mut sabr);
+        apply_yt_client_policy(&store, 1, &mut sabr, &AuthSource::None);
         assert!(
             sabr.extractor_args.contains("player-client=tv"),
             "the stored default must not read as a hand-written override: {}",
@@ -517,6 +545,64 @@ mod tests {
         // Everything else in the preset survives the swap.
         assert!(sabr.extractor_args.contains("webpage-client=web"));
         assert!(sabr.extractor_args.contains("missing_pot"));
+    }
+
+    /// Only two of the four (client, auth) combinations work. Measured live
+    /// against a public YouTube stream on 2026-08-20:
+    ///
+    /// * `tv`  + anonymous -> "Sign in to confirm you're not a bot"
+    /// * `tv`  + cookies   -> "The page needs to be reloaded"
+    /// * `web` + anonymous -> "Sign in to confirm you're not a bot"
+    /// * `web` + cookies   -> works
+    ///
+    /// So the client cannot be chosen independently of the auth. It was, and
+    /// when the auth ladder inverted (cookies became the normal rung) that
+    /// left every ordinary public capture — and every live-edge play — on
+    /// cookies + `tv`, which fails both ways.
+    #[test]
+    fn cookies_force_the_web_client_whatever_the_primary_says() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_setting("ytdlp_sabr_primary_client", "tv").unwrap();
+        let preset = || SabrConfig {
+            extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.to_string(),
+            ..Default::default()
+        };
+
+        // Anonymous: the primary is the point — `tv` has no GVS PO-token
+        // policy, so an attestation wave cannot touch it.
+        let mut anon = preset();
+        apply_yt_client_policy(&store, 1, &mut anon, &AuthSource::None);
+        assert!(anon.extractor_args.contains("player-client=tv"), "{}", anon.extractor_args);
+
+        // Cookies of either kind: `web`, because `tv` cannot load a page with
+        // cookies attached.
+        for auth in [
+            AuthSource::CookiesBrowser("firefox".into()),
+            AuthSource::CookiesFile("c.txt".into()),
+        ] {
+            let mut with_cookies = preset();
+            apply_yt_client_policy(&store, 1, &mut with_cookies, &auth);
+            assert!(
+                with_cookies.extractor_args.contains("player-client=web"),
+                "cookies must force web, got {}",
+                with_cookies.extractor_args
+            );
+        }
+    }
+
+    /// The pairing is a correctness constraint, not a preference, so it wins
+    /// over hand-written extractor-args: honouring a custom `player-client=tv`
+    /// alongside cookies would mean shipping a combination that cannot fetch.
+    #[test]
+    fn cookies_override_even_hand_written_extractor_args() {
+        let store = Store::open_in_memory().unwrap();
+        let hand = "youtube:formats=duplicate;player-client=tv";
+        store.set_setting("ytdlp_sabr_extractor_args", hand).unwrap();
+        let mut sabr = SabrConfig { extractor_args: hand.to_string(), ..Default::default() };
+        apply_yt_client_policy(&store, 1, &mut sabr, &AuthSource::CookiesBrowser("firefox".into()));
+        assert!(sabr.extractor_args.contains("player-client=web"));
+        // Everything else the user wrote survives.
+        assert!(sabr.extractor_args.contains("formats=duplicate"));
     }
 
     #[test]
@@ -529,7 +615,7 @@ mod tests {
             ..Default::default()
         };
         store.set_setting("ytdlp_sabr_extractor_args", hand).unwrap();
-        apply_yt_client_policy(&store, 1, &mut sabr);
+        apply_yt_client_policy(&store, 1, &mut sabr, &AuthSource::None);
         assert_eq!(sabr.extractor_args, hand, "a real override must not be rewritten");
     }
 
@@ -540,7 +626,7 @@ mod tests {
             extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.to_string(),
             ..Default::default()
         };
-        apply_yt_client_policy(&store, 1, &mut sabr);
+        apply_yt_client_policy(&store, 1, &mut sabr, &AuthSource::None);
         assert!(sabr.extractor_args.contains("player-client=tv"));
     }
 
