@@ -122,7 +122,8 @@ pub async fn reorganize_recording_files(
     }
 
     let new_path_str = new_video_path.to_string_lossy().into_owned();
-    store.update_recording_output_path(rec_id, &new_path_str)?;
+    // Moved, not replaced — same bytes at a new address.
+    store.update_recording_output_path(rec_id, &new_path_str, RepointBytes::Unchanged)?;
     Ok(Some(new_path_str))
 }
 
@@ -274,7 +275,8 @@ pub async fn rename_recording_files(
     rename_companion_sidecars(&dir, &old_stem, &new_stem_clean, store).await;
 
     let new_path = new_file.to_string_lossy().into_owned();
-    store.update_recording_output_path(rec_id, &new_path)?;
+    // A rename: the file is the same one, byte for byte.
+    store.update_recording_output_path(rec_id, &new_path, RepointBytes::Unchanged)?;
     Ok(Some(new_path))
 }
 /// Rename a finished capture to `new_stem` (keeping its extension), avoiding
@@ -375,7 +377,8 @@ pub(super) async fn patch_stuck_title_games_placeholder(
     }
     let new_stem = sanitize_filename(&new_stem);
     let new_path = rename_for_media(final_path, &new_stem, store).await;
-    let _ = store.update_recording_output_path(rec_id, &new_path.to_string_lossy());
+    // Placeholder stem swapped for the real title — a rename, nothing more.
+    let _ = store.update_recording_output_path(rec_id, &new_path.to_string_lossy(), RepointBytes::Unchanged);
     new_path
 }
 
@@ -1591,6 +1594,71 @@ impl Supervisor {
     /// removable bay that dropped out, or a volume mounted without its tree,
     /// would otherwise read as "every issue resolved itself" and take the
     /// pointers with it.
+    /// Correct takes whose recorded `bytes` is smaller than the file actually
+    /// sitting at their `output_path`.
+    ///
+    /// Every join, splice, remux and VOD replacement re-points a row at a
+    /// *different* file; before [`RepointBytes`] made that explicit, five of
+    /// those sites left `bytes` at the old file's size. Measured on a live
+    /// archive: **412 GB under-reported across 66 takes**, worst on the biggest
+    /// ones (0.04 GB recorded for a 16.41 GB file) because the shortfall is
+    /// exactly the size of the head that had to be fetched. The call sites are
+    /// fixed, but nothing would have healed the rows already written.
+    ///
+    /// **Upward only.** A file *smaller* than its row is a different question —
+    /// a truncation, or the deliberate accounting that lets a failed take
+    /// report its capture-cache leftovers — and quietly shrinking the row would
+    /// hide it. It also makes an offline drive harmless: every stat fails, every
+    /// candidate reads as smaller, and nothing is touched.
+    async fn reconcile_recorded_sizes(&self) {
+        use std::collections::HashMap;
+
+        let rows = match self.store.takes_with_media_on_disk() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("size repair: failed to load takes: {e:#}");
+                return;
+            }
+        };
+        let mut drive_ok: HashMap<char, bool> = HashMap::new();
+        let (mut fixed, mut gained) = (0usize, 0i64);
+        for (rec_id, path, recorded) in rows {
+            let p = PathBuf::from(&path);
+            if let Some(d) = crate::downloader::drive_of(&p) {
+                let ok = match drive_ok.get(&d) {
+                    Some(v) => *v,
+                    None => {
+                        let root = PathBuf::from(format!("{d}:\\"));
+                        let ok = crate::iomon::fs::metadata(Cat::Startup, &root).await.is_ok();
+                        drive_ok.insert(d, ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            let actual = crate::downloader::remux::file_len(&p).await as i64;
+            if actual <= recorded {
+                continue;
+            }
+            match self.store.set_recording_bytes(rec_id, actual) {
+                Ok(()) => {
+                    fixed += 1;
+                    gained += actual - recorded;
+                }
+                Err(e) => warn!(rec_id, "size repair: update failed: {e:#}"),
+            }
+        }
+        if fixed > 0 {
+            info!(
+                takes = fixed,
+                gained_gb = gained / (1024 * 1024 * 1024),
+                "size repair: corrected takes whose row was smaller than the file on disk"
+            );
+        }
+    }
+
     async fn reconcile_stale_issues(&self) {
         use std::collections::HashMap;
 
@@ -1782,7 +1850,11 @@ impl Supervisor {
                 continue; // nothing on disk — Issues lists it as missing
             };
             let cap_s = capture.to_string_lossy();
-            if let Err(e) = self.store.update_recording_output_path(rec_id, &cap_s) {
+            if let Err(e) = self.store.update_recording_output_path(
+                rec_id,
+                &cap_s,
+                RepointBytes::Measured(cap_len as i64),
+            ) {
                 warn!(rec_id, "orphan repair: retarget failed: {e:#}");
                 continue;
             }
@@ -1814,6 +1886,7 @@ impl Supervisor {
         }
         self.reconcile_companion_paths().await;
         self.reconcile_stale_issues().await;
+        self.reconcile_recorded_sizes().await;
     }
 }
 

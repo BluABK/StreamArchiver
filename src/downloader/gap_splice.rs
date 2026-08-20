@@ -499,7 +499,11 @@ impl Supervisor {
                 let dest_s = dest.to_string_lossy().into_owned();
                 // Re-point BEFORE any disposal — never a window where
                 // `output_path` names a deleted file.
-                if let Err(e) = self.store.update_recording_output_path(rec_id, &dest_s) {
+                // Base plus every spliced-in patch: a different, longer file.
+                let dest_len = super::remux::disk_bytes_for(&dest).await;
+                if let Err(e) =
+                    self.store.update_recording_output_path(rec_id, &dest_s, RepointBytes::Measured(dest_len))
+                {
                     warn!(rec_id, "gap splice: could not re-point output_path: {e:#}");
                     let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
                     finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));

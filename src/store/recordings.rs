@@ -21,6 +21,32 @@ pub enum CompanionPath {
     VodDl,
 }
 
+/// What a take's recorded `bytes` should become when its `output_path` moves.
+///
+/// Re-pointing is two different operations wearing one name:
+///
+/// * a **relocation** — the same file at a new place (a drive move, a rename
+///   once the real title arrives). The size on disk did not change.
+/// * a **substitution** — a *different* file now backs the take (a head+live
+///   join, a gap splice, a `.ts` remuxed to `.mkv`, a published VOD replacing
+///   the live capture). The old size is simply wrong.
+///
+/// Making the caller say which is not ceremony. Head-backfill left `bytes` at
+/// the live capture's size while `output_path` named the joined `full.mkv`, and
+/// four other substitution sites did the same — 412 GB under-reported across 66
+/// takes when this was measured. The error is worst on the biggest takes,
+/// because the under-report is exactly the size of the head that was missing:
+/// one take recorded 0.04 GB for a 16.41 GB file. Those are precisely the rows
+/// the storage stats exist to surface, so the stats were blindest where they
+/// mattered most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepointBytes {
+    /// Same file, new path — keep the recorded size.
+    Unchanged,
+    /// A different file backs the take now; this is its measured size.
+    Measured(i64),
+}
+
 /// `(id, started_at, ended_at, status)` — see `Store::earlier_takes_for_stream`.
 pub type EarlierTakeRow = (i64, i64, Option<i64>, String);
 
@@ -842,12 +868,49 @@ impl Store {
         Ok(())
     }
 
-    pub fn update_recording_output_path(&self, id: i64, path: &str) -> Result<()> {
+    /// Re-point a take at a different `output_path`, stating what its recorded
+    /// `bytes` should become. See [`RepointBytes`] for why that is not optional.
+    pub fn update_recording_output_path(&self, id: i64, path: &str, bytes: RepointBytes) -> Result<()> {
         let conn = self.db();
-        conn.execute(
-            "UPDATE recording SET output_path = ?2 WHERE id = ?1",
-            params![id, path],
+        match bytes {
+            RepointBytes::Unchanged => conn.execute(
+                "UPDATE recording SET output_path = ?2 WHERE id = ?1",
+                params![id, path],
+            )?,
+            RepointBytes::Measured(n) => conn.execute(
+                "UPDATE recording SET output_path = ?2, bytes = ?3 WHERE id = ?1",
+                params![id, path, n],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Every take whose `output_path` names a file materially larger than its
+    /// recorded `bytes` — the drift left behind by every join/splice/remux that
+    /// re-pointed a row before [`RepointBytes`] existed. Returns
+    /// `(id, output_path, recorded_bytes)`; the caller stats each file (this is
+    /// the sync store; disk I/O belongs in the async reconcile) and corrects
+    /// the ones that really are wrong.
+    ///
+    /// Deliberately *not* limited to `.full.mkv`/`.gapless.mkv`: the same drift
+    /// reaches any take a substitution touched, and the caller's own stat is
+    /// the authority on whether a given row needs correcting.
+    pub fn takes_with_media_on_disk(&self) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, output_path, bytes FROM recording
+             WHERE output_path <> '' AND status IN ('completed', 'ended', 'stopped')",
         )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Correct a take's recorded size to what is actually on disk.
+    pub fn set_recording_bytes(&self, id: i64, bytes: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE recording SET bytes = ?2 WHERE id = ?1", params![id, bytes])?;
         Ok(())
     }
 
@@ -4132,7 +4195,7 @@ mod tests {
         // countdown produces, and the sweep is the only thing that can stamp
         // it; excluding it here is what made these rows read "due" for ever.
         let no_file = take(5, TTL);
-        store.update_recording_output_path(no_file, "").unwrap();
+        store.update_recording_output_path(no_file, "", RepointBytes::Unchanged).unwrap();
         // Still recording: no `ended_at`, so the clock hasn't started.
         let recording = store
             .insert_recording(mid, 6, "C:/tmp/6.mkv", None, false, None, None, "", "")
@@ -4160,6 +4223,73 @@ mod tests {
     /// the verifier is handed: the ones the panel is showing because of a
     /// file, and no others — a verifier scoped to "every take with a missing
     /// file" would rewrite thousands of unrelated rows on startup.
+    /// Re-pointing a take must say what its size becomes, because the two
+    /// kinds of re-point disagree: a relocation keeps the size, a substitution
+    /// replaces it. Conflating them under-reported 412 GB across 66 takes.
+    #[test]
+    fn repointing_a_take_keeps_or_replaces_its_size_as_the_caller_states() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, r"G:\streams\c\a.mkv", None, false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(rid, 110, 3_000_000_000, Some(0), "completed", r"G:\streams\c\a.mkv", "")
+            .unwrap();
+        let size = |id: i64| store.get_recording(id).unwrap().unwrap().bytes;
+        assert_eq!(size(rid), 3_000_000_000);
+
+        // A drive move: same file, new address. The size must survive.
+        store
+            .update_recording_output_path(rid, r"P:\streams\c\a.mkv", RepointBytes::Unchanged)
+            .unwrap();
+        assert_eq!(size(rid), 3_000_000_000, "a relocation must not resize the take");
+
+        // A head+live join: a different, larger file now backs the take.
+        store
+            .update_recording_output_path(
+                rid,
+                r"P:\streams\c\a.full.mkv",
+                RepointBytes::Measured(18_000_000_000),
+            )
+            .unwrap();
+        assert_eq!(size(rid), 18_000_000_000, "a substitution must adopt the new file's size");
+    }
+
+    /// The repair sweep's candidate list is what the reconciler stats, so it
+    /// has to carry the recorded size to compare against — and it must not
+    /// offer rows with no file to measure.
+    #[test]
+    fn the_size_sweep_lists_archived_takes_with_their_recorded_size() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let mk = |n: i64, path: &str, bytes: i64, status: &str| -> i64 {
+            let rid = store
+                .insert_recording(mid, n, path, None, false, None, None, "", "")
+                .unwrap();
+            store.finish_recording(rid, n + 10, bytes, Some(0), status, path, "").unwrap();
+            rid
+        };
+        let joined = mk(100, r"G:\streams\c\a.full.mkv", 1_000, "completed");
+        let pathless = mk(200, "", 5_000, "completed");
+        store.update_recording_output_path(pathless, "", RepointBytes::Unchanged).unwrap();
+
+        let rows = store.takes_with_media_on_disk().unwrap();
+        assert!(
+            rows.iter().any(|(id, p, b)| *id == joined && p.ends_with("a.full.mkv") && *b == 1_000),
+            "an archived take is offered with the size to compare against"
+        );
+        assert!(
+            !rows.iter().any(|(id, _, _)| *id == pathless),
+            "a take with no path has nothing to stat"
+        );
+
+        store.set_recording_bytes(joined, 18_000_000_000).unwrap();
+        assert_eq!(store.get_recording(joined).unwrap().unwrap().bytes, 18_000_000_000);
+    }
+
     #[test]
     fn only_file_backed_issue_entries_are_offered_for_verification() {
         let store = Store::open_in_memory().unwrap();
@@ -4409,7 +4539,7 @@ mod tests {
                 // clock start that isn't `ended_at`.
                 store.unkeep_rolling_recording(rid, ENDED - TTL).unwrap();
             }
-            store.update_recording_output_path(rid, path).unwrap();
+            store.update_recording_output_path(rid, path, RepointBytes::Unchanged).unwrap();
             rolling.push(rid);
         }
 

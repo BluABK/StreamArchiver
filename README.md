@@ -1146,7 +1146,7 @@ can always start a fresh backfill.
 
 ### Repairs at startup
 
-Two passes run once when the app starts, both comparing what the database
+Four passes run once when the app starts, all comparing what the database
 believes against what is actually on disk.
 
 **Orphan outputs** promotes a take whose file turned out to be intact after an
@@ -1158,8 +1158,9 @@ there is no more to remux there than in a file that was deleted. Every
 Issues section is built from database state alone — none of them asks whether
 the file is still there — so an entry outlives its subject: a "needs remux" row
 keeps asking for a `.ts` that was swept months ago. On one real archive **177 of
-465** path-bearing entries were like that, enough to hide the 210 that were
-genuine work (648 GB of unremuxed captures) in plain sight.
+465** path-bearing entries pointed at nothing, and of the 199 that remained
+**136 were 0-byte husks** — leaving 63 entries of genuine work buried under
+three times their number in noise.
 
 **Companion pointers** forgets a `full` / head-backfill / recovery / VOD-download
 path whose file is gone. The main recording path is cleared wherever the app
@@ -1168,6 +1169,18 @@ independently — a manual delete, a trash sweep, a drive reorganisation outside
 the app — and nothing noticed. One real archive had 35 such pointers across 12
 channels, some weeks old; they only surfaced because a path relocation rewrote
 four of them onto a new drive where they equally did not exist.
+
+**Recorded sizes** corrects any take whose file on disk is larger than the size
+in its row. A take's size is written when its capture finishes, but a later
+head-backfill join, gap splice, re-remux or published-VOD replacement swaps in a
+*different* file — and five of those paths re-pointed the row without re-measuring
+it. The shortfall is exactly the material that was added, so the error is worst
+on the takes that needed the most repair: one real archive under-reported **412 GB
+across 66 takes**, including a row reading 0.04 GB for a 16.41 GB file. Those are
+precisely the rows the storage stats exist to surface, so the totals were blindest
+where they mattered most. The repair only ever corrects *upward* — a file smaller
+than its row is a truncation or a deliberate capture-cache accounting, and
+silently shrinking the row would hide it.
 
 **An unreachable drive is never read as an absent file.** Each drive is probed
 once per pass and, if its root does not answer, every pointer on it is left

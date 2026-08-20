@@ -863,7 +863,14 @@ impl Supervisor {
                             }
                         };
                         let live_s = live.to_string_lossy().into_owned();
-                        let _ = self.store.update_recording_output_path(rec_id, &live_s);
+                        // The published VOD has replaced the live capture at this
+                        // path — a wholly different file, usually a different size.
+                        let vod_len = super::remux::disk_bytes_for(&live).await;
+                        let _ = self.store.update_recording_output_path(
+                            rec_id,
+                            &live_s,
+                            RepointBytes::Measured(vod_len),
+                        );
                         let _ = self.store.set_recording_vod_archived(rec_id, &live_s, "replaced");
                         info!(rec_id, "vod archive: replaced live recording with the published VOD (original {how})");
                     }

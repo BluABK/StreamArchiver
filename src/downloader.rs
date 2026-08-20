@@ -30,7 +30,7 @@ use crate::models::{
     SabrCodecPref, Tool, Video, now_unix,
 };
 use crate::platform::DetachedJob;
-use crate::store::Store;
+use crate::store::{RepointBytes, Store};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;

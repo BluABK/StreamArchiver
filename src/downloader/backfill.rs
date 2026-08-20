@@ -1263,7 +1263,14 @@ impl Supervisor {
         // NOT by deriving from the now-`.full.mkv` output_path (that
         // derivation would yield `{stem}.full.chat.jsonl`, which never exists).
         let full_s = full.to_string_lossy().into_owned();
-        let live_note = match self.store.update_recording_output_path(rec_id, &full_s) {
+        // The joined file is head + live, so it is larger than the capture the
+        // row was sized from — measure it, or this take under-reports by
+        // exactly the head we just went and fetched.
+        let full_len = super::remux::disk_bytes_for(full).await;
+        let live_note = match self
+            .store
+            .update_recording_output_path(rec_id, &full_s, RepointBytes::Measured(full_len))
+        {
             Ok(()) => {
                 match crate::disposal::dispose_media(
                     &self.store,

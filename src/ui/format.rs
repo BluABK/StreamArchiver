@@ -403,7 +403,11 @@ pub(super) fn format_event_totals(totals: [i64; 6]) -> String {
 /// at the expected quality — a stream that should be 1080p60 but averages
 /// 2 Mbps is worth a second look).
 pub(super) fn stream_size_hover(total_bytes: u64, captured_secs: i64) -> String {
-    let base = format!("{} captured across all takes", fmt_bytes(total_bytes as i64));
+    // "on disk", not "captured": a take's size now includes whatever a
+    // head-backfill join or gap splice added, which was fetched from the CDN
+    // rather than captured live. Same correction the Background view's
+    // "Total on disk" got, for the same reason.
+    let base = format!("{} on disk across all takes", fmt_bytes(total_bytes as i64));
     if captured_secs <= 0 {
         return base;
     }
@@ -774,7 +778,7 @@ mod tests {
         // is binary (base-1024), so the byte count reads as "953.7 MB", not "1 GB".
         let s = stream_size_hover(1_000_000_000, 8);
         assert!(s.contains("1000.0 Mbps average"), "got {s:?}");
-        assert!(s.starts_with("953.7 MB captured across all takes"), "got {s:?}");
+        assert!(s.starts_with("953.7 MB on disk across all takes"), "got {s:?}");
     }
 
     #[test]

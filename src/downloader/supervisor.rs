@@ -405,7 +405,11 @@ progress_info: None,
                 Ok(()) => {
                     let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &capture).await;
                     let path_s = final_.to_string_lossy();
-                    if let Err(e) = store.update_recording_output_path(rec_id, &path_s) {
+                    // The `.mkv` is a different file from the `.ts` just deleted.
+                    let mkv_len = crate::downloader::remux::disk_bytes_for(&final_).await;
+                    if let Err(e) =
+                        store.update_recording_output_path(rec_id, &path_s, RepointBytes::Measured(mkv_len))
+                    {
                         warn!("re-remux: DB update failed for rec_id={rec_id}: {e:#}");
                     }
                     let _ = tx.send(AppEvent::BackgroundTaskFinished {
@@ -484,9 +488,14 @@ progress_info: None,
                 match remux_ts_to_mkv(&store, &shutdown, *rec_id, &ts, &mkv, None, &opts).await {
                     Ok(()) => {
                         let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &ts).await;
-                        if mkv != planned_mkv {
-                            let _ = store.update_recording_output_path(*rec_id, &mkv.to_string_lossy());
-                        }
+                        // Always re-size, even when the path is unchanged: the
+                        // row was sized from the `.ts` we just removed.
+                        let mkv_len = crate::downloader::remux::disk_bytes_for(&mkv).await;
+                        let _ = store.update_recording_output_path(
+                            *rec_id,
+                            &mkv.to_string_lossy(),
+                            RepointBytes::Measured(mkv_len),
+                        );
                         let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
                     }
                     Err(e) => warn!("re-remux-all failed for rec_id={rec_id}: {e:#}"),
@@ -801,7 +810,7 @@ progress_info: None,
             match rename_or_shorten(&capture, &output_dir, &stem, &ext).await {
                 Ok(actual) => {
                     if let Err(e) = store
-                        .update_recording_output_path(rec_id, &actual.to_string_lossy())
+                        .update_recording_output_path(rec_id, &actual.to_string_lossy(), RepointBytes::Unchanged)
                     {
                         warn!(rec_id, "recover stuck capture: DB update failed: {e:#}");
                     }

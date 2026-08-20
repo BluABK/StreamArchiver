@@ -166,7 +166,7 @@ mod migrations;
 mod monitors;
 mod posts;
 mod recordings;
-pub use recordings::{ChatIndexTarget, EarlierTakeRow, TakeLabel};
+pub use recordings::{ChatIndexTarget, EarlierTakeRow, RepointBytes, TakeLabel};
 mod recording_groups;
 mod scheduled;
 mod stats_history;
