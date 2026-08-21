@@ -3074,6 +3074,16 @@ VOD genuinely isn't recoverable). Disabled while the take is still actively
 recording — there's a live edge to watch instead at that point (▷ Play
 stream (live edge), above).
 
+While a Twitch take IS live, its row instead offers **▷ Play live (CDN
+source)**: the broadcast's growing CDN `chunked/` playlist in the media
+player — **true source quality even on manifest-gated channels** where the
+normal live edge is capped at 720p60 for every non-browser client, with the
+whole stream so far seekable. It runs roughly half a minute behind the real
+live edge (VOD playlists trail the broadcast), so it's the "quality over
+latency" way to watch; ▷ Play stream (live edge) stays the low-latency one.
+No-ops quietly if the CDN folder doesn't resolve yet — it can take a minute
+or two after go-live to appear.
+
 ### Audio & subtitle tracks
 
 Both the Streams add/edit form (live recordings) and the Videos download form

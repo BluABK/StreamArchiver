@@ -656,6 +656,38 @@ fn player_log(channel: &str, tool: &str) -> std::process::Stdio {
     }
 }
 
+/// Play a live broadcast's growing CDN source (`chunked/`) playlist — full
+/// quality on manifest-gated channels where the normal live edge is capped
+/// (Twitch serves the gated manifest to every non-browser client, but the
+/// CDN VOD folder carries true source). ffmpeg's HLS demuxer keeps polling a
+/// playlist with no ENDLIST, so mpv follows the broadcast as it grows;
+/// `--start=-30` opens near the live edge with the whole DVR seekable
+/// behind it. Registered as a LIVE player (chat dock-on-play applies).
+pub(super) fn spawn_cdn_source_player(
+    player: &str,
+    playlist_url: &str,
+    row: &crate::models::MonitorWithChannel,
+    title_template: &str,
+    title_auto_update: bool,
+    store: &Arc<crate::store::Store>,
+    meta: Option<&LiveMetaCtx>,
+) {
+    let mut cmd = std::process::Command::new(player);
+    hide_console(&mut cmd);
+    cmd.stderr(player_log(&row.channel.name, "player"));
+    if player_is_mpv(player) {
+        cmd.args(MPV_LIVE_FLAGS);
+        cmd.arg("--start=-30");
+    }
+    apply_live_title_and_spawn_updater(
+        &mut cmd, player, row, title_template, title_auto_update, store, meta,
+    );
+    cmd.arg(playlist_url);
+    if let Some(msg) = spawn_logged(cmd, "media player", Some(row.monitor.id), None, true) {
+        warn!(channel = %row.channel.name, "play CDN source: {msg}");
+    }
+}
+
 // ----- Open-player presence (which instances are on screen right now) -----
 
 /// monitor_id -> (players currently open, unix time the last one closed).

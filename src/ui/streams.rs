@@ -272,6 +272,10 @@ struct StreamsOut {
     /// "▷ Play VOD" on a past take/stream row — by recording id. Works
     /// regardless of whether the take was ever captured.
     play_vod_now: Option<i64>,
+    /// "▷ Play live (CDN source)" on an ACTIVE Twitch take — by recording
+    /// id. Watch the growing CDN source playlist at full quality while the
+    /// broadcast runs (manifest-gated channels cap the normal live edge).
+    play_cdn_source: Option<i64>,
     /// "🌐 Open VOD webpage" on a past take/stream row — by recording id.
     open_vod_webpage: Option<i64>,
     /// "🔗 Copy video URL" on a take/stream row — by recording id. Works on
@@ -2613,6 +2617,7 @@ impl StreamArchiverApp {
             backfill_missed_vod_now,
             scan_for_missed_streams,
             play_vod_now,
+            play_cdn_source,
             open_vod_webpage,
             copy_video_url,
             backfill_head_now,
@@ -2696,6 +2701,66 @@ impl StreamArchiverApp {
         if let Some(rec_id) = play_vod_now {
             self.core.manual(ManualCommand::PlayVodNow(rec_id));
             self.status = "Resolving VOD to play…".into();
+        }
+        if let Some(rec_id) = play_cdn_source {
+            // Resolve the broadcast's CDN source playlist off-thread (host
+            // probing is network I/O), then hand it to the player — the
+            // watch-at-source-quality answer for manifest-gated channels.
+            let player = self.settings.media_player_path.trim().to_string();
+            if player.is_empty() {
+                self.status = "Set a media player in Settings first.".into();
+            } else if let Ok(Some(rec)) = self.core.store.get_recording(rec_id)
+                && let Ok(Some(row)) = self.core.store.get_monitor_with_channel(rec.monitor_id)
+                && let (Some(login), Some(sid), Some(gl)) = (
+                    crate::detectors::twitch_login(&row.monitor.url),
+                    rec.stream_id.clone(),
+                    rec.went_live_at.filter(|t| *t > 0),
+                )
+            {
+                self.status =
+                    format!("Resolving {}'s CDN source playlist…", row.channel.name);
+                let store = self.core.store.clone();
+                let template = self.settings.live_title_template.trim().to_string();
+                let auto_update = self.settings.live_title_auto_update;
+                let meta = crate::ui::player::LiveMetaCtx::from_core(&self.core);
+                let went_live_approx = rec.went_live_approx;
+                let vod_id = rec.vod_id.clone();
+                self.core.rt.spawn(async move {
+                    let client = reqwest::Client::new();
+                    let hosts = crate::recovery::load_hosts(&store);
+                    let max_conc = crate::recovery::load_max_conc(&store);
+                    let inputs = crate::recovery::RecoveryInputs {
+                        login,
+                        broadcast_id: sid,
+                        start_epoch: gl,
+                        went_live_approx,
+                        vod_id,
+                    };
+                    match crate::recovery::resolve_playlist(&client, &inputs, &hosts, max_conc)
+                        .await
+                    {
+                        Some(found) => {
+                            crate::ui::player::spawn_cdn_source_player(
+                                &player,
+                                &found.url,
+                                &row,
+                                &template,
+                                auto_update,
+                                &store,
+                                meta.as_ref(),
+                            );
+                        }
+                        None => tracing::warn!(
+                            channel = %row.channel.name,
+                            "play CDN source: no CDN folder resolves yet — try again in a minute"
+                        ),
+                    }
+                });
+            } else {
+                self.status =
+                    "No stream id / go-live time on this take to derive the CDN folder from."
+                        .into();
+            }
         }
         if let Some(rec_id) = open_vod_webpage {
             self.core.manual(ManualCommand::OpenVodWebpage(rec_id));
@@ -6213,6 +6278,37 @@ impl StreamArchiverApp {
                 {
                     out.view_chat_rec = Some((t.monitor_id, t.id));
                     ui.close();
+                }
+                // Live counterpart of "Play VOD": the broadcast's growing
+                // CDN source (chunked/) playlist. On manifest-gated channels
+                // ▷ Play stream (live edge) is capped (720p60 for every
+                // non-browser client) while the CDN folder serves the true
+                // source — this button is how you WATCH at source quality
+                // during the stream. Trails the real live edge by roughly
+                // half a minute (VOD playlists lag the broadcast), and the
+                // whole DVR back to second 0 is seekable.
+                if t.stream_id.is_some()
+                    && t.is_active()
+                    && rows
+                        .iter()
+                        .find(|r| r.monitor.id == t.monitor_id)
+                        .is_some_and(|r| r.monitor.platform() == crate::models::Platform::Twitch)
+                {
+                    if ui
+                        .button("▷  Play live (CDN source)")
+                        .on_hover_text(
+                            "Play this live broadcast's CDN source playlist — full \
+                             (source) quality even on channels whose live manifest is \
+                             capped for non-browser players, with the whole stream so \
+                             far seekable. Runs ~30 s behind the true live edge. \
+                             No-ops quietly if no CDN folder resolves yet (can take a \
+                             minute or two after go-live).",
+                        )
+                        .clicked()
+                    {
+                        out.play_cdn_source = Some(t.id);
+                        ui.close();
+                    }
                 }
                 // "Play VOD"/"Open VOD webpage" work on a past broadcast
                 // regardless of whether it was ever captured (unlike the
