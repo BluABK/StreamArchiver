@@ -3263,7 +3263,8 @@ impl StreamArchiverApp {
         let interval =
             if self.show_processes { Duration::from_millis(1500) } else { Duration::from_secs(5) };
         let stale = self.processes_refreshed.map(|t| t.elapsed() >= interval).unwrap_or(true);
-        if stale && self.processes_load.is_none() {
+        // Held while text is selected — see `text_selection_hold`.
+        if stale && self.processes_load.is_none() && !super::text_selection_hold(ctx) {
             let core = self.core.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             debug!("spawning list-processes thread");

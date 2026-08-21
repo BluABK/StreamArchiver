@@ -2162,7 +2162,10 @@ Media that is gone stops counting:                          immediately when the
             .bg_index_stats
             .as_ref()
             .is_none_or(|(_, _, at)| at.elapsed() >= INDEX_STAT_REFRESH);
-        if stale && let Some(idx) = crate::chat_index::shared() {
+        // Held while text is selected — see `text_selection_hold`.
+        if stale && !super::text_selection_hold(ui.ctx())
+            && let Some(idx) = crate::chat_index::shared()
+        {
             let total = self.core.store.chat_index_candidates().map(|v| v.len() as i64).unwrap_or(0);
             if let Ok(h) = idx.health() {
                 self.bg_index_stats = Some((h, total, std::time::Instant::now()));

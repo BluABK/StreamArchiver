@@ -271,6 +271,70 @@ const COOKIE_BROWSERS: [&str; 8] = [
 /// Clip counts `(total, archived)` per parent VOD id. Named so the cache field
 /// and the render path share one spelling (and to keep clippy's type-complexity
 /// lint quiet), the same reason `TrashActionOutcome` exists.
+/// Whether periodic model refreshes should HOLD OFF because the user has
+/// text selected somewhere.
+///
+/// egui drops a label selection the moment the selected label isn't re-seen
+/// identically on a pass (its own source deselects with "we will have
+/// horrible glitches, so let's just deselect") — so every timer that swaps a
+/// view's model out from under the user cancels their selection. With half
+/// the views refreshing on 1–5 s timers, text could not be kept highlighted
+/// long enough to copy it.
+///
+/// The hold is CAPPED, not open-ended: egui selections can outlive the
+/// user's interest (clicking empty space doesn't always clear one), and an
+/// abandoned selection must not freeze every readout in the app forever.
+/// The cap restarts while the selection is actively being dragged out, so
+/// slow, deliberate selecting never times out mid-gesture; after that the
+/// user has [`SELECTION_HOLD`] to hit Ctrl+C, which is what selections are
+/// for. Refreshes resume (and the stale selection dies) after.
+pub(crate) fn text_selection_hold(ctx: &egui::Context) -> bool {
+    /// How long a settled selection keeps refreshes paused.
+    const SELECTION_HOLD: std::time::Duration = std::time::Duration::from_secs(45);
+    static HELD_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+    let has_selection = ctx
+        .plugin_opt::<egui::text_selection::LabelSelectionState>()
+        .map(|h| h.lock().has_selection())
+        .unwrap_or(false);
+    let dragging = has_selection && ctx.input(|i| i.pointer.primary_down());
+
+    let mut held = HELD_SINCE.lock().unwrap();
+    selection_hold_decision(has_selection, dragging, std::time::Instant::now(), &mut held, SELECTION_HOLD)
+}
+
+/// The [`text_selection_hold`] state machine, pure for testing: given whether
+/// a selection exists and is being dragged, decide whether refreshes hold,
+/// and keep `held` (when the current hold started) up to date.
+fn selection_hold_decision(
+    has_selection: bool,
+    dragging: bool,
+    now: std::time::Instant,
+    held: &mut Option<std::time::Instant>,
+    cap: std::time::Duration,
+) -> bool {
+    match (has_selection, *held) {
+        (false, _) => {
+            *held = None;
+            false
+        }
+        (true, None) => {
+            *held = Some(now);
+            true
+        }
+        (true, Some(since)) => {
+            if dragging {
+                // Still extending it: the clock restarts so the cap can never
+                // cut a selection gesture short.
+                *held = Some(now);
+                true
+            } else {
+                now.duration_since(since) < cap
+            }
+        }
+    }
+}
+
 type ClipsByVod = HashMap<String, (i64, i64)>;
 /// One rev-keyed Streams cache slot: `(streams_cache_rev at fill time, data)`.
 /// The data sits behind an `Arc` so the per-frame handoff into
@@ -3052,7 +3116,10 @@ impl eframe::App for StreamArchiverApp {
         // columns would drift stale until F5. A 30s re-read keeps the grid —
         // and therefore its sort order — current without user action.
         let now = now_unix();
-        if now - self.last_auto_reload >= 30 {
+        // `last_auto_reload` is deliberately NOT advanced while a selection
+        // holds the reload off — the moment the hold clears, the overdue
+        // reload runs instead of waiting another 30 s.
+        if now - self.last_auto_reload >= 30 && !text_selection_hold(ctx) {
             self.last_auto_reload = now;
             self.spawn_pending_reload();
             // Bound the probe cache: age out entries no longer being rendered.
@@ -3985,5 +4052,57 @@ impl eframe::App for StreamArchiverApp {
         // above register their widgets after the root CentralPanel, so an
         // earlier drain would split one frame's widgets across two snapshots.
         self.inspector.lock().unwrap().end_frame(self.show_inspector);
+    }
+}
+
+#[cfg(test)]
+mod selection_hold_tests {
+    use super::selection_hold_decision;
+    use std::time::{Duration, Instant};
+
+    const CAP: Duration = Duration::from_secs(45);
+
+    /// The hold exists so a refresh can't cancel a selection mid-copy; the
+    /// cap exists so an abandoned selection can't freeze every readout in
+    /// the app forever. Both halves matter equally.
+    #[test]
+    fn a_selection_holds_refreshes_until_the_cap_then_releases() {
+        let t0 = Instant::now();
+        let mut held = None;
+
+        // No selection: never held, state stays empty.
+        assert!(!selection_hold_decision(false, false, t0, &mut held, CAP));
+        assert!(held.is_none());
+
+        // Selection appears: held, and the clock starts.
+        assert!(selection_hold_decision(true, false, t0, &mut held, CAP));
+        assert_eq!(held, Some(t0));
+
+        // Settled selection inside the cap: still held, clock NOT restarted.
+        let t1 = t0 + Duration::from_secs(30);
+        assert!(selection_hold_decision(true, false, t1, &mut held, CAP));
+        assert_eq!(held, Some(t0), "an idle selection must not extend its own hold");
+
+        // Past the cap: refreshes resume even though the selection lingers.
+        let t2 = t0 + CAP + Duration::from_secs(1);
+        assert!(!selection_hold_decision(true, false, t2, &mut held, CAP));
+
+        // Selection cleared: state resets so the next one gets a fresh cap.
+        assert!(!selection_hold_decision(false, false, t2, &mut held, CAP));
+        assert!(held.is_none());
+    }
+
+    /// Dragging restarts the clock, so a slow, deliberate selection gesture
+    /// can never be cut short by the cap — only a SETTLED selection ages.
+    #[test]
+    fn dragging_restarts_the_clock() {
+        let t0 = Instant::now();
+        let mut held = Some(t0);
+        let t1 = t0 + CAP - Duration::from_secs(1); // one second before expiry
+        assert!(selection_hold_decision(true, true, t1, &mut held, CAP));
+        assert_eq!(held, Some(t1), "the gesture pushed the deadline out");
+        // And the full cap applies from the drag, not from the start.
+        let t2 = t1 + CAP - Duration::from_secs(1);
+        assert!(selection_hold_decision(true, false, t2, &mut held, CAP));
     }
 }

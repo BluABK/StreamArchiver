@@ -171,11 +171,19 @@ impl LogViewPopupState {
     /// edit, not something to do every frame); an unchanged filter only
     /// scans records newer than `last_seq`, so a quiet log costs nothing per
     /// frame and a busy one costs proportional to how much actually arrived.
-    fn refresh(&mut self) {
+    /// `hold` pauses the live tail (new lines keep queueing in the capture
+    /// ring and land in one batch when the hold clears) — appending rows
+    /// while the user has text selected is what cancels the selection, and
+    /// a log window is one of the main places text gets copied FROM.
+    /// A filter change is a user action and always rebuilds regardless.
+    fn refresh(&mut self, hold: bool) {
         let key = (self.search.clone(), self.regex, self.min_level, self.platform);
         if key != self.last_filter {
             self.rebuild();
         } else {
+            if hold {
+                return;
+            }
             let newer = crate::log_capture::since(self.last_seq);
             if !newer.is_empty() {
                 self.last_seq = newer.last().map(|r| r.seq).unwrap_or(self.last_seq);
@@ -218,7 +226,7 @@ impl StreamArchiverApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     s.closed = true;
                 }
-                s.refresh();
+                s.refresh(crate::ui::text_selection_hold(ctx));
                 // Live-tailing: keep the frame loop running while open so new
                 // lines actually arrive without needing input to wake it up.
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));

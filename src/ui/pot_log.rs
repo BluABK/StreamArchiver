@@ -67,7 +67,9 @@ impl StreamArchiverApp {
             .pot_log_refreshed
             .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
             .unwrap_or(true);
-        if stale {
+        // Held while text is selected: this window exists to copy errors out
+        // of, and a 1 s tail swap cancelled the selection before Ctrl+C.
+        if stale && !super::text_selection_hold(ctx) {
             self.pot_log_text = read_pot_log_tail();
             self.pot_log_refreshed = Some(std::time::Instant::now());
         }

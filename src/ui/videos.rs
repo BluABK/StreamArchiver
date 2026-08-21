@@ -431,6 +431,8 @@ impl StreamArchiverApp {
         if self
             .videos_refreshed
             .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+            // Held while text is selected — see `text_selection_hold`.
+            && !super::text_selection_hold(ui.ctx())
         {
             self.reload_videos();
         }

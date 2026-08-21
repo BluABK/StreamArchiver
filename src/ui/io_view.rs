@@ -143,7 +143,8 @@ impl StreamArchiverApp {
             .io_refreshed
             .map(|t| t.elapsed().as_millis() >= 900)
             .unwrap_or(true);
-        if stale {
+        // Held while text is selected — see `text_selection_hold`.
+        if stale && !super::text_selection_hold(ui.ctx()) {
             self.io_hist = iomon::history();
             self.io_snap = Some(iomon::snapshot());
             self.io_refreshed = Some(std::time::Instant::now());

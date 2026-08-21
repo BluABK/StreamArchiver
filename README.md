@@ -73,6 +73,18 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ## Using it
 
+**Selected text stays selected.** Every periodic refresh in the app — the
+Issues/Warnings rescans, the Videos and Process Manager lists, the I/O and
+stats readouts, the log tail, a live chat window's own tail — pauses while you
+have text highlighted anywhere, because rebuilding a label out from under a
+selection is exactly what cancels it (and half these views refresh every
+second, which made copying anything a race). The pause is capped at ~45
+seconds for a settled selection — an abandoned highlight can't freeze the
+readouts forever — and the clock restarts while you're still dragging one out,
+so a slow selection is never cut short. Whatever a view skipped catches up in
+one batch the moment the selection clears.
+
+
 ### The top bar
 
 The **StreamArchiver** label on the far left is a menu: **⏻ Quit (keep

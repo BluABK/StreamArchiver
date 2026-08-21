@@ -509,7 +509,14 @@ impl StreamArchiverApp {
             Arc<HashMap<String, crate::assets::RewardEntry>>,
         );
         let reload_info: Option<ReloadInfo> =
-            if rec_active && popup.last_reload.elapsed() >= reload_after {
+            // The selection hold pauses the live tail too: appending rows is
+            // what cancels a selection, and chat is THE text people copy.
+            // Messages keep landing in the sidecar; the next reload after the
+            // hold clears catches the window up in one batch.
+            if rec_active
+                && popup.last_reload.elapsed() >= reload_after
+                && !crate::ui::text_selection_hold(ctx)
+            {
                 // Sidecar located via the probe cache: this runs on the UI
                 // thread every 3s per live popup, and a direct stat against
                 // the recordings drive can block the frame for seconds.

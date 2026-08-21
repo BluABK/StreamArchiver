@@ -75,7 +75,7 @@ impl StreamArchiverApp {
     /// The YouTube posts feed as a top-level tab. Shares [`Self::render_posts_feed`]
     /// with the pop-out posts window.
     pub(super) fn posts_view(&mut self, ui: &mut egui::Ui) {
-        Self::posts_maybe_reload(&self.core, &mut self.posts, &mut self.posts_refreshed);
+        Self::posts_maybe_reload(ui.ctx(), &self.core, &mut self.posts, &mut self.posts_refreshed);
         let mut refresh = false;
         Self::render_posts_feed(
             ui,
@@ -103,7 +103,7 @@ impl StreamArchiverApp {
             self.posts_popup = None;
             return;
         }
-        Self::posts_maybe_reload(&self.core, &mut self.posts, &mut self.posts_refreshed);
+        Self::posts_maybe_reload(ctx, &self.core, &mut self.posts, &mut self.posts_refreshed);
 
         if self.posts_popup.is_none() {
             self.posts_popup = Some(Arc::new(Mutex::new(PostsPopupState {
@@ -277,6 +277,7 @@ impl StreamArchiverApp {
     /// per frame from wherever this feed is shown (Posts tab, pop-out
     /// window) BEFORE `render_posts_feed`.
     pub(super) fn posts_maybe_reload(
+        ctx: &egui::Context,
         core: &Arc<AppCore>,
         posts: &mut Vec<crate::store::CommunityPostRow>,
         posts_refreshed: &mut Option<std::time::Instant>,
@@ -284,7 +285,8 @@ impl StreamArchiverApp {
         let stale = posts_refreshed
             .map(|t| t.elapsed() >= std::time::Duration::from_secs(5))
             .unwrap_or(true);
-        if stale {
+        // Held while text is selected — see `text_selection_hold`.
+        if stale && !super::text_selection_hold(ctx) {
             *posts = core.store.list_community_posts(None, 500).unwrap_or_default();
             *posts_refreshed = Some(std::time::Instant::now());
         }

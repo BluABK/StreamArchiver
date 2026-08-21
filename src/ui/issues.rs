@@ -1932,7 +1932,11 @@ impl StreamArchiverApp {
             .notif_refreshed
             .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
-        if stale {
+        // All three throttles here also hold while the user has text selected
+        // anywhere — swapping the model out from under a selection is what
+        // cancels it (see `text_selection_hold`). The overdue refresh runs the
+        // frame after the hold clears; none of these feed anything but the UI.
+        if stale && !super::text_selection_hold(ctx) {
             self.notif_unread = self.core.store.unread_notification_count().unwrap_or(0);
             // The 📣 Posts tab badge rides the same throttle — it's the same
             // `notification` table, just one kind of it.
@@ -2343,7 +2347,7 @@ impl StreamArchiverApp {
             Duration::from_secs(60)
         };
         let stale = self.warn_refreshed.map(|t| t.elapsed() >= interval).unwrap_or(true);
-        if stale {
+        if stale && !super::text_selection_hold(ctx) {
             self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
             // The Streams-grid take/stream badges ride the same throttle.
             self.rec_alert_badges =
@@ -2913,7 +2917,7 @@ impl StreamArchiverApp {
     pub(super) fn issues_window(&mut self, ctx: &egui::Context) {
         use std::time::Duration;
         self.issues_drain_scan(ctx);
-        self.issues_refresh_scan();
+        self.issues_refresh_scan(ctx);
         if !self.show_issues {
             self.issues_popup = None;
             return;
@@ -3219,7 +3223,7 @@ impl StreamArchiverApp {
     /// Refresh the Issues lists when stale. DB-only queries (fast, system
     /// drive) run synchronously; everything that stats the recordings drive
     /// runs off-thread (see [`IssuesScan`]).
-    fn issues_refresh_scan(&mut self) {
+    fn issues_refresh_scan(&mut self, ctx: &egui::Context) {
         use std::time::{Duration, Instant};
         // Always refresh so the toolbar button count stays current even when the
         // panel is closed — but much less often then: the badge going stale for
@@ -3238,7 +3242,7 @@ impl StreamArchiverApp {
             .issues_refreshed
             .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
-        if stale && self.issues_missing_load.is_none() {
+        if stale && self.issues_missing_load.is_none() && !super::text_selection_hold(ctx) {
             self.issues_dirty = false;
             // DB-only queries (fast, system drive) stay synchronous.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
