@@ -1141,6 +1141,11 @@ pub(super) struct ChanEntry {
 /// The Streams view's frame-invariant data, cached across repaints (see the
 /// rebuild block in `channels_view`). `stamp` is (unix second — 0 while no
 /// capture is active, so an idle grid never rebuilds on time alone; cache rev).
+/// The five DB-derived maps below are `Arc`-shared with their rev-keyed
+/// sources on the app (`clips_by_vod_cache` and friends): rebuilding this
+/// frame cache used to deep-clone all of them — ~33k Strings per rebuild for
+/// the clips map alone, growing with the catalogue — where an Arc bump is
+/// free and the data is immutable either way.
 pub(super) struct StreamsViewCache {
     pub(super) stamp: (i64, u64),
     pub(super) chan_entries: Vec<ChanEntry>,
@@ -1161,26 +1166,26 @@ pub(super) struct StreamsViewCache {
     pub(super) twitch_login_to_mid: HashMap<String, i64>,
     /// Each monitor's most recent `raid_out` event, if any — powers the
     /// "Follow raid" play action's enabled state and target.
-    pub(super) latest_raid_out: HashMap<i64, crate::models::StreamEventRow>,
+    pub(super) latest_raid_out: std::sync::Arc<HashMap<i64, crate::models::StreamEventRow>>,
     /// Takes still counting down towards rolling auto-deletion, by monitor id
     /// (absent = none), with the soonest deadline among them — the 🕰 rollup
     /// badge and column on instance and channel rows. A DB read, so it lives
     /// here rather than in the render path; see [`crate::rolling`].
-    pub(super) rolling_rollups: HashMap<i64, crate::rolling::RollingRollup>,
+    pub(super) rolling_rollups: std::sync::Arc<HashMap<i64, crate::rolling::RollingRollup>>,
     /// Drive letters each monitor's takes are stored on (absent = nothing
     /// stored) — the 🖴 column on channel and instance rows, which have no
     /// per-take data loaded to derive it themselves. A DB read, so it lives
     /// here rather than in the render path.
-    pub(super) monitor_drives: HashMap<i64, Vec<char>>,
+    pub(super) monitor_drives: std::sync::Arc<HashMap<i64, Vec<char>>>,
     /// Clip counts `(total, archived)` per parent VOD id — the 🎞 summary row
     /// under a broadcast, and whether a single-take broadcast is expandable at
     /// all. A DB read, so it lives here rather than in the render path.
-    pub(super) clips_by_vod: HashMap<String, (i64, i64)>,
+    pub(super) clips_by_vod: std::sync::Arc<HashMap<String, (i64, i64)>>,
     /// Per-monitor sum of finished-take bytes — the "Disk use" column on
     /// channel/instance rows. See `Store::monitor_disk_usage`'s doc comment
     /// for why this is a coarser figure than what period/stream/take rows
     /// show (those confirm each file against disk; this doesn't).
-    pub(super) monitor_disk_usage: HashMap<i64, i64>,
+    pub(super) monitor_disk_usage: std::sync::Arc<HashMap<i64, i64>>,
     pub(super) model: Vec<Vec<Cell>>,
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.

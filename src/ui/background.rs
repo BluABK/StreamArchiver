@@ -1360,7 +1360,7 @@ impl StreamArchiverApp {
                     ui.label("Total on disk").on_hover_text(
                         "Every take's media that is still on disk, archived or not. A                          capture that died mid-stream still occupies whatever it wrote to                          the capture cache, and that counts here — it used to record as                          zero, which is how hundreds of GB of unfinished captures stayed                          invisible to every total in the app.
 
-Media that has since been                          deleted stops counting from the next startup sweep: the take's                          history row and its recorded size both survive, but a file that                          is gone is not disk usage. That was 413 GB of takes and 335 GB of                          downloads on this archive.",
+Media that is gone stops counting:                          immediately when the app disposed of it itself (an expired                          rolling recording, a manual delete), and from the next startup                          sweep when it vanished outside the app. The take's history row                          and its recorded size both survive either way — a file that is                          gone is just not disk usage. Together those two classes were                          claiming ~3 TB that wasn't there on this archive.",
                     );
                     ui.strong(fmt_bytes(global.total_bytes));
                     ui.end_row();

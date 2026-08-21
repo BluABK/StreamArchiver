@@ -561,7 +561,13 @@ impl Store {
         let r = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM recording)                                            AS total_recordings,
-               (SELECT COALESCE(SUM(bytes), 0) FROM recording WHERE media_missing_at = 0) AS total_bytes,
+               -- On-disk needs both guards: media_missing_at catches files
+               -- that vanished outside the app, output_path <> '' catches takes
+               -- the app disposed of itself (disposal clears the path but keeps
+               -- bytes as the historical size). Measured before the second
+               -- guard: 217 disposed takes still counted 2,265 GB.
+               (SELECT COALESCE(SUM(bytes), 0) FROM recording
+                 WHERE media_missing_at = 0 AND output_path <> '')               AS total_bytes,
                (SELECT COUNT(*) FROM monitor)                                              AS total_monitors,
                (SELECT COUNT(*) FROM monitor WHERE enabled = 1)                            AS active_monitors,
                (SELECT COUNT(*) FROM channel)                                              AS total_channels,

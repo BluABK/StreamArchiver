@@ -1216,6 +1216,16 @@ view's per-directory totals and **Total on disk** all stop charging for it,
 while the history row and its recorded size stay intact. It reverses on its own
 — remount a drive and its media counts again on the next sweep.
 
+Media the app disposed of **itself** (an expired rolling recording, a manual
+delete, a trash sweep) never needed the stamp — disposal clears the take's
+path — but the totals used to count those rows anyway, because they filtered
+only on the stamp: **217 disposed takes were still counted as 2,265 GB** of
+disk usage on one archive. Every space-in-use figure now excludes pathless
+rows too, so both ways media leaves are handled: in-app disposals drop out
+immediately, outside deletions drop out at the next sweep. A 0-byte husk at a
+take's path counts as absent as well — it backs no media, and letting it keep
+a stale multi-GB claim is the same phantom usage with a file extension.
+
 **An unreachable drive is never read as an absent file.** Each drive is probed
 once per pass and, if its root does not answer, every pointer on it is left
 alone and retried next start. A file whose whole parent directory is missing is

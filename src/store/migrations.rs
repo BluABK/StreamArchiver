@@ -2014,7 +2014,24 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 98)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 98);
+        if version < 99 {
+            // The Streams tree's per-VOD clip rollup (`clip_counts_by_vod`)
+            // groups 30k+ rows and reads `state` for every one; with the old
+            // (platform, vod_id) index each row cost a table lookup — 414 ms
+            // measured cold on 32.8k clips, held under the store's one
+            // connection lock, i.e. ~25 dropped frames every grid rebuild.
+            // Adding `state` makes the index COVERING: 10.8 ms on the same
+            // data (38x). The old index is a strict prefix of the new one, so
+            // everything it served is still served; keeping both would just
+            // double the write cost per clip upsert.
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_clip_vod;
+                 CREATE INDEX idx_clip_vod_state ON clip(platform, vod_id, state)
+                     WHERE vod_id <> '';",
+            )?;
+            conn.pragma_update(None, "user_version", 99)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 99);
         Ok(())
     }
 }

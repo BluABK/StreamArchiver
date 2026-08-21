@@ -1057,6 +1057,35 @@ mod tests {
         );
     }
 
+    /// The per-VOD rollup groups 30k+ rows on every Streams-grid rebuild,
+    /// under the store's single connection lock. It must run off the COVERING
+    /// index — with the plain (platform, vod_id) index it read `state` from
+    /// the table per row: 414 ms vs 10.8 ms measured on 32.8k clips, and every
+    /// one of those milliseconds queued the UI's own reads. Assert the PLAN,
+    /// not the timing: the timing passes on any machine having a good day.
+    #[test]
+    fn the_vod_rollup_runs_off_the_covering_index() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.db();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT vod_id, COUNT(*), SUM(CASE WHEN state='archived' THEN 1 ELSE 0 END)
+                 FROM clip WHERE platform='twitch' AND vod_id <> '' GROUP BY vod_id",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("COVERING INDEX idx_clip_vod_state"),
+            "rollup must be index-only, got: {joined}"
+        );
+    }
+
     #[test]
     fn vod_cdn_cache_roundtrips_and_updates_in_place() {
         let store = Store::open_in_memory().unwrap();

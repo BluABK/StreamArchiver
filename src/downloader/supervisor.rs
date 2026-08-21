@@ -3377,7 +3377,17 @@ progress_info: None,
         // capture does, so the same under-reporting applies here — not fixed
         // in this pass because the video table's `bytes` feeds different
         // readouts and deserves its own look.
-        let bytes = file_len(&final_path).await as i64;
+        // Promoted size first; a FAILED download's disk usage is its cache
+        // leftovers (per-format `.fNNN.*` partials that never merged), which
+        // `disk_bytes_for` sums when the promoted file is absent or empty.
+        // Same correction recordings got — a dead download leaving 5 GB of
+        // partials used to record 0 and be invisible to every total, which
+        // is exactly how 826 GB of capture cache went unnoticed once already.
+        // `bytes` still never decides success: `media_ok` is the only judge.
+        let bytes = match file_len(&final_path).await as i64 {
+            n if n > 0 => n,
+            _ => crate::downloader::remux::disk_bytes_for(&plan.capture_path).await,
+        };
         // A clean exit with a media-named file is trusted; a nonzero/unknown
         // exit must additionally prove itself to ffprobe (partial-but-playable
         // files stay "completed"-eligible, promoted logs never are).

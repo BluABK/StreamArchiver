@@ -1737,7 +1737,7 @@ impl StreamArchiverApp {
             // which reloads the grid and bumps the rev.
             if self.raid_out_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
                 let fresh = self.core.store.latest_raid_outs_all().unwrap_or_default();
-                self.raid_out_cache = Some((self.streams_cache_rev, fresh));
+                self.raid_out_cache = Some((self.streams_cache_rev, std::sync::Arc::new(fresh)));
             }
             let latest_raid_out = self
                 .raid_out_cache
@@ -1749,7 +1749,7 @@ impl StreamArchiverApp {
             if self.rolling_rollup_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev)
             {
                 let fresh = self.core.store.rolling_rollup_by_monitor().unwrap_or_default();
-                self.rolling_rollup_cache = Some((self.streams_cache_rev, fresh));
+                self.rolling_rollup_cache = Some((self.streams_cache_rev, std::sync::Arc::new(fresh)));
             }
             let rolling_rollups = self
                 .rolling_rollup_cache
@@ -1761,7 +1761,7 @@ impl StreamArchiverApp {
             // paths loaded to derive it from while collapsed.
             if self.drives_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
                 let fresh = self.core.store.drive_letters_by_monitor().unwrap_or_default();
-                self.drives_cache = Some((self.streams_cache_rev, fresh));
+                self.drives_cache = Some((self.streams_cache_rev, std::sync::Arc::new(fresh)));
             }
             let monitor_drives = self
                 .drives_cache
@@ -1778,8 +1778,10 @@ impl StreamArchiverApp {
                     .store
                     .clip_counts_by_vod(crate::models::Platform::Twitch)
                     .unwrap_or_default();
-                self.clips_by_vod_cache = Some((self.streams_cache_rev, fresh));
+                self.clips_by_vod_cache = Some((self.streams_cache_rev, std::sync::Arc::new(fresh)));
             }
+            // `m.clone()` here (and for its four neighbours) is an Arc bump,
+            // not a map copy — this used to deep-clone ~33k Strings per frame.
             let clips_by_vod = self
                 .clips_by_vod_cache
                 .as_ref()
@@ -1790,7 +1792,7 @@ impl StreamArchiverApp {
             // loaded to sum itself when collapsed (see `groups`, above).
             if self.disk_usage_cache.as_ref().map(|(rev, _)| *rev) != Some(self.streams_cache_rev) {
                 let fresh = self.core.store.monitor_disk_usage().unwrap_or_default();
-                self.disk_usage_cache = Some((self.streams_cache_rev, fresh));
+                self.disk_usage_cache = Some((self.streams_cache_rev, std::sync::Arc::new(fresh)));
             }
             let monitor_disk_usage = self
                 .disk_usage_cache

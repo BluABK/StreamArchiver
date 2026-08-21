@@ -2167,11 +2167,12 @@ impl StreamArchiverApp {
             (crate::db_backup::K_INTERVAL_HOURS, s.db_backup_interval_hours.trim()),
             (crate::db_backup::K_RETENTION_COUNT, s.db_backup_retention_count.trim()),
         ];
-        for (k, v) in pairs {
-            if let Err(e) = self.core.store.set_setting(k, v) {
-                self.status = format!("Error saving settings: {e}");
-                return;
-            }
+        // One transaction for the whole form — this used to be ~150 separate
+        // commits (one lock acquisition + WAL commit per key) per Save click.
+        let batch: Vec<(&str, String)> = pairs.iter().map(|(k, v)| (*k, v.to_string())).collect();
+        if let Err(e) = self.core.store.set_settings_batch(&batch) {
+            self.status = format!("Error saving settings: {e}");
+            return;
         }
         // Trigger rules serialize to JSON, so they can't ride the &str pairs.
         if let Err(e) =

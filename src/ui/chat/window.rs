@@ -377,6 +377,9 @@ impl StreamArchiverApp {
         if !enabled {
             return;
         }
+        // Deleted monitors leave the ledger too — a HashMap that only ever
+        // grows is a leak, however small.
+        self.chat_dock_seen_gen.retain(|mid, _| self.rows.iter().any(|r| r.monitor.id == *mid));
         // Monitors with a live player whose spawn we have not acted on yet.
         let due: Vec<i64> = self
             .rows
@@ -418,9 +421,9 @@ impl StreamArchiverApp {
                 .flatten()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(480);
-            // Same title format the popup builder uses — the dock finds the
-            // HWND by exact title match.
-            crate::window_dock::request_dock(mid, format!("💬  Chat — {name}"), side, width);
+            // The dock finds the HWND by exact title match, so this MUST be
+            // the same function the popup builder uses.
+            crate::window_dock::request_dock(mid, super::chat_window_title(&name), side, width);
         }
     }
 
@@ -471,7 +474,7 @@ impl StreamArchiverApp {
         // Watchdog: name this phase so a freeze dialog points at the chat popup.
         self.heartbeat.set_context(format!("Chat: {}", popup.monitor_name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Chat);
-        let title = format!("💬  Chat — {}", popup.monitor_name);
+        let title = super::chat_window_title(&popup.monitor_name);
         let vp_id = chat_vp_id(popup.monitor_id);
 
         // Whether the selected recording is still in progress (chat file is growing).

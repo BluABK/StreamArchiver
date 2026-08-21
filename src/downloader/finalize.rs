@@ -1660,7 +1660,12 @@ impl Supervisor {
                 }
             }
             let actual = crate::downloader::remux::file_len(&p).await as i64;
-            let missing = actual == 0 && crate::iomon::fs::metadata(Cat::Startup, &p).await.is_err();
+            // A 0-byte file counts as missing for the STATS' purposes too: a
+            // husk backs no media, and letting it keep a stale multi-GB
+            // `bytes` claim is the same phantom usage as a deleted file.
+            // (The Issues repair already treats husks as non-work for the
+            // same reason.) The stamp reverses if content ever appears.
+            let missing = actual == 0;
             let stamp = if missing { now } else { 0 };
             let changed = if is_take {
                 self.store.set_recording_media_missing(row.id, stamp)

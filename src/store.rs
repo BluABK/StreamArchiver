@@ -38,7 +38,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 98;
+const SCHEMA_VERSION: i64 = 99;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -761,6 +761,32 @@ impl Store {
         let value = loaded.get(key).cloned();
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
         Ok(value)
+    }
+
+    /// Write many settings in ONE transaction. The Save button persists the
+    /// whole form (~150 keys) — as individual `set_setting` calls that was
+    /// 150 lock acquisitions and 150 WAL commits for one click. The mirror
+    /// is updated only after the commit succeeds, same contract as
+    /// [`Store::set_setting`].
+    pub fn set_settings_batch(&self, pairs: &[(&str, String)]) -> Result<()> {
+        {
+            let mut conn = self.db();
+            let tx = conn.transaction()?;
+            for (k, v) in pairs {
+                tx.execute(
+                    "INSERT INTO app_settings(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![k, v],
+                )?;
+            }
+            tx.commit()?;
+        }
+        if let Some(map) = self.settings.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            for (k, v) in pairs {
+                map.insert(k.to_string(), v.clone());
+            }
+        }
+        Ok(())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {

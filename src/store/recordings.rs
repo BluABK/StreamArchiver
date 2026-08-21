@@ -1705,7 +1705,8 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT monitor_id, COUNT(*), COALESCE(SUM(bytes), 0)
-             FROM recording WHERE media_missing_at = 0 GROUP BY monitor_id",
+             FROM recording WHERE media_missing_at = 0 AND output_path <> ''
+             GROUP BY monitor_id",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -4362,6 +4363,21 @@ mod tests {
         assert!(store.set_recording_media_missing(gone, 0).unwrap());
         assert_eq!(usage(&store), 10_000);
         assert_ne!(here, gone);
+
+        // The OTHER way media leaves: the app disposes of it and clears the
+        // path, keeping `bytes` as the historical size. The startup sweep can
+        // never stamp a pathless row (there is no file to stat), so the
+        // queries must exclude them on their own — 217 disposed takes were
+        // still counted as 2,265 GB of disk usage before this guard.
+        store.update_recording_output_path(gone, "", RepointBytes::Unchanged).unwrap();
+        assert_eq!(usage(&store), 3_000, "a disposed take is not disk usage");
+        assert_eq!(
+            store.get_recording(gone).unwrap().unwrap().bytes,
+            7_000,
+            "its historical size still survives"
+        );
+        let g = store.global_stats().unwrap();
+        assert_eq!(g.total_bytes, 3_000, "Total on disk excludes disposed takes too");
     }
 
     #[test]

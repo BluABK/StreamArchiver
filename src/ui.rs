@@ -272,6 +272,10 @@ const COOKIE_BROWSERS: [&str; 8] = [
 /// and the render path share one spelling (and to keep clippy's type-complexity
 /// lint quiet), the same reason `TrashActionOutcome` exists.
 type ClipsByVod = HashMap<String, (i64, i64)>;
+/// One rev-keyed Streams cache slot: `(streams_cache_rev at fill time, data)`.
+/// The data sits behind an `Arc` so the per-frame handoff into
+/// [`StreamsViewCache`] is a refcount bump, not a map copy.
+type RevCache<T> = Option<(u64, Arc<T>)>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -2205,23 +2209,27 @@ pub struct StreamArchiverApp {
     /// reloads the grid (and bumps the rev), so re-running the query on the
     /// streams cache's *per-second* stamp was pure waste. It was also the
     /// single most expensive thing the UI thread did — see migration 87.
-    raid_out_cache: Option<(u64, HashMap<i64, crate::models::StreamEventRow>)>,
+    // The rev-keyed caches below hold their map behind an `Arc` on purpose:
+    // the Streams render takes a handle every frame, and a plain clone of the
+    // clips map is ~33k Strings per frame (growing with the clip catalogue).
+    // An Arc clone is a refcount bump regardless of size.
+    raid_out_cache: RevCache<HashMap<i64, crate::models::StreamEventRow>>,
     /// Per-monitor rolling rollup (how many takes are counting down towards
     /// auto-deletion, and when the first goes), cached against
     /// `streams_cache_rev` — same shape and same reasoning as
     /// [`Self::raid_out_cache`]. Backs the 🕰 rollup badge and column.
-    rolling_rollup_cache: Option<(u64, HashMap<i64, crate::rolling::RollingRollup>)>,
+    rolling_rollup_cache: RevCache<HashMap<i64, crate::rolling::RollingRollup>>,
     /// Per-monitor drive letters of stored takes, cached against
     /// `streams_cache_rev` — same shape and reasoning as
     /// [`Self::rolling_rollup_cache`]. Backs the 🖴 Drives column on
     /// channel/instance rows (the rows below them derive it from their own
     /// takes, which are already in memory).
-    drives_cache: Option<(u64, HashMap<i64, Vec<char>>)>,
+    drives_cache: RevCache<HashMap<i64, Vec<char>>>,
     /// Per-broadcast clip counts `(total, archived)` keyed by parent VOD id,
     /// cached against `streams_cache_rev` — same shape and reasoning as
     /// [`Self::drives_cache`]. Backs the Streams tree's 🎞 summary row and
     /// decides whether a single-take broadcast gains an expander at all.
-    clips_by_vod_cache: Option<(u64, ClipsByVod)>,
+    clips_by_vod_cache: RevCache<ClipsByVod>,
     /// Per-monitor sum of finished-take bytes, cached against
     /// `streams_cache_rev` — same shape and same reasoning as
     /// [`Self::rolling_rollup_cache`]. Backs the Streams grid's "Disk use"
@@ -2229,7 +2237,7 @@ pub struct StreamArchiverApp {
     /// loaded to sum itself — see `Store::monitor_disk_usage`'s doc comment);
     /// period/stream/take rows below them use `take_size_bytes` instead,
     /// which confirms each file still exists.
-    disk_usage_cache: Option<(u64, HashMap<i64, i64>)>,
+    disk_usage_cache: RevCache<HashMap<i64, i64>>,
     /// An in-flight "🔄 Rescan disk usage" scan (channel/instance context menu,
     /// or the Streams toolbar for every monitor) — `None` while idle. The
     /// scan runs off-thread (one `exists_sync` per finished take can block on

@@ -888,6 +888,15 @@ pub(super) struct ChatPopup {
 /// and background sidecar loads have to *wake* it by the same id. A mismatch
 /// wakes a viewport nothing draws — silently, and only on a live channel the
 /// user isn't touching, which is exactly how it went unnoticed.
+/// The chat popup's OS window title. One function on purpose: the window
+/// dock finds the popup's HWND by EXACT title match, so the builder
+/// (`chat_popup_window`) and dock-on-play (`reconcile_chat_dock_on_play`)
+/// must agree to the byte — two format strings drifting apart would leave
+/// every auto-dock stuck Pending until its 60 s timeout.
+pub(in crate::ui) fn chat_window_title(name: &str) -> String {
+    format!("💬  Chat — {name}")
+}
+
 pub(in crate::ui) fn chat_vp_id(monitor_id: i64) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("chat_popup_vp", monitor_id))
 }
