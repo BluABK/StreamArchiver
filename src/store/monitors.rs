@@ -20,7 +20,7 @@ impl Store {
         let ch = conn
             .query_row(
                 "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
-                 automation_enabled, primary_group_id, posts_hidden FROM channel WHERE url = ?1",
+                 automation_enabled, primary_group_id, posts_hidden, color_source FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
             )
@@ -151,7 +151,7 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
-             automation_enabled, primary_group_id, posts_hidden FROM channel
+             automation_enabled, primary_group_id, posts_hidden, color_source FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt
@@ -220,6 +220,21 @@ impl Store {
         let conn = self.db();
         conn.execute(
             "UPDATE channel SET preferred_platform = ?2 WHERE id = ?1",
+            params![id, source.map(|s| s.to_db()).unwrap_or_default()],
+        )?;
+        Ok(())
+    }
+
+    /// Which account's broadcaster colour paints the channel name — see
+    /// `Channel::color_source`. `None` restores the automatic pick.
+    pub fn set_channel_color_source(
+        &self,
+        id: i64,
+        source: Option<&crate::models::PreferredAssetSource>,
+    ) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE channel SET color_source = ?2 WHERE id = ?1",
             params![id, source.map(|s| s.to_db()).unwrap_or_default()],
         )?;
         Ok(())

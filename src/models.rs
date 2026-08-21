@@ -837,6 +837,13 @@ pub struct Channel {
     /// = auto: the first instance with a fetched icon. Set explicitly via the
     /// channel's Properties → icon source.
     pub preferred_asset: Option<PreferredAssetSource>,
+    /// Which account's Twitch broadcaster colour paints the channel NAME —
+    /// independent of `preferred_asset` (the icon/banner source), because a
+    /// container holding two personas of one streamer wants the icon from one
+    /// account and the colour of whichever persona is CURRENT. `None` = the
+    /// old behaviour: the preferred-asset account when it's Twitch, else the
+    /// first Twitch instance.
+    pub color_source: Option<PreferredAssetSource>,
     /// Channel-level **Auto-record** flag. Independent from each instance's
     /// `Monitor::enabled`; a monitor auto-records only when both this AND
     /// `monitor.enabled` are true. Auto gates disk recording ONLY — not

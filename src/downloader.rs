@@ -646,6 +646,7 @@ pub(crate) mod test_util {
                 created_at: 0,
                 color: String::new(),
                 preferred_asset: None,
+                color_source: None,
                 enabled: true,
                 automation_enabled: true,
                 primary_group_id: None,

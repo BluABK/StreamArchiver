@@ -3776,7 +3776,19 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
 - **Channel colors** are the *same* ones the Streams list uses: a manually
   chosen custom color wins, else the streamer's own **Twitch name color**
   (darkened just enough that white block text stays readable), else the
-  automatic palette. Every schedule surface — event blocks, month chips,
+  automatic palette. Which Twitch account's color that is defaults to the
+  icon-source account (else the first Twitch instance) — right until a
+  container holds two personas of one streamer, where only you know which
+  persona is current: **Rename channel → Name colour source** pins it to a
+  specific instance, and the **↺ Reset** button beside the hex field forgets
+  both the custom color and the cached broadcaster color, so a stale one
+  (a persona switch, a color the streamer changed) is re-read from the
+  source account immediately instead of surviving indefinitely.
+- **The sidebar's show/hide list names every channel**, not just those with
+  loaded events. It used to be built from the events themselves, which made
+  a hidden channel vanish from the very list needed to un-hide it — hidden
+  once, its schedule was gone with no way back short of editing the setting
+  by hand. Channels with nothing upcoming simply show a zero count. Every schedule surface — event blocks, month chips,
   agenda stripes, day lists, the sidebar legend — resolves through this one
   map, so an event is recognizable by color across views.
 - **⋯ Display** (header dropdown) holds four persisted toggles, collapsed

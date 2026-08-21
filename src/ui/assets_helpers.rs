@@ -1323,8 +1323,18 @@ impl StreamArchiverApp {
             };
             let channel = first.channel.clone();
             let accounts = channel_asset_accounts(&mons);
-            let account = preferred_account_index(&channel.preferred_asset, &accounts)
+            // An explicit colour source wins outright — a container holding
+            // two personas of one streamer (Nyana + Anya) keeps its icon from
+            // one account and its NAME colour from whichever persona is
+            // current, and only the user knows which that is. Falls back to
+            // the old pick: preferred-asset account when Twitch, else the
+            // first Twitch instance.
+            let account = preferred_account_index(&channel.color_source, &accounts)
                 .filter(|&i| accounts[i].platform == Platform::Twitch)
+                .or_else(|| {
+                    preferred_account_index(&channel.preferred_asset, &accounts)
+                        .filter(|&i| accounts[i].platform == Platform::Twitch)
+                })
                 .map(|i| &accounts[i])
                 .or_else(|| accounts.iter().find(|a| a.platform == Platform::Twitch))
                 .map(|a| a.account.clone());

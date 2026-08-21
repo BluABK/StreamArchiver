@@ -1878,7 +1878,7 @@ impl Store {
                 m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
                 m.last_live_since, m.last_live_since_approx, m.last_collab,
                 m.capture_offline, m.last_tags, m.last_language, r.err_ack, c.primary_group_id,
-                c.posts_hidden
+                c.posts_hidden, c.color_source
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -1901,6 +1901,9 @@ impl Store {
                     automation_enabled: r.get::<_, i64>(52)? != 0,
                     primary_group_id: r.get(64)?,
                     posts_hidden: r.get::<_, i64>(65)? != 0,
+                    color_source: crate::models::PreferredAssetSource::parse(
+                        &r.get::<_, String>(66)?,
+                    ),
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,

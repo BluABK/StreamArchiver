@@ -38,7 +38,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 99;
+const SCHEMA_VERSION: i64 = 100;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -848,6 +848,7 @@ impl Store {
             automation_enabled: r.get::<_, i64>(8)? != 0,
             primary_group_id: r.get(9)?,
             posts_hidden: r.get::<_, i64>(10)? != 0,
+            color_source: crate::models::PreferredAssetSource::parse(&r.get::<_, String>(11)?),
         })
     }
 }

@@ -1119,13 +1119,34 @@ impl StreamArchiverApp {
                 });
                 ui.add_space(2.0);
 
-                // Distinct channels with upcoming streams, sorted by name,
-                // narrowed by the filter box above (case-insensitive substring).
+                // EVERY channel, sorted by name, narrowed by the filter box
+                // above — deliberately NOT just the channels with loaded
+                // events. A hidden channel contributes no events, so building
+                // this list from the events made a hidden channel vanish from
+                // the very list needed to un-hide it: Nyana's schedule was
+                // invisible with no way back short of editing the setting by
+                // hand. Channels without upcoming events simply show a 0
+                // count.
                 let needle = self.schedule_channel_filter.trim().to_lowercase();
                 let mut chans: Vec<(i64, &str)> = Vec::new();
                 let mut seen: HashSet<i64> = HashSet::new();
+                for r in &self.rows {
+                    if seen.insert(r.channel.id)
+                        && (needle.is_empty()
+                            || r.channel.name.to_lowercase().contains(&needle))
+                    {
+                        chans.push((r.channel.id, r.channel.name.as_str()));
+                    }
+                }
+                // Plus any event whose channel has no monitor row anymore
+                // (deleted instance with lingering segments) — those were the
+                // ONLY thing the old events-derived list could show that this
+                // one couldn't.
                 for s in &self.schedule_all {
-                    if seen.insert(s.channel_id) && (needle.is_empty() || s.channel_name.to_lowercase().contains(&needle)) {
+                    if seen.insert(s.channel_id)
+                        && (needle.is_empty()
+                            || s.channel_name.to_lowercase().contains(&needle))
+                    {
                         chans.push((s.channel_id, s.channel_name.as_str()));
                     }
                 }

@@ -62,6 +62,15 @@ pub(super) struct ChannelForm {
     pub(super) name: String,
     /// Hex color string (e.g. `"#ff9800"` or `"ff9800"`). Empty = auto palette.
     pub(super) color: String,
+    /// Which Twitch account's broadcaster colour paints the channel name
+    /// (`None` = automatic: preferred-asset account, else first Twitch).
+    pub(super) color_source: Option<crate::models::PreferredAssetSource>,
+    /// The channel's Twitch instances, snapshotted for the dropdown (the
+    /// deferred closure can't reach `self.rows`): `(label, account slug)`.
+    pub(super) twitch_accounts: Vec<(String, Option<String>)>,
+    /// Set by the ↺ button: evict the cached broadcaster colour on save so
+    /// the (possibly re-pointed) source is re-read from disk immediately.
+    pub(super) reset_color_cache: bool,
     /// Post-stream VOD-download overrides for this channel (`None` = inherit global).
     pub(super) vod_download: Option<bool>,
     pub(super) vod_replace: Option<bool>,
@@ -521,7 +530,57 @@ impl StreamArchiverApp {
                                     if !s.color.is_empty() && ui.small_button("✕").clicked() {
                                         s.color.clear();
                                     }
+                                    if ui
+                                        .small_button("↺ Reset")
+                                        .on_hover_text(
+                                            "Forget the custom colour AND the cached Twitch                                              broadcaster colour, so the name re-reads its                                              colour from the source account on save. Use                                              this when a streamer's colour changed (or a                                              persona switch left a stale one).",
+                                        )
+                                        .clicked()
+                                    {
+                                        s.color.clear();
+                                        s.reset_color_cache = true;
+                                    }
                                 });
+                                ui.end_row();
+
+                                ui.label("Name colour source").on_hover_text(
+                                    "Which Twitch account's broadcaster colour paints this                                      channel's NAME everywhere it appears. Auto follows the                                      icon-source account (when it's Twitch), else the first                                      Twitch instance — right for most channels, wrong for a                                      container holding two personas of one streamer, where                                      only you know which persona is current. Independent of                                      the icon source, and ignored entirely while a custom                                      hex colour is set above.",
+                                );
+                                egui::ComboBox::from_id_salt("chform_color_source")
+                                    .selected_text(match &s.color_source {
+                                        None => "Auto (icon source / first Twitch)".to_string(),
+                                        Some(src) => src
+                                            .account
+                                            .clone()
+                                            .unwrap_or_else(|| "first Twitch".into()),
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        let mut pick = |v: Option<crate::models::PreferredAssetSource>,
+                                                        label: &str,
+                                                        ui: &mut egui::Ui| {
+                                            if ui
+                                                .selectable_label(s.color_source == v, label)
+                                                .clicked()
+                                            {
+                                                s.color_source = v;
+                                                // A new source means the old cached colour
+                                                // is the wrong account's — evict on save.
+                                                s.reset_color_cache = true;
+                                            }
+                                        };
+                                        pick(None, "Auto (icon source / first Twitch)", ui);
+                                        let accounts = s.twitch_accounts.clone();
+                                        for (label, account) in accounts {
+                                            pick(
+                                                Some(crate::models::PreferredAssetSource {
+                                                    platform: Platform::Twitch,
+                                                    account,
+                                                }),
+                                                &label,
+                                                ui,
+                                            );
+                                        }
+                                    });
                                 ui.end_row();
 
                                 ui.label("Download VOD after end");
@@ -841,6 +900,8 @@ impl StreamArchiverApp {
             } else {
                 let id_opt = f.id;
                 let color = f.color.trim().to_string();
+                let color_source = f.color_source.clone();
+                let reset_color_cache = f.reset_color_cache;
                 let platform_pref = f.primary_platform_pref;
                 let simulcast_scope = crate::simulcast::SimulcastScope {
                     pref: f.simulcast_pref,
@@ -877,7 +938,19 @@ impl StreamArchiverApp {
                             .store
                             .rename_channel(id, &name)
                             .and_then(|()| self.core.store.set_channel_color(id, &color))
+                            .and_then(|()| {
+                                self.core
+                                    .store
+                                    .set_channel_color_source(id, color_source.as_ref())
+                            })
                             .map(|()| id);
+                        if reset_color_cache {
+                            // Drop the in-memory broadcaster colour so the next
+                            // frame re-reads name_color.txt from the (new)
+                            // source account instead of serving the stale one.
+                            self.channel_twitch_colors.remove(&id);
+                            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                        }
                         // The asset cache tree is keyed by display name, not id —
                         // follow the rename so avatar/banner/emotes/Twitch name-colour
                         // don't silently orphan under the old name.
@@ -2909,10 +2982,28 @@ impl StreamArchiverApp {
                     .unwrap_or_default()
                     .into_iter()
                     .collect();
+                // Twitch instances of this channel, for the colour-source
+                // dropdown (label = the account slug the asset tree uses).
+                let twitch_accounts: Vec<(String, Option<String>)> = self
+                    .rows
+                    .iter()
+                    .filter(|r| {
+                        r.channel.id == cid && r.monitor.platform() == Platform::Twitch
+                    })
+                    .map(|r| {
+                        let slug =
+                            crate::assets::account_slug(&r.monitor.url, Platform::Twitch);
+                        let account = (!slug.is_empty()).then(|| slug.clone());
+                        (if slug.is_empty() { "first Twitch".into() } else { slug }, account)
+                    })
+                    .collect();
                 self.channel_form = Some(Arc::new(Mutex::new(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
                     color: c.color.clone(),
+                    color_source: c.color_source.clone(),
+                    twitch_accounts,
+                    reset_color_cache: false,
                     vod_download: sc.download,
                     vod_replace: sc.replace,
                     head_backfill_fetch: hbsc.fetch,

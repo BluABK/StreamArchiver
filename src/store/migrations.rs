@@ -2031,7 +2031,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 99)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 99);
+        if version < 100 {
+            // Which account's Twitch broadcaster colour paints the channel
+            // NAME, independently of `preferred_platform` (the icon/banner
+            // source). A container holding two personas of one streamer
+            // (Nyana + Anya) kept the retired persona's colour because the
+            // name colour silently followed the first Twitch instance; empty
+            // keeps exactly that behaviour.
+            conn.execute_batch(
+                "ALTER TABLE channel ADD COLUMN color_source TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 100)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 100);
         Ok(())
     }
 }
