@@ -101,6 +101,11 @@ pub(super) struct IssuesPopupState {
     /// Toolbar row-shape filter for the main table. Popup-owned, same as
     /// `filter`.
     pub(super) kind_filter: IssueKind,
+    /// Drive letters (uppercase) whose main-table rows are hidden — the "park
+    /// a flaky disk's backlog until the hardware improves" switch. Synced
+    /// from the app each call (persisted in `K_ISSUES_MUTED_DRIVES`); changes
+    /// flow back via [`Act::SetMutedDrives`]. Bulk actions skip muted rows.
+    pub(super) muted_drives: Vec<char>,
     /// Column order/visibility draft — mirrors `self.issues_grid.entries`,
     /// synced back to it (and persisted) by the wrapper whenever the header's
     /// column-chooser context menu changes it.
@@ -245,6 +250,10 @@ pub(super) enum Act {
     AckMissingError(usize),
     ClearEmpties,
     ClearAllMissing,
+    /// Persist the muted-drives set (uppercase letters) — flows to
+    /// `K_ISSUES_MUTED_DRIVES` and the app-side mirror the wrapper re-seeds
+    /// the popup from.
+    SetMutedDrives(Vec<char>),
     ClearAllErrors,
     ClearFilelessErrors,
     RecoverStuck(usize),
@@ -504,7 +513,36 @@ fn issue_filter_hit(filter: &str, ch_name: &str, path: &str) -> bool {
         || path.to_lowercase().contains(filter)
 }
 
+/// The main table's full row predicate: the toolbar text filter AND the
+/// muted-drives switch. One function so the row builders, the visible
+/// counter, and the bulk actions can never disagree about what's shown.
+fn issue_row_visible(filter: &str, muted: &[char], ch_name: &str, path: &str) -> bool {
+    if crate::iomon::drive_letter(std::path::Path::new(path)).is_some_and(|d| muted.contains(&d)) {
+        return false;
+    }
+    issue_filter_hit(filter, ch_name, path)
+}
+
 impl IssuesPopupState {
+    /// The five row lists behind the main table — the set every muted-drive
+    /// computation walks, in one place so a future sixth list can't be
+    /// forgotten by half of them.
+    fn main_table_lists(&self) -> [&Vec<crate::models::Recording>; 5] {
+        [
+            &self.issues_recs,
+            &self.issues_stuck,
+            &self.issues_missing,
+            &self.issues_errors_no_file,
+            &self.issues_errors,
+        ]
+    }
+
+    /// Whether this path's drive letter is muted (🖴 toolbar menu).
+    fn drive_is_muted(&self, path: &str) -> bool {
+        crate::iomon::drive_letter(std::path::Path::new(path))
+            .is_some_and(|d| self.muted_drives.contains(&d))
+    }
+
     /// ── Quota warnings ── one row per active warning + dismiss button.
     fn issues_quota_section(
         &self,
@@ -1023,6 +1061,16 @@ impl IssuesPopupState {
         // bulk buttons this outgrows any sane window width, and a plain
         // `horizontal` would push the last buttons out of reach instead of
         // starting a second line.
+        // Main-table rows hidden by the muted-drives switch — kept out of the
+        // headline count so a parked drive's backlog doesn't read as
+        // actionable. (Sections above the table are unaffected: they are
+        // small and individually actionable.)
+        let drive_hidden = self
+            .main_table_lists()
+            .iter()
+            .flat_map(|l| l.iter())
+            .filter(|r| self.drive_is_muted(&r.output_path))
+            .count();
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "{} recording(s) need attention",
@@ -1034,7 +1082,13 @@ impl IssuesPopupState {
                     + self.issues_unmerged.len()
                     + self.issues_head_mismatch.len()
                     + self.issues_stale_recording.len()
+                    - drive_hidden
             ));
+            if drive_hidden > 0 {
+                ui.weak(format!("(+{drive_hidden} on muted drives)")).on_hover_text(
+                    "Rows hidden by the 🖴 drive filter — parked, not resolved.                      Un-mute the drive to see and act on them again.",
+                );
+            }
             if ui.button("⟳ Refresh").clicked() {
                 self.refresh = true;
             }
@@ -1062,6 +1116,67 @@ impl IssuesPopupState {
                     }
                 });
             self.kind_filter = kind;
+            // ── Muted drives ── park a flaky disk's whole backlog. Letters
+            // are collected from the rows themselves, so the menu always
+            // offers exactly the drives that have issues (muted ones
+            // included — else there'd be no way to un-mute).
+            {
+                let mut letters: Vec<char> = self
+                    .main_table_lists()
+                    .iter()
+                    .flat_map(|l| l.iter())
+                    .filter_map(|r| {
+                        crate::iomon::drive_letter(std::path::Path::new(&r.output_path))
+                    })
+                    .collect();
+                letters.sort_unstable();
+                letters.dedup();
+                for &m in &self.muted_drives {
+                    if !letters.contains(&m) {
+                        letters.push(m); // muted + currently issue-free: still listed
+                    }
+                }
+                if !letters.is_empty() {
+                    let label = if self.muted_drives.is_empty() {
+                        "🖴 Drives".to_string()
+                    } else {
+                        format!(
+                            "🖴 Drives ({} muted)",
+                            self.muted_drives.iter().map(|c| format!("{c}:")).collect::<Vec<_>>().join(" ")
+                        )
+                    };
+                    ui.menu_button(label, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Untick a drive to hide its rows from this table and the                                  headline count — for parking a flaky disk's backlog until                                  the hardware improves. Bulk buttons skip hidden rows.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.separator();
+                        let mut changed = false;
+                        for d in letters {
+                            let mut on = !self.muted_drives.contains(&d);
+                            if ui.checkbox(&mut on, format!("{d}:")).changed() {
+                                if on {
+                                    self.muted_drives.retain(|&m| m != d);
+                                } else {
+                                    self.muted_drives.push(d);
+                                    self.muted_drives.sort_unstable();
+                                }
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            *act = Some(Act::SetMutedDrives(self.muted_drives.clone()));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Show/hide this table's rows per drive letter. Muted drives are                          remembered across restarts.",
+                    );
+                }
+            }
             if shown != total {
                 ui.weak(format!("showing {shown} of {total}")).on_hover_text(
                     "The filters narrow the table only. The bulk buttons to the right \
@@ -1091,7 +1206,7 @@ impl IssuesPopupState {
                         *act = Some(Act::ConfirmClear);
                     }
                 } else if ui.button("🗑 Delete all")
-                    .on_hover_text("Delete all .ts capture files and remove them from the list.")
+                    .on_hover_text("Delete all .ts capture files and remove them from the list. \n                     Rows on muted drives (🖴 menu) are left alone.")
                     .clicked()
                 {
                     *act = Some(Act::ConfirmClear);
@@ -1115,7 +1230,7 @@ impl IssuesPopupState {
             }
             if n_errors > 0 {
                 if ui.button(format!("✕ Clear all {} failed", n_errors))
-                    .on_hover_text("Delete DB records for all failed/aborted/orphaned recordings that still have a file. Files are deleted too.")
+                    .on_hover_text("Delete DB records for all failed/aborted/orphaned recordings that still have a file. Files are deleted too. \n                     Rows on muted drives (🖴 menu) are left alone.")
                     .clicked()
                 {
                     *act = Some(Act::ClearAllErrors);
@@ -1222,7 +1337,7 @@ impl IssuesPopupState {
                 .iter()
                 .filter(|rec| {
                     let ch = mon_info.get(&rec.monitor_id).map(|(n, _)| n.as_str()).unwrap_or("?");
-                    issue_filter_hit(filter, ch, &rec.output_path)
+                    issue_row_visible(filter, &self.muted_drives, ch, &rec.output_path)
                 })
                 .count();
         }
@@ -1251,7 +1366,7 @@ impl IssuesPopupState {
                 .get(&rec.monitor_id)
                 .map(|(n, p)| (n.as_str(), *p))
                 .unwrap_or(("?", crate::models::Platform::Generic));
-            if !issue_filter_hit(filter, ch_name, &rec.output_path) {
+            if !issue_row_visible(filter, &self.muted_drives, ch_name, &rec.output_path) {
                 continue;
             }
             let path = std::path::Path::new(&rec.output_path);
@@ -1294,6 +1409,13 @@ impl IssuesPopupState {
                         "file" => {
                             ui.label(&fname)
                                 .on_hover_text(&rec.output_path);
+                        }
+                        "drive" => {
+                            ui.label(
+                                crate::iomon::drive_letter(std::path::Path::new(&rec.output_path))
+                                    .map(|d| format!("{d}:"))
+                                    .unwrap_or_else(|| "—".into()),
+                            );
                         }
                         "size" => {
                             if empty {
@@ -1424,7 +1546,7 @@ impl IssuesPopupState {
                 .get(&rec.monitor_id)
                 .map(|(n, p)| (n.as_str(), *p))
                 .unwrap_or(("?", crate::models::Platform::Generic));
-            if !issue_filter_hit(filter, ch_name, &rec.output_path) {
+            if !issue_row_visible(filter, &self.muted_drives, ch_name, &rec.output_path) {
                 continue;
             }
             let path = std::path::Path::new(&rec.output_path);
@@ -1448,6 +1570,13 @@ impl IssuesPopupState {
                         "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
                         "file" => {
                             ui.label(&fname).on_hover_text(&rec.output_path);
+                        }
+                        "drive" => {
+                            ui.label(
+                                crate::iomon::drive_letter(std::path::Path::new(&rec.output_path))
+                                    .map(|d| format!("{d}:"))
+                                    .unwrap_or_else(|| "—".into()),
+                            );
                         }
                         "size" => { ui.label(fmt_bytes(file_bytes as i64)); }
                         "type" => {
@@ -1512,7 +1641,7 @@ impl IssuesPopupState {
                 .get(&rec.monitor_id)
                 .map(|(n, p)| (n.as_str(), *p))
                 .unwrap_or(("?", crate::models::Platform::Generic));
-            if !issue_filter_hit(filter, ch_name, &rec.output_path) {
+            if !issue_row_visible(filter, &self.muted_drives, ch_name, &rec.output_path) {
                 continue;
             }
             let path = std::path::Path::new(&rec.output_path);
@@ -1542,6 +1671,13 @@ impl IssuesPopupState {
                         "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
                         "file" => {
                             ui.label(&fname).on_hover_text(&rec.output_path);
+                        }
+                        "drive" => {
+                            ui.label(
+                                crate::iomon::drive_letter(std::path::Path::new(&rec.output_path))
+                                    .map(|d| format!("{d}:"))
+                                    .unwrap_or_else(|| "—".into()),
+                            );
                         }
                         "size" => {
                             ui.colored_label(
@@ -1593,7 +1729,7 @@ impl IssuesPopupState {
                 .get(&rec.monitor_id)
                 .map(|(n, p)| (n.as_str(), *p))
                 .unwrap_or(("?", crate::models::Platform::Generic));
-            if !issue_filter_hit(filter, ch_name, &rec.output_path) {
+            if !issue_row_visible(filter, &self.muted_drives, ch_name, &rec.output_path) {
                 continue;
             }
             let path = std::path::Path::new(&rec.output_path);
@@ -1632,6 +1768,13 @@ impl IssuesPopupState {
                         "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
                         "file" => {
                             ui.label(&fname).on_hover_text(&rec.output_path);
+                        }
+                        "drive" => {
+                            ui.label(
+                                crate::iomon::drive_letter(std::path::Path::new(&rec.output_path))
+                                    .map(|d| format!("{d}:"))
+                                    .unwrap_or_else(|| "—".into()),
+                            );
                         }
                         "size" => {
                             ui.colored_label(egui::Color32::from_rgb(200, 130, 30), "gone");
@@ -1693,7 +1836,7 @@ impl IssuesPopupState {
                 .get(&rec.monitor_id)
                 .map(|(n, p)| (n.as_str(), *p))
                 .unwrap_or(("?", crate::models::Platform::Generic));
-            if !issue_filter_hit(filter, ch_name, &rec.output_path) {
+            if !issue_row_visible(filter, &self.muted_drives, ch_name, &rec.output_path) {
                 continue;
             }
             let has_file = !rec.output_path.is_empty()
@@ -1741,6 +1884,13 @@ impl IssuesPopupState {
                         "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
                         "file" => {
                             ui.label(&fname).on_hover_text(&rec.output_path);
+                        }
+                        "drive" => {
+                            ui.label(
+                                crate::iomon::drive_letter(std::path::Path::new(&rec.output_path))
+                                    .map(|d| format!("{d}:"))
+                                    .unwrap_or_else(|| "—".into()),
+                            );
                         }
                         "size" => {
                             if has_file && file_size > 0 {
@@ -2949,6 +3099,7 @@ impl StreamArchiverApp {
                 issues_confirm_clear: false,
                 filter: String::new(),
                 kind_filter: IssueKind::All,
+                muted_drives: Vec::new(),
                 issues_entries: self.issues_grid.entries.clone(),
                 reorder_columns: None,
                 issues_error_view: None,
@@ -2990,6 +3141,7 @@ impl StreamArchiverApp {
         {
             let mut s = state.lock().unwrap();
             s.issues_recs = self.issues_recs.clone();
+            s.muted_drives = self.issues_muted_drives.clone();
             s.issues_missing = self.issues_missing.clone();
             s.issues_errors = self.issues_errors.clone();
             s.issues_errors_no_file = self.issues_errors_no_file.clone();
@@ -3367,6 +3519,20 @@ impl StreamArchiverApp {
     /// Apply the single action collected during this frame's render, after
     /// the viewport closure has released its borrows of `self`.
     fn issues_apply_act(&mut self, act: Option<Act>) {
+        // Bulk actions below skip rows parked behind the 🖴 drive mute —
+        // snapshot the set up front so the checks don't re-borrow `self`
+        // inside the drain/partition closures.
+        let muted_drives = self.issues_muted_drives.clone();
+        let drive_muted = |path: &str| {
+            crate::iomon::drive_letter(std::path::Path::new(path))
+                .is_some_and(|d| muted_drives.contains(&d))
+        };
+        if let Some(Act::SetMutedDrives(ref drives)) = act {
+            self.issues_muted_drives = drives.clone();
+            let joined: String =
+                drives.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(";");
+            let _ = self.core.store.set_setting(K_ISSUES_MUTED_DRIVES, &joined);
+        }
         if let Some(Act::Remux(i)) = act {
             if let Some(rec) = self.issues_recs.get(i) {
                 // The promoted location = the capture path minus its cache
@@ -3415,7 +3581,8 @@ impl StreamArchiverApp {
         }
         if let Some(Act::ClearEmpties) = act {
             let empties: Vec<_> = self.issues_recs.iter().filter(|r| {
-                crate::iomon::fs::metadata_sync(crate::iomon::Cat::RecordingDelete, &r.output_path).map(|m| m.len()).unwrap_or(0) == 0
+                !drive_muted(&r.output_path)
+                    && crate::iomon::fs::metadata_sync(crate::iomon::Cat::RecordingDelete, &r.output_path).map(|m| m.len()).unwrap_or(0) == 0
             }).cloned().collect();
             for rec in empties {
                 let path = std::path::Path::new(&rec.output_path);
@@ -3433,7 +3600,11 @@ impl StreamArchiverApp {
             }
         }
         if let Some(Act::ClearAllMissing) = act {
-            let all: Vec<_> = self.issues_missing.drain(..).collect();
+            let (all, kept): (Vec<_>, Vec<_>) = self
+                .issues_missing
+                .drain(..)
+                .partition(|r| !drive_muted(&r.output_path));
+            self.issues_missing = kept;
             for rec in all {
                 let _ = self.core.store.clear_recording_capture(rec.id);
             }
@@ -3442,7 +3613,12 @@ impl StreamArchiverApp {
             self.issues_confirm_clear = !self.issues_confirm_clear;
         }
         if let Some(Act::ClearAll) = act {
-            let all: Vec<_> = self.issues_recs.drain(..).collect();
+            // Muted drives are parked, not resolved — Delete all leaves them.
+            let (all, kept): (Vec<_>, Vec<_>) = self
+                .issues_recs
+                .drain(..)
+                .partition(|r| !drive_muted(&r.output_path));
+            self.issues_recs = kept;
             for rec in all {
                 let path = std::path::Path::new(&rec.output_path);
                 if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
@@ -3598,7 +3774,11 @@ impl StreamArchiverApp {
             self.issues_errors_no_file.retain(|r| r.id != rec.id);
         }
         if let Some(Act::ClearAllErrors) = act {
-            let all: Vec<_> = self.issues_errors.drain(..).collect();
+            let (all, kept): (Vec<_>, Vec<_>) = self
+                .issues_errors
+                .drain(..)
+                .partition(|r| !drive_muted(&r.output_path));
+            self.issues_errors = kept;
             for rec in all {
                 let path = std::path::Path::new(&rec.output_path);
                 if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
@@ -3609,7 +3789,11 @@ impl StreamArchiverApp {
         }
         if let Some(Act::ClearFilelessErrors) = act {
             // issues_errors_no_file holds all failed recordings where the file is gone.
-            let all: Vec<_> = self.issues_errors_no_file.drain(..).collect();
+            let (all, kept): (Vec<_>, Vec<_>) = self
+                .issues_errors_no_file
+                .drain(..)
+                .partition(|r| !drive_muted(&r.output_path));
+            self.issues_errors_no_file = kept;
             for rec in all {
                 let _ = self.core.store.delete_recording(rec.id);
             }

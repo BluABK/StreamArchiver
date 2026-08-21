@@ -603,6 +603,13 @@ impl StreamArchiverApp {
         let clips_grid = GridState::load(&core.store, GridTableId::Clips, &CLIP_COLUMNS);
         let clips_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Clips);
         let settings_tab = SettingsTab::from_id(&setting_or_empty(&core, K_SETTINGS_TAB));
+        // Read before the struct literal: `core` moves into the struct, and
+        // fields after that move can't borrow it.
+        let issues_muted_drives: Vec<char> = setting_or_empty(&core, K_ISSUES_MUTED_DRIVES)
+            .split(';')
+            .filter_map(|t| t.trim().chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
 
         let mut app = StreamArchiverApp {
             core,
@@ -645,6 +652,7 @@ impl StreamArchiverApp {
             issues_refreshed: None,
             issues_dirty: false,
             issues_confirm_clear: false,
+            issues_muted_drives,
             issues_popup: None,
             show_notifications: false,
             notifications: Vec::new(),

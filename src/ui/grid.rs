@@ -973,11 +973,12 @@ pub(super) const PROCESSES_COLUMNS: [GridCol; 11] = [
 /// Issues window columns (no sort/filter — hide/reorder only). Shared by all 5
 /// row-rendering blocks (needs-remux, stuck-in-cache, missing, errors-no-file,
 /// errors); the blank-titled `platform` column holds only an icon.
-pub(super) const ISSUES_COLUMNS: [GridCol; 8] = [
+pub(super) const ISSUES_COLUMNS: [GridCol; 9] = [
     GridCol { id: "platform", title: "",        tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "channel",  title: "Channel", tooltip: "", min_width: 100.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "started",  title: "Started", tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "file",     title: "File",    tooltip: "", min_width: 160.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "drive",    title: "🖴",       tooltip: "Drive letter the file lives on — mute whole drives via the 🖴 toolbar menu.", min_width: 36.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "size",     title: "Size",    tooltip: "", min_width: 60.0,  initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "type",     title: "Type",    tooltip: "", min_width: 80.0,  initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "status",   title: "Status",  tooltip: "", min_width: 130.0, initial: 0.0, sortable: false, stretch: false },

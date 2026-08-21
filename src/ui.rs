@@ -214,6 +214,11 @@ pub(crate) const K_CHAT_DOCK_ON_PLAY: &str = "chat_dock_on_play";
 /// (closing a window the user may be rewinding is not a default). Only
 /// windows carrying this app's exact invisible title tag are ever closed.
 pub(crate) const K_PLAYER_CLOSE_ON_END: &str = "player_close_on_end";
+/// Drive letters (";"-separated, e.g. `"A;B"`) whose rows the Issues
+/// window's main table hides — parking a flaky disk's backlog until the
+/// hardware improves. Set from the Issues toolbar's 🖴 menu; bulk actions
+/// skip hidden rows.
+pub(crate) const K_ISSUES_MUTED_DRIVES: &str = "issues_muted_drives";
 /// Which clock the chat replay's timestamps show: `"relative"` (default,
 /// `[00:40:10]` into the broadcast) or `"clock"` (`19:30` local time, as
 /// Twitch's own popout does). Flipped from the 🕒 toolbar toggle in any chat
@@ -1738,6 +1743,9 @@ pub struct StreamArchiverApp {
     /// the closed-panel refresh interval instead of forcing an immediate one.
     issues_dirty: bool,
     issues_confirm_clear: bool,
+    /// Mirror of [`K_ISSUES_MUTED_DRIVES`] — the Issues popup re-seeds its
+    /// copy from this each call; `Act::SetMutedDrives` writes it back.
+    issues_muted_drives: Vec<char>,
     /// Deferred-viewport state while the Issues window is open (None =
     /// closed) — see [`issues::IssuesPopupState`]. Replaces the old separate
     /// `issues_error_view` (now `IssuesPopupState::issues_error_view`).
