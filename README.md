@@ -970,7 +970,12 @@ for exactly this "usher won't give us the stream" shape), which captures the
 broadcast at source quality with no authentication at all. Fires at most once
 per stream, shares the once-per-stream ledger with the ordinary restart, and
 a channel whose source genuinely is 720p (the CDN says so) is left alone.
-The 🔔 feed reports the escalation like any quality upgrade.
+The escalation is reported three ways: the 🔔 feed (as a quality
+upgrade), the log, and a 🎚 **Quality-gated channel** entry in the 🚨 Warnings
+window — warning severity, not error, because the outcome is good: it exists
+so you know the platform gates this channel, that the capture path changed
+mid-broadcast, and that takes recorded before the detection existed are still
+at the capped quality. One entry per broadcast, not per take.
 
 **Since 2026-08-16, tv is the PRIMARY client for public broadcasts** —
 **Settings → Downloads → 📺 Capture public streams via tv client** (default

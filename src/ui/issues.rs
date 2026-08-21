@@ -165,6 +165,10 @@ fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
         "po_token_rejected" => ("🎫", "PO token rejected"),
         "youtube_experiment" => ("🧪", "Platform experiment"),
         "cookies_invalid" => ("🍪", "Cookies expired"),
+        // Good news filed as a warning: the capture escalated itself to the
+        // broadcast's real quality, but the user should know the platform
+        // quality-gates this channel.
+        "quality_gated" => ("🎚", "Quality-gated channel — upgraded via CDN"),
         _ => ("⚠", "Tool warnings"),
     }
 }

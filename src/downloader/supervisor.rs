@@ -2818,6 +2818,35 @@ progress_info: None,
             from: format!("{cur_h}p{cur_fps}"),
             to: format!("{src_h}p{src_fps} (CDN source — manifest quality-gated)"),
         });
+        // Also a 🚨 Warnings entry — warning severity, not error: the outcome
+        // is GOOD (the broadcast is being captured at its real quality), but
+        // the user should know their platform quality-gates this channel, that
+        // the capture path changed mid-broadcast, and that any takes from
+        // before this detection existed are still at the capped quality.
+        let alert = crate::store::NewCaptureAlert {
+            kind: "quality_gated".to_string(),
+            severity: "warning".to_string(),
+            source: "capture".to_string(),
+            // Once per broadcast: the takeover itself is once-per-stream, and
+            // the alert should follow it, not the take.
+            take_key: format!("quality_gated:{stream_key}"),
+            monitor_id: Some(monitor_id),
+            recording_id: Some(rec_id),
+            video_id: None,
+            channel: channel.to_string(),
+            count: 1,
+            lost_segments: 0,
+            last_line: format!(
+                "Twitch offered this session at most {cur_h}p{cur_fps} while the broadcast's                  real source is {src_h}p{src_fps} — the platform withholds the source rendition                  from non-browser sessions on this channel (the manifest never improves, so a                  quality restart cannot help). The capture was handed to a CDN session and is                  now recording at {src_h}p{src_fps} straight from the source playlist; the                  first ~8 minutes were captured at {cur_h}p{cur_fps} before the gate could be                  proven, and the head backfill re-fetches that span at source quality."
+            ),
+        };
+        match self.store.upsert_capture_alert(&alert) {
+            Ok((id, true)) => {
+                info!(rec_id, "filed quality-gate alert #{id} for {channel}")
+            }
+            Ok(_) => {}
+            Err(e) => warn!(rec_id, "failed to file quality-gate alert: {e:#}"),
+        }
         // Stop the capped take the way the restart path does; the CDN session
         // then owns the broadcast (try_begin defers to it), so streamlink is
         // not respawned into the same capped manifest.
