@@ -21,8 +21,17 @@ use crate::display::PixelRect;
 pub const PLACEMENT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// mpv CLI args that put its window at `rect` immediately at launch.
+///
+/// `--keepaspect-window=no` matters as much as the geometry: a tile is
+/// almost never at the video's aspect, and with mpv's default (yes) the
+/// forced off-aspect window becomes the aspect mpv then ENFORCES on every
+/// interactive resize — the user drags a corner and the giant letterbox
+/// just scales with the window, unrecoverable short of closing it (hit
+/// 2026-08-21 with collab tiles). With `no`, the window resizes freely and
+/// the video letterboxes minimally into whatever shape it currently has —
+/// drag it to ~16:9 and the bars are gone.
 pub fn mpv_geometry_args(rect: PixelRect) -> Vec<String> {
-    vec![rect.geometry_arg()]
+    vec![rect.geometry_arg(), "--keepaspect-window=no".to_string()]
 }
 
 /// Every pid in `root_pid`'s process tree (itself + all descendants),
@@ -152,6 +161,14 @@ mod tests {
     #[test]
     fn mpv_geometry_args_shape() {
         let rect = PixelRect { x: -100, y: 50, w: 800, h: 600 };
-        assert_eq!(mpv_geometry_args(rect), vec!["--geometry=800x600+-100+50".to_string()]);
+        assert_eq!(
+            mpv_geometry_args(rect),
+            vec![
+                "--geometry=800x600+-100+50".to_string(),
+                // Free-form resize: without this the off-aspect tile shape
+                // becomes the enforced window aspect forever.
+                "--keepaspect-window=no".to_string(),
+            ]
+        );
     }
 }

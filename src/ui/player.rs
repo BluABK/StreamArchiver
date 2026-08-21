@@ -1692,6 +1692,12 @@ pub(super) fn spawn_play_new_instance(
     // preview branch ([`spawn_live_preview`]): collab is a Twitch-only
     // feature (`models::CollabPartner`), so that branch is unreachable from
     // any tiled call site.
+    //
+    // A tiled play is also NOT auto-dock eligible (`spawn_logged`'s `live`
+    // arg gets `&& tile_rect.is_none()`): the tiler just laid the whole
+    // screen out in video tiles, and dock-on-play dropping a chat column
+    // onto each tile's edge would bury the neighboring players (hit
+    // 2026-08-21). The 🔗 toggle in any chat window still docks manually.
     tile_rect: Option<crate::display::PixelRect>,
 ) -> Option<String> {
     use crate::downloader::{
@@ -1784,8 +1790,14 @@ pub(super) fn spawn_play_new_instance(
             // socket above; a non-mpv player instead falls through to
             // spawn_logged's Win32 fallback below (streamlink spawns it as a
             // child, so the pid tree walk still finds its window).
-            let mpv_geometry =
-                tile_rect.filter(|_| player_is_mpv(player)).map(|r| r.geometry_arg());
+            // Same flags as the direct-spawn path (`mpv_geometry_args`) —
+            // including --keepaspect-window=no, or the off-aspect tile shape
+            // becomes the enforced window aspect forever. Space-joined: the
+            // whole --player-args value is shlex-split downstream and
+            // neither flag contains spaces.
+            let mpv_geometry = tile_rect
+                .filter(|_| player_is_mpv(player))
+                .map(|r| crate::window_placement::mpv_geometry_args(r).join(" "));
             if let Some(player_args) = streamlink_player_args(
                 ipc_pipe.as_deref(),
                 mute && player_is_mpv(player),
@@ -1802,7 +1814,7 @@ pub(super) fn spawn_play_new_instance(
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
             hide_console(&mut cmd);
             let win32_tile_rect = if mpv_geometry.is_some() { None } else { tile_rect };
-            let status = spawn_logged(cmd, "streamlink", Some(m.id), win32_tile_rect, !is_vod);
+            let status = spawn_logged(cmd, "streamlink", Some(m.id), win32_tile_rect, !is_vod && tile_rect.is_none());
             // Both updaters start only if Streamlink actually started —
             // otherwise one would sit on a pipe that can never appear and log
             // a spurious warning a minute later.
@@ -1882,7 +1894,7 @@ pub(super) fn spawn_play_new_instance(
                         cmd.arg("--mute");
                     }
                     let win32_tile_rect = apply_tile_or_geometry(&mut cmd, player, tile_rect);
-                    spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect, !is_vod)
+                    spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect, !is_vod && tile_rect.is_none())
                 }
                 Err(e) => {
                     warn!(%line, "play-new-instance: failed to spawn yt-dlp: {e}");
@@ -1904,7 +1916,7 @@ pub(super) fn spawn_play_new_instance(
             }
             cmd.arg(&m.url);
             let win32_tile_rect = apply_tile_or_geometry(&mut cmd, player, tile_rect);
-            spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect, !is_vod)
+            spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect, !is_vod && tile_rect.is_none())
         }
     }
 }

@@ -3271,6 +3271,11 @@ live, and archived:
   they survive a resolution change, and fall back to the primary display if
   the display they named is gone. Placement uses mpv's own `--geometry` when
   mpv is the configured player, and a Win32 move-after-launch otherwise.
+  Tiled mpv windows resize freely afterwards (`--keepaspect-window=no` rides
+  along with the geometry — without it the off-aspect tile shape becomes the
+  aspect mpv enforces on every later resize, letterbox and all), and tiled
+  plays never auto-open docked chats — the tiles ARE the layout; dock a chat
+  manually with its 🔗 toggle if you want one.
   Two Settings → Defaults options tune this: **Mute collab instances**
   (default on) silences every OTHER angle opened by the bulk "Play all
   collab instances (live edge)" action — the instance you actually
