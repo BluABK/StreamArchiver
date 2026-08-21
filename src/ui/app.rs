@@ -308,18 +308,27 @@ impl StreamArchiverApp {
             fetch_thumb_embed: false,
             maintenance_filename_preset: String::new(),
             maintenance_apply_all: false,
-            media_player_path: {
-                let v = setting_or_empty(&core, K_MEDIA_PLAYER);
-                if v.is_empty() { r"C:\Progs\mpv\mpv.exe".into() } else { v }
+            // Tri-state on purpose: ABSENT (never saved) seeds the default,
+            // but a PRESENT empty value is the user's own "no player" — the
+            // README documents blank as "buttons disabled, Open file falls
+            // back to the file association", and the old is_empty()
+            // substitution made that state impossible to keep: every restart
+            // silently refilled the default path.
+            media_player_path: match core.store.get_setting(K_MEDIA_PLAYER).ok().flatten() {
+                None => r"C:\Progs\mpv\mpv.exe".into(),
+                Some(v) => v,
             },
             chat_dock_side: {
                 let v = setting_or_empty(&core, K_CHAT_DOCK_SIDE);
                 if v.is_empty() { "right".into() } else { v }
             },
             chat_dock_on_play: setting_or_empty(&core, K_CHAT_DOCK_ON_PLAY) != "0",
-            live_title_template: {
-                let v = setting_or_empty(&core, K_LIVE_TITLE_TEMPLATE);
-                if v.is_empty() { "{channel}: 【{game}】- {title_trimmed}".into() } else { v }
+            // Tri-state like media_player_path: the hover promises "leave
+            // blank to restore the old behavior (no title override)", which
+            // only works if a saved blank survives the next load.
+            live_title_template: match core.store.get_setting(K_LIVE_TITLE_TEMPLATE).ok().flatten() {
+                None => "{channel}: 【{game}】- {title_trimmed}".into(),
+                Some(v) => v,
             },
             live_title_auto_update: super::live_title_auto_update_setting(&core.store),
             mute_collab_instances: setting_or_empty(&core, K_MUTE_COLLAB_INSTANCES) != "0",
@@ -1988,6 +1997,30 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Normalize a form value for persistence: a value EQUAL to its built-in
+    /// default is stored as `""`.
+    ///
+    /// The settings form substitutes defaults into empty fields on load, and
+    /// Save used to write those substitutes back verbatim — so after one Save,
+    /// every "absent means default" key held an explicit copy of the app's own
+    /// default, and no code could ever again distinguish "user chose this"
+    /// from "the form filled this in". That is the Panko bug generator: a
+    /// stored copy of `SABR_DEFAULT_EXTRACTOR_ARGS` read back as a hand-written
+    /// override, pinned every public capture to `web`, and killed a take at
+    /// frag 309 when the PO token was rejected. The differs-from-default read
+    /// guard fixed that one consumer; normalizing HERE fixes the class:
+    /// non-empty in the table now always means genuinely customized.
+    ///
+    /// Also self-corrects: values already polluted by old Saves are compared
+    /// against the default on the next Save and collapse back to `""`.
+    ///
+    /// Only for keys whose contract is "absent/empty ⇒ default". Keys where
+    /// present-but-empty means something else (e.g. the PO-fallback client's
+    /// "empty = disabled") must NOT go through this.
+    fn default_as_empty<'a>(value: &'a str, default: &str) -> &'a str {
+        if value == default { "" } else { value }
+    }
+
     pub(super) fn save_settings(&mut self, ctx: &egui::Context) {
         // Settings (e.g. the date format) feed the cached Streams-view model.
         self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
@@ -2034,7 +2067,7 @@ impl StreamArchiverApp {
             (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
             (K_FILENAME_MEDIA, s.filename_media_info.as_str()),
             (K_DATE_FORMAT, s.date_fmt.as_str()),
-            (K_SHORT_TS_FMT, s.short_ts_fmt.trim()),
+            (K_SHORT_TS_FMT, Self::default_as_empty(s.short_ts_fmt.trim(), "%d/%m %H:%M")),
             (K_SCHEDULE_DEFAULT_VIEW, s.schedule_default_view.as_str()),
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
@@ -2044,8 +2077,8 @@ impl StreamArchiverApp {
             (K_YTDLP_BINARY, s.ytdlp_binary_path.trim()),
             (K_SABR_BINARY, s.sabr_binary_path.trim()),
             (K_SABR_ENABLED, if s.sabr_enabled { "1" } else { "0" }),
-            (K_SABR_FORMAT, s.sabr_format.trim()),
-            (K_SABR_EXTRACTOR_ARGS, s.sabr_extractor_args.trim()),
+            (K_SABR_FORMAT, Self::default_as_empty(s.sabr_format.trim(), crate::downloader::SABR_DEFAULT_FORMAT)),
+            (K_SABR_EXTRACTOR_ARGS, Self::default_as_empty(s.sabr_extractor_args.trim(), crate::downloader::SABR_DEFAULT_EXTRACTOR_ARGS)),
             (K_SABR_DEEP_REWIND, if s.sabr_deep_rewind { "1" } else { "0" }),
             (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
             (K_SABR_POT_ARGS, s.sabr_pot_args.trim()),
@@ -2068,7 +2101,7 @@ impl StreamArchiverApp {
             (K_YT_ANON, if s.yt_anon_public { "1" } else { "0" }),
             (K_SABR_CODEC_PREF, s.sabr_codec_pref.id()),
             (K_SABR_CODEC_CUSTOM, s.sabr_codec_custom.trim()),
-            (K_DASH_FORMAT, s.dash_format.trim()),
+            (K_DASH_FORMAT, Self::default_as_empty(s.dash_format.trim(), crate::downloader::DASH_DEFAULT_FORMAT)),
             (
                 crate::pot_server::K_POT_SERVER_AUTOSTART,
                 if s.pot_server_autostart { "1" } else { "0" },
@@ -2102,23 +2135,23 @@ impl StreamArchiverApp {
             (K_APP_ICON, s.app_icon.trim()),
             (K_REMUX_EMBED_THUMBNAIL, if s.remux_embed_thumbnail { "1" } else { "0" }),
             (K_REMUX_EMBED_TITLE,     if s.remux_embed_title     { "1" } else { "0" }),
-            (K_REMUX_TITLE_TEMPLATE, s.remux_title_template.trim()),
+            (K_REMUX_TITLE_TEMPLATE, Self::default_as_empty(s.remux_title_template.trim(), "{title}")),
             (K_REMUX_EMBED_SUBS,      if s.remux_embed_subs      { "1" } else { "0" }),
             (crate::io_gate::K_POSTPROC_READRATE, postproc_readrate.as_str()),
             (crate::iomon::K_IOMON_LOG, if s.iomon_sample_log { "1" } else { "0" }),
             (K_FILE_SPLIT_ENABLED,  if s.file_split_enabled { "1" } else { "0" }),
-            (K_FILE_SPLIT_VIDEOS, s.file_split_videos.trim()),
-            (K_FILE_SPLIT_SUBS,   s.file_split_subs.trim()),
-            (K_FILE_SPLIT_CHAT,   s.file_split_chat.trim()),
-            (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
-            (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
+            (K_FILE_SPLIT_VIDEOS, Self::default_as_empty(s.file_split_videos.trim(), "videos")),
+            (K_FILE_SPLIT_SUBS,   Self::default_as_empty(s.file_split_subs.trim(), "subs")),
+            (K_FILE_SPLIT_CHAT,   Self::default_as_empty(s.file_split_chat.trim(), "chat")),
+            (K_FILE_SPLIT_THUMBS, Self::default_as_empty(s.file_split_thumbs.trim(), "thumbs")),
+            (K_FILE_SPLIT_LOGS,   Self::default_as_empty(s.file_split_logs.trim(), "logs")),
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
-            (K_CHAT_DOCK_SIDE, s.chat_dock_side.trim()),
+            (K_CHAT_DOCK_SIDE, Self::default_as_empty(s.chat_dock_side.trim(), "right")),
             (K_CHAT_DOCK_ON_PLAY, if s.chat_dock_on_play { "1" } else { "0" }),
             (K_LIVE_TITLE_TEMPLATE, s.live_title_template.trim()),
             (K_LIVE_TITLE_AUTO_UPDATE, if s.live_title_auto_update { "1" } else { "0" }),
             (K_MUTE_COLLAB_INSTANCES, if s.mute_collab_instances { "1" } else { "0" }),
-            (K_COLLAB_UNTRACKED_TITLE_TEMPLATE, s.collab_untracked_title_template.trim()),
+            (K_COLLAB_UNTRACKED_TITLE_TEMPLATE, Self::default_as_empty(s.collab_untracked_title_template.trim(), "{channel} (collab)")),
             (crate::downloader::K_TOKEN_STYLE, if s.token_style_branded { "branded" } else { "plain" }),
             (crate::downloader::K_TOKEN_OVERRIDES, s.token_overrides.trim()),
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),

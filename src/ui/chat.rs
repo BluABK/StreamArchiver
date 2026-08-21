@@ -893,8 +893,25 @@ pub(super) struct ChatPopup {
 /// (`chat_popup_window`) and dock-on-play (`reconcile_chat_dock_on_play`)
 /// must agree to the byte — two format strings drifting apart would leave
 /// every auto-dock stuck Pending until its 60 s timeout.
-pub(in crate::ui) fn chat_window_title(name: &str) -> String {
-    format!("💬  Chat — {name}")
+///
+/// The visible text is followed by an INVISIBLE per-monitor discriminator:
+/// the monitor id in binary, written in zero-width characters (U+200B = 0,
+/// U+200C = 1). Two instances can carry the same channel name — a main and
+/// an alt account of the same channel — and then a visible-text match is
+/// ambiguous: the dock's fallback was first-come claim order, which could
+/// stick the wrong chat to a player. With the discriminator every title is
+/// unique from birth, in a way no title bar, taskbar or alt-tab renders.
+pub(in crate::ui) fn chat_window_title(name: &str, monitor_id: i64) -> String {
+    let mut t = format!("💬  Chat — {name}");
+    let mut v = monitor_id.max(0) as u64;
+    loop {
+        t.push(if v & 1 == 1 { '\u{200C}' } else { '\u{200B}' });
+        v >>= 1;
+        if v == 0 {
+            break;
+        }
+    }
+    t
 }
 
 pub(in crate::ui) fn chat_vp_id(monitor_id: i64) -> egui::ViewportId {
@@ -928,6 +945,28 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
+
+    /// Two monitors can share a channel name (main + alt account); the dock
+    /// finds chat windows by EXACT title, so titles must differ even then —
+    /// invisibly, because the visible text is the user's.
+    #[test]
+    fn chat_titles_are_unique_per_monitor_but_visibly_identical() {
+        let a = chat_window_title("girl_dm_", 5);
+        let b = chat_window_title("girl_dm_", 87);
+        assert_ne!(a, b, "same name, different monitors: titles must differ");
+
+        // The discriminator is entirely zero-width: strip it and both read
+        // exactly like the plain title.
+        let visible = |s: &str| {
+            s.chars().filter(|c| *c != '\u{200B}' && *c != '\u{200C}').collect::<String>()
+        };
+        assert_eq!(visible(&a), "💬  Chat — girl_dm_");
+        assert_eq!(visible(&a), visible(&b));
+
+        // Deterministic: the dock re-derives the title later (dock-on-play)
+        // and must land on the same string the builder used.
+        assert_eq!(a, chat_window_title("girl_dm_", 5));
+    }
     #[allow(unused_imports)]
     use std::path::PathBuf;
 
