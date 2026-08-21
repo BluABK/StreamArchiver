@@ -14,11 +14,7 @@ pub(super) fn probe_dims_sync(path: &str) -> String {
         "-v", "error", "-select_streams", "v:0", "-show_entries",
         "stream=codec_name,width,height,r_frame_rate", "-of", "csv=p=0", path,
     ]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    hide_console(&mut cmd);
     let Ok(out) = cmd.output() else { return String::new() };
     // csv=p=0 → "h264,1280,720,60/1"
     let line = String::from_utf8_lossy(&out.stdout);
@@ -44,6 +40,23 @@ pub(super) fn probe_dims_sync(path: &str) -> String {
 /// Open a path (file or directory) with the default associated application.
 pub(super) fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+/// Keep a console-subsystem child (streamlink, yt-dlp, mpv, taskkill) from
+/// popping a visible console window. The release build is GUI-subsystem, so
+/// without this every console child allocates its own console on screen —
+/// invisible in debug runs only because those attach children to the console
+/// the app was launched from. The hidden console still exists, so a child
+/// that spawns its own children (streamlink → mpv) shares it rather than
+/// creating a new one.
+fn hide_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
 }
 
 /// What "Play local recording (start)" should open for a recording, and how.
@@ -564,6 +577,7 @@ pub(super) fn fwd_slashes(p: &std::path::Path) -> String {
 /// and `appending://` URLs for growing files; other players get plain paths.
 pub(super) fn build_player_command(player: &str, t: &StreamTarget) -> std::process::Command {
     let mut cmd = std::process::Command::new(player);
+    hide_console(&mut cmd);
     let mpv = player_is_mpv(player);
     match t {
         StreamTarget::Finished(p) => {
@@ -1391,12 +1405,10 @@ pub(super) fn spawn_live_preview(
     };
     let line = format!("{program} {}", args.join(" "));
     tracing::info!(%line, "live-preview: spawning downloader");
-    let mut dl = match std::process::Command::new(&program)
-        .args(&args)
-        .stdout(log_out)
-        .stderr(log_err)
-        .spawn()
-    {
+    let mut dl_cmd = std::process::Command::new(&program);
+    dl_cmd.args(&args).stdout(log_out).stderr(log_err);
+    hide_console(&mut dl_cmd);
+    let mut dl = match dl_cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = crate::iomon::fs::remove_dir_all_sync(crate::iomon::Cat::Preview, &tmp);
@@ -1422,11 +1434,12 @@ pub(super) fn spawn_live_preview(
     std::thread::spawn(move || {
         let cleanup = |dl: &mut std::process::Child, tmp: &std::path::Path| {
             let pid = dl.id().to_string();
-            let _ = std::process::Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid])
+            let mut tk = std::process::Command::new("taskkill");
+            tk.args(["/T", "/F", "/PID", &pid])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+                .stderr(std::process::Stdio::null());
+            hide_console(&mut tk);
+            let _ = tk.status();
             let _ = dl.kill(); // fallback; no-op if taskkill got it
             let _ = dl.wait();
             for _ in 0..10 {
@@ -1524,6 +1537,7 @@ pub(super) fn spawn_live_preview(
                     if ready {
                         tracing::info!(%channel, "live-preview: serving live HLS playlist");
                         let mut cmd = std::process::Command::new(&player);
+                        hide_console(&mut cmd);
                         cmd.args(MPV_LIVE_FLAGS);
                         // Segments end in ".part", which lavf's HLS demuxer
                         // blocks by default for local files.
@@ -1765,6 +1779,7 @@ pub(super) fn spawn_play_new_instance(
             // Streamlink spawns mpv itself here, so its stderr is the only
             // window into BOTH processes for the Twitch path.
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
+            hide_console(&mut cmd);
             let win32_tile_rect = if mpv_geometry.is_some() { None } else { tile_rect };
             let status = spawn_logged(cmd, "streamlink", Some(m.id), win32_tile_rect, !is_vod);
             // Both updaters start only if Streamlink actually started —
@@ -1824,15 +1839,16 @@ pub(super) fn spawn_play_new_instance(
             tracing::info!(%line, "play-new-instance: spawning yt-dlp pipe");
             // stdout stays piped (it IS the video going into the player);
             // stderr is the only diagnostic this path has, so keep it.
-            match std::process::Command::new(&ytdlp_bin)
-                .args(&args)
+            let mut yt = std::process::Command::new(&ytdlp_bin);
+            yt.args(&args)
                 .stdout(Stdio::piped())
-                .stderr(player_log(&row.channel.name, "yt-dlp"))
-                .spawn()
-            {
+                .stderr(player_log(&row.channel.name, "yt-dlp"));
+            hide_console(&mut yt);
+            match yt.spawn() {
                 Ok(mut child) => {
                     let pipe = child.stdout.take()?;
                     let mut cmd = std::process::Command::new(player);
+                    hide_console(&mut cmd);
                     cmd.arg("-")
                         .stdin(Stdio::from(pipe))
                         .stderr(player_log(&row.channel.name, "player"));
@@ -1855,6 +1871,7 @@ pub(super) fn spawn_play_new_instance(
         }
         Tool::Ffmpeg => {
             let mut cmd = std::process::Command::new(player);
+            hide_console(&mut cmd);
             cmd.stderr(player_log(&row.channel.name, "player"));
             apply_live_title_and_spawn_updater(
                 &mut cmd, player, row,
