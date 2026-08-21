@@ -130,13 +130,20 @@ impl Supervisor {
         }
     }
 
-    /// Periodic retry for transient chapters-embed failures
-    /// (`chapters_state = "queued"`, see `record_chapters_failure`) — so a
-    /// recording self-heals from e.g. a momentarily-overloaded disk without
-    /// needing the manual "Re-embed chapters" button. Hourly: enough backoff
-    /// for a transient I/O blip to clear without hammering a still-broken
-    /// enclosure, same cadence as `asset_refresh_loop`. Toggleable from the
-    /// Background view like every other periodic job (`TOGGLEABLE_JOBS`).
+    /// Periodic retry for chapters embeds that are pending for ANY reason:
+    /// transient failures awaiting backoff (`chapters_state = "queued"`, see
+    /// `record_chapters_failure`) AND fresh `""` candidates whose one-shot
+    /// finalize-time trigger misfired — `chapters_job` returns silently on a
+    /// momentarily-unreadable precondition (e.g. a DB read erroring under
+    /// lock pressure counts as "unsettled"), and before this ran the full
+    /// sweep such a take sat in the Background view's "Queued" list until
+    /// the next app restart (hit 2026-08-21: a chrchie take queued 84
+    /// minutes with nothing coming for it). Mirrors
+    /// `retry_pending_gap_splices_loop`, which has always swept its full
+    /// candidate list. Hourly: enough backoff for a transient I/O blip to
+    /// clear without hammering a still-broken enclosure, same cadence as
+    /// `asset_refresh_loop`. Toggleable from the Background view like every
+    /// other periodic job (`TOGGLEABLE_JOBS`).
     pub async fn retry_queued_chapters_loop(&self, shutdown: Arc<AtomicBool>, jobs: crate::events::JobRegistry) {
         const INITIAL_DELAY_SECS: u64 = 90;
         const TICK_SECS: u64 = 3600;
@@ -147,9 +154,10 @@ impl Supervisor {
                 return;
             }
             if self.store.job_enabled("job_chapters_retry") {
-                for rec_id in self.store.recordings_with_queued_chapters().unwrap_or_default() {
-                    self.spawn_chapters_sequential(rec_id, Vec::new()).await;
-                }
+                // The same sequential sweep startup runs — its candidate
+                // query covers both '' and 'queued' states, and the
+                // per-recording dedup set makes overlapping triggers safe.
+                self.sweep_pending_chapters().await;
                 crate::events::mark_job(&jobs, "Chapters retry", TICK_SECS as i64);
             }
             crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
@@ -224,15 +232,30 @@ impl Supervisor {
     async fn chapters_job(&self, rec_id: i64, gap_meta: Vec<SplicedGap>) {
         let Some(rec) = self.store.get_recording(rec_id).ok().flatten() else { return };
         if !chapters_precondition_met(&rec.status, &rec.head_backfill_state, &rec.chapters_state) {
+            // Routine for most triggers (chapters already done, take still
+            // recording) — logged anyway because a take whose ONLY trigger
+            // bails here silently used to look stuck in the "Queued" panel
+            // with no trace of why (the hourly sweep retries it now).
+            debug!(
+                rec_id,
+                status = %rec.status,
+                head = %rec.head_backfill_state,
+                chapters = %rec.chapters_state,
+                "chapters: precondition not met — skipping this trigger",
+            );
             return;
         }
         // Gap ranges might still be resolving even when `gap_meta` is empty
         // (e.g. this call came from `finalize_recording`, not a completed
         // gap-splice) — wait for them to settle before touching anything,
-        // same "unsettled" check `gap_splice_job` runs on itself.
+        // same "unsettled" check `gap_splice_job` runs on itself. A failed
+        // read counts as unsettled (deferring is always safe — the hourly
+        // sweep comes back around), but say so: an error here under DB lock
+        // pressure used to be a completely silent dead end.
         let unsettled = self.store.gap_ranges_in_state(rec_id, "pending").map(|v| !v.is_empty()).unwrap_or(true)
             || self.store.gap_ranges_in_state(rec_id, "fetching").map(|v| !v.is_empty()).unwrap_or(true);
         if unsettled {
+            debug!(rec_id, "chapters: gap ranges unsettled (or unreadable) — deferring to the hourly sweep");
             return;
         }
 

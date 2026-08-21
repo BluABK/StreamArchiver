@@ -1169,16 +1169,6 @@ impl Store {
         Ok(())
     }
 
-    /// Recordings currently queued for an automatic chapters-embed retry
-    /// (`chapters_state = "queued"`) — the periodic retry sweep's candidate
-    /// list. See `record_chapters_failure`.
-    pub fn recordings_with_queued_chapters(&self) -> Result<Vec<i64>> {
-        let conn = self.db();
-        let mut stmt = conn.prepare("SELECT id FROM recording WHERE chapters_state = 'queued'")?;
-        let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
-        Ok(rows)
-    }
-
     /// Persist the actual embedded chapter list — see
     /// [`crate::models::Recording::chapters_json`]. Set alongside
     /// `chapters_state = "done"` on a successful embed.
@@ -4070,21 +4060,28 @@ mod tests {
         let rec = store
             .insert_recording(mid, 100, "C:/tmp/x.mkv", Some(50), false, Some("s1"), None, "", "")
             .unwrap();
+        // Finished take: the hourly retry sweeps
+        // `recordings_needing_chapters_check`, whose candidates must be
+        // completed — a fresh '' take is eligible from the moment it ends.
+        store.finish_recording(rec, 160, 1, Some(0), "completed", "C:/tmp/x.mkv", "").unwrap();
+        assert_eq!(store.recordings_needing_chapters_check().unwrap(), vec![rec]);
 
-        // First few failures requeue (not yet at the cap).
+        // First few failures requeue (not yet at the cap) — still a sweep
+        // candidate.
         store.record_chapters_failure(rec, 1, false).unwrap();
         let row = store.get_recording(rec).unwrap().unwrap();
         assert_eq!(row.chapters_state, "queued");
         assert_eq!(row.chapters_attempts, 1);
-        assert_eq!(store.recordings_with_queued_chapters().unwrap(), vec![rec]);
+        assert_eq!(store.recordings_needing_chapters_check().unwrap(), vec![rec]);
 
         // The caller decides "exhausted" (mirrors gap-recovery's own
-        // attempts-vs-cap check) — once true, it's terminal.
+        // attempts-vs-cap check) — once true, it's terminal and the sweep
+        // leaves it alone.
         store.record_chapters_failure(rec, 5, true).unwrap();
         let row = store.get_recording(rec).unwrap().unwrap();
         assert_eq!(row.chapters_state, "failed");
         assert_eq!(row.chapters_attempts, 5);
-        assert!(store.recordings_with_queued_chapters().unwrap().is_empty());
+        assert!(store.recordings_needing_chapters_check().unwrap().is_empty());
 
         // A manual reset (retrigger / bulk re-embed) always zeroes the
         // counter along with the state, regardless of how it got here.

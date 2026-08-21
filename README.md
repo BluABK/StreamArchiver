@@ -2276,9 +2276,11 @@ settings in the same section.
 momentary I/O error — not a corrupt source file): a failed embed pass
 requeues itself automatically rather than giving up immediately. An hourly
 background job (Settings → Background → *Chapters retry*, toggleable like
-every other periodic job) retries every recording still awaiting one, so a
-one-off disk hiccup clears up on its own within the hour — no manual click
-needed. After 5 automatic attempts still fail, it stops retrying and needs
+every other periodic job) re-runs the full pending sweep — both requeued
+failures and takes whose finalize-time trigger never fired at all (e.g. a
+precondition read hit a momentary DB error and deferred silently) — so a
+one-off hiccup clears up on its own within the hour instead of waiting for
+the next app restart. No manual click needed. After 5 automatic attempts still fail, it stops retrying and needs
 the manual **📑 Embed chapters** context-menu action on that one recording to
 try again. (Settings' **Re-embed chapters** button is a *different*,
 much blunter tool — it re-runs every eligible recording regardless of

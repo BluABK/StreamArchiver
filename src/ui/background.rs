@@ -611,7 +611,8 @@ impl StreamArchiverApp {
                                 egui::RichText::new(
                                     "Waiting for the sequential embed/splice backlog sweep to reach \
                                      them — processed one at a time, oldest first, so a large backlog \
-                                     doesn't flood the disk gate.",
+                                     doesn't flood the disk gate. The sweep runs at startup and then \
+                                     hourly (the Chapters retry / Gap-splice retry background jobs).",
                                 )
                                 .small()
                                 .weak(),
