@@ -4302,6 +4302,28 @@ seconds**, so a chat spamming your name can't spawn fifty. Rules are re-read by 
 logger every 30 seconds and by open chat windows immediately, so a rule added
 mid-stream starts working without restarting anything.
 
+**🔗 Dock the chat to the player.** The toolbar's 🔗 toggle sticks that
+window to the mpv instance playing the same channel — video|chat as one
+unit, the way the website lays it out. While docked, the pair **moves,
+minimizes and restores together**: drag either window and the other follows
+(the video is the primary — if both move at once, the chat re-pins to the
+player), the chat always matches the player's height, and its width is
+whatever you last dragged its outer edge to (remembered across restarts).
+Quitting the player **closes a docked chat with it**; closing the chat leaves
+the player running. Player fullscreen (`f` in mpv) suspends the dock — the
+chat stays where it is and re-snaps when fullscreen ends. The toggle is
+disabled (with a hover explaining why) until a player window for that
+instance exists.
+
+With **Settings → Interface → Dock chat to player** on (the default),
+**▷ Play stream (live edge)** does all of this in one click: the chat window
+opens by itself, already docked. It fires once per play — manually detaching
+a chat is respected until the next play — and only for live plays, never for
+a local recording or VOD. **Docked chat side** (same section) flips the pair
+to chat-left. Docking follows the *player window*, whoever spawned it, so it
+works on every launch path: Streamlink (which spawns mpv itself), the
+YouTube SABR live preview, and the direct pipe/URL players.
+
 **Two clocks, one click apart.** The 🕒 toolbar toggle switches that
 window's timestamps between **time into the broadcast** (`[00:40:10]`, the default —
 this is an archive tool, and it's what lets you seek the local recording to a

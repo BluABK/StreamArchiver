@@ -700,6 +700,7 @@ pub(super) fn spawn_logged(
     what: &str,
     watch_monitor: Option<i64>,
     tile_rect: Option<crate::display::PixelRect>,
+    live: bool,
 ) -> Option<String> {
     let line = format!(
         "{} {}",
@@ -718,12 +719,18 @@ pub(super) fn spawn_logged(
             }
             if let Some(mid) = watch_monitor.filter(|&m| m > 0) {
                 note_player_opened(mid);
+                // Register the pid for chat docking too. On the streamlink
+                // path this is streamlink's own pid — the dock resolves the
+                // real player window by walking the whole process tree.
+                let pid = child.id();
+                crate::window_dock::note_player_spawned(mid, pid, live);
                 // The streamlink path's child is streamlink itself, which
                 // exits when the player it owns closes — waiting on either
                 // process shape means "the window is gone".
                 std::thread::spawn(move || {
                     let _ = child.wait();
                     note_player_closed(mid);
+                    crate::window_dock::note_player_exited(mid, pid);
                 });
             }
             None
@@ -1563,6 +1570,8 @@ pub(super) fn spawn_live_preview(
         }
         match launched {
             Some((mut p, Some(mut hp))) => {
+                let pid = p.id();
+                crate::window_dock::note_player_spawned(watch_mid, pid, true);
                 // Keep the playlists fresh while the player runs. When the
                 // preview download ends (stream over / killed), write final
                 // playlists with ENDLIST so the player finishes cleanly
@@ -1581,11 +1590,15 @@ pub(super) fn spawn_live_preview(
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 note_player_closed(watch_mid);
+                crate::window_dock::note_player_exited(watch_mid, pid);
                 tracing::info!(%channel, "live-preview: player closed, stopping preview download");
             }
             Some((mut p, None)) => {
+                let pid = p.id();
+                crate::window_dock::note_player_spawned(watch_mid, pid, true);
                 let _ = p.wait();
                 note_player_closed(watch_mid);
+                crate::window_dock::note_player_exited(watch_mid, pid);
                 tracing::info!(%channel, "live-preview: player closed, stopping preview download");
             }
             None => {}
@@ -1753,7 +1766,7 @@ pub(super) fn spawn_play_new_instance(
             // window into BOTH processes for the Twitch path.
             cmd.args(&args).stderr(player_log(&row.channel.name, "streamlink"));
             let win32_tile_rect = if mpv_geometry.is_some() { None } else { tile_rect };
-            let status = spawn_logged(cmd, "streamlink", Some(m.id), win32_tile_rect);
+            let status = spawn_logged(cmd, "streamlink", Some(m.id), win32_tile_rect, !is_vod);
             // Both updaters start only if Streamlink actually started —
             // otherwise one would sit on a pipe that can never appear and log
             // a spurious warning a minute later.
@@ -1832,7 +1845,7 @@ pub(super) fn spawn_play_new_instance(
                         cmd.arg("--mute");
                     }
                     let win32_tile_rect = apply_tile_or_geometry(&mut cmd, player, tile_rect);
-                    spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect)
+                    spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect, !is_vod)
                 }
                 Err(e) => {
                     warn!(%line, "play-new-instance: failed to spawn yt-dlp: {e}");
@@ -1853,7 +1866,7 @@ pub(super) fn spawn_play_new_instance(
             }
             cmd.arg(&m.url);
             let win32_tile_rect = apply_tile_or_geometry(&mut cmd, player, tile_rect);
-            spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect)
+            spawn_logged(cmd, "media player", Some(m.id), win32_tile_rect, !is_vod)
         }
     }
 }

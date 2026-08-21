@@ -1522,6 +1522,43 @@ impl StreamArchiverApp {
                     );
                     ui.checkbox(&mut self.settings.live_title_auto_update, "");
                     ui.end_row();
+                    ui.label("Dock chat to player").on_hover_text(
+                        "Open the chat window automatically whenever ▷ Play \
+                         stream (live edge) starts a player, docked to its side — \
+                         video|chat as one unit, like the website. While docked, the \
+                         pair moves, minimizes and restores together (drag either \
+                         window), the chat matches the player\'s height, and quitting \
+                         the player closes the chat with it; closing the chat leaves \
+                         the player running. Dock or detach any chat manually with the \
+                         🔗 toggle in its toolbar — that works with this \
+                         off, too. The chat\'s docked width is remembered from the last \
+                         time you resized it (drag its outer edge).",
+                    );
+                    ui.checkbox(&mut self.settings.chat_dock_on_play, "");
+                    ui.end_row();
+                    ui.label("Docked chat side").on_hover_text(
+                        "Which side of the player a docked chat sticks to. Right is \
+                         the website\'s own arrangement.",
+                    );
+                    egui::ComboBox::from_id_salt("chat_dock_side_combo")
+                        .selected_text(if self.settings.chat_dock_side == "left" {
+                            "Left of the player"
+                        } else {
+                            "Right of the player"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.chat_dock_side,
+                                "right".to_string(),
+                                "Right of the player",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.chat_dock_side,
+                                "left".to_string(),
+                                "Left of the player",
+                            );
+                        });
+                    ui.end_row();
                     ui.label("Mute collab instances").on_hover_text(
                         "Mute every OTHER angle opened by \"Play all collab instances \
                          (live edge)\" — the instance you actually right-clicked keeps its \

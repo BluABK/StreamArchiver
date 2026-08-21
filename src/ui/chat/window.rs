@@ -355,9 +355,90 @@ impl StreamArchiverApp {
         });
     }
 
+    /// Dock-on-play: a live ▷ Play spawns a player; if the setting is on,
+    /// open that monitor's chat (when absent) and dock it — the website's
+    /// video|chat pair from a single click.
+    ///
+    /// Generation-keyed: each spawn advances a global counter, and this acts
+    /// once per generation. That is what makes the behaviors compose — a
+    /// manual undock is never fought (same generation, already seen), while
+    /// the next play docks again (new generation). Local-file and VOD plays
+    /// never register a LIVE generation, so a week-old recording never pops
+    /// a live chat next to itself.
+    pub(in crate::ui) fn reconcile_chat_dock_on_play(&mut self, ctx: &egui::Context) {
+        let enabled = self
+            .core
+            .store
+            .get_setting(super::super::K_CHAT_DOCK_ON_PLAY)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if !enabled {
+            return;
+        }
+        // Monitors with a live player whose spawn we have not acted on yet.
+        let due: Vec<i64> = self
+            .rows
+            .iter()
+            .map(|r| r.monitor.id)
+            .filter(|mid| {
+                let g = crate::window_dock::live_player_generation(*mid);
+                g > 0 && self.chat_dock_seen_gen.get(mid).copied().unwrap_or(0) < g
+            })
+            .collect();
+        for mid in due {
+            let g = crate::window_dock::live_player_generation(mid);
+            self.chat_dock_seen_gen.insert(mid, g);
+            let already_open =
+                self.chat_popups.iter().any(|p| p.lock().unwrap().monitor_id == mid);
+            if !already_open {
+                self.open_chat_popup(mid, None, ctx);
+            }
+            let name = self
+                .rows
+                .iter()
+                .find(|r| r.monitor.id == mid)
+                .map(|r| r.channel.name.clone())
+                .unwrap_or_default();
+            let side = crate::window_dock::DockSide::from_setting(
+                &self
+                    .core
+                    .store
+                    .get_setting(super::super::K_CHAT_DOCK_SIDE)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            );
+            let width: i32 = self
+                .core
+                .store
+                .get_setting(super::super::K_CHAT_DOCK_WIDTH)
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(480);
+            // Same title format the popup builder uses — the dock finds the
+            // HWND by exact title match.
+            crate::window_dock::request_dock(mid, format!("💬  Chat — {name}"), side, width);
+        }
+    }
+
     #[allow(deprecated)]
     /// Render every open chat window (one OS viewport per monitor).
     pub(in crate::ui) fn chat_popup_windows(&mut self, ctx: &egui::Context) {
+        // A docked pair behaves as one application: when the player exits,
+        // the dock thread queues its chat here and it closes with it. (An
+        // UNDOCKED chat is never on this list — nothing is yanked away.)
+        let close_with_player = crate::window_dock::take_chat_close_requests();
+        if !close_with_player.is_empty() {
+            for p in &self.chat_popups {
+                let mut popup = p.lock().unwrap();
+                if close_with_player.contains(&popup.monitor_id) {
+                    popup.closed = true;
+                }
+            }
+        }
         let mut closed: Vec<i64> = Vec::new();
         for idx in 0..self.chat_popups.len() {
             self.pump_chat_paints(idx);
@@ -366,6 +447,12 @@ impl StreamArchiverApp {
             }
         }
         if !closed.is_empty() {
+            // Whatever closed a popup — user, or the player exit above — its
+            // dock is over. Undocking here (not only on user closes) is what
+            // keeps the dock map from ever holding a dead window.
+            for mid in &closed {
+                crate::window_dock::note_chat_closed(*mid);
+            }
             self.chat_popups.retain(|p| !closed.contains(&p.lock().unwrap().monitor_id));
             if self.chat_popups.is_empty() {
                 // Free all decoded emote frame textures once the last chat
@@ -481,6 +568,28 @@ impl StreamArchiverApp {
         // below. The emotes themselves must NOT use this one — see the
         // closure's own `now`.
         let wrapper_now = ctx.input(|i| i.time);
+
+        // A chat width the user dragged out while docked becomes the width
+        // the next dock opens with. The dock thread has no store handle on
+        // purpose; this wrapper is the store side of that split.
+        if let Some(w) = crate::window_dock::take_dirty_width(popup.monitor_id) {
+            let _ = self.core.store.set_setting(super::super::K_CHAT_DOCK_WIDTH, &w.to_string());
+        }
+        // Captured for the dock toggle in the toolbar closure below: the
+        // toggle needs the window title (dock finds the HWND by it) and the
+        // user's side/width preferences at click time.
+        let dock_title = title.clone();
+        let dock_side = crate::window_dock::DockSide::from_setting(
+            &self.core.store.get_setting(super::super::K_CHAT_DOCK_SIDE).ok().flatten().unwrap_or_default(),
+        );
+        let dock_width: i32 = self
+            .core
+            .store
+            .get_setting(super::super::K_CHAT_DOCK_WIDTH)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(480);
 
         // Release the lock before registering the deferred closure — it
         // takes its own lock on the SAME Arc each time it repaints, which
@@ -968,6 +1077,41 @@ impl StreamArchiverApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.toggle_value(&mut popup.full_view, "View full");
+                            // Dock to the player: the pair moves, minimizes
+                            // and closes as one. Free functions over the
+                            // window_dock globals — this closure has no
+                            // &mut self, exactly like OPEN_PLAYERS' readers.
+                            let status = crate::window_dock::dock_status(popup.monitor_id);
+                            let docked = status != crate::window_dock::DockStatus::Undocked;
+                            let available =
+                                docked || crate::window_dock::player_available(popup.monitor_id);
+                            let label = match status {
+                                crate::window_dock::DockStatus::Undocked => "🔗",
+                                crate::window_dock::DockStatus::Pending => "🔗…",
+                                crate::window_dock::DockStatus::Docked => "🔗",
+                            };
+                            let mut on = docked;
+                            let resp = ui
+                                .add_enabled(available, egui::SelectableLabel::new(on, label))
+                                .on_hover_text(
+                                    "Dock this chat to the player window: video|chat move,                                      minimize and close together, like the website. Drag                                      either window to move the pair; drag the chat's outer                                      edge to set its width (remembered). Quitting the player                                      closes a docked chat; closing the chat leaves the                                      player running.",
+                                )
+                                .on_disabled_hover_text(
+                                    "No player window to dock to — use ▷ Play stream                                      (live edge) first.",
+                                );
+                            if resp.clicked() {
+                                on = !on;
+                                if on {
+                                    crate::window_dock::request_dock(
+                                        popup.monitor_id,
+                                        dock_title.clone(),
+                                        dock_side,
+                                        dock_width,
+                                    );
+                                } else {
+                                    crate::window_dock::request_undock(popup.monitor_id);
+                                }
+                            }
                             if icon_button(
                                 ui,
                                 Some(&ui_tex),

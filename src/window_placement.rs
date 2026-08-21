@@ -47,7 +47,7 @@ fn tracked_pids(root_pid: u32) -> std::collections::HashSet<u32> {
 }
 
 #[cfg(windows)]
-fn find_top_level_window_for_pid_tree(
+pub(crate) fn find_top_level_window_for_pid_tree(
     root_pid: u32,
 ) -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::Foundation::{HWND, LPARAM};

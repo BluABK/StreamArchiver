@@ -195,6 +195,18 @@ pub(crate) const K_APP_FONT_FAMILY: &str = "app_font_family";
 /// ([`crate::fonts::CHAT_FAMILY`]) so the two can differ without either
 /// losing the non-Latin fallbacks.
 pub(crate) const K_CHAT_FONT_FAMILY: &str = "chat_font_family";
+/// Which side of the player a docked chat window sticks to: `"right"`
+/// (default, the website's own arrangement) or `"left"`.
+pub(crate) const K_CHAT_DOCK_SIDE: &str = "chat_dock_side";
+/// Width in physical pixels of a docked chat window. Written from the dock
+/// itself when the user resizes the chat while docked, so the width they
+/// dragged out is the width the next dock opens with. Default 480.
+pub(crate) const K_CHAT_DOCK_WIDTH: &str = "chat_dock_width_px";
+/// Whether ▷ Play (live edge) opens the chat window automatically and docks
+/// it to the player — one click for the website's video|chat pair. Default
+/// on. A docked chat closes with its player either way; this only controls
+/// the automatic opening.
+pub(crate) const K_CHAT_DOCK_ON_PLAY: &str = "chat_dock_on_play";
 /// Which clock the chat replay's timestamps show: `"relative"` (default,
 /// `[00:40:10]` into the broadcast) or `"clock"` (`19:30` local time, as
 /// Twitch's own popout does). Flipped from the 🕒 toolbar toggle in any chat
@@ -1291,6 +1303,10 @@ pub(crate) struct SettingsForm {
     maintenance_apply_all: bool,
     /// Path to the media player binary (e.g. `C:\Progs\mpv\mpv.exe`).
     media_player_path: String,
+    /// Docked chat sits on this side of the player ("right"/"left").
+    chat_dock_side: String,
+    /// ▷ Play auto-opens + docks the chat window (K_CHAT_DOCK_ON_PLAY).
+    chat_dock_on_play: bool,
     /// Window-title template for "Play stream (live edge)" — same
     /// falls-back-to-default-on-empty convention as `media_player_path`.
     live_title_template: String,
@@ -2285,6 +2301,11 @@ pub struct StreamArchiverApp {
     /// Chat log viewer popup (None = closed).
     /// Open chat windows, one per monitor (each is its own OS viewport).
     chat_popups: Vec<Arc<Mutex<ChatPopup>>>,
+    /// Dock-on-play bookkeeping: the last live-player generation each
+    /// monitor's auto-dock acted on. Generation-keyed so each new ▷ Play
+    /// triggers exactly once — a manual undock of the SAME player is never
+    /// overridden, and the next play docks again.
+    chat_dock_seen_gen: HashMap<i64, u64>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
     /// Chat/toolbar affordance icons, uploaded on first use (None until then).
@@ -3052,6 +3073,11 @@ impl eframe::App for StreamArchiverApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
+
+        // ▷ Play opened a live player? Open its chat docked (the website's
+        // video|chat pair from one click). Before popup_windows so the fresh
+        // popup's viewport is declared in this same pass.
+        self.reconcile_chat_dock_on_play(ctx);
 
         // Deliberately here and NOT in `ui()` — see `popup_windows`'s docs:
         // eframe skips `ui()` while the root window is minimized or hidden,

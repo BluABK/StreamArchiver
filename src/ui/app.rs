@@ -312,6 +312,11 @@ impl StreamArchiverApp {
                 let v = setting_or_empty(&core, K_MEDIA_PLAYER);
                 if v.is_empty() { r"C:\Progs\mpv\mpv.exe".into() } else { v }
             },
+            chat_dock_side: {
+                let v = setting_or_empty(&core, K_CHAT_DOCK_SIDE);
+                if v.is_empty() { "right".into() } else { v }
+            },
+            chat_dock_on_play: setting_or_empty(&core, K_CHAT_DOCK_ON_PLAY) != "0",
             live_title_template: {
                 let v = setting_or_empty(&core, K_LIVE_TITLE_TEMPLATE);
                 if v.is_empty() { "{channel}: 【{game}】- {title_trimmed}".into() } else { v }
@@ -847,6 +852,7 @@ impl StreamArchiverApp {
             save_preset_dialog: None,
             quality_preset_manager: None,
             chat_popups: Vec::new(),
+            chat_dock_seen_gen: HashMap::new(),
             platform_tex: None,
             ui_tex: None,
             app_font: installed_fonts.app.clone(),
@@ -2107,6 +2113,8 @@ impl StreamArchiverApp {
             (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
             (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
+            (K_CHAT_DOCK_SIDE, s.chat_dock_side.trim()),
+            (K_CHAT_DOCK_ON_PLAY, if s.chat_dock_on_play { "1" } else { "0" }),
             (K_LIVE_TITLE_TEMPLATE, s.live_title_template.trim()),
             (K_LIVE_TITLE_AUTO_UPDATE, if s.live_title_auto_update { "1" } else { "0" }),
             (K_MUTE_COLLAB_INSTANCES, if s.mute_collab_instances { "1" } else { "0" }),

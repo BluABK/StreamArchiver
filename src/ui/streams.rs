@@ -2436,7 +2436,7 @@ impl StreamArchiverApp {
         for (t, rect) in targets.into_iter().zip(rects) {
             let mut cmd = build_player_command(&player, &t);
             let win32_rect = apply_tile_or_geometry(&mut cmd, &player, Some(rect));
-            if let Some(msg) = spawn_logged(cmd, "stream in player", None, win32_rect) {
+            if let Some(msg) = spawn_logged(cmd, "stream in player", None, win32_rect, false) {
                 self.status = msg;
             }
         }

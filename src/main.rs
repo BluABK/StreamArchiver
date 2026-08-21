@@ -62,6 +62,7 @@ mod version;
 mod vod_archive;
 mod watchdog;
 mod websub;
+mod window_dock;
 mod window_placement;
 
 use std::sync::Arc;
