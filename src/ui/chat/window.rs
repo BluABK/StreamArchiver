@@ -393,38 +393,54 @@ impl StreamArchiverApp {
         for mid in due {
             let g = crate::window_dock::live_player_generation(mid);
             self.chat_dock_seen_gen.insert(mid, g);
-            let already_open =
-                self.chat_popups.iter().any(|p| p.lock().unwrap().monitor_id == mid);
-            if !already_open {
-                self.open_chat_popup(mid, None, ctx);
-            }
-            let name = self
-                .rows
-                .iter()
-                .find(|r| r.monitor.id == mid)
-                .map(|r| r.channel.name.clone())
-                .unwrap_or_default();
-            let side = crate::window_dock::DockSide::from_setting(
-                &self
-                    .core
-                    .store
-                    .get_setting(super::super::K_CHAT_DOCK_SIDE)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default(),
-            );
-            let width: i32 = self
+            self.open_docked_chat(mid, None, false, ctx);
+        }
+    }
+
+    /// Open a monitor's chat window — pinned to `rec_id`'s chat log when
+    /// given, else the live/latest log — and dock it to the newest player
+    /// window registered for that monitor. `retarget` re-points an
+    /// already-open window at the requested take (used when a specific
+    /// recording's playback wants ITS chat beside it); the dock-on-play
+    /// reconciler passes `false` so a second ▷ Play never resets a live
+    /// window's scroll position by reloading it.
+    pub(in crate::ui) fn open_docked_chat(
+        &mut self,
+        mid: i64,
+        rec_id: Option<i64>,
+        retarget: bool,
+        ctx: &egui::Context,
+    ) {
+        let already_open = self.chat_popups.iter().any(|p| p.lock().unwrap().monitor_id == mid);
+        if retarget || !already_open {
+            self.open_chat_popup(mid, rec_id, ctx);
+        }
+        let name = self
+            .rows
+            .iter()
+            .find(|r| r.monitor.id == mid)
+            .map(|r| r.channel.name.clone())
+            .unwrap_or_default();
+        let side = crate::window_dock::DockSide::from_setting(
+            &self
                 .core
                 .store
-                .get_setting(super::super::K_CHAT_DOCK_WIDTH)
+                .get_setting(super::super::K_CHAT_DOCK_SIDE)
                 .ok()
                 .flatten()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(480);
-            // The dock finds the HWND by exact title match, so this MUST be
-            // the same function the popup builder uses.
-            crate::window_dock::request_dock(mid, super::chat_window_title(&name, mid), side, width);
-        }
+                .unwrap_or_default(),
+        );
+        let width: i32 = self
+            .core
+            .store
+            .get_setting(super::super::K_CHAT_DOCK_WIDTH)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(480);
+        // The dock finds the HWND by exact title match, so this MUST be
+        // the same function the popup builder uses.
+        crate::window_dock::request_dock(mid, super::chat_window_title(&name, mid), side, width);
     }
 
     #[allow(deprecated)]

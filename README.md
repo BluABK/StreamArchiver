@@ -4388,6 +4388,14 @@ to chat-left. Docking follows the *player window*, whoever spawned it, so it
 works on every launch path: Streamlink (which spawns mpv itself), the
 YouTube SABR live preview, and the direct pipe/URL players.
 
+Archived material gets the pair too: **🛟 Open recovered file** and **📼 Open
+downloaded VOD** (right-click a recovery/backfill row) play the file in the
+media player with that take's **chat replay opened and docked beside it** —
+the recorded log, scrollable with broadcast-relative timestamps, not synced
+to the playback position. The same *Dock chat to player* setting governs it,
+and with no media player configured the file opens in the system default app
+with the chat window undocked.
+
 **Two clocks, one click apart.** The 🕒 toolbar toggle switches that
 window's timestamps between **time into the broadcast** (`[00:40:10]`, the default —
 this is an archive tool, and it's what lets you seek the local recording to a

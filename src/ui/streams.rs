@@ -287,6 +287,11 @@ struct StreamsOut {
     set_err_ack: Option<(i64, bool)>,
     /// (monitor id, recording id) — "View chat" on a stream/take row.
     view_chat_rec: Option<(i64, i64)>,
+    /// (monitor id, recording id, file) — "Open recovered file" / "Open
+    /// downloaded VOD": play the file in the media player with the take's
+    /// chat opened and docked beside it (the same video|chat pair a live
+    /// ▷ Play produces, minus playback sync).
+    play_file_with_chat: Option<(i64, i64, std::path::PathBuf)>,
     // Container-level actions.
     toggle_channel_enabled: Option<(i64, bool)>, // set all instances
     toggle_channel_automation: Option<(i64, bool)>, // master switch
@@ -2615,6 +2620,7 @@ impl StreamArchiverApp {
             retrigger_chapters,
             set_err_ack,
             view_chat_rec,
+            play_file_with_chat,
             toggle_channel_enabled,
             toggle_channel_automation,
             rename_channel,
@@ -3105,6 +3111,40 @@ impl StreamArchiverApp {
         }
         if let Some((mid, rid)) = view_chat_rec {
             self.open_chat_popup(mid, Some(rid), ui.ctx());
+        }
+        if let Some((mid, rid, path)) = play_file_with_chat {
+            // The video|chat pair for an archived file: spawn the player
+            // through the same machinery a live ▷ Play uses (registering the
+            // pid so the dock can find its window) and put the take's chat
+            // replay beside it. Without a configured player the OS default
+            // app opens the file instead — no pid to dock to, so the chat
+            // opens undocked.
+            let player = self.settings.media_player_path.trim().to_string();
+            let dock_on_play = self
+                .core
+                .store
+                .get_setting(K_CHAT_DOCK_ON_PLAY)
+                .ok()
+                .flatten()
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if player.is_empty() {
+                crate::platform::open_path(&path);
+                if dock_on_play {
+                    self.open_chat_popup(mid, Some(rid), ui.ctx());
+                }
+            } else {
+                let cmd =
+                    build_player_command(&player, &StreamTarget::Finished(path));
+                let err = spawn_logged(cmd, "media player", Some(mid), None, false);
+                match err {
+                    Some(msg) => self.status = msg,
+                    None if dock_on_play => {
+                        self.open_docked_chat(mid, Some(rid), true, ui.ctx());
+                    }
+                    None => {}
+                }
+            }
         }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
@@ -6611,9 +6651,16 @@ impl StreamArchiverApp {
                         let rp_ok = fs_probes.is_file(std::path::Path::new(rp));
                         if ui
                             .add_enabled(rp_ok, egui::Button::new("🛟  Open recovered file"))
+                            .on_hover_text(
+                                "Play the recovered file in the media player with \
+                                 this take's chat opened and docked beside it \
+                                 (falls back to the system default app when no \
+                                 player is configured).",
+                            )
                             .clicked()
                         {
-                            out.open_path = Some(std::path::PathBuf::from(rp));
+                            out.play_file_with_chat =
+                                Some((t.monitor_id, t.id, std::path::PathBuf::from(rp)));
                             ui.close();
                         }
                     }
@@ -6629,9 +6676,16 @@ impl StreamArchiverApp {
                         let vp_ok = fs_probes.is_file(std::path::Path::new(vp));
                         if ui
                             .add_enabled(vp_ok, egui::Button::new("📼  Open downloaded VOD"))
+                            .on_hover_text(
+                                "Play the downloaded VOD in the media player with \
+                                 this take's chat opened and docked beside it \
+                                 (falls back to the system default app when no \
+                                 player is configured).",
+                            )
                             .clicked()
                         {
-                            out.open_path = Some(std::path::PathBuf::from(vp));
+                            out.play_file_with_chat =
+                                Some((t.monitor_id, t.id, std::path::PathBuf::from(vp)));
                             ui.close();
                         }
                     }
