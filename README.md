@@ -4370,11 +4370,15 @@ mid-stream starts working without restarting anything.
 
 **🔗 Dock the chat to the player.** The toolbar's 🔗 toggle sticks that
 window to the mpv instance playing the same channel — video|chat as one
-unit, the way the website lays it out. While docked, the pair **moves,
-minimizes and restores together**: drag either window and the other follows
-(the video is the primary — if both move at once, the chat re-pins to the
-player), the chat always matches the player's height, and its width is
-whatever you last dragged its outer edge to (remembered across restarts).
+unit, the way the website lays it out. While docked, the pair **moves
+together**: drag either window and the other follows (the video is the
+primary — if both move at once, the chat re-pins to the player), the chat
+always matches the player's height, and its width is whatever you last
+dragged its outer edge to (remembered across restarts). Minimize is
+**player-primary**: minimizing the player takes the pair down and restoring
+either window brings the pair back — but minimizing the **chat** collapses
+just the chat while the video keeps playing; restore it from the taskbar
+and it snaps straight back onto the player's edge.
 Quitting the player **closes a docked chat with it**; closing the chat leaves
 the player running. Player fullscreen (`f` in mpv) suspends the dock — the
 chat stays where it is and re-snaps when fullscreen ends. The toggle is

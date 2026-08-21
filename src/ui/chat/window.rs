@@ -1120,7 +1120,14 @@ impl StreamArchiverApp {
                             let resp = ui
                                 .add_enabled(available, egui::SelectableLabel::new(on, label))
                                 .on_hover_text(
-                                    "Dock this chat to the player window: video|chat move,                                      minimize and close together, like the website. Drag                                      either window to move the pair; drag the chat's outer                                      edge to set its width (remembered). Quitting the player                                      closes a docked chat; closing the chat leaves the                                      player running.",
+                                    "Dock this chat to the player window: video|chat move and \
+                                     close together, like the website. Drag either window to \
+                                     move the pair; drag the chat's outer edge to set its width \
+                                     (remembered). Minimizing the player minimizes both; \
+                                     minimizing the CHAT collapses just the chat — restore it \
+                                     from the taskbar and it snaps back. Quitting the player \
+                                     closes a docked chat; closing the chat leaves the player \
+                                     running.",
                                 )
                                 .on_disabled_hover_text(
                                     "No player window to dock to — use ▷ Play stream                                      (live edge) first.",

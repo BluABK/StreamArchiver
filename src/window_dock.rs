@@ -2,9 +2,13 @@
 //! one unit, the way the website lays it out.
 //!
 //! A single background thread polls both windows' DWM frame rectangles every
-//! [`TICK`] and mirrors changes **both ways**: drag the player and the chat
-//! follows, drag the chat and the player follows, minimize either and both
-//! minimize. All geometry runs OS-side (`SetWindowPos` on both HWNDs, the
+//! [`TICK`] and mirrors changes **both ways** for movement: drag the player
+//! and the chat follows, drag the chat and the player follows. Minimize is
+//! player-primary: minimizing the player takes the pair down (and restoring
+//! either window brings the pair back), while minimizing the CHAT hides just
+//! the chat — the "collapse the chat, keep watching" gesture — and it
+//! re-pins the moment it's restored from the taskbar (see [`mirror_min`]).
+//! All geometry runs OS-side (`SetWindowPos` on both HWNDs, the
 //! chat viewport's included) in physical virtual-desktop pixels. The egui
 //! route — `ViewportCommand::OuterPosition` — is deliberately not used for
 //! following: it is denominated in points (per-viewport `pixels_per_point`,
@@ -395,14 +399,20 @@ pub(crate) fn frame_to_window(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MinAction {
     MinimizeChat,
-    MinimizePlayer,
     RestoreChat,
     RestorePlayer,
 }
 
-/// Mirror iconic state both ways, at most one action per change. `expected`
-/// is the last state this dock put (or observed) both windows in — without
-/// it, a user restoring one window would fight a per-tick re-minimize.
+/// Mirror iconic state with the player as the primary, at most one action
+/// per change. `expected` is the last pair-minimized state this dock put (or
+/// observed) the windows in — without it, a user restoring one window would
+/// fight a per-tick re-minimize.
+///
+/// Asymmetric by design: minimizing the PLAYER takes the pair down, and
+/// restoring either window brings the pair back — but minimizing the CHAT
+/// hides just the chat (the "collapse the chat, keep watching" gesture),
+/// leaving the player untouched. A solo-hidden chat re-pins to the player
+/// the moment it's restored from the taskbar.
 pub(crate) fn mirror_min(
     expected: Option<bool>,
     player_iconic: bool,
@@ -411,7 +421,9 @@ pub(crate) fn mirror_min(
     let exp = expected.unwrap_or(false);
     match (player_iconic, chat_iconic) {
         (true, false) if !exp => Some(MinAction::MinimizeChat),
-        (false, true) if !exp => Some(MinAction::MinimizePlayer),
+        // (false, true) with !exp is the chat hidden solo — deliberately no
+        // action, and `expected_min` stays false so a later player minimize/
+        // restore cycle behaves normally around it.
         (false, true) if exp => Some(MinAction::RestoreChat),
         (true, false) if exp => Some(MinAction::RestorePlayer),
         _ => None,
@@ -638,15 +650,11 @@ mod win {
             unsafe {
                 match act {
                     MinAction::MinimizeChat => _ = ShowWindow(ch, SW_MINIMIZE),
-                    MinAction::MinimizePlayer => _ = ShowWindow(ph, SW_MINIMIZE),
                     MinAction::RestoreChat => _ = ShowWindow(ch, SW_RESTORE),
                     MinAction::RestorePlayer => _ = ShowWindow(ph, SW_RESTORE),
                 }
             }
-            d.expected_min = Some(matches!(
-                act,
-                MinAction::MinimizeChat | MinAction::MinimizePlayer
-            ));
+            d.expected_min = Some(matches!(act, MinAction::MinimizeChat));
             // A restore can land a window anywhere; re-snap next tick.
             if matches!(act, MinAction::RestoreChat | MinAction::RestorePlayer) {
                 d.expected_player = None;
@@ -835,12 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn minimize_mirrors_both_ways_and_never_refires() {
+    fn minimize_mirrors_player_first_and_never_refires() {
         use MinAction::*;
         // Player minimized while the pair was up -> chat follows down.
         assert_eq!(mirror_min(Some(false), true, false), Some(MinimizeChat));
-        // Chat minimized -> player follows down.
-        assert_eq!(mirror_min(Some(false), false, true), Some(MinimizePlayer));
+        // Chat minimized solo -> player DELIBERATELY untouched (the
+        // "collapse the chat, keep watching" gesture).
+        assert_eq!(mirror_min(Some(false), false, true), None);
         // Pair is down, player restored -> chat follows up.
         assert_eq!(mirror_min(Some(true), false, true), Some(RestoreChat));
         // Pair is down, chat restored -> player follows up.
@@ -849,6 +858,11 @@ mod tests {
         // user restoring one window would be re-minimized every tick).
         assert_eq!(mirror_min(Some(true), true, true), None);
         assert_eq!(mirror_min(Some(false), false, false), None);
+        // Chat hidden solo, player then minimized and restored around it:
+        // both-down never acts, and the player coming back alone must NOT
+        // re-minimize it or drag the solo-hidden chat up.
+        assert_eq!(mirror_min(Some(false), true, true), None);
+        assert_eq!(mirror_min(Some(false), false, true), None);
         // Unknown starting state assumes "up".
         assert_eq!(mirror_min(None, true, false), Some(MinimizeChat));
     }
