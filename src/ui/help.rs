@@ -176,7 +176,7 @@ impl StreamArchiverApp {
         egui::Panel::left("help_toc")
             .resizable(true)
             .default_size(240.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.add_space(4.0);
                 // Right-to-left: the clear button claims its space FIRST, so
                 // the text edit's `desired_width(ui.available_width())` below
@@ -239,7 +239,7 @@ impl StreamArchiverApp {
                 });
             });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if state.selected == 0 {
                 about_panel(ui);
                 return;

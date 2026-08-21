@@ -67,20 +67,22 @@ impl StreamArchiverApp {
 /// re-registers the same `Arc` callback each time; the actual UI closure
 /// execution is what's decoupled from the caller's frame.
 ///
-/// `render` receives the raw `&egui::Context` (not a pre-built `Ui`) so it
-/// can use whichever container the window already used — `CentralPanel`,
-/// `egui::Window`, etc. — unchanged from before the migration.
+/// `render` receives the viewport pass's root `&mut Ui` (egui 0.36 hands
+/// deferred callbacks a `Ui`, not a `Context`): wrap content in
+/// `egui::CentralPanel::default().show(ui, …)` for the classic margin +
+/// window background, and reach the context via `ui.ctx()` for
+/// `egui::Window`/`Area` (those still root off a `&Context`).
 pub(super) fn show_deferred_popup<T: Send + 'static>(
     ctx: &egui::Context,
     id: egui::ViewportId,
     builder: egui::ViewportBuilder,
     state: Arc<Mutex<T>>,
     shared: PopupShared,
-    render: impl Fn(&egui::Context, &mut T, &PopupShared) + Send + Sync + 'static,
+    render: impl Fn(&mut egui::Ui, &mut T, &PopupShared) + Send + Sync + 'static,
 ) {
-    ctx.show_viewport_deferred(id, builder, move |ctx, _class| {
+    ctx.show_viewport_deferred(id, builder, move |ui, _class| {
         if let Ok(mut guard) = state.lock() {
-            render(ctx, &mut guard, &shared);
+            render(ui, &mut guard, &shared);
         }
     });
 }

@@ -3219,7 +3219,7 @@ impl eframe::App for StreamArchiverApp {
 
         egui::Panel::top("top")
             .resizable(false)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     // The brand label doubles as an app menu with the two
                     // quit actions, so quitting never REQUIRES the tray icon
@@ -3716,7 +3716,7 @@ impl eframe::App for StreamArchiverApp {
         // isn't enough, it wraps to a third row rather than overlapping
         // anything below it.
         if self.view == View::Streams {
-            egui::Panel::top("streams_toolbar").resizable(false).show_inside(ui, |ui| {
+            egui::Panel::top("streams_toolbar").resizable(false).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("➕ Stream")
@@ -3977,7 +3977,7 @@ impl eframe::App for StreamArchiverApp {
 
         egui::Panel::bottom("status")
             .resizable(false)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(if self.status.is_empty() {
                         "Ready."
@@ -3987,7 +3987,7 @@ impl eframe::App for StreamArchiverApp {
                 });
             });
 
-        let panel_resp = egui::CentralPanel::default().show_inside(ui, |ui| match self.view {
+        let panel_resp = egui::CentralPanel::default().show(ui, |ui| match self.view {
             View::Streams => self.channels_view(ui),
             View::Videos => self.videos_view(ui),
             View::Schedule => self.schedule_view(ui),

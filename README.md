@@ -97,6 +97,15 @@ readouts forever — and the clock restarts while you're still dragging one out,
 so a slow selection is never cut short. Whatever a view skipped catches up in
 one batch the moment the selection clears.
 
+The other half of the fix is egui 0.36: before it, text selection state was
+global to the whole app, and ANY window repainting deselected a highlight
+made in a different window — the root repaints once a second, so a selection
+in a popup (Issues, chat, Properties) was dead within a second of making it;
+the highlight only *looked* alive until your next mouse move or keypress
+repainted the popup, which read as "the UI cancels my selection the moment I
+touch anything." egui 0.36 keeps selection state per window, so a highlight
+now survives every other window's repaints and Ctrl+C works normally.
+
 
 ### The top bar
 

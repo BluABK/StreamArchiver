@@ -631,7 +631,13 @@ impl StreamArchiverApp {
                 .with_inner_size([480.0, 600.0]),
             popup_arc.clone(),
             shared,
-            move |ctx, popup, shared| {
+            move |vp_ui, popup, shared| {
+                // egui 0.36 hands deferred viewports a `&mut Ui`; the body
+                // below predates that and speaks `&Context`, so keep a real
+                // context handle under the old name — only the two panel
+                // `.show` calls need the `Ui` itself.
+                let ctx_owned = vp_ui.ctx().clone();
+                let ctx = &ctx_owned;
                 if ctx.input(|i| i.viewport().close_requested()) {
                     popup.closed = true;
                 }
@@ -662,8 +668,8 @@ impl StreamArchiverApp {
                 // `auto_shrink([false, false])`, so a bar added afterwards
                 // would simply have no height left to occupy.
                 if popup.send.is_some() {
-                    egui::TopBottomPanel::bottom(egui::Id::new(("chat_send_bar", popup.monitor_id))).show(
-                        ctx,
+                    egui::Panel::bottom(egui::Id::new(("chat_send_bar", popup.monitor_id))).show(
+                        vp_ui,
                         |ui| {
                             let core = shared.core.clone();
                             // Read off `popup` BEFORE the mutable borrow of
@@ -739,7 +745,7 @@ impl StreamArchiverApp {
                                 let had_token = egui::TextEdit::load_state(ctx, edit_id)
                                     .and_then(|st| st.cursor.char_range())
                                     .is_some_and(|r| {
-                                        let c = r.primary.index;
+                                        let c = r.primary.index.0; // CharIndex -> usize (egui 0.36)
                                         emote_token(&bar.draft, c).is_some()
                                             || mention_token(&bar.draft, c).is_some()
                                     });
@@ -779,7 +785,7 @@ impl StreamArchiverApp {
                                     ))
                                     .show(ui);
                                 let resp = out.response;
-                                let caret = out.cursor_range.map(|c| c.primary.index);
+                                let caret = out.cursor_range.map(|c| c.primary.index.0); // CharIndex -> usize (egui 0.36)
                                 let mut completion = emote_autocomplete(
                                     ui,
                                     bar,
@@ -973,7 +979,7 @@ impl StreamArchiverApp {
                         },
                     );
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(vp_ui, |ui| {
                     // ── Toolbar ──────────────────────────────────────────────
                     ui.horizontal(|ui| {
                         // Recording picker: only if >1 recording has a chat file.
@@ -1123,7 +1129,7 @@ impl StreamArchiverApp {
                             // adopts it — detach-on-quit deliberately leaves
                             // players running across restarts.
                             let resp = ui
-                                .add(egui::SelectableLabel::new(on, label))
+                                .add(egui::Button::selectable(on, label))
                                 .on_hover_text(
                                     "Dock this chat to the player window: video|chat move and \
                                      close together, like the website. Drag either window to \

@@ -1217,8 +1217,14 @@ fn viewer_graph_ui(
         .include_y(0.0)
         .x_axis_formatter(move |mark, _| fx(mark.value))
         .y_axis_formatter(|mark, _| grid::fmt_viewers(mark.value.max(0.0) as i64))
-        .label_formatter(move |name, v| {
-            format!("{name}\n{}: {}", fx(v.x), grid::fmt_viewers(v.y.max(0.0) as i64))
+        .label_formatter(move |hp| {
+            // egui_plot 0.37: hover gets a HoverPosition enum.
+            let (name, v) = match hp {
+                egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (*plot_name, *position),
+                egui_plot::HoverPosition::Elsewhere { position } => ("", *position),
+            };
+            Some(
+            format!("{name}\n{}: {}", fx(v.x), grid::fmt_viewers(v.y.max(0.0) as i64)))
         })
         .show(ui, |plot_ui| {
             // Category / collab change markers first (under the data).
@@ -1347,8 +1353,14 @@ fn viewer_graph_ui(
             .allow_scroll(false)
             .x_axis_formatter(move |mark, _| fx(mark.value))
             .y_axis_formatter(|mark, _| grid::fmt_viewers(mark.value.max(0.0) as i64))
-            .label_formatter(move |name, v| {
-                format!("{name}\n{}: {}", fx(v.x), grid::fmt_viewers(v.y.max(0.0) as i64))
+            .label_formatter(move |hp| {
+                // egui_plot 0.37: hover gets a HoverPosition enum.
+                let (name, v) = match hp {
+                    egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (*plot_name, *position),
+                    egui_plot::HoverPosition::Elsewhere { position } => ("", *position),
+                };
+                Some(
+                format!("{name}\n{}: {}", fx(v.x), grid::fmt_viewers(v.y.max(0.0) as i64)))
             })
             .show(ui, |plot_ui| {
                 let mut per_monitor: std::collections::BTreeMap<i64, Vec<[f64; 2]>> =

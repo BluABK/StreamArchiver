@@ -276,13 +276,18 @@ impl StreamArchiverApp {
                         format!("{:.0}", mark.value)
                     }
                 })
-                .label_formatter(move |name, value| {
+                .label_formatter(move |hp| {
+                    // egui_plot 0.37: hover gets a HoverPosition enum.
+                    let (name, value) = match hp {
+                        egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (*plot_name, *position),
+                        egui_plot::HoverPosition::Elsewhere { position } => ("", *position),
+                    };
                     let v = if is_bytes {
                         format!("{}/s", fmt_bytes(value.y.max(0.0) as i64))
                     } else {
                         format!("{:.0}", value.y)
                     };
-                    format!("{name}\n{:.0}s: {v}", value.x)
+                    Some(format!("{name}\n{:.0}s: {v}", value.x))
                 })
                 .show(ui, |plot_ui| {
                     for (name, pts) in series {

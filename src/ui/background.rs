@@ -1398,7 +1398,14 @@ impl StreamArchiverApp {
                     .include_y(0.0)
                     .x_axis_formatter(move |mark, _| fx(mark.value))
                     .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
-                    .label_formatter(move |name, v| format!("{name}\n{}: {:.1}%", fx(v.x), v.y))
+                    .label_formatter(move |hp| {
+                        // egui_plot 0.37: hover gets a HoverPosition enum.
+                        let (name, v) = match hp {
+                            egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (*plot_name, *position),
+                            egui_plot::HoverPosition::Elsewhere { position } => ("", *position),
+                        };
+                        Some(format!("{name}\n{}: {:.1}%", fx(v.x), v.y))
+                    })
                     .show(ui, |plot_ui| {
                         for p in Platform::ALL {
                             let Some(buckets) = per_platform.get(p.as_str()) else { continue };
@@ -1435,8 +1442,14 @@ impl StreamArchiverApp {
                     .include_y(0.0)
                     .x_axis_formatter(move |mark, _| fx(mark.value))
                     .y_axis_formatter(|mark, _| format!("{:.0}", mark.value))
-                    .label_formatter(move |name, v| {
-                        format!("{name}\n{}: {:.0} requests / {bucket_label}", fx(v.x), v.y)
+                    .label_formatter(move |hp| {
+                        // egui_plot 0.37: hover gets a HoverPosition enum.
+                        let (name, v) = match hp {
+                            egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (*plot_name, *position),
+                            egui_plot::HoverPosition::Elsewhere { position } => ("", *position),
+                        };
+                        Some(
+                        format!("{name}\n{}: {:.0} requests / {bucket_label}", fx(v.x), v.y))
                     })
                     .show(ui, |plot_ui| {
                         for (method, buckets) in &per_method {
@@ -2171,8 +2184,14 @@ Media that is gone stops counting:                          immediately when the
                 // be moved into both formatters.
                 .x_axis_formatter(move |mark, _| fx(mark.value))
                 .y_axis_formatter(|mark, _| format!("{}/s", fmt_bytes(mark.value as i64)))
-                .label_formatter(move |name, v| {
-                    format!("{name}\n{}: {}/s", fx(v.x), fmt_bytes(v.y as i64))
+                .label_formatter(move |hp| {
+                    // egui_plot 0.37: hover gets a HoverPosition enum.
+                    let (name, v) = match hp {
+                        egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (*plot_name, *position),
+                        egui_plot::HoverPosition::Elsewhere { position } => ("", *position),
+                    };
+                    Some(
+                    format!("{name}\n{}: {}/s", fx(v.x), fmt_bytes(v.y as i64)))
                 })
                 .show(ui, |plot_ui| {
                     for k in NetKind::NETWORK {

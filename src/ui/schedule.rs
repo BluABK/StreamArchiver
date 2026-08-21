@@ -805,7 +805,7 @@ impl StreamArchiverApp {
             self.schedule_nav_dates(mode, anchor, &collide);
 
         // ── Center: the calendar for the selected mode. ──
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Header: view mode + navigation + title + collision controls.
             self.schedule_toolbar(
                 ui,
@@ -1090,7 +1090,7 @@ impl StreamArchiverApp {
             .resizable(true)
             .default_size(210.0)
             .size_range(160.0..=380.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.heading("Channels");
                 ui.add_space(2.0);
@@ -3027,11 +3027,15 @@ impl StreamArchiverApp {
                 .with_inner_size([480.0, 360.0]),
             state.clone(),
             shared,
-            move |ctx, s, _shared| {
+            move |vp_ui, s, _shared| {
+                // egui 0.36: deferred viewports hand out a `&mut Ui`; keep a
+                // Context handle for the closure body's ctx.* calls.
+                let ctx_owned = vp_ui.ctx().clone();
+                let ctx = &ctx_owned;
                 if ctx.input(|i| i.viewport().close_requested()) {
                     s.closed = true;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(vp_ui, |ui| {
                     if entries.is_empty() {
                         ui.label("No streams scheduled this day.");
                         return;

@@ -2948,11 +2948,15 @@ impl StreamArchiverApp {
                 .with_resizable(false),
             state.clone(),
             shared,
-            |ctx, d, _shared| {
+            |vp_ui, d, _shared| {
+                // egui 0.36: deferred viewports hand out a `&mut Ui`; keep a
+                // Context handle for the closure body's ctx.* calls.
+                let ctx_owned = vp_ui.ctx().clone();
+                let ctx = &ctx_owned;
                 if ctx.input(|i| i.viewport().close_requested()) {
                     d.closed = true;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(vp_ui, |ui| {
                     ui.label("Preset name:");
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut d.name)
@@ -3664,7 +3668,7 @@ impl StreamArchiverApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     s.closed = true;
                 }
-                egui::TopBottomPanel::bottom("monitor_form_bottom_bar").show(ctx, |ui| {
+                egui::Panel::bottom("monitor_form_bottom_bar").show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {

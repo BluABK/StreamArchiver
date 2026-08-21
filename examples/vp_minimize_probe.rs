@@ -67,7 +67,6 @@ struct App {
 }
 
 impl App {
-    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     fn declare_child(&self, ctx: &egui::Context) {
         let calls = self.child_calls.clone();
         ctx.show_viewport_deferred(
@@ -77,7 +76,7 @@ impl App {
                 .with_inner_size([320.0, 200.0]),
             move |ui, _class| {
                 *calls.lock().unwrap() += 1;
-                egui::CentralPanel::default().show(ui.ctx(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.label("probe child");
                 });
             },

@@ -138,19 +138,19 @@ impl StreamArchiverApp {
         egui::Panel::bottom("video_add_panel")
             .resizable(true)
             .default_size(300.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 // Per-platform defaults on the right; download form on the left.
                 egui::Panel::right("video_defaults_panel")
                     .resizable(true)
                     .default_size(360.0)
-                    .show_inside(ui, |ui| {
+                    .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("video_defaults_scroll")
                             .show(ui, |ui| {
                                 self.video_defaults_editor(ui);
                             });
                     });
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("video_form_scroll")
                         .show(ui, |ui| {
@@ -158,7 +158,7 @@ impl StreamArchiverApp {
                         });
                 });
             });
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             self.videos_list(ui);
         });
     }

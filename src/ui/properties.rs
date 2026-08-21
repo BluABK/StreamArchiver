@@ -605,11 +605,11 @@ impl InstancePropsPopupState {
                             continue;
                         }
                         let resp = match provider {
-                            EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                            EmoteProvider::SevenTv => ui.add(egui::Button::image(
                                 egui::Image::from_texture(&ptex.seventv)
                                     .fit_to_exact_size(egui::vec2(18.0, 18.0)),
                             )),
-                            EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                            EmoteProvider::Bttv => ui.add(egui::Button::image(
                                 egui::Image::from_texture(&ptex.bttv)
                                     .fit_to_exact_size(egui::vec2(18.0, 18.0)),
                             )),
@@ -1230,11 +1230,11 @@ impl ChannelPropsPopupState {
                             continue;
                         }
                         let resp = match provider {
-                            EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                            EmoteProvider::SevenTv => ui.add(egui::Button::image(
                                 egui::Image::from_texture(&ptex.seventv)
                                     .fit_to_exact_size(egui::vec2(18.0, 18.0)),
                             )),
-                            EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                            EmoteProvider::Bttv => ui.add(egui::Button::image(
                                 egui::Image::from_texture(&ptex.bttv)
                                     .fit_to_exact_size(egui::vec2(18.0, 18.0)),
                             )),
@@ -2834,7 +2834,11 @@ impl StreamArchiverApp {
                 .with_inner_size([560.0, 600.0]),
             view,
             shared,
-            move |ctx, v, shared| {
+            move |vp_ui, v, shared| {
+                // egui 0.36: deferred viewports hand out a `&mut Ui`; keep a
+                // Context handle for the closure body's ctx.* calls.
+                let ctx_owned = vp_ui.ctx().clone();
+                let ctx = &ctx_owned;
                 if ctx.input(|i| i.viewport().close_requested()) {
                     v.closed = true;
                 }
@@ -2864,7 +2868,7 @@ impl StreamArchiverApp {
                 let mut pending_properties: Option<ViewerEmote> = None;
                 let mut clear_properties = false;
 
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(vp_ui, |ui| {
                     if v.stale {
                         // Assets were refetched behind this window; the lists are a
                         // snapshot from when it opened. Amber, matching other

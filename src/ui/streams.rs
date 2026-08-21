@@ -484,7 +484,7 @@ impl StreamArchiverApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     s.closed = true;
                 }
-                egui::TopBottomPanel::bottom("channel_form_bottom_bar").show(ctx, |ui| {
+                egui::Panel::bottom("channel_form_bottom_bar").show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -7002,14 +7002,18 @@ impl StreamArchiverApp {
                 .with_inner_size([620.0, 560.0]),
             state.clone(),
             shared,
-            |ctx, dialog, _shared| {
+            |vp_ui, dialog, _shared| {
+                // egui 0.36: deferred viewports hand out a `&mut Ui`; keep a
+                // Context handle for the closure body's ctx.* calls.
+                let ctx_owned = vp_ui.ctx().clone();
+                let ctx = &ctx_owned;
                 if ctx.input(|i| i.viewport().close_requested()) {
                     dialog.closed = true;
                 }
                 let existing_channels = dialog.existing_channels.clone();
 
                 if !dialog.loaded {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         match &*dialog.load.lock().unwrap() {
                             ImportLoadState::Loading => {
                                 ui.horizontal(|ui| {
@@ -7059,7 +7063,7 @@ impl StreamArchiverApp {
                     .count();
                 let pending = dialog.rows.iter().filter(|r| r.guess_pending).count();
 
-                egui::TopBottomPanel::bottom("import_bottom_bar").show(ctx, |ui| {
+                egui::Panel::bottom("import_bottom_bar").show(vp_ui, |ui| {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
@@ -7083,7 +7087,7 @@ impl StreamArchiverApp {
                     ui.add_space(6.0);
                 });
 
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(vp_ui, |ui| {
                     ui.horizontal(|ui| {
                         let already_count = dialog.rows.iter().filter(|r| r.already).count();
                         ui.label(format!("{} channels found.", dialog.rows.len()));

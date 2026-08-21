@@ -3082,12 +3082,12 @@ impl StreamArchiverApp {
                     || !s.issues_head_mismatch.is_empty()
                     || !s.issues_gap_splice.is_empty();
                 if any_sections {
-                    egui::TopBottomPanel::top("issues_sections")
+                    egui::Panel::top("issues_sections")
                         .resizable(true)
-                        .default_height(260.0)
+                        .default_size(260.0)
                         // Floor keeps a dragged-shut panel grabbable again;
                         // ceiling keeps it from swallowing the whole window.
-                        .height_range(60.0..=600.0)
+                        .size_range(60.0..=600.0)
                         .show(ctx, |ui| {
                             egui::ScrollArea::vertical()
                                 .id_salt("issues_top_sections")
@@ -3104,7 +3104,7 @@ impl StreamArchiverApp {
                 }
                 let filter_lc = s.filter.to_lowercase();
                 let (shown, total) = s.issues_visible_count(&mon_info, &filter_lc);
-                egui::TopBottomPanel::top("issues_toolbar").show(ctx, |ui| {
+                egui::Panel::top("issues_toolbar").show(ctx, |ui| {
                     s.issues_toolbar(
                         ui,
                         n_empty,

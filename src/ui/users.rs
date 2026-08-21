@@ -337,7 +337,7 @@ impl StreamArchiverApp {
         egui::Panel::left("users_list")
             .resizable(true)
             .default_size(240.0)
-            .show_inside(ui, |ui| self.user_list(ui));
+            .show(ui, |ui| self.user_list(ui));
 
         match self.users_detail.take() {
             Some(mut detail) => {
