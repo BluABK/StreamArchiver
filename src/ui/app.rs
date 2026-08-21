@@ -23,6 +23,7 @@ impl StreamArchiverApp {
         ui_rx: Receiver<UiCommand>,
         heartbeat: crate::watchdog::Heartbeat,
         egui_ctx: egui::Context,
+        start_hidden: bool,
     ) -> StreamArchiverApp {
         let events_rx = core.subscribe();
         let autostart = AutoStart::new();
@@ -681,6 +682,9 @@ impl StreamArchiverApp {
             quitting: false,
             heartbeat,
             startup_window_size_checked: false,
+            startup_frames_painted: 0,
+            startup_revealed: false,
+            start_hidden,
             view: View::Streams,
             help: None,
             topbar: TopBarLayout::default(),

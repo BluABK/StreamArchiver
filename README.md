@@ -41,6 +41,11 @@ cargo build --release
 ./target/release/streamarchiver --hidden   # start straight to the tray (used by autostart)
 ```
 
+The window stays invisible until its first frames have actually painted and
+settled, then appears fully drawn — it is never shown as a bare white
+surface being resized through startup (which used to read as rapid
+flashing, a hazard for photosensitive users).
+
 Right-click the tray icon → **Open** / **Quit (keep recording)** / **Quit &
 stop recordings** — or click the **StreamArchiver** label in the window's top
 bar for the same two quit actions (handy when a notification storm makes the

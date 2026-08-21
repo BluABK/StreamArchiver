@@ -251,7 +251,14 @@ fn main() -> Result<()> {
             ))
             .with_inner_size([960.0, 600.0])
             .with_min_inner_size([680.0, 420.0])
-            .with_visible(!start_hidden)
+            // ALWAYS created invisible — including normal launches. The
+            // window used to appear immediately and sit as an unpainted
+            // white surface being resized/re-positioned through startup's
+            // heavy first frames, which read as rapid white flashing (a
+            // photosensitivity hazard). `logic()` reveals it once the first
+            // frames have painted (see `startup_revealed` in ui.rs);
+            // `--hidden` launches skip the reveal and stay in the tray.
+            .with_visible(false)
             .with_icon(egui::IconData {
                 rgba,
                 width: w,
@@ -312,6 +319,7 @@ fn main() -> Result<()> {
                 ui_rx,
                 heartbeat,
                 cc.egui_ctx.clone(),
+                start_hidden,
             )))
         }),
     )

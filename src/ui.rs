@@ -1845,6 +1845,21 @@ pub struct StreamArchiverApp {
     /// bug this flag guards against. `false` until the fix has been checked
     /// (and applied, if needed) once.
     startup_window_size_checked: bool,
+    /// The main window is created INVISIBLE (`with_visible(false)` in
+    /// main.rs) and only shown from `logic()` once the first frames have
+    /// painted and settled. Shown from creation, the window used to sit as
+    /// an unpainted white surface through startup's heavy first frames —
+    /// repositioned/resized several times by state restore and the size
+    /// self-heal above — which read as rapid white flashing (a real problem
+    /// for photosensitive users). Counts frames; reveal happens once, at
+    /// [`STARTUP_REVEAL_FRAME`].
+    startup_frames_painted: u8,
+    /// True once the reveal decision was made (shown, or deliberately kept
+    /// hidden for a `--hidden`/tray start) — the counter above stops there.
+    startup_revealed: bool,
+    /// `--hidden`/`-Embedding` launch: never auto-reveal; the tray "Open"
+    /// (→ [`raise_window`]) shows the window on demand instead.
+    start_hidden: bool,
 
     view: View,
     /// Help/About view state, built lazily on first open (parses the embedded
@@ -3098,6 +3113,31 @@ impl eframe::App for StreamArchiverApp {
                     height = rect.height(),
                     "startup: restored window size was degenerate — reset to default"
                 );
+            }
+        }
+
+        // ── One-shot startup reveal ─────────────────────────────────────
+        // The window is created invisible (main.rs) and shown only here,
+        // after the first frames have painted and geometry restore/self-heal
+        // has settled — before this, launch showed an unpainted white
+        // surface being flashed and re-positioned for seconds (a genuine
+        // photosensitivity hazard). Commands sent during frame N apply after
+        // that frame presents, so revealing at frame 3 guarantees real
+        // content is on the swapchain by the time the window appears.
+        if !self.startup_revealed {
+            self.startup_frames_painted = self.startup_frames_painted.saturating_add(1);
+            const STARTUP_REVEAL_FRAME: u8 = 3;
+            if self.startup_frames_painted >= STARTUP_REVEAL_FRAME {
+                self.startup_revealed = true;
+                if !self.start_hidden {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            } else {
+                // Idle frames tick at the 1 fps repaint floor — without this
+                // the reveal could lag seconds behind launch. Back-to-back
+                // repaints make the settle frames take milliseconds.
+                ctx.request_repaint();
             }
         }
 
