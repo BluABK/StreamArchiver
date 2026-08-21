@@ -73,6 +73,14 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ## Using it
 
+**📌 Add to Start Menu** (Settings → Interface, under App icon) creates — or
+repairs — a Start Menu shortcut pointing at the exact binary currently
+running, with its folder as the working directory. It's purely a launcher:
+toasts and the taskbar identity never depended on a shortcut (the app
+registers its own AppUserModelID at startup), so there is nothing else to
+install. Click it again after moving or rebuilding the exe and the shortcut
+follows.
+
 **Selected text stays selected.** Every periodic refresh in the app — the
 Issues/Warnings rescans, the Videos and Process Manager lists, the I/O and
 stats readouts, the log tail, a live chat window's own tail — pauses while you

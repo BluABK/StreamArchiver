@@ -2099,6 +2099,22 @@ impl StreamArchiverApp {
                 }
             });
 
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("📌 Add to Start Menu")
+                    .on_hover_text(
+                        "Create (or repair) a Start Menu shortcut to this exact binary —                          %APPDATA%\\…\\Start Menu\\Programs\\StreamArchiver.lnk, working                          directory set to the exe's folder. Purely a launcher: toasts and                          the taskbar identity never depended on a shortcut (the app                          registers its own AppUserModelID at startup). Safe to click again                          after moving or rebuilding the exe — the shortcut is overwritten                          to point at wherever the app is running from right now.",
+                    )
+                    .clicked()
+                {
+                    match crate::platform::create_start_menu_shortcut() {
+                        Ok(p) => self.status = format!("Start Menu shortcut created: {}", p.display()),
+                        Err(e) => self.status = format!("Start Menu shortcut failed: {e}"),
+                    }
+                }
+            });
+
             }
     }
 

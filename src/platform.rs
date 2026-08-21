@@ -1690,3 +1690,66 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 }
+
+/// Create (or overwrite) the app's Start Menu shortcut —
+/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs\StreamArchiver.lnk`,
+/// pointing at the currently-running exe with its directory as the working
+/// dir.
+///
+/// A shortcut is purely a LAUNCHER convenience here: toast identity does not
+/// depend on it (`toast_activation` registers the AUMID in HKCU precisely to
+/// avoid the classic stamped-shortcut route), and the process sets its own
+/// explicit AppUserModelID at startup, so a shortcut-launched instance gets
+/// the same taskbar/toast identity as any other. Overwriting on every call is
+/// the point — re-running it heals a shortcut left pointing at a moved or
+/// renamed binary.
+#[cfg(windows)]
+pub fn create_start_menu_shortcut() -> Result<std::path::PathBuf, String> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, CoCreateInstance, COINIT_APARTMENTTHREADED, CoInitializeEx,
+        CoUninitialize, IPersistFile,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{HSTRING, Interface, PCWSTR};
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let appdata = std::env::var("APPDATA").map_err(|e| format!("APPDATA: {e}"))?;
+    let dir = std::path::Path::new(&appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+    let lnk = dir.join("StreamArchiver.lnk");
+
+    unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| -> Result<(), String> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("ShellLink: {e}"))?;
+            link.SetPath(PCWSTR(HSTRING::from(exe.as_os_str()).as_ptr()))
+                .map_err(|e| format!("SetPath: {e}"))?;
+            if let Some(parent) = exe.parent() {
+                link.SetWorkingDirectory(PCWSTR(HSTRING::from(parent.as_os_str()).as_ptr()))
+                    .map_err(|e| format!("SetWorkingDirectory: {e}"))?;
+            }
+            link.SetDescription(PCWSTR(
+                HSTRING::from("StreamArchiver — stream capture & archive").as_ptr(),
+            ))
+            .map_err(|e| format!("SetDescription: {e}"))?;
+            let file: IPersistFile = link.cast().map_err(|e| format!("IPersistFile: {e}"))?;
+            file.Save(PCWSTR(HSTRING::from(lnk.as_os_str()).as_ptr()), true)
+                .map_err(|e| format!("Save: {e}"))?;
+            Ok(())
+        })();
+        if com.is_ok() {
+            CoUninitialize();
+        }
+        result?;
+    }
+    Ok(lnk)
+}
+
+#[cfg(not(windows))]
+pub fn create_start_menu_shortcut() -> Result<std::path::PathBuf, String> {
+    Err("Start Menu shortcuts are Windows-only".into())
+}
