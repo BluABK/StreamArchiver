@@ -324,6 +324,13 @@ impl StreamArchiverApp {
                 if v.is_empty() { "right".into() } else { v }
             },
             chat_dock_on_play: setting_or_empty(&core, K_CHAT_DOCK_ON_PLAY) != "0",
+            player_close_on_end: {
+                let on = setting_or_empty(&core, K_PLAYER_CLOSE_ON_END) == "1";
+                // Push into window_dock's global — the player reaper threads
+                // read it there (no store handle in that module).
+                crate::window_dock::set_close_player_on_end(on);
+                on
+            },
             // Tri-state like media_player_path: the hover promises "leave
             // blank to restore the old behavior (no title override)", which
             // only works if a saved blank survives the next load.
@@ -2152,6 +2159,7 @@ impl StreamArchiverApp {
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
             (K_CHAT_DOCK_SIDE, Self::default_as_empty(s.chat_dock_side.trim(), "right")),
             (K_CHAT_DOCK_ON_PLAY, if s.chat_dock_on_play { "1" } else { "0" }),
+            (K_PLAYER_CLOSE_ON_END, if s.player_close_on_end { "1" } else { "0" }),
             (K_LIVE_TITLE_TEMPLATE, s.live_title_template.trim()),
             (K_LIVE_TITLE_AUTO_UPDATE, if s.live_title_auto_update { "1" } else { "0" }),
             (K_MUTE_COLLAB_INSTANCES, if s.mute_collab_instances { "1" } else { "0" }),
@@ -2211,6 +2219,9 @@ impl StreamArchiverApp {
             self.status = format!("Error saving settings: {e}");
             return;
         }
+        // Live-apply: the player reaper threads read this from a window_dock
+        // global (that module has no store handle).
+        crate::window_dock::set_close_player_on_end(self.settings.player_close_on_end);
         // Trigger rules serialize to JSON, so they can't ride the &str pairs.
         if let Err(e) =
             crate::triggers::save_global_rules(&self.core.store, &self.settings.trigger_rules)

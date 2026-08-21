@@ -879,6 +879,10 @@ pub(super) struct ChatPopup {
     /// held, gives a completed selection time to survive long enough to
     /// Ctrl+C before the next message re-engages the snap.
     pub(super) pause_stick_until: f64,
+    /// Transient outcome of the last 🔗 dock attempt that could not bind (no
+    /// registered player and rediscovery found nothing) — rendered as a ⚠
+    /// beside the toggle until a dock succeeds or the user undocks.
+    pub(super) dock_notice: Option<String>,
 }
 
 /// The deferred viewport one monitor's chat window lives in.

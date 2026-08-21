@@ -745,6 +745,11 @@ pub(super) fn spawn_logged(
                     let _ = child.wait();
                     note_player_closed(mid);
                     crate::window_dock::note_player_exited(mid, pid);
+                    // Opt-in: mpv runs --keep-open=yes, so when the feed
+                    // process ends (stream over) the window would sit on the
+                    // last frame forever — close tag-matched windows for
+                    // this monitor if the setting says so.
+                    crate::window_dock::maybe_close_players_on_end(mid);
                 });
             }
             None
@@ -999,7 +1004,14 @@ fn run_live_title_updater(
                     title_seen = row.last_title.clone();
                 }
                 (
-                    mpv_live_title_value(&template, &row.channel.name, &title_seen, &row.last_game),
+                    // Tag travels on every push — the Streamlink path's mpv
+                    // has no tag at launch (Streamlink owns its argv), so the
+                    // first IPC title update is what tags that window.
+                    format!(
+                        "{}{}",
+                        mpv_live_title_value(&template, &row.channel.name, &title_seen, &row.last_game),
+                        crate::window_dock::player_title_marker(monitor_id),
+                    ),
                     static_live_title(&template, &row.channel.name, &title_seen, &row.last_game),
                 )
             }
@@ -1038,7 +1050,16 @@ fn apply_live_title_and_spawn_updater(
     if !player_is_mpv(player) || template.is_empty() {
         return;
     }
-    cmd.arg(format!("--title={}", mpv_live_title_value(template, channel, last_title, last_game)));
+    // The invisible tag is what lets the app recognize this window again
+    // after a restart (adopt via the chat 🔗 toggle, the Background view's
+    // player list, close-on-end) — window-title surface only, never
+    // force-media-title, where libass could render the zero-width chars as
+    // boxes in the OSC.
+    cmd.arg(format!(
+        "--title={}{}",
+        mpv_live_title_value(template, channel, last_title, last_game),
+        crate::window_dock::player_title_marker(monitor_id),
+    ));
     if !auto_update {
         return;
     }

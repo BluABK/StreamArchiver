@@ -291,6 +291,181 @@ pub fn take_chat_close_requests() -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Player-window identity + rediscovery (survives app restarts)
+// ---------------------------------------------------------------------------
+
+/// "Close the player window when its stream feed ends" — pushed in from the
+/// settings form (window_dock has no store handle). Read by
+/// [`maybe_close_players_on_end`] from the player reaper threads.
+static CLOSE_PLAYER_ON_END: AtomicBool = AtomicBool::new(false);
+
+pub fn set_close_player_on_end(on: bool) {
+    CLOSE_PLAYER_ON_END.store(on, Ordering::Relaxed);
+}
+
+/// Invisible monitor-id tag appended to every mpv WINDOW title this app
+/// sets: a `U+2060` (word joiner) sentinel, then the id's bits LSB-first as
+/// `U+200C` (1) / `U+200B` (0). Title bars render all three as nothing, but
+/// the tag lets the app recognize ITS OWN players again after a restart —
+/// the in-memory registry is gone, yet detach-on-quit deliberately leaves
+/// the processes running. Distinct sentinel from the chat-window tag (a
+/// bare zero-width run, no `U+2060`), so the two can never cross-match.
+/// Empty for synthetic rows (`monitor_id <= 0`) — nothing to rediscover.
+pub fn player_title_marker(monitor_id: i64) -> String {
+    if monitor_id <= 0 {
+        return String::new();
+    }
+    let mut t = String::from('\u{2060}');
+    let mut v = monitor_id as u64;
+    loop {
+        t.push(if v & 1 == 1 { '\u{200C}' } else { '\u{200B}' });
+        v >>= 1;
+        if v == 0 {
+            break;
+        }
+    }
+    t
+}
+
+/// Inverse of [`player_title_marker`]: the monitor id tagged into a window
+/// title, if any. Scans from the LAST sentinel so a pathological title that
+/// happens to contain an earlier `U+2060` still decodes the app's own tag.
+pub fn decode_player_marker(title: &str) -> Option<i64> {
+    let (idx, _) = title.char_indices().rfind(|(_, c)| *c == '\u{2060}')?;
+    let mut v: u64 = 0;
+    let mut bits = 0u32;
+    for c in title[idx..].chars().skip(1) {
+        match c {
+            '\u{200B}' => bits += 1,
+            '\u{200C}' => {
+                v |= 1 << (bits.min(62));
+                bits += 1;
+            }
+            _ => break,
+        }
+        if bits > 62 {
+            return None; // garbage run, not ours
+        }
+    }
+    (bits > 0 && v <= i64::MAX as u64).then_some(v as i64).filter(|&m| m > 0)
+}
+
+/// One top-level mpv window found on screen, matched back to a monitor
+/// where possible (exact title tag first, then channel-name-in-title for
+/// players spawned before the tag existed / by Streamlink before its first
+/// IPC title push).
+#[derive(Clone, Debug)]
+pub struct PlayerWindow {
+    pub hwnd: isize,
+    pub pid: u32,
+    pub title: String,
+    /// `Some` = recognized as (probably) this app's player for that monitor.
+    pub monitor_id: Option<i64>,
+    /// True when the match came from the exact invisible tag rather than a
+    /// channel-name heuristic.
+    pub exact: bool,
+}
+
+/// Enumerate mpv-class top-level windows and match them to monitors.
+/// `channels` is the app's `(monitor_id, channel name)` list for the fuzzy
+/// tier. Windows matching neither tier are returned with `monitor_id: None`
+/// so the UI can show them greyed out — they are NEVER auto-closed.
+pub fn list_player_windows(channels: &[(i64, String)]) -> Vec<PlayerWindow> {
+    #[cfg(windows)]
+    {
+        win::list_player_windows(channels)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = channels;
+        Vec::new()
+    }
+}
+
+/// Find a running player window for this monitor — exact tag first, then
+/// title-contains-channel-name — skipping pids already registered (to any
+/// monitor: never steal a tracked player). Used by the chat 🔗 toggle to
+/// re-bind to a player that survived an app restart.
+pub fn discover_player(monitor_id: i64, channel: &str) -> Option<PlayerWindow> {
+    let all = list_player_windows(&[(monitor_id, channel.to_string())]);
+    let registered: std::collections::HashSet<u32> = PLAYERS
+        .lock()
+        .unwrap()
+        .values()
+        .flat_map(|v| v.iter().map(|p| p.root_pid))
+        .collect();
+    all.into_iter()
+        .filter(|w| w.monitor_id == Some(monitor_id) && !registered.contains(&w.pid))
+        .max_by_key(|w| w.exact)
+}
+
+/// Register a player process this app did NOT spawn (rediscovered after a
+/// restart) and watch it: a thread waits on the process handle and runs the
+/// normal exit bookkeeping, so docking, `player_available` and
+/// close-with-player all behave exactly as for an own spawn. Returns false
+/// when the process can't be opened (already gone / access denied).
+pub fn adopt_external_player(monitor_id: i64, pid: u32) -> bool {
+    if monitor_id <= 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let Some(handle) = win::open_process_for_wait(pid) else { return false };
+        note_player_spawned(monitor_id, pid, false);
+        std::thread::Builder::new()
+            .name("player-adopt-watch".into())
+            .spawn(move || {
+                win::wait_process(handle);
+                note_player_exited(monitor_id, pid);
+            })
+            .ok();
+        tracing::info!(monitor_id, pid, "chat dock: adopted a running player window");
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Gracefully close a player window (WM_CLOSE — same as clicking its ✕;
+/// mpv treats it as quit). Used by the Background view's player list.
+pub fn close_player_window(hwnd: isize) {
+    #[cfg(windows)]
+    win::post_close(hwnd);
+    #[cfg(not(windows))]
+    let _ = hwnd;
+}
+
+/// Player-reaper hook: the feed for `monitor_id` ended (Streamlink/yt-dlp
+/// exited). With the opt-in setting on, close any window carrying this
+/// monitor's EXACT title tag — with `--keep-open=yes` mpv otherwise sits on
+/// the last frame forever, and ended players pile up across days. The
+/// channel-name heuristic is deliberately NOT used here: it may only ever
+/// pick windows for the user to review, never feed an automatic close (a
+/// personal mpv playing an archived file has the channel name in its title
+/// too).
+pub fn maybe_close_players_on_end(monitor_id: i64) {
+    if monitor_id <= 0 || !CLOSE_PLAYER_ON_END.load(Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        for w in win::list_player_windows(&[]) {
+            if w.exact && w.monitor_id == Some(monitor_id) {
+                tracing::info!(
+                    monitor_id,
+                    pid = w.pid,
+                    "player: stream feed ended — closing its player window (setting)"
+                );
+                win::post_close(w.hwnd);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure geometry + decision logic (unit-tested; no Win32 anywhere below until
 // the #[cfg(windows)] section)
 // ---------------------------------------------------------------------------
@@ -453,9 +628,9 @@ mod win {
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-        IsWindowVisible, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE,
-        SW_RESTORE,
+        EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+        IsIconic, IsWindow, IsWindowVisible, PostMessageW, SetWindowPos, ShowWindow,
+        SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
     };
     use windows::core::BOOL;
 
@@ -510,6 +685,84 @@ mod win {
             );
         }
         frame_rect(h)
+    }
+
+    /// Enumerate visible top-level windows of window class `mpv` and match
+    /// each to a monitor: the exact invisible title tag first
+    /// ([`decode_player_marker`]), else title-contains-channel-name against
+    /// `channels`. See [`super::list_player_windows`].
+    pub(super) fn list_player_windows(channels: &[(i64, String)]) -> Vec<PlayerWindow> {
+        struct Ctx<'a> {
+            channels: &'a [(i64, String)],
+            out: Vec<PlayerWindow>,
+        }
+        let mut ctx = Ctx { channels, out: Vec::new() };
+        unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
+            let ctx = unsafe { &mut *(lp.0 as *mut Ctx) };
+            if !unsafe { IsWindowVisible(h) }.as_bool() {
+                return BOOL(1);
+            }
+            let mut cls = [0u16; 32];
+            let n = unsafe { GetClassNameW(h, &mut cls) };
+            if n <= 0 || String::from_utf16_lossy(&cls[..n as usize]) != "mpv" {
+                return BOOL(1);
+            }
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+            if pid == 0 {
+                return BOOL(1);
+            }
+            let mut buf = [0u16; 512];
+            let len = unsafe { GetWindowTextW(h, &mut buf) };
+            let title = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+            let mut exact = false;
+            let monitor_id = match decode_player_marker(&title) {
+                Some(mid) => {
+                    exact = true;
+                    Some(mid)
+                }
+                None => {
+                    let tl = title.to_lowercase();
+                    ctx.channels
+                        .iter()
+                        .filter(|(_, name)| !name.trim().is_empty())
+                        .find(|(_, name)| tl.contains(&name.to_lowercase()))
+                        .map(|(mid, _)| *mid)
+                }
+            };
+            ctx.out.push(PlayerWindow { hwnd: h.0 as isize, pid, title, monitor_id, exact });
+            BOOL(1)
+        }
+        unsafe {
+            let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+        }
+        ctx.out
+    }
+
+    /// `OpenProcess(SYNCHRONIZE)` for an adopt-watch. `None` when the
+    /// process is already gone (or inaccessible).
+    pub(super) fn open_process_for_wait(pid: u32) -> Option<isize> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+        unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.ok().map(|h| h.0 as isize)
+    }
+
+    /// Block until the adopted process exits, then release the handle.
+    pub(super) fn wait_process(handle: isize) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+        let h = HANDLE(handle as *mut core::ffi::c_void);
+        unsafe {
+            WaitForSingleObject(h, INFINITE);
+            let _ = CloseHandle(h);
+        }
+    }
+
+    /// Graceful close — identical to the user clicking the window's ✕.
+    pub(super) fn post_close(raw: isize) {
+        use windows::Win32::Foundation::WPARAM;
+        unsafe {
+            let _ = PostMessageW(Some(hwnd(raw)), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
     }
 
     /// Find this process's chat popup window by exact title, excluding HWNDs
@@ -865,6 +1118,25 @@ mod tests {
         assert_eq!(mirror_min(Some(false), false, true), None);
         // Unknown starting state assumes "up".
         assert_eq!(mirror_min(None, true, false), Some(MinimizeChat));
+    }
+
+    #[test]
+    fn player_marker_roundtrips_and_never_matches_chat_tags() {
+        for mid in [1i64, 2, 3, 121, 208, 9_999_999, i64::MAX / 2] {
+            let t = format!("Limes - some title ${{time-pos}}{}", player_title_marker(mid));
+            assert_eq!(decode_player_marker(&t), Some(mid), "mid {mid}");
+        }
+        // Synthetic rows carry no tag.
+        assert_eq!(player_title_marker(0), "");
+        assert_eq!(player_title_marker(-3), "");
+        // A chat window's tag is a bare zero-width run with NO U+2060
+        // sentinel — must never decode as a player tag.
+        let chat = "💬  Chat — Limes\u{200C}\u{200B}\u{200C}";
+        assert_eq!(decode_player_marker(chat), None);
+        // Plain titles decode to nothing.
+        assert_eq!(decode_player_marker("Limes - mpv"), None);
+        // A stray sentinel with no bit run decodes to nothing.
+        assert_eq!(decode_player_marker("weird\u{2060}title"), None);
     }
 
     #[test]

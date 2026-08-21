@@ -1559,6 +1559,18 @@ impl StreamArchiverApp {
                             );
                         });
                     ui.end_row();
+                    ui.label("Close player when the stream ends").on_hover_text(
+                        "When the live feed behind a player exits (the stream went \
+                         offline), close that player window automatically. Off by \
+                         default: live players deliberately keep their last frame open \
+                         (mpv --keep-open), which is handy for rewinding — but ended \
+                         players pile up if never closed. Only windows this app can \
+                         positively identify as its own (invisible title tag) are ever \
+                         closed; leftovers are also always listed under Background → \
+                         Player windows with per-window Close buttons.",
+                    );
+                    ui.checkbox(&mut self.settings.player_close_on_end, "");
+                    ui.end_row();
                     ui.label("Mute collab instances").on_hover_text(
                         "Mute every OTHER angle opened by \"Play all collab instances \
                          (live edge)\" — the instance you actually right-clicked keeps its \

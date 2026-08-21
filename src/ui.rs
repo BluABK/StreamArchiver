@@ -207,6 +207,13 @@ pub(crate) const K_CHAT_DOCK_WIDTH: &str = "chat_dock_width_px";
 /// on. A docked chat closes with its player either way; this only controls
 /// the automatic opening.
 pub(crate) const K_CHAT_DOCK_ON_PLAY: &str = "chat_dock_on_play";
+/// Close the player window automatically when its stream feed ends
+/// (Streamlink/yt-dlp exits) — live-play mpv runs `--keep-open=yes`, so
+/// without this an ended stream's window sits on its last frame until
+/// closed by hand, and they pile up across days. `"1"`/`"0"`, default off
+/// (closing a window the user may be rewinding is not a default). Only
+/// windows carrying this app's exact invisible title tag are ever closed.
+pub(crate) const K_PLAYER_CLOSE_ON_END: &str = "player_close_on_end";
 /// Which clock the chat replay's timestamps show: `"relative"` (default,
 /// `[00:40:10]` into the broadcast) or `"clock"` (`19:30` local time, as
 /// Twitch's own popout does). Flipped from the 🕒 toolbar toggle in any chat
@@ -1375,6 +1382,9 @@ pub(crate) struct SettingsForm {
     chat_dock_side: String,
     /// ▷ Play auto-opens + docks the chat window (K_CHAT_DOCK_ON_PLAY).
     chat_dock_on_play: bool,
+    /// Auto-close the player window when its stream feed ends
+    /// (K_PLAYER_CLOSE_ON_END). Default off.
+    player_close_on_end: bool,
     /// Window-title template for "Play stream (live edge)" — same
     /// falls-back-to-default-on-empty convention as `media_player_path`.
     live_title_template: String,

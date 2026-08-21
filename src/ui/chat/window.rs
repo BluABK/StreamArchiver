@@ -268,6 +268,7 @@ impl StreamArchiverApp {
             gigantified: std::collections::HashSet::new(),
             channel_by_login,
             pause_stick_until: 0.0,
+            dock_notice: None,
         };
         // One chat window per monitor: re-targeting an already-open window
         // (e.g. "View chat" on another take) replaces its content in place;
@@ -1109,16 +1110,20 @@ impl StreamArchiverApp {
                             // &mut self, exactly like OPEN_PLAYERS' readers.
                             let status = crate::window_dock::dock_status(popup.monitor_id);
                             let docked = status != crate::window_dock::DockStatus::Undocked;
-                            let available =
-                                docked || crate::window_dock::player_available(popup.monitor_id);
                             let label = match status {
                                 crate::window_dock::DockStatus::Undocked => "🔗",
                                 crate::window_dock::DockStatus::Pending => "🔗…",
                                 crate::window_dock::DockStatus::Docked => "🔗",
                             };
                             let mut on = docked;
+                            // Always enabled: with no registered player the
+                            // click hunts for a running mpv window from a
+                            // previous app session (exact invisible title
+                            // tag, else channel name in the title) and
+                            // adopts it — detach-on-quit deliberately leaves
+                            // players running across restarts.
                             let resp = ui
-                                .add_enabled(available, egui::SelectableLabel::new(on, label))
+                                .add(egui::SelectableLabel::new(on, label))
                                 .on_hover_text(
                                     "Dock this chat to the player window: video|chat move and \
                                      close together, like the website. Drag either window to \
@@ -1127,22 +1132,58 @@ impl StreamArchiverApp {
                                      minimizing the CHAT collapses just the chat — restore it \
                                      from the taskbar and it snaps back. Quitting the player \
                                      closes a docked chat; closing the chat leaves the player \
-                                     running.",
-                                )
-                                .on_disabled_hover_text(
-                                    "No player window to dock to — use ▷ Play stream                                      (live edge) first.",
+                                     running. No player was opened this session? The click \
+                                     finds a still-running player window from before a restart \
+                                     and re-binds to it.",
                                 );
                             if resp.clicked() {
                                 on = !on;
                                 if on {
-                                    crate::window_dock::request_dock(
+                                    let mut ready = crate::window_dock::player_available(
                                         popup.monitor_id,
-                                        dock_title.clone(),
-                                        dock_side,
-                                        dock_width,
                                     );
+                                    if !ready {
+                                        // Re-bind to a survivor from a
+                                        // previous session, if one is on
+                                        // screen for this channel.
+                                        if let Some(w) = crate::window_dock::discover_player(
+                                            popup.monitor_id,
+                                            &popup.monitor_name,
+                                        ) {
+                                            ready = crate::window_dock::adopt_external_player(
+                                                popup.monitor_id,
+                                                w.pid,
+                                            );
+                                        }
+                                    }
+                                    if ready {
+                                        popup.dock_notice = None;
+                                        crate::window_dock::request_dock(
+                                            popup.monitor_id,
+                                            dock_title.clone(),
+                                            dock_side,
+                                            dock_width,
+                                        );
+                                    } else {
+                                        popup.dock_notice = Some(
+                                            "No running player window found for this channel — \
+                                             ▷ Play opens one."
+                                                .into(),
+                                        );
+                                    }
                                 } else {
+                                    popup.dock_notice = None;
                                     crate::window_dock::request_undock(popup.monitor_id);
+                                }
+                            }
+                            if let Some(n) = popup.dock_notice.clone() {
+                                if docked {
+                                    popup.dock_notice = None;
+                                } else {
+                                    ui.label(egui::RichText::new("⚠").color(
+                                        egui::Color32::from_rgb(220, 160, 30),
+                                    ))
+                                    .on_hover_text(n);
                                 }
                             }
                             if icon_button(

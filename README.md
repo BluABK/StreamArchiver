@@ -4407,6 +4407,24 @@ to the playback position. The same *Dock chat to player* setting governs it,
 and with no media player configured the file opens in the system default app
 with the chat window undocked.
 
+**Players survive restarts — and the dock finds them again.** Quitting the
+app deliberately leaves players running, so after a restart a chat window
+can face an mpv the app no longer knows. Clicking 🔗 then **rediscovers the
+running player** (every player window carries an invisible title tag naming
+its channel instance; older untagged windows match by channel name) and
+re-binds to it as if the app had spawned it — docking, close-with-player,
+all of it. If nothing is found, a ⚠ next to the toggle says so.
+
+**Ended players pile up? Two tools.** Live players keep their last frame
+open when the stream ends (mpv `--keep-open`, useful for rewinding), so
+they accumulate if never closed. **Background → Player windows** lists
+every mpv window recognized as this app's — channel, recording state,
+title — with per-window **✖ Close** and a **Close all not recording**
+sweep; unrelated mpv windows are never listed or touched. And **Settings →
+Interface → Close player when the stream ends** (off by default) closes a
+player automatically the moment its live feed exits — only ever windows
+carrying the app's own title tag.
+
 **Two clocks, one click apart.** The 🕒 toolbar toggle switches that
 window's timestamps between **time into the broadcast** (`[00:40:10]`, the default —
 this is an archive tool, and it's what lets you seek the local recording to a

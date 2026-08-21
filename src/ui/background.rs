@@ -686,6 +686,124 @@ impl StreamArchiverApp {
             }
             ui.add_space(12.0);
 
+            // ── Player windows (mpv) ─────────────────────────────────────
+            // Live-play mpv runs `--keep-open=yes`, so a window whose stream
+            // ended sits on the last frame until someone closes it — and
+            // detach-on-quit deliberately leaves players running across app
+            // restarts, so they pile up invisibly. This lists every mpv
+            // window recognized as this app's (exact invisible title tag, or
+            // channel name in the title) with a Close button each. Unrelated
+            // mpv windows are never listed and never touched.
+            {
+                let channels: Vec<(i64, String)> = self
+                    .rows
+                    .iter()
+                    .map(|r| (r.monitor.id, r.channel.name.clone()))
+                    .collect();
+                let wins: Vec<_> = crate::window_dock::list_player_windows(&channels)
+                    .into_iter()
+                    .filter(|w| w.monitor_id.is_some())
+                    .collect();
+                if !wins.is_empty() {
+                    let recording_now = |mid: i64| -> bool {
+                        self.rows.iter().any(|r| {
+                            r.monitor.id == mid
+                                && r.last_recording_status.as_deref() == Some("recording")
+                        })
+                    };
+                    egui::CollapsingHeader::new(format!("Player windows ({})", wins.len()))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "mpv windows recognized as this app's players — including \
+                                     ones left over from before a restart (live players keep \
+                                     the last frame open when their stream ends). Close is \
+                                     the same as clicking the window's ✕. Unrelated mpv \
+                                     windows are never listed here.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.add_space(4.0);
+                            let stale: Vec<isize> = wins
+                                .iter()
+                                .filter(|w| !w.monitor_id.is_some_and(&recording_now))
+                                .map(|w| w.hwnd)
+                                .collect();
+                            if !stale.is_empty()
+                                && ui
+                                    .button(format!("✖ Close all not recording ({})", stale.len()))
+                                    .on_hover_text(
+                                        "Close every listed player whose channel is not \
+                                         being recorded right now — the ended-stream \
+                                         leftovers. Players for channels currently \
+                                         recording are left alone.",
+                                    )
+                                    .clicked()
+                            {
+                                for h in stale {
+                                    crate::window_dock::close_player_window(h);
+                                }
+                            }
+                            egui::Grid::new("bg_players_grid")
+                                .num_columns(4)
+                                .striped(true)
+                                .spacing([16.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Channel");
+                                    ui.strong("State");
+                                    ui.strong("Window title");
+                                    ui.strong("");
+                                    ui.end_row();
+                                    for w in &wins {
+                                        let mid = w.monitor_id.unwrap_or(0);
+                                        let name = self
+                                            .rows
+                                            .iter()
+                                            .find(|r| r.monitor.id == mid)
+                                            .map(|r| r.channel.name.clone())
+                                            .unwrap_or_else(|| format!("monitor {mid}"));
+                                        let l = ui.label(&name);
+                                        if !w.exact {
+                                            l.on_hover_text(
+                                                "Matched by channel name in the window title \
+                                                 (a player from before title tagging existed) \
+                                                 — could in principle be another mpv playing \
+                                                 this channel's material.",
+                                            );
+                                        }
+                                        if recording_now(mid) {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(120, 200, 120),
+                                                "● recording",
+                                            );
+                                        } else {
+                                            ui.weak("idle / ended");
+                                        }
+                                        let short =
+                                            super::chat::truncate_label(w.title.trim(), 60);
+                                        let t = ui.label(&short);
+                                        if short != w.title {
+                                            t.on_hover_text(&w.title);
+                                        }
+                                        if ui
+                                            .button("✖ Close")
+                                            .on_hover_text(
+                                                "Close this player window (same as its ✕).",
+                                            )
+                                            .clicked()
+                                        {
+                                            crate::window_dock::close_player_window(w.hwnd);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    ui.add_space(12.0);
+                }
+            }
+
             // ── Recent completed / failed ────────────────────────────────
             egui::CollapsingHeader::new(format!("Recent ({})", self.finished_tasks.len()))
                 .default_open(true)
