@@ -955,6 +955,23 @@ backfill re-fetches what the failed take missed, so a storm typically costs
 one short gap at worst. The escalating cooldown remains as the last resort
 when the fallback is disabled or the fallback take itself gets rejected.
 
+**Quality-gated Twitch channels are captured from the CDN.** For some
+channels Twitch withholds the source rendition from non-browser sessions
+entirely: every anonymous client — streamlink, yt-dlp, with or without codec
+flags, live or VOD — is offered at most 720p60, while the website (logged in)
+plays 1080p60 and the CDN's own `chunked/` folder serves the full 1080p60
+H.264 source to anyone who asks it directly (measured 2026-08-21; Nyana
+Banyana and Ekkomori were being archived at 720p60 this way). The
+restart-at-better-quality watcher can't fix that by restarting — the manifest
+never improves — so at its last check it now asks the CDN itself: if the
+source playlist resolves and its newest segment measures better than the
+capture, the take is handed to the **sub-only CDN session machinery** (built
+for exactly this "usher won't give us the stream" shape), which captures the
+broadcast at source quality with no authentication at all. Fires at most once
+per stream, shares the once-per-stream ledger with the ordinary restart, and
+a channel whose source genuinely is 720p (the CDN says so) is left alone.
+The 🔔 feed reports the escalation like any quality upgrade.
+
 **Since 2026-08-16, tv is the PRIMARY client for public broadcasts** —
 **Settings → Downloads → 📺 Capture public streams via tv client** (default
 on). The rejection waves had become a daily occurrence (the Warnings history

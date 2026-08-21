@@ -2743,17 +2743,120 @@ progress_info: None,
     /// backfill covers the seam — at source on both sides, so it joins into
     /// a complete `full.mkv` at the better quality. At most one restart per
     /// stream (see `quality_upgraded`).
+    /// The manifest claims we're at its best but the capture is below
+    /// source: verify against the CDN's own `chunked/` (source) playlist and,
+    /// if the broadcast really is better than what the access token offers,
+    /// hand the take to the sub-only CDN session machinery — which exists for
+    /// exactly this shape of problem ("usher won't give us the stream"), and
+    /// fetches from the CDN anonymously at source quality.
+    ///
+    /// Once per stream, sharing the `quality_upgraded` ledger with the
+    /// ordinary restart path: whichever fires first, the other stands down.
+    #[allow(clippy::too_many_arguments)]
+    async fn gated_quality_takeover(
+        &self,
+        row: &MonitorWithChannel,
+        rec_id: i64,
+        stream_key: &str,
+        stream_id: &str,
+        went_live_at: Option<i64>,
+        (cur_h, cur_fps): (i64, i64),
+        final_path: &Path,
+        channel: &str,
+    ) {
+        let monitor_id = row.monitor.id;
+        let (Some(login), Some(went_live)) = (
+            crate::detectors::twitch_login(&row.monitor.url),
+            went_live_at.filter(|t| *t > 0),
+        ) else {
+            return; // no CDN folder derivable without login + go-live time
+        };
+        if stream_id.is_empty() || self.quality_upgraded.lock().unwrap().contains(stream_key) {
+            return;
+        }
+        let client = self.ctx.http_client();
+        let hosts = crate::recovery::load_hosts(&self.store);
+        let max_conc = crate::recovery::load_max_conc(&self.store);
+        let inputs = crate::recovery::RecoveryInputs {
+            login,
+            broadcast_id: stream_id.to_string(),
+            start_epoch: went_live,
+            went_live_approx: false,
+            vod_id: None,
+        };
+        let Some(found) = crate::recovery::resolve_playlist(&client, &inputs, &hosts, max_conc).await
+        else {
+            return; // no source folder reachable — nothing to escalate to
+        };
+        // What the source actually is, from its newest published segment.
+        let Ok(body) = client.get(&found.url).send().await else { return };
+        let Ok(text) = crate::detectors::read_body(body).await else { return };
+        let Some(seg) = text.lines().rev().find(|l| !l.is_empty() && !l.starts_with('#')) else {
+            return;
+        };
+        let base = found.url.rsplit_once('/').map(|(b, _)| b).unwrap_or(&found.url);
+        let Some(info) = probe_media(&format!("{base}/{seg}")).await else { return };
+        let (Ok(src_h), Ok(src_fps)) = (info.height.parse::<i64>(), info.fps.parse::<f64>())
+        else {
+            return;
+        };
+        let src_fps = src_fps.round() as i64;
+        if (src_h, src_fps) <= (cur_h, cur_fps) {
+            return; // the source really is what we're capturing (e.g. a 720p channel)
+        }
+        if !self.quality_upgraded.lock().unwrap().insert(stream_key.to_string()) {
+            return;
+        }
+        warn!(
+            monitor_id,
+            rec_id,
+            "quality gate: manifest caps at {cur_h}p{cur_fps} but the CDN source is              {src_h}p{src_fps} — handing the broadcast to a CDN capture session"
+        );
+        let _ = self.events.send(AppEvent::QualityUpgraded {
+            monitor_id,
+            channel: channel.to_string(),
+            from: format!("{cur_h}p{cur_fps}"),
+            to: format!("{src_h}p{src_fps} (CDN source — manifest quality-gated)"),
+        });
+        // Stop the capped take the way the restart path does; the CDN session
+        // then owns the broadcast (try_begin defers to it), so streamlink is
+        // not respawned into the same capped manifest.
+        self.stopping_monitors.lock().unwrap().insert(monitor_id);
+        let pid = self.active.lock().unwrap().get(&monitor_id).copied();
+        if let Some(pid) = pid.filter(|&p| p > 0) {
+            crate::platform::kill_process_tree(pid);
+        }
+        let companion = self.active_secondary.lock().unwrap().get(&monitor_id).copied();
+        if let Some(p) = companion.filter(|&p| p > 0) {
+            crate::platform::kill_process_tree(p);
+        }
+        self.maybe_start_sub_only_session(
+            row,
+            rec_id,
+            Some(stream_id),
+            Some(went_live),
+            final_path,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn quality_upgrade_watcher(
         self,
-        monitor_id: i64,
+        row: MonitorWithChannel,
+        rec_id: i64,
         stream_key: String,
-        url: String,
+        stream_id: String,
+        went_live_at: Option<i64>,
         capture_path: PathBuf,
-        channel: String,
+        final_path: PathBuf,
     ) {
+        let monitor_id = row.monitor.id;
+        let url = row.monitor.url.clone();
+        let channel = row.channel.name.clone();
         // First check after the rendition list has had time to fill in;
         // second catches a late transcode→source flip.
         const CHECKS_AT_SECS: [u64; 2] = [180, 480];
+        let last_at = *CHECKS_AT_SECS.last().unwrap();
         let mut elapsed = 0u64;
         for at in CHECKS_AT_SECS {
             while elapsed < at {
@@ -2785,6 +2888,21 @@ progress_info: None,
                 continue;
             };
             if (best_h, best_fps) <= (cur_h, cur_fps) {
+                // The manifest says we already record the best it offers —
+                // but for some channels the manifest LIES to non-browser
+                // sessions: Twitch withholds the source rendition from the
+                // access token while the CDN's `chunked/` folder serves it
+                // to anyone (measured 2026-08-21: usher capped a 1080p60
+                // H.264 broadcast at 720p60 for every anonymous client while
+                // the website played 1080p60). Ask the CDN itself, once, at
+                // the last check.
+                if at == last_at && cur_h < 1080 {
+                    self.gated_quality_takeover(
+                        &row, rec_id, &stream_key, &stream_id, went_live_at,
+                        (cur_h, cur_fps), &final_path, &channel,
+                    )
+                    .await;
+                }
                 continue; // already recording the best on offer
             }
             if !self.quality_upgraded.lock().unwrap().insert(stream_key.clone()) {
@@ -3973,7 +4091,7 @@ progress_info: None,
         );
         let (meta_done, meta_task) =
             self.spawn_meta_watcher(&row, &trigger_rule, monitor_id, rec_id, started_at);
-        self.spawn_quality_upgrade_watcher(&row, &plan, monitor_id, &stream_id);
+        self.spawn_quality_upgrade_watcher(&row, &plan, monitor_id, rec_id, &stream_id, went_live_at);
         let (chat_done, chat_task) = self.spawn_chat_loggers(
             &row,
             &plan,
@@ -4771,7 +4889,9 @@ progress_info: None,
         row: &MonitorWithChannel,
         plan: &DownloadPlan,
         monitor_id: i64,
+        rec_id: i64,
         stream_id: &Option<String>,
+        went_live_at: Option<i64>,
     ) {
         // Restart-at-better-quality watcher: a Twitch capture that joins
         // seconds after go-live often sees only transcodes (the source
@@ -4792,11 +4912,15 @@ progress_info: None,
         {
             let this = self.clone();
             let key = format!("{monitor_id}:{}", stream_id.clone().unwrap_or_default());
-            let url = row.monitor.url.clone();
             let capture = plan.capture_path.clone();
-            let channel = row.channel.name.clone();
+            let final_path = plan.final_path.clone();
+            let row = row.clone();
+            let stream_id = stream_id.clone().unwrap_or_default();
             tokio::spawn(async move {
-                this.quality_upgrade_watcher(monitor_id, key, url, capture, channel).await;
+                this.quality_upgrade_watcher(
+                    row, rec_id, key, stream_id, went_live_at, capture, final_path,
+                )
+                .await;
             });
         }
     }
