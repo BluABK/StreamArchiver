@@ -229,6 +229,68 @@ impl Supervisor {
         });
     }
 
+    /// Embed the take's chapter markers into a file that covers the
+    /// broadcast FROM SECOND 0 — a CDN-recovered VOD or a downloaded
+    /// published VOD. Same events and settings chain as the capture's own
+    /// embed, but broadcast-anchored (see `collect_chapter_events`'s
+    /// `anchor_broadcast_start`) and with no gap/recovered markers (those
+    /// describe capture repairs, not broadcast content). Never touches
+    /// `chapters_state` — that column tracks the CAPTURE's embed; this is a
+    /// best-effort bonus pass on a sidecar file (failures just log).
+    pub(super) async fn embed_chapters_into_broadcast_file(
+        &self,
+        rec_id: i64,
+        path: &Path,
+        what: &str,
+    ) {
+        let Some(rec) = self.store.get_recording(rec_id).ok().flatten() else { return };
+        let Some(row) = self.store.get_monitor_with_channel(rec.monitor_id).ok().flatten() else {
+            return;
+        };
+        if !ch::effective_chapters_enabled(&self.store, row.channel.id, row.monitor.id) {
+            return;
+        }
+        if !crate::iomon::fs::is_file_sync(Cat::Promote, path) {
+            return;
+        }
+        let kinds = ch::chapter_kinds(&self.store);
+        let coalesce =
+            ch::effective_chapters_coalesce_secs(&self.store, row.channel.id, row.monitor.id);
+        let events = collect_chapter_events(&self.store, &rec, &kinds, &[], coalesce, true);
+        let chapters = ch::merge_close_events(events);
+        if chapters.is_empty() {
+            debug!(rec_id, what, "chapters: no chapter-worthy events for the broadcast file");
+            return;
+        }
+        info!(
+            rec_id,
+            channel = %row.channel.name,
+            what,
+            "chapters: embedding {} marker(s) into {}",
+            chapters.len(),
+            path.display(),
+        );
+        let total = media_duration_secs(path).await.map(|d| d as f64);
+        let ffmetadata = ch::build_ffmetadata(&chapters, total);
+        // Reuses the capture embed's ffmpeg-job plumbing (tmp + rename +
+        // abort); keyed by the same (kind, rec_id), which is safe because
+        // this runs after the recovery/download completed — long after any
+        // capture embed for the same take finished.
+        if let Err(e) = embed_chapters_into_mkv(
+            &self.store,
+            &self.shutdown,
+            rec_id,
+            path,
+            &ffmetadata,
+            total,
+            None,
+        )
+        .await
+        {
+            warn!(rec_id, what, "chapters: broadcast-file embed failed: {e:#}");
+        }
+    }
+
     async fn chapters_job(&self, rec_id: i64, gap_meta: Vec<SplicedGap>) {
         let Some(rec) = self.store.get_recording(rec_id).ok().flatten() else { return };
         if !chapters_precondition_met(&rec.status, &rec.head_backfill_state, &rec.chapters_state) {
@@ -300,7 +362,7 @@ impl Supervisor {
 
         let kinds = ch::chapter_kinds(&self.store);
         let coalesce_secs = ch::effective_chapters_coalesce_secs(&self.store, row.channel.id, row.monitor.id);
-        let events = collect_chapter_events(&self.store, &rec, &kinds, &gap_meta, coalesce_secs);
+        let events = collect_chapter_events(&self.store, &rec, &kinds, &gap_meta, coalesce_secs, false);
         let chapters = ch::merge_close_events(events);
         if chapters.is_empty() {
             debug!(rec_id, "chapters: no chapter-worthy events found — skipping");
@@ -432,6 +494,13 @@ fn collect_chapter_events(
     kinds: &ChapterKinds,
     gap_meta: &[SplicedGap],
     coalesce_secs: i64,
+    // `true`: the target file covers the broadcast FROM SECOND 0 (a
+    // CDN-recovered VOD / a downloaded published VOD), so every
+    // capture-relative timestamp shifts forward by the capture's join
+    // estimate — the same math a spliced head would apply, regardless of
+    // whether the CAPTURE ever got one. `false`: the capture file itself
+    // (existing behavior).
+    anchor_broadcast_start: bool,
 ) -> Vec<(f64, String)> {
     // `gap_meta`'s `orig_start`/`orig_end` arrive in gap_splice's own raw,
     // broadcast-relative frame (relative to `went_live_at`) — every other
@@ -441,7 +510,8 @@ fn collect_chapter_events(
     // `local_start`/`local_end` need no such conversion (already
     // final-file-relative — see `SplicedGap`'s doc comment).
     let join_estimate = (rec.started_at - rec.went_live_at.unwrap_or(rec.started_at)).max(0) as f64;
-    let head_shift = head_shift_for(rec);
+    let head_shift =
+        if anchor_broadcast_start { join_estimate } else { head_shift_for(rec) };
     let rebase_gaps: Vec<SplicedGap> = gap_meta
         .iter()
         .map(|g| SplicedGap { orig_start: g.orig_start - join_estimate, orig_end: g.orig_end - join_estimate, ..*g })

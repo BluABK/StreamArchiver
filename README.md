@@ -2185,7 +2185,13 @@ Twitch ones.
 Once a take's file is stable — finished, no head backfill pending, and any
 gap-splice attempt for it resolved one way or another — the app can embed
 chapter markers into the finalized MKV so it's easy to scrub through in a
-player (mpv, VLC, …). Five independently-toggleable kinds:
+player (mpv, VLC, …). **CDN-recovered VODs and downloaded published VODs get
+the same markers**: after a recovery or a VOD archive completes, the take's
+chapters are embedded into that file too, shifted to the broadcast's own
+timeline (those files start at second 0 of the broadcast, so a chapter that
+sat at `12:00` into the capture lands at `12:00 + however late the capture
+joined`). Gap-repair markers ("recovered"/"muted stretch") are capture
+bookkeeping and are left out of those files. Five independently-toggleable kinds:
 - **Title changes** and **category/game changes** — one chapter per change,
   from the same title/category history the 📝 popup already shows, plus an
   initial chapter at exactly `00:00:00.000` for whatever title/game the take
@@ -2642,7 +2648,12 @@ afterwards.
 - **Probe first** — the dialog's **🔎 Probe** button checks availability before
   downloading, reporting the host, the resolved true start, the available qualities,
   and a `present / total · un-muted · missing` segment count (warning when the
-  recovery would be partial).
+  recovery would be partial). **Un-muted counts are perishable**: Twitch keeps
+  propagating mutes for hours after a broadcast, revoking the pre-mute
+  originals as it goes — a probe can honestly report originals alive and the
+  recovery minutes later find them 403'd and fall back to silenced copies
+  (which the completion note now reports as `N MUTED (silenced copies)`).
+  If the probe shows un-muted segments, recover immediately.
 
 **Automatic & bulk recovery** (Settings → *Twitch VOD recovery*):
 

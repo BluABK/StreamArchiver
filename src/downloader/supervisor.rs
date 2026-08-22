@@ -282,12 +282,31 @@ impl Supervisor {
                 let store = self.store.clone();
                 let tx = self.events.clone();
                 let client = self.ctx.http_client();
+                let this = self.clone();
+                let rec_sink = match &sink {
+                    crate::recovery::RecoverySink::Recording(id) => Some(*id),
+                    crate::recovery::RecoverySink::Standalone { .. } => None,
+                };
                 tokio::spawn(async move {
                     let task_id = crate::events::next_task_id();
                     crate::recovery::run_recovery(
                         client, store, tx, inputs, quality, sink, probe_all, task_id,
                     )
                     .await;
+                    // The recovered file covers the broadcast from second 0 —
+                    // give it the take's chapter markers too (no-op when the
+                    // recovery failed and left recovered_path empty).
+                    if let Some(rec_id) = rec_sink
+                        && let Ok(Some(rp)) = this.store.recording_recovered_path(rec_id)
+                        && !rp.is_empty()
+                    {
+                        this.embed_chapters_into_broadcast_file(
+                            rec_id,
+                            std::path::Path::new(&rp),
+                            "recovered VOD",
+                        )
+                        .await;
+                    }
                 });
             }
             ManualCommand::ScanRecoverableVods { window_days, quality } => {

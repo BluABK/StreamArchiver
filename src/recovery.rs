@@ -1179,10 +1179,32 @@ pub async fn run_recovery(
                     }
                 }
             }
-            let note = format!(
-                "{}/{} segments · {} un-muted · {} missing",
-                recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
-            );
+            // Muted fallbacks get called out loudly: the probe may have seen
+            // live un-muted originals that Twitch's still-propagating mute
+            // revoked by the time this mux fetched them (hit 2026-08-22 —
+            // probe said 11 un-muted, the file landed with silenced spans).
+            let note = if recovered.muted_used > 0 {
+                format!(
+                    "{}/{} segments · {} un-muted · {} MUTED (silenced copies) · {} missing",
+                    recovered.present,
+                    recovered.total,
+                    recovered.unmuted_recovered,
+                    recovered.muted_used,
+                    recovered.missing
+                )
+            } else {
+                format!(
+                    "{}/{} segments · {} un-muted · {} missing",
+                    recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
+                )
+            };
+            if recovered.muted_used > 0 {
+                tracing::warn!(
+                    muted = recovered.muted_used,
+                    "recovery: {} segment(s) fell back to silenced copies — the pre-mute                      originals were already revoked (muting propagates for hours after a                      broadcast; probe counts are perishable)",
+                    recovered.muted_used,
+                );
+            }
             let _ = events.send(AppEvent::BackgroundTaskFinished {
                 id: task_id,
                 outcome: crate::events::TaskOutcome::CompletedWithNote(note),

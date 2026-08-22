@@ -821,6 +821,16 @@ impl Supervisor {
             &vod_path,
             if muted { "muted" } else { "archived" },
         );
+        // The downloaded VOD covers the broadcast from second 0 — embed the
+        // take's chapter markers into it too (best-effort; spawned so the
+        // replace/finalize flow below never waits on an ffmpeg pass).
+        {
+            let this = self.clone();
+            let p = final_path.to_path_buf();
+            tokio::spawn(async move {
+                this.embed_chapters_into_broadcast_file(rec_id, &p, "downloaded VOD").await;
+            });
+        }
 
         let Some((channel_id, monitor_id, live_path, _)) = replace_info else {
             let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });

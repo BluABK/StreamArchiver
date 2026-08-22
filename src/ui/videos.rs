@@ -1787,6 +1787,12 @@ impl StreamArchiverApp {
                             ui.label(format!(
                                 "Segments: {present}/{total} present · {unmuted} un-muted · {missing} missing",
                             ));
+                            if *unmuted > 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 160, 30),
+                                    "⏳ Un-muted originals are perishable — Twitch keeps                                      propagating mutes for hours after a broadcast, and                                      originals the probe just saw can be revoked minutes                                      later. Recover immediately; the completion note says                                      how many segments actually kept audio.",
+                                );
+                            }
                             if *missing > 0 {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(220, 160, 30),

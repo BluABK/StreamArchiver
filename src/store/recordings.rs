@@ -1036,6 +1036,19 @@ impl Store {
 
     /// Attach a recovered MKV to a recording with a terminal recovery status
     /// (`recovered` for a complete timeline, `partial` when segments were gone).
+    /// The CDN-recovered sidecar file's path, if any — read back by the
+    /// post-recovery chapters embed.
+    pub fn recording_recovered_path(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT COALESCE(recovered_path, '') FROM recording WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn set_recording_recovered(&self, id: i64, path: &str, state: &str) -> Result<()> {
         let conn = self.db();
         conn.execute(
